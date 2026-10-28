@@ -15,9 +15,24 @@ const HOST_DIR_NAME: &str = "com.ndm.downloadmanager";
 const QUEUE_FILE_NAME: &str = "incoming.jsonl";
 const MAX_MESSAGE_BYTES: u32 = 1 << 20; // native messaging messages are small
 
-fn queue_path() -> io::Result<PathBuf> {
+fn queue_dir() -> io::Result<PathBuf> {
     let base = data_home()?;
-    Ok(base.join(HOST_DIR_NAME).join(QUEUE_FILE_NAME))
+    Ok(base.join(HOST_DIR_NAME))
+}
+
+fn queue_path() -> io::Result<PathBuf> {
+    Ok(queue_dir()?.join(QUEUE_FILE_NAME))
+}
+
+/// Unique id for one queue entry: the app echoes it back as an ack
+/// file once it has actually surfaced the entry, which is what lets
+/// the extension say "Sent" honestly (see wait_for_ack).
+fn new_entry_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos:x}-{:x}", std::process::id())
 }
 
 #[cfg(windows)]
@@ -39,14 +54,15 @@ fn data_home() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("share"))
 }
 
-fn append_to_queue(kind: &str, url: &str, title: &str, page_url: &str, cookies: &str) -> io::Result<()> {
+fn append_to_queue(kind: &str, url: &str, title: &str, page_url: &str, cookies: &str) -> io::Result<String> {
     let path = queue_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    let id = new_entry_id();
     // One buffer, one write: two host processes (Chrome + Firefox) appending
     // at the same moment must never interleave into a corrupt queue line.
-    let mut obj = json!({ "kind": kind, "url": url, "title": title, "pageUrl": page_url });
+    let mut obj = json!({ "id": id, "kind": kind, "url": url, "title": title, "pageUrl": page_url });
     // the browser's captured session for this page (video downloads);
     // the app persists it under a token and feeds it to yt-dlp
     if !cookies.is_empty() {
@@ -54,7 +70,31 @@ fn append_to_queue(kind: &str, url: &str, title: &str, page_url: &str, cookies: 
     }
     let line = obj.to_string() + "\n";
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(line.as_bytes())
+    file.write_all(line.as_bytes())?;
+    Ok(id)
+}
+
+/// Wait until the app confirms it has surfaced this entry (it writes
+/// `acks/<id>.ack` next to the queue file as it processes the line).
+/// The browser pill turns green on this signal alone: "the link was
+/// written to a queue file" is not "the app showed the download
+/// dialog", and claiming otherwise left users staring at a green
+/// "Sent ✓" with no dialog anywhere. 10 s covers a cold app launch;
+/// the extension's own reply timeout is 25 s.
+fn wait_for_ack(id: &str) -> bool {
+    let Ok(dir) = queue_dir() else { return false };
+    let ack = dir.join("acks").join(format!("{id}.ack"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if ack.exists() {
+            let _ = std::fs::remove_file(&ack);
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
 }
 
 /// Handles one parsed message; returns the reply object to frame back.
@@ -91,9 +131,19 @@ fn handle_download(message: &Value) -> Value {
     let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
     let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
     match append_to_queue(kind, url, title, page_url, cookies) {
-        Ok(()) => {
+        Ok(id) => {
             ensure_app_running();
-            json!({ "ok": true })
+            if kind == "video" {
+                // `picked` is the app's own confirmation that the
+                // dialog surfaced — the pill stays amber without it.
+                // Files keep the instant reply: the browser's
+                // interception verdict waits on it, and a caught file
+                // makes no on-screen promise the pill must police.
+                let picked = wait_for_ack(&id);
+                json!({ "ok": true, "picked": picked })
+            } else {
+                json!({ "ok": true })
+            }
         }
         Err(e) => {
             eprintln!("ndm-host: cannot write queue: {e}");
@@ -128,8 +178,22 @@ fn ensure_app_running() {
             candidates.push(dir.join("../../bin/ndm-app"));
         }
     }
-    candidates.push(PathBuf::from("ndm-app")); // PATH lookup (/usr/bin)
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            candidates.push(dir.join("ndm-app"));
+        }
+    }
     for cand in candidates {
+        // setsid itself spawns fine even when the program it should
+        // run does not exist — the failure happens inside its child
+        // and spawn() still reports success. Handing it the first
+        // candidate blindly therefore "launched" nothing whenever
+        // the sibling path was absent (the .deb layout: the host
+        // sits in /usr/lib/ndm, the app in /usr/bin) and the app
+        // silently never opened. Only existing binaries qualify.
+        if !cand.is_file() {
+            continue;
+        }
         let spawned = std::process::Command::new("setsid")
             .arg(&cand)
             .stdin(std::process::Stdio::null())

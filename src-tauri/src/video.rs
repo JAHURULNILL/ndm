@@ -27,6 +27,10 @@ pub struct VideoInfo {
     pub title: String,
     pub duration: u64,
     pub options: Vec<QualityOption>,
+    /// the page's own format list carries sound at all — a finished
+    /// video job whose source had audio must produce a file WITH an
+    /// audio stream; the finish path enforces this (see spawn())
+    pub has_audio: bool,
 }
 
 /// Locate a helper tool: app-data components dir → folder next to the NDM
@@ -267,6 +271,14 @@ pub fn probe(url: &str, components_dir: &Path, cookies: Option<&Path>) -> Result
         serde_json::from_slice(&stdout).map_err(|e| format!("bad yt-dlp output: {e}"))?;
     let title = v["title"].as_str().unwrap_or("Video").to_string();
     let duration = v["duration"].as_u64().unwrap_or(0);
+    let has_audio = v["formats"]
+        .as_array()
+        .map(|fs| {
+            fs.iter().any(|f| {
+                f["acodec"].as_str().map(|c| c != "none").unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
     let mut heights: Vec<u64> = v["formats"]
         .as_array()
         .map(|fs| {
@@ -313,6 +325,7 @@ pub fn probe(url: &str, components_dir: &Path, cookies: Option<&Path>) -> Result
         title,
         duration,
         options,
+        has_audio,
     })
 }
 
@@ -339,11 +352,34 @@ impl Default for VideoProgress {
     }
 }
 
+/// (has_video, has_audio) from `ffmpeg -i` output: streams are listed
+/// on stderr as "Stream #0:0: Video: h264 …" / "Stream #0:1: Audio:
+/// aac …". Pure text check so it can be unit-tested on samples.
+fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
+    (text.contains(" Video: "), text.contains(" Audio: "))
+}
+
+/// Stream presence in a finished file, probed with ffmpeg itself
+/// (it exits non-zero on a bare -i; the stream listing is the answer,
+/// not the exit code). None = the check could not run at all —
+/// callers must read that as "unknown", never as a failed download.
+fn probe_streams(path: &Path, components_dir: &Path) -> Option<(bool, bool)> {
+    let ffmpeg = find_tool("ffmpeg", components_dir)?;
+    let out = Command::new(ffmpeg).arg("-i").arg(path).output().ok()?;
+    Some(streams_in_ffmpeg_info(&String::from_utf8_lossy(&out.stderr)))
+}
+
 pub struct VideoJob {
     pub url: String,
     pub dir: PathBuf,
     pub selector: String,
     pub audio: bool,
+    /// the source page had sound and this is a video job: the
+    /// finished file MUST carry an audio stream (checked at finish)
+    pub expect_audio: bool,
+    /// remembered so the finish path can find ffmpeg for the
+    /// stream check without the caller threading it through
+    pub components_dir: PathBuf,
     pub cookies: Option<PathBuf>,
     pub progress: Arc<Mutex<VideoProgress>>,
     child: Mutex<Option<Child>>,
@@ -364,6 +400,7 @@ impl VideoJob {
         dir: &Path,
         selector: &str,
         audio: bool,
+        expect_audio: bool,
         cookies: Option<PathBuf>,
         components_dir: &Path,
     ) -> Result<Arc<VideoJob>, String> {
@@ -372,6 +409,8 @@ impl VideoJob {
             dir: dir.to_path_buf(),
             selector: selector.to_string(),
             audio,
+            expect_audio,
+            components_dir: components_dir.to_path_buf(),
             cookies,
             progress: Arc::new(Mutex::new(VideoProgress::default())),
             child: Mutex::new(None),
@@ -596,12 +635,31 @@ impl VideoJob {
                     .or_else(|| find_final_file(&job.dir, &before, job.audio));
                 match found {
                     Some(fp) => {
-                        p.status = "finished".to_string();
-                        if let Ok(m) = fp.metadata() {
-                            p.total = m.len();
-                            p.done = m.len();
+                        // a file with pictures but no sound, from a
+                        // page that HAS sound, is a broken merge —
+                        // not a finished download. Say so plainly
+                        // instead of letting the user discover a
+                        // silent video in their player.
+                        let silent = job.expect_audio
+                            && matches!(
+                                probe_streams(&fp, &job.components_dir),
+                                Some((true, false))
+                            );
+                        if silent {
+                            p.status = "error".to_string();
+                            p.error = Some(
+                                "the downloaded file has no sound — the video and audio could not be joined into one playable file. The silent file was kept in the download folder; please try the download again"
+                                    .to_string(),
+                            );
+                            p.final_path = Some(fp);
+                        } else {
+                            p.status = "finished".to_string();
+                            if let Ok(m) = fp.metadata() {
+                                p.total = m.len();
+                                p.done = m.len();
+                            }
+                            p.final_path = Some(fp);
                         }
-                        p.final_path = Some(fp);
                     }
                     None => {
                         p.status = "error".to_string();
@@ -666,4 +724,27 @@ impl VideoJob {
         self.spawn(components_dir)
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::streams_in_ffmpeg_info;
+
+    #[test]
+    fn merged_mp4_reports_both_streams() {
+        let info = "  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1920x1080, 2500 kb/s, 30 fps\n  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, stereo, fltp, 128 kb/s";
+        assert_eq!(streams_in_ffmpeg_info(info), (true, true));
+    }
+
+    #[test]
+    fn video_only_file_reports_missing_audio() {
+        let info = "  Stream #0:0: Video: vp9, yuv420p, 1280x720, 1100 kb/s, 30 fps";
+        assert_eq!(streams_in_ffmpeg_info(info), (true, false));
+    }
+
+    #[test]
+    fn audio_only_file_reports_no_video() {
+        let info = "  Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 192 kb/s";
+        assert_eq!(streams_in_ffmpeg_info(info), (false, true));
+    }
 }

@@ -589,6 +589,7 @@ $('vStart').onclick = async () => {
     try {
       await invoke('add_video', {
         url, dir, selector: opt.selector, audio: opt.audio, title: vInfo.title,
+        hasAudio: !!vInfo.has_audio,
         cookies,
       });
     } catch (e) { console.error('add_video failed', e); toast('Could not add the video: ' + e); }
