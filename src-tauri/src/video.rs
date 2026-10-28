@@ -363,6 +363,38 @@ fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
 /// (it exits non-zero on a bare -i; the stream listing is the answer,
 /// not the exit code). None = the check could not run at all —
 /// callers must read that as "unknown", never as a failed download.
+/// Mux a separately-downloaded audio rendition into a silent video
+/// file (stream copy, no re-encode). The muxed result is verified to
+/// carry BOTH streams before it replaces the video file in place;
+/// the audio sidecar is consumed on success.
+fn mux_audio_into(video: &Path, audio: &Path, components_dir: &Path) -> Option<PathBuf> {
+    let ffmpeg = find_tool("ffmpeg", components_dir)?;
+    let tmp = video.with_extension("mux.mp4");
+    let ok = Command::new(&ffmpeg)
+        .args(["-y", "-i"])
+        .arg(video)
+        .args(["-i"])
+        .arg(audio)
+        .args(["-map", "0:v:0", "-map", "1:a:0", "-c", "copy", "-movflags", "+faststart"])
+        .arg(&tmp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|st| st.success())
+        .unwrap_or(false);
+    if !ok || !tmp.is_file() {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    if !matches!(probe_streams(&tmp, components_dir), Some((true, true))) {
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+    std::fs::rename(&tmp, video).ok()?;
+    let _ = std::fs::remove_file(audio);
+    Some(video.to_path_buf())
+}
+
 fn probe_streams(path: &Path, components_dir: &Path) -> Option<(bool, bool)> {
     let ffmpeg = find_tool("ffmpeg", components_dir)?;
     let out = Command::new(ffmpeg).arg("-i").arg(path).output().ok()?;
@@ -377,10 +409,25 @@ pub struct VideoJob {
     /// the source page had sound and this is a video job: the
     /// finished file MUST carry an audio stream (checked at finish)
     pub expect_audio: bool,
+    /// sniffed HLS whose master carries a SEPARATE audio rendition:
+    /// yt-dlp (generic extractor) downloads only the video variant
+    /// even when both formats are explicitly selected — verified —
+    /// so the job fetches this rendition itself and muxes it in
+    pub pair_audio_url: String,
+    /// where the paired rendition landed (set during spawn)
+    pair_audio_file: Mutex<Option<PathBuf>>,
     /// remembered so the finish path can find ffmpeg for the
     /// stream check without the caller threading it through
     pub components_dir: PathBuf,
     pub cookies: Option<PathBuf>,
+    /// the output file's stem, fixed at start from the entry's name:
+    /// the download writes HERE, deterministically — never a
+    /// %(title)s guess, which collides across jobs (every HLS
+    /// manifest is "titled" master/index/playlist) and once made the
+    /// finish path attribute a CONCURRENT download's file to a job
+    /// whose own yt-dlp had quietly skipped an existing same-named
+    /// file and exited 0
+    pub out_stem: String,
     pub progress: Arc<Mutex<VideoProgress>>,
     child: Mutex<Option<Child>>,
     stop_flag: Mutex<Option<String>>, // "paused" | "cancelled" when WE stopped it
@@ -394,13 +441,41 @@ pub struct VideoJob {
     gen: std::sync::atomic::AtomicU64,
 }
 
+/// A display name made safe as a file stem: no separators, no
+/// template metacharacters, no control characters, bounded length.
+pub fn file_stem(name: &str) -> String {
+    let mut s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '%') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(120)
+        .collect();
+    while s.ends_with([' ', '.']) {
+        s.pop();
+    }
+    let s = s.trim().to_string();
+    if s.is_empty() || s == "." || s == ".." {
+        "video".to_string()
+    } else {
+        s
+    }
+}
+
 impl VideoJob {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         url: &str,
         dir: &Path,
         selector: &str,
         audio: bool,
         expect_audio: bool,
+        pair_audio_url: &str,
+        name_hint: &str,
         cookies: Option<PathBuf>,
         components_dir: &Path,
     ) -> Result<Arc<VideoJob>, String> {
@@ -410,8 +485,11 @@ impl VideoJob {
             selector: selector.to_string(),
             audio,
             expect_audio,
+            pair_audio_url: pair_audio_url.to_string(),
+            pair_audio_file: Mutex::new(None),
             components_dir: components_dir.to_path_buf(),
             cookies,
+            out_stem: file_stem(name_hint),
             progress: Arc::new(Mutex::new(VideoProgress::default())),
             child: Mutex::new(None),
             stop_flag: Mutex::new(None),
@@ -475,7 +553,7 @@ impl VideoJob {
         args.push("-o".into());
         args.push(
             self.dir
-                .join("%(title)s.%(ext)s")
+                .join(format!("{}.%(ext)s", self.out_stem))
                 .display()
                 .to_string(),
         );
@@ -495,6 +573,41 @@ impl VideoJob {
                     return Err("this video is already downloading".to_string());
                 }
             }
+        }
+        // separate HLS audio rendition: fetch it now (small next to
+        // the video itself; a leftover from an earlier attempt is
+        // reused). The finish path muxes it into the video file —
+        // yt-dlp left to itself would deliver a silent video here.
+        if !self.pair_audio_url.is_empty() && !self.audio {
+            let audio_path = self.dir.join(format!("{}.audio.mp4", self.out_stem));
+            let have_it = std::fs::metadata(&audio_path)
+                .map(|m| m.is_file() && m.len() > 0)
+                .unwrap_or(false);
+            if !have_it {
+                let mut aargs = base_args(components_dir, self.cookies.as_deref());
+                aargs.push("--hls-prefer-native".into());
+                aargs.push("-o".into());
+                aargs.push(
+                    self.dir
+                        .join(format!("{}.audio.%(ext)s", self.out_stem))
+                        .display()
+                        .to_string(),
+                );
+                aargs.push("--".into());
+                aargs.push(self.pair_audio_url.clone());
+                let out = Command::new(&ytdlp)
+                    .args(&aargs)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .output()
+                    .map_err(|e| format!("could not start the audio download: {e}"))?;
+                if !out.status.success() || !audio_path.is_file() {
+                    return Err(
+                        "the separate audio track could not be downloaded".to_string()
+                    );
+                }
+            }
+            *self.pair_audio_file.lock().unwrap() = Some(audio_path);
         }
         // cleared BEFORE the process exists: a pause landing during the
         // spawn sets the flag after this point and is honoured (pause
@@ -628,11 +741,38 @@ impl VideoJob {
                 // silently skips the merge and still claims success,
                 // leaving two unplayable half-files behind. Never call
                 // that "finished": the file itself is the ground truth.
+                let exact = job.dir.join(format!(
+                    "{}.{}",
+                    job.out_stem,
+                    if job.audio { "mp3" } else { "mp4" }
+                ));
                 let found = p
                     .final_path
                     .clone()
                     .filter(|fp| fp.is_file())
+                    .or_else(|| exact.is_file().then_some(exact))
                     .or_else(|| find_final_file(&job.dir, &before, job.audio));
+                // paired HLS audio: the variant alone is silent and
+                // the rendition fetched at spawn is on disk — mux the
+                // two into the real file NOW; only a muxed (or
+                // natively sounded) file may call itself finished,
+                // anything else falls into the silent guard below
+                let mut found = found;
+                if let Some(fp) = &found {
+                    let pair = job.pair_audio_file.lock().unwrap().clone();
+                    if let Some(audio_file) = pair {
+                        if matches!(
+                            probe_streams(fp, &job.components_dir),
+                            Some((true, false))
+                        ) {
+                            if let Some(muxed) =
+                                mux_audio_into(fp, &audio_file, &job.components_dir)
+                            {
+                                found = Some(muxed);
+                            }
+                        }
+                    }
+                }
                 match found {
                     Some(fp) => {
                         // a file with pictures but no sound, from a

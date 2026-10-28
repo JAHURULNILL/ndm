@@ -154,13 +154,37 @@ fn handle_panel(message: &Value, is_probe: bool) -> Value {
     let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
     let mut extra: Vec<(&str, Value)> = Vec::new();
     if !is_probe {
-        let selector = message.get("selector").and_then(Value::as_str).unwrap_or("");
-        if selector.is_empty() || selector.len() > 2000 {
-            return json!({ "ok": false, "error": "a quality selector is required" });
+        // sniffed direct starts carry a mode + the captured stream
+        // address instead of a page selector
+        let mode = message.get("mode").and_then(Value::as_str).unwrap_or("");
+        if mode == "manifest" || mode == "file" {
+            let direct = message.get("directUrl").and_then(Value::as_str).unwrap_or("");
+            if !(direct.starts_with("http://") || direct.starts_with("https://")) || direct.len() > 2048 {
+                return json!({ "ok": false, "error": "a valid stream address is required" });
+            }
+            extra.push(("mode", json!(mode)));
+            extra.push(("directUrl", json!(direct)));
+            extra.push(("height", json!(message.get("height").and_then(Value::as_u64).unwrap_or(0).min(10_000))));
+            extra.push(("hasAudio", json!(message.get("hasAudio").and_then(Value::as_bool).unwrap_or(false))));
+            // separate HLS audio rendition for the app to pair & mux
+            let audio_url = message.get("audioUrl").and_then(Value::as_str).unwrap_or("");
+            if !audio_url.is_empty() {
+                if !(audio_url.starts_with("http://") || audio_url.starts_with("https://")) || audio_url.len() > 2048 {
+                    return json!({ "ok": false, "error": "a valid audio address is required" });
+                }
+                extra.push(("audioUrl", json!(audio_url)));
+            }
+            let fname = clean(message.get("fileName").and_then(Value::as_str).unwrap_or(""), 300);
+            extra.push(("fileName", json!(fname)));
+        } else {
+            let selector = message.get("selector").and_then(Value::as_str).unwrap_or("");
+            if selector.is_empty() || selector.len() > 2000 {
+                return json!({ "ok": false, "error": "a quality selector is required" });
+            }
+            extra.push(("selector", json!(selector)));
+            extra.push(("audio", json!(message.get("audio").and_then(Value::as_bool).unwrap_or(false))));
+            extra.push(("hasAudio", json!(message.get("hasAudio").and_then(Value::as_bool).unwrap_or(false))));
         }
-        extra.push(("selector", json!(selector)));
-        extra.push(("audio", json!(message.get("audio").and_then(Value::as_bool).unwrap_or(false))));
-        extra.push(("hasAudio", json!(message.get("hasAudio").and_then(Value::as_bool).unwrap_or(false))));
     }
     match append_to_queue(kind, url, &title, &page_url, cookies, &extra) {
         Ok(id) => {
