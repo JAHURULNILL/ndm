@@ -125,7 +125,7 @@ fn def_dir() -> String {
     "~/Downloads".to_string()
 }
 fn def_conns() -> usize {
-    16
+    32
 }
 fn def_sched_start() -> String {
     "22:00".to_string()
@@ -215,6 +215,9 @@ fn load_settings(state: &AppState) {
     }
     if let Ok(raw) = std::fs::read(&path) {
         if let Ok(mut s) = serde_json::from_slice::<Settings>(&raw) {
+            if s.max_connections == 16 || s.max_connections == 8 {
+                s.max_connections = 32;
+            }
             s.sanitize();
             ndm::set_global_limit(s.speed_limit_bps);
             ndm::set_global_connections(s.max_connections);
@@ -2420,9 +2423,10 @@ fn raise_main_window(handle: &AppHandle) {
 }
 
 /// One queued extension link:
-/// - `video_direct`: user already selected quality & folder inside the
-///   in-browser IDM video popup, so start (or queue) the video download
-///   immediately and raise the NDM window.
+/// - `video_direct` / `file_direct`: user already selected options inside
+///   the in-browser IDM popup, so start (or queue) the download silently
+///   in the background WITHOUT raising the NDM window or stealing focus!
+/// - `show_app`: user explicitly clicked "Show in NDM" -> raise NDM window.
 /// - `video`: open the in-app Video Download dialog.
 /// - `file`: open the in-app File Download Info dialog.
 fn handle_incoming_line(handle: &AppHandle, line: &str) {
@@ -2430,6 +2434,10 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         return;
     };
     let kind = v["kind"].as_str().unwrap_or("file");
+    if kind == "show_app" {
+        raise_main_window(handle);
+        return;
+    }
     let url = v["url"].as_str().unwrap_or("");
     if url.is_empty() {
         return;
@@ -2462,7 +2470,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         }
     }
     if kind == "video_direct" {
-        raise_main_window(handle);
+        // Run silently in the background — NEVER steal focus from the browser!
         let state = handle.state::<AppState>();
         let dir = v["dir"]
             .as_str()
@@ -2491,6 +2499,51 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             later,
             total_hint,
         );
+        return;
+    }
+    if kind == "file_direct" {
+        // Run silently in the background — NEVER steal focus from the browser!
+        let state = handle.state::<AppState>();
+        let dir = v["dir"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("~/Downloads");
+        let later = v["later"].as_bool().unwrap_or(false);
+        let total_hint = v["total"].as_u64().unwrap_or(0);
+        let title = v["title"].as_str().unwrap_or("").trim();
+        let page_url = v["pageUrl"].as_str().unwrap_or("");
+        let name_hint = if title.is_empty() { None } else { Some(title) };
+        if let Ok(stub) = register_http_stub(
+            &state,
+            url,
+            dir,
+            None,
+            name_hint,
+            &token,
+            page_url,
+        ) {
+            let max = current_settings(&state).max_simultaneous;
+            let must_wait =
+                later || scheduler_blocks(&state) || (max > 0 && count_active(&state) >= max);
+            if must_wait {
+                if later {
+                    stub.queued.store(false, Ordering::Relaxed);
+                    *stub.restored.lock().unwrap() = Some(Restored {
+                        total: total_hint,
+                        done_bytes: 0,
+                        blocks: Vec::new(),
+                        resumable: true,
+                        status: "paused".to_string(),
+                    });
+                } else {
+                    stub.queued.store(true, Ordering::Relaxed);
+                }
+                let _ = handle.emit("progress", payload_of(&stub));
+                persist(&state);
+            } else {
+                start_entry(handle, stub);
+            }
+        }
         return;
     }
     if kind == "video" {
@@ -2522,9 +2575,13 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
 fn native_host_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    for cand in [dir.join("ndm-host"), dir.join("../lib/ndm/ndm-host")] {
+    for cand in [
+        dir.join("ndm-host"),
+        dir.join("../../../target/release/ndm-host"),
+        dir.join("../lib/ndm/ndm-host"),
+    ] {
         if cand.is_file() {
-            return Some(cand);
+            return Some(cand.canonicalize().unwrap_or(cand));
         }
     }
     None
@@ -2613,6 +2670,11 @@ fn main() {
             update_busy: AtomicBool::new(false),
         })
         .setup(|app| {
+            if std::env::args().any(|a| a == "--background") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
             let components = dir.join("components");

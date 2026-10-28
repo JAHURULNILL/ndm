@@ -114,14 +114,13 @@ body {
 .st-cancelled { color: var(--dim); }
 .empty { padding: 26px; text-align: center; color: var(--dim); }
 
-/* detail panel */
-.detail { border-top: 1px solid var(--line); background: var(--panel); margin-top: auto; }
-.detail.hidden { display: none; }
-.detail-tabs { display: flex; gap: 2px; padding: 6px 10px 0; }
-.detail-tabs .tab { padding: 5px 12px; color: var(--dim); border-radius: 6px 6px 0 0; cursor: pointer; }
-.detail-tabs .tab.active { background: var(--panel2); color: var(--text); }
-.detail-body { padding: 10px 14px 12px; background: var(--panel2); }
-.kv { display: grid; grid-template-columns: 130px 1fr; row-gap: 3px; margin-bottom: 9px; }
+/* detail modal (IDM Download Status floating window) */
+.modal-card.detail-modal { width: 580px; max-width: 95vw; }
+.detail-tabs { display: flex; gap: 2px; padding: 0 2px; border-bottom: 1px solid var(--line); }
+.detail-tabs .tab { padding: 6px 12px; color: var(--dim); border-radius: 6px 6px 0 0; cursor: pointer; font-weight: 600; font-size: 12.5px; }
+.detail-tabs .tab.active { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-bottom-color: var(--panel2); margin-bottom: -1px; }
+.detail-body { padding: 12px 14px; background: var(--panel2); border: 1px solid var(--line); border-top: none; border-radius: 0 0 8px 8px; }
+.kv { display: grid; grid-template-columns: 130px 1fr; row-gap: 4px; margin-bottom: 10px; }
 .kv dt { color: var(--dim); } .kv dd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar {
   position: relative; height: 16px; background: var(--track); border-radius: 4px;
@@ -131,7 +130,7 @@ body {
 .bar span { position: relative; font-size: 11px; line-height: 16px; color: var(--bar-text); text-shadow: var(--bar-shadow); }
 .seg-label { color: var(--dim); margin-bottom: 4px; }
 #segMap { width: 100%; height: 86px; background: var(--seg-bg); border: 1px solid var(--line); border-radius: 4px; }
-.detail-btns { display: flex; gap: 6px; margin-top: 9px; }
+.detail-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .detail-btns button {
   background: var(--panel); color: var(--text); border: 1px solid var(--line);
   border-radius: 6px; padding: 5px 14px; cursor: pointer; transition: background .15s;

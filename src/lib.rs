@@ -60,7 +60,7 @@ pub fn global_limit() -> u64 {
     LIMIT_RATE.load(Ordering::Relaxed)
 }
 
-static MAX_CONN: AtomicU64 = AtomicU64::new(16);
+static MAX_CONN: AtomicU64 = AtomicU64::new(32);
 
 /// The user's per-download connection setting, mirrored process-wide so
 /// sidecar tools (yt-dlp fragment downloads) can honour it too.
@@ -220,7 +220,14 @@ struct Shared {
 }
 
 fn save_state(shared: &Shared, force: bool) {
-    let mut last = shared.last_save.lock().unwrap();
+    let mut last = if force {
+        shared.last_save.lock().unwrap()
+    } else {
+        match shared.last_save.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        }
+    };
     if !force
         && last.elapsed() < SAVE_EVERY
         && shared.since_save.load(Ordering::Relaxed) < SAVE_EVERY_BYTES
@@ -232,20 +239,20 @@ fn save_state(shared: &Shared, force: bool) {
     let tmp = shared.state_path.with_extension("json.tmp");
     let mut saved = false;
     if let Ok(f) = File::create(&tmp) {
-        if serde_json::to_writer(&f, &snapshot).is_ok() && f.sync_all().is_ok() {
+        let write_ok = serde_json::to_writer(&f, &snapshot).is_ok();
+        let sync_ok = !force || f.sync_all().is_ok();
+        if write_ok && sync_ok {
             saved = std::fs::rename(&tmp, &shared.state_path).is_ok();
         }
     }
     if saved {
-        // best-effort directory fsync so the rename itself survives an OS crash
-        if let Some(dir) = shared.state_path.parent() {
-            if let Ok(d) = File::open(dir) {
-                let _ = d.sync_all();
+        if force {
+            if let Some(dir) = shared.state_path.parent() {
+                if let Ok(d) = File::open(dir) {
+                    let _ = d.sync_all();
+                }
             }
         }
-        // only a successful save resets the throttle counters — a failed
-        // one (disk full, permissions) must be retried at the next block,
-        // not silently deferred by a full interval
         shared.since_save.store(0, Ordering::Relaxed);
         *last = Instant::now();
     }
@@ -260,6 +267,7 @@ pub struct Probe {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub suggested_name: Option<String>,
+    pub final_url: String,
 }
 
 /// Extract a clean filename from a `Content-Disposition` header value
@@ -426,7 +434,9 @@ fn verify_range(agent: &ureq::Agent, url: &str, total: u64, header_claim: bool, 
 
 fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, String> {
     let mut head_suggested: Option<String> = None;
+    let mut head_final_url: Option<String> = None;
     if let Ok(resp) = apply_auth(agent.head(url), auth).set("Accept-Encoding", "identity").call() {
+        let resolved = resp.get_url().to_string();
         let etag = resp.header("ETag").map(|x| x.to_string());
         let last_modified = resp.header("Last-Modified").map(|x| x.to_string());
         let suggested_name = extract_suggested_name(&resp, url);
@@ -436,10 +446,10 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
         {
             if total > 0 {
                 let header_claim = resp
-                .header("Accept-Ranges")
-                .map(|v| v.eq_ignore_ascii_case("bytes"))
-                .unwrap_or(false);
-                let range_ok = verify_range(agent, url, total, header_claim, auth);
+                    .header("Accept-Ranges")
+                    .map(|v| v.eq_ignore_ascii_case("bytes"))
+                    .unwrap_or(false);
+                let range_ok = verify_range(agent, &resolved, total, header_claim, auth);
                 return Ok(Probe {
                     total,
                     range_ok,
@@ -447,14 +457,12 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                     etag,
                     last_modified,
                     suggested_name,
+                    final_url: resolved,
                 });
             }
-            // HEAD said Content-Length: 0 — some frameworks/proxies report
-            // 0 on HEAD while GET serves the real body, so a zero is not
-            // trusted: fall through to the GET probe below (416 there is
-            // what actually proves the file is empty)
         }
         head_suggested = suggested_name;
+        head_final_url = Some(resolved);
     }
     let resp = match apply_auth(agent.get(url), auth)
         .set("Range", "bytes=0-0")
@@ -462,8 +470,6 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
         .call()
     {
         Ok(r) => r,
-        // 416 to a 1-byte range request means the file is empty: that
-        // range is satisfiable for any non-empty file
         Err(ureq::Error::Status(416, _)) => {
             return Ok(Probe {
                 total: 0,
@@ -472,10 +478,12 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                 etag: None,
                 last_modified: None,
                 suggested_name: head_suggested,
+                final_url: head_final_url.unwrap_or_else(|| url.to_string()),
             });
         }
         Err(e) => return Err(format!("probe failed: {e}")),
     };
+    let resolved = resp.get_url().to_string();
     let suggested_name = extract_suggested_name(&resp, url).or(head_suggested);
     if resp.status() == 206 {
         let (s, _e, total) = resp
@@ -494,6 +502,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
             etag: resp.header("ETag").map(|s| s.to_string()),
             last_modified: resp.header("Last-Modified").map(|s| s.to_string()),
             suggested_name,
+            final_url: resolved,
         });
     }
     let etag = resp.header("ETag").map(|s| s.to_string());
@@ -503,8 +512,6 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
         .and_then(|v| v.parse().ok())
     {
         Some(t) => t,
-        // no length anywhere (chunked / generated responses): still
-        // downloadable single-stream, just with an unknown total
         None => {
             return Ok(Probe {
                 total: 0,
@@ -513,6 +520,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                 etag,
                 last_modified,
                 suggested_name,
+                final_url: resolved,
             });
         }
     };
@@ -523,6 +531,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
         etag,
         last_modified,
         suggested_name,
+        final_url: resolved,
     })
 }
 
@@ -532,11 +541,14 @@ enum BlockError {
     Cancelled,
 }
 
-fn download_block(
+fn download_block_run(
     agent: &ureq::Agent,
     url: &str,
     file: &File,
-    start: u64,
+    cur_block: &mut usize,
+    b_end_excl: usize,
+    block_size: u64,
+    total: u64,
     end: u64,
     pos: &mut u64,
     shared: &Shared,
@@ -546,40 +558,48 @@ fn download_block(
         return Ok(());
     }
     let req_start = *pos;
-    let total = shared.state.lock().unwrap().total;
-    let resp = apply_auth(agent.get(url), &shared.auth)
-        .set("Range", &format!("bytes={req_start}-{end}"))
-        .set("Accept-Encoding", "identity")
-        .call()
-        .map_err(|e| {
-            if matches!(e, ureq::Error::Status(403, _) | ureq::Error::Status(429, _)) {
-                shared.throttle_events.fetch_add(1, Ordering::Relaxed);
-            }
-            BlockError::Retry(format!("http: {e}"))
-        })?;
-    if resp.status() != 206 {
+    let is_gvideo = url.contains("googlevideo.com/videoplayback")
+        && !url.contains("&range=")
+        && !url.contains("?range=");
+    let req_url = if is_gvideo {
+        let sep = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{sep}range={req_start}-{end}")
+    } else {
+        url.to_string()
+    };
+    let mut req = apply_auth(agent.get(&req_url), &shared.auth)
+        .set("Accept-Encoding", "identity");
+    if !is_gvideo {
+        req = req.set("Range", &format!("bytes={req_start}-{end}"));
+    }
+    let resp = req.call().map_err(|e| {
+        if matches!(e, ureq::Error::Status(403, _) | ureq::Error::Status(429, _)) {
+            shared.throttle_events.fetch_add(1, Ordering::Relaxed);
+        }
+        BlockError::Retry(format!("http: {e}"))
+    })?;
+    let status = resp.status();
+    if is_gvideo && status == 200 {
+        // googlevideo &range= query parameter returns 200 OK for the requested byte slice
+    } else if status == 206 {
+        let range_ok = resp
+            .header("Content-Range")
+            .and_then(parse_content_range)
+            .map(|(s, e, t)| s == req_start && e == end && t == total)
+            .unwrap_or(false);
+        if !range_ok {
+            return Err(BlockError::Retry(
+                "server answered a range request with the wrong range".to_string(),
+            ));
+        }
+    } else {
         return Err(BlockError::Retry(format!(
-            "server answered {} to a range request",
-            resp.status()
+            "server answered {status} to a range request"
         )));
     }
-    // the answer must be exactly the range we asked for, from a file of
-    // exactly the probed size: a server that streams from a different
-    // offset (some broken frameworks/CDNs answer every Range request
-    // with the file's first bytes) would otherwise fill this block with
-    // the wrong bytes at the right length — silent corruption
-    let range_ok = resp
-        .header("Content-Range")
-        .and_then(parse_content_range)
-        .map(|(s, e, t)| s == req_start && e == end && t == total)
-        .unwrap_or(false);
-    if !range_ok {
-        return Err(BlockError::Retry(
-            "server answered a range request with the wrong range".to_string(),
-        ));
-    }
+
     let mut reader = resp.into_reader();
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut buf = vec![0u8; 512 * 1024];
     loop {
         if shared.control.cancelled.load(Ordering::Relaxed) {
             return Err(BlockError::Cancelled);
@@ -587,10 +607,6 @@ fn download_block(
         if shared.control.paused.load(Ordering::Relaxed) {
             return Err(BlockError::Paused);
         }
-        // never read past the block's end: a server that streams more
-        // than the requested range would otherwise overwrite the NEXT
-        // block's region (possibly already marked done) or grow the file
-        // past its true size — silent corruption
         let remaining = end + 1 - *pos;
         if remaining == 0 {
             break;
@@ -605,16 +621,42 @@ fn download_block(
         }
         write_at(file, &buf[..n], *pos).map_err(|e| BlockError::Retry(format!("write: {e}")))?;
         *pos += n as u64;
-        shared.partial[worker_id].store(*pos - start, Ordering::Relaxed);
         shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
         shared.since_save.fetch_add(n as u64, Ordering::Relaxed);
+
+        // Mark any completed blocks in this contiguous run immediately
+        while *cur_block < b_end_excl {
+            let b_limit = ((*cur_block as u64 + 1) * block_size).min(total);
+            if *pos >= b_limit {
+                {
+                    let mut st = shared.state.lock().unwrap();
+                    if st.done[*cur_block] == 0 {
+                        st.done[*cur_block] = 1;
+                        shared.done_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                shared.block_state[*cur_block].store(1, Ordering::Relaxed);
+                *cur_block += 1;
+                if *cur_block < b_end_excl {
+                    shared.block_state[*cur_block].store(2, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+        if *cur_block < b_end_excl {
+            let b_base = (*cur_block as u64) * block_size;
+            shared.partial[worker_id].store((*pos).saturating_sub(b_base), Ordering::Relaxed);
+        } else {
+            shared.partial[worker_id].store(0, Ordering::Relaxed);
+        }
         throttle_global(n as u64, read_at);
     }
     if *pos != end + 1 {
         return Err(BlockError::Retry(format!(
-            "short block: got {} of {} bytes",
-            *pos - start,
-            end - start + 1
+            "short block run: got {} bytes, expected to reach {}",
+            *pos,
+            end + 1
         )));
     }
     Ok(())
@@ -639,6 +681,10 @@ fn worker(
     shared: Arc<Shared>,
     total_blocks: usize,
 ) {
+    let (block_size, total) = {
+        let st = shared.state.lock().unwrap();
+        (st.block_size, st.total)
+    };
     loop {
         if shared.failed.load(Ordering::Relaxed)
             || shared.control.cancelled.load(Ordering::Relaxed)
@@ -651,80 +697,111 @@ fn worker(
             }
             continue;
         }
-        // adaptive gate: workers above the current limit wait instead of claiming
-        // work — but must still exit once every block is complete
-        if id >= shared.active_limit.load(Ordering::Relaxed) {
+        let active = shared.active_limit.load(Ordering::Relaxed).max(1);
+        if id >= active {
             if shared.done_count.load(Ordering::Relaxed) >= total_blocks {
                 return;
             }
             std::thread::sleep(Duration::from_millis(80));
             continue;
         }
-        let idx = shared.next_block.fetch_add(1, Ordering::Relaxed);
-        if idx >= total_blocks {
+        // Claim a contiguous run of blocks so each worker keeps its TCP window
+        // saturated over a multi-megabyte stream, shrinking automatically to 1
+        // block at the end of the file so all workers share the tail.
+        let cur_next = shared.next_block.load(Ordering::Relaxed);
+        if cur_next >= total_blocks {
             return;
         }
-        {
-            let st = shared.state.lock().unwrap();
-            if st.done[idx] == 1 {
-                continue;
-            }
+        let rem_blocks = total_blocks.saturating_sub(cur_next);
+        let run_len = (rem_blocks / (active * 2)).clamp(1, 16);
+        let claim_start = shared.next_block.fetch_add(run_len, Ordering::Relaxed);
+        if claim_start >= total_blocks {
+            return;
         }
-        let (start, end) = {
-            let st = shared.state.lock().unwrap();
-            let start = idx as u64 * st.block_size;
-            let end = (start + st.block_size - 1).min(st.total - 1);
-            (start, end)
-        };
-        shared.block_state[idx].store(2, Ordering::Relaxed);
-        let mut cur_pos = start;
-        let mut attempt = 0;
-        loop {
-            match download_block(&agent, &url, &file, start, end, &mut cur_pos, &shared, id) {
-                Ok(()) => {
-                    shared.partial[id].store(0, Ordering::Relaxed);
-                    {
-                        let mut st = shared.state.lock().unwrap();
-                        st.done[idx] = 1;
-                    }
-                    shared.done_count.fetch_add(1, Ordering::Relaxed);
-                    shared.block_state[idx].store(1, Ordering::Relaxed);
-                    save_state(&shared, false);
+        let claim_end = (claim_start + run_len).min(total_blocks);
+
+        // Process any undone sub-runs inside [claim_start, claim_end)
+        let mut cursor = claim_start;
+        while cursor < claim_end {
+            let (b_first, b_last) = {
+                let st = shared.state.lock().unwrap();
+                while cursor < claim_end && st.done[cursor] == 1 {
+                    cursor += 1;
+                }
+                if cursor >= claim_end {
                     break;
                 }
-                Err(BlockError::Paused) => {
-                    shared.block_state[idx].store(0, Ordering::Relaxed);
-                    if !wait_while_paused(&shared) {
+                let first = cursor;
+                while cursor < claim_end && st.done[cursor] == 0 {
+                    cursor += 1;
+                }
+                (first, cursor)
+            };
+
+            let start = b_first as u64 * block_size;
+            let end = ((b_last as u64) * block_size - 1).min(total - 1);
+            let mut cur_block = b_first;
+            let mut cur_pos = start;
+            let mut attempt = 0;
+            shared.block_state[cur_block].store(2, Ordering::Relaxed);
+
+            loop {
+                match download_block_run(
+                    &agent,
+                    &url,
+                    &file,
+                    &mut cur_block,
+                    b_last,
+                    block_size,
+                    total,
+                    end,
+                    &mut cur_pos,
+                    &shared,
+                    id,
+                ) {
+                    Ok(()) => {
+                        shared.partial[id].store(0, Ordering::Relaxed);
+                        save_state(&shared, false);
+                        break;
+                    }
+                    Err(BlockError::Paused) => {
+                        if cur_block < b_last {
+                            shared.block_state[cur_block].store(0, Ordering::Relaxed);
+                        }
+                        if !wait_while_paused(&shared) {
+                            shared.partial[id].store(0, Ordering::Relaxed);
+                            return;
+                        }
+                        if cur_block < b_last {
+                            shared.block_state[cur_block].store(2, Ordering::Relaxed);
+                        }
+                    }
+                    Err(BlockError::Cancelled) => {
+                        if cur_block < b_last {
+                            shared.block_state[cur_block].store(0, Ordering::Relaxed);
+                        }
                         shared.partial[id].store(0, Ordering::Relaxed);
                         return;
                     }
-                    shared.block_state[idx].store(2, Ordering::Relaxed);
-                    // retry the same block from cur_pos; a pause is not a failure attempt
-                }
-                Err(BlockError::Cancelled) => {
-                    shared.block_state[idx].store(0, Ordering::Relaxed);
-                    shared.partial[id].store(0, Ordering::Relaxed);
-                    return;
-                }
-                Err(BlockError::Retry(e)) => {
-                    attempt += 1;
-                    if attempt >= 5 {
-                        shared.partial[id].store(0, Ordering::Relaxed);
-                        let mut err = shared.error.lock().unwrap();
-                        *err = Some(format!("block {idx}: {e}"));
-                        shared.failed.store(true, Ordering::Relaxed);
-                        shared.block_state[idx].store(0, Ordering::Relaxed);
-                        return;
+                    Err(BlockError::Retry(e)) => {
+                        attempt += 1;
+                        if attempt >= 5 {
+                            shared.partial[id].store(0, Ordering::Relaxed);
+                            let mut err = shared.error.lock().unwrap();
+                            *err = Some(format!("block {cur_block}: {e}"));
+                            shared.failed.store(true, Ordering::Relaxed);
+                            if cur_block < b_last {
+                                shared.block_state[cur_block].store(0, Ordering::Relaxed);
+                            }
+                            return;
+                        }
+                        let backoff = (300u64 << (attempt - 1)).min(5_000);
+                        let jitter = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| (d.as_nanos() % 150) as u64)
+                            .unwrap_or(0);
+                        std::thread::sleep(Duration::from_millis(backoff + jitter));
                     }
-                    // exponential back-off with jitter: 300ms, 600ms,
-                    // 1.2s, 2.4s — a fixed rhythm lets every worker hit a
-                    // struggling server in lockstep
-                    let backoff = (300u64 << (attempt - 1)).min(5_000);
-                    let jitter = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| (d.as_nanos() % 150) as u64)
-                        .unwrap_or(0);
-                    std::thread::sleep(Duration::from_millis(backoff + jitter));
                 }
             }
         }
@@ -1001,7 +1078,7 @@ fn start_impl(
     for id in 0..max_conn.max(1) {
         let s = shared.clone();
         let f = file.clone();
-        let u = url.to_string();
+        let u = probed.final_url.clone();
         let a = agent.clone();
         handles.push(std::thread::spawn(move || worker(id, a, u, f, s, total_blocks)));
     }

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NDM \u2014 Nill Download Manager",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "description": "Send downloads and online videos from your browser to NDM \u2014 Nill Download Manager, a fast desktop download manager.",
   "icons": {
     "16": "icon16.png",
@@ -33,6 +33,17 @@
     }
   },
   "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "page-hook.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN",
+      "all_frames": false
+    },
     {
       "matches": [
         "<all_urls>"

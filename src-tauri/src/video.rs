@@ -197,9 +197,18 @@ pub struct VideoJob {
     pub cookies: Option<PathBuf>,
     pub progress: Arc<Mutex<VideoProgress>>,
     child: Mutex<Option<Child>>,
+    active_downloads: Mutex<Vec<Arc<ndm::Download>>>,
     stop_flag: Mutex<Option<String>>, // "paused" | "cancelled" when WE stopped it
     spawn_lock: Mutex<()>,
     gen: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Clone)]
+struct DirectStream {
+    url: String,
+    ext: String,
+    cookie: Option<String>,
+    referer: Option<String>,
 }
 
 impl VideoJob {
@@ -221,6 +230,7 @@ impl VideoJob {
             cookies,
             progress: Arc::new(Mutex::new(VideoProgress::default())),
             child: Mutex::new(None),
+            active_downloads: Mutex::new(Vec::new()),
             stop_flag: Mutex::new(None),
             spawn_lock: Mutex::new(()),
             gen: std::sync::atomic::AtomicU64::new(0),
@@ -229,79 +239,333 @@ impl VideoJob {
         Ok(job)
     }
 
+    /// Resolve direct HTTP(S) stream URLs via yt-dlp JSON so we can download
+    /// them over NDM's 32-connection parallel Rust engine instead of yt-dlp's
+    /// single-threaded Python HTTP loop.
+    fn resolve_direct_streams(
+        &self,
+        ytdlp: &Path,
+        components_dir: &Path,
+        sel: &str,
+    ) -> Option<(String, Vec<DirectStream>)> {
+        let mut args = base_args(components_dir, self.cookies.as_deref());
+        args.push("-j".into());
+        args.push("-f".into());
+        args.push(sel.to_string());
+        args.push("--".into());
+        args.push(self.url.clone());
+
+        let out = Command::new(ytdlp)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let line = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find(|l| l.trim_start().starts_with('{'))?
+            .to_string();
+        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+        let resolved_title = v["title"].as_str().unwrap_or("").to_string();
+        let formats: Vec<&serde_json::Value> = match v["requested_formats"].as_array() {
+            Some(arr) if !arr.is_empty() => arr.iter().collect(),
+            _ => vec![&v],
+        };
+        if formats.is_empty() || formats.len() > 2 {
+            return None;
+        }
+        let mut streams = Vec::new();
+        for f in formats {
+            let proto = f["protocol"].as_str().unwrap_or("");
+            if proto != "https" && proto != "http" {
+                return None;
+            }
+            let u = f["url"].as_str().unwrap_or("");
+            if !u.starts_with("http://") && !u.starts_with("https://") {
+                return None;
+            }
+            let lower = u.to_ascii_lowercase();
+            if lower.contains(".m3u8") || lower.contains(".mpd") {
+                return None;
+            }
+            let ext = f["ext"].as_str().unwrap_or("mp4").to_string();
+            let headers = &f["http_headers"];
+            let cookie = headers["Cookie"]
+                .as_str()
+                .or_else(|| headers["cookie"].as_str())
+                .map(|s| s.to_string());
+            let referer = headers["Referer"]
+                .as_str()
+                .or_else(|| headers["referer"].as_str())
+                .map(|s| s.to_string());
+            streams.push(DirectStream {
+                url: u.to_string(),
+                ext,
+                cookie,
+                referer,
+            });
+        }
+        Some((resolved_title, streams))
+    }
+
+    fn run_parallel_engine(
+        self: &Arc<Self>,
+        ytdlp: &Path,
+        ffmpeg: &Path,
+        components_dir: &Path,
+        sel: &str,
+        my_gen: u64,
+    ) -> bool {
+        let Some((resolved_title, streams)) =
+            self.resolve_direct_streams(ytdlp, components_dir, sel)
+        else {
+            return false;
+        };
+        if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+            || self.stop_flag.lock().unwrap().is_some()
+        {
+            return true;
+        }
+
+        let title_source = if !self.title.trim().is_empty() {
+            &self.title
+        } else {
+            &resolved_title
+        };
+        let mut stem = safe_filename_stem(title_source);
+        if stem.is_empty() {
+            stem = "video".to_string();
+        }
+        let final_ext = if self.audio {
+            if sel.contains("m4a") && !sel.contains("mp3") {
+                "m4a"
+            } else {
+                "mp3"
+            }
+        } else {
+            "mp4"
+        };
+        let final_path = self.dir.join(format!("{stem}.{final_ext}"));
+
+        let max_conn = ndm::global_connections().clamp(8, 32);
+        let per_stream_conn = if streams.len() > 1 {
+            (max_conn / 2).max(8)
+        } else {
+            max_conn
+        };
+
+        let mut part_paths: Vec<PathBuf> = Vec::new();
+        let mut dls: Vec<Arc<ndm::Download>> = Vec::new();
+        for (i, st) in streams.iter().enumerate() {
+            let part = self
+                .dir
+                .join(format!(".{stem}.ndm_stream{i}.{}.part", st.ext));
+            let auth = ndm::Auth {
+                cookie: st.cookie.clone(),
+                referer: st.referer.clone(),
+            };
+            match ndm::start_with_auth(&st.url, &part, per_stream_conn, ndm::DEFAULT_BLOCK, auth) {
+                Ok(dl) => {
+                    part_paths.push(part);
+                    dls.push(dl);
+                }
+                Err(_) => {
+                    for d in &dls {
+                        d.control.cancel();
+                    }
+                    for p in &part_paths {
+                        let _ = std::fs::remove_file(p);
+                        let _ = std::fs::remove_file(ndm::state_path_for(p));
+                    }
+                    return false;
+                }
+            }
+        }
+
+        *self.active_downloads.lock().unwrap() = dls.clone();
+
+        // Poll parallel multi-connection progress until all streams finish
+        loop {
+            if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                for d in &dls {
+                    d.control.cancel();
+                }
+                return true;
+            }
+            if let Some(flag) = self.stop_flag.lock().unwrap().clone() {
+                if flag == "cancelled" {
+                    for d in &dls {
+                        d.control.cancel();
+                    }
+                    for p in &part_paths {
+                        let _ = std::fs::remove_file(p);
+                        let _ = std::fs::remove_file(ndm::state_path_for(p));
+                    }
+                    let mut p = self.progress.lock().unwrap();
+                    p.status = "cancelled".to_string();
+                    p.speed_bps = 0.0;
+                    return true;
+                }
+            }
+
+            let mut total_sum = 0u64;
+            let mut done_sum = 0u64;
+            let mut speed_sum = 0.0f64;
+            let mut all_finished = true;
+            let mut any_error = false;
+            let mut any_paused = false;
+
+            for d in &dls {
+                let pr = d.progress();
+                total_sum = total_sum.saturating_add(pr.total);
+                done_sum = done_sum.saturating_add(pr.done_bytes);
+                if pr.status == ndm::Status::Downloading {
+                    speed_sum += pr.speed_bps;
+                }
+                match pr.status {
+                    ndm::Status::Finished => {}
+                    ndm::Status::Paused => {
+                        all_finished = false;
+                        any_paused = true;
+                    }
+                    ndm::Status::Error | ndm::Status::Cancelled => {
+                        all_finished = false;
+                        any_error = true;
+                    }
+                    ndm::Status::Downloading => {
+                        all_finished = false;
+                    }
+                }
+            }
+
+            {
+                let mut p = self.progress.lock().unwrap();
+                if total_sum > 0 {
+                    p.total = total_sum;
+                }
+                p.done = done_sum;
+                p.speed_bps = if any_paused { 0.0 } else { speed_sum };
+                p.status = if any_paused {
+                    "paused".to_string()
+                } else {
+                    "downloading".to_string()
+                };
+            }
+
+            if any_error {
+                for d in &dls {
+                    d.control.cancel();
+                }
+                for p in &part_paths {
+                    let _ = std::fs::remove_file(p);
+                    let _ = std::fs::remove_file(ndm::state_path_for(p));
+                }
+                self.active_downloads.lock().unwrap().clear();
+                return false; // Fall back to yt-dlp
+            }
+
+            if all_finished {
+                break;
+            }
+            std::thread::sleep( std::time::Duration::from_millis(120));
+        }
+
+        self.active_downloads.lock().unwrap().clear();
+        {
+            let mut p = self.progress.lock().unwrap();
+            if p.total > 0 {
+                p.done = p.total;
+            }
+            p.speed_bps = 0.0;
+        }
+
+        // Merge / remux into final output file with ffmpeg
+        let mut ff_args: Vec<String> = vec!["-y".into(), "-loglevel".into(), "error".into()];
+        for part in &part_paths {
+            ff_args.push("-i".into());
+            ff_args.push(part.display().to_string());
+        }
+        if self.audio {
+            ff_args.push("-vn".into());
+            if final_ext == "m4a" {
+                ff_args.extend(["-c:a".into(), "aac".into(), "-b:a".into(), "192k".into()]);
+            } else {
+                ff_args.extend(["-c:a".into(), "libmp3lame".into(), "-q:a".into(), "0".into()]);
+            }
+        } else if part_paths.len() >= 2 {
+            ff_args.extend([
+                "-map".into(),
+                "0:v:0".into(),
+                "-map".into(),
+                "1:a:0".into(),
+                "-c:v".into(),
+                "copy".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+                "-movflags".into(),
+                "+faststart".into(),
+            ]);
+        } else {
+            ff_args.extend([
+                "-c:v".into(),
+                "copy".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+                "-movflags".into(),
+                "+faststart".into(),
+            ]);
+        }
+        ff_args.push(final_path.display().to_string());
+
+        let merge_ok = Command::new(ffmpeg)
+            .args(&ff_args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            && final_path.is_file();
+
+        for p in &part_paths {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(ndm::state_path_for(p));
+        }
+
+        if merge_ok {
+            let mut p = self.progress.lock().unwrap();
+            if let Ok(m) = final_path.metadata() {
+                p.total = m.len();
+                p.done = m.len();
+            }
+            p.status = "finished".to_string();
+            p.speed_bps = 0.0;
+            p.final_path = Some(final_path);
+            true
+        } else {
+            false
+        }
+    }
+
     fn spawn(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
         let ytdlp = find_tool("yt-dlp", components_dir)
             .ok_or("yt-dlp not found — the video component is not installed yet")?;
-        if find_tool("ffmpeg", components_dir).is_none() {
-            return Err("ffmpeg is not available on this system — it joins the video and audio into one playable file. Install ffmpeg with your system package manager (Debian/Ubuntu: sudo apt install ffmpeg), or use an NDM build that bundles it, then try again".to_string());
-        }
-        let mut args = base_args(components_dir, self.cookies.as_deref());
+        let ffmpeg = find_tool("ffmpeg", components_dir).ok_or(
+            "ffmpeg is not available on this system — it joins the video and audio into one playable file. Install ffmpeg with your system package manager (Debian/Ubuntu: sudo apt install ffmpeg), or use an NDM build that bundles it, then try again".to_string(),
+        )?;
         let sel = if self.selector.trim().is_empty() {
             ndm::video_probe::best_selector()
         } else {
             self.selector.clone()
         };
-        args.push("-f".into());
-        args.push(sel);
-        if self.audio {
-            args.push("-x".into());
-            args.push("--audio-format".into());
-            args.push("mp3".into());
-            args.push("--audio-quality".into());
-            args.push("0".into());
-        } else {
-            args.push("--merge-output-format".into());
-            args.push("mp4".into());
-            // Guarantee universally playable audio inside MP4 containers:
-            // stream-copy video (0 CPU cost, instant) and convert any
-            // non-AAC audio (Opus/WebM, Vorbis, HE-AAC) to standard LC-AAC.
-            args.push("--postprocessor-args".into());
-            args.push("Merger+ffmpeg_o1:-c:v copy -c:a aac -b:a 192k".into());
-        }
-        // High-speed parallel fragment & ranged chunk downloading:
-        // - 16 concurrent fragments for HLS/DASH streams
-        // - 10M HTTP chunk size bypasses YouTube single-stream bandwidth throttling
-        let frags = ndm::global_connections().clamp(1, 16);
-        args.push("--concurrent-fragments".into());
-        args.push(frags.to_string());
-        args.push("--buffer-size".into());
-        args.push("64K".into());
-        args.push("--http-chunk-size".into());
-        args.push("10M".into());
-        args.push("--hls-prefer-native".into());
-        args.push("--trim-filenames".into());
-        args.push("60".into());
-
-        let limit = ndm::global_limit();
-        if limit > 0 {
-            args.push("--limit-rate".into());
-            args.push(format!("{}K", (limit / 1024).max(1)));
-        }
-        if let Some(ffmpeg) = find_tool("ffmpeg", components_dir) {
-            if let Some(parent) = ffmpeg.parent() {
-                args.push("--ffmpeg-location".into());
-                args.push(parent.display().to_string());
-            }
-        }
-        args.push("--progress-template".into());
-        args.push(
-            "NDMPROG:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s"
-                .into(),
-        );
-        // Honor the user's custom/edited title when valid, otherwise fall back
-        // to yt-dlp's byte-sliced title (150 UTF-8 bytes max) so multi-byte
-        // Bengali/Unicode titles plus `.f<format_id>.mp4.part` never exceed
-        // the 255-byte Linux/Windows filename limit.
-        let stem = safe_filename_stem(&self.title);
-        let out_tmpl = if stem.is_empty() {
-            self.dir.join("%(title).150B.%(ext)s")
-        } else {
-            self.dir.join(format!("{stem}.%(ext)s"))
-        };
-        args.push("-o".into());
-        args.push(out_tmpl.display().to_string());
-        args.push("--".into());
-        args.push(self.url.clone());
 
         let _spawn_guard = self.spawn_lock.lock().unwrap();
         {
@@ -317,26 +581,97 @@ impl VideoJob {
             .gen
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let mut child = Command::new(&ytdlp)
-            .args(&args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not start yt-dlp: {e}"))?;
-        let stdout = child.stdout.take().ok_or("no stdout from yt-dlp")?;
-        let stderr = child.stderr.take();
-        let my_pid = child.id();
-        {
-            let mut slot = self.child.lock().unwrap();
-            if let Some(mut old) = slot.take() {
-                let _ = old.wait();
-            }
-            *slot = Some(child);
-        }
         self.progress.lock().unwrap().status = "downloading".to_string();
 
         let job = self.clone();
+        let comp_dir = components_dir.to_path_buf();
         std::thread::spawn(move || {
+            // 1. Try 32-connection parallel Rust engine download first
+            if job.run_parallel_engine(&ytdlp, &ffmpeg, &comp_dir, &sel, my_gen) {
+                return;
+            }
+            if job.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+                || job.stop_flag.lock().unwrap().is_some()
+            {
+                return;
+            }
+
+            // 2. Fallback to yt-dlp with 32 concurrent fragments for HLS/DASH streams
+            let mut args = base_args(&comp_dir, job.cookies.as_deref());
+            args.push("-f".into());
+            args.push(sel.clone());
+            if job.audio {
+                args.push("-x".into());
+                args.push("--audio-format".into());
+                args.push("mp3".into());
+                args.push("--audio-quality".into());
+                args.push("0".into());
+            } else {
+                args.push("--merge-output-format".into());
+                args.push("mp4".into());
+                args.push("--postprocessor-args".into());
+                args.push("Merger+ffmpeg_o1:-c:v copy -c:a aac -b:a 192k".into());
+            }
+            let frags = ndm::global_connections().clamp(16, 32);
+            args.push("--concurrent-fragments".into());
+            args.push(frags.to_string());
+            args.push("--buffer-size".into());
+            args.push("512K".into());
+            args.push("--http-chunk-size".into());
+            args.push("10M".into());
+            args.push("--hls-prefer-native".into());
+            args.push("--trim-filenames".into());
+            args.push("60".into());
+
+            let limit = ndm::global_limit();
+            if limit > 0 {
+                args.push("--limit-rate".into());
+                args.push(format!("{}K", (limit / 1024).max(1)));
+            }
+            if let Some(parent) = ffmpeg.parent() {
+                args.push("--ffmpeg-location".into());
+                args.push(parent.display().to_string());
+            }
+            args.push("--progress-template".into());
+            args.push(
+                "NDMPROG:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s"
+                    .into(),
+            );
+            let stem = safe_filename_stem(&job.title);
+            let out_tmpl = if stem.is_empty() {
+                job.dir.join("%(title).150B.%(ext)s")
+            } else {
+                job.dir.join(format!("{stem}.%(ext)s"))
+            };
+            args.push("-o".into());
+            args.push(out_tmpl.display().to_string());
+            args.push("--".into());
+            args.push(job.url.clone());
+
+            let Ok(mut child) = Command::new(&ytdlp)
+                .args(&args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            else {
+                let mut p = job.progress.lock().unwrap();
+                p.status = "error".to_string();
+                p.error = Some("could not start yt-dlp".to_string());
+                return;
+            };
+            let Some(stdout) = child.stdout.take() else {
+                return;
+            };
+            let stderr = child.stderr.take();
+            let my_pid = child.id();
+            {
+                let mut slot = job.child.lock().unwrap();
+                if let Some(mut old) = slot.take() {
+                    let _ = old.wait();
+                }
+                *slot = Some(child);
+            }
+
             let err_buf = Arc::new(Mutex::new(String::new()));
             if let Some(mut se) = stderr {
                 let eb = err_buf.clone();
@@ -462,6 +797,16 @@ impl VideoJob {
 
     pub fn pause(&self) {
         let _spawn_guard = self.spawn_lock.lock().unwrap();
+        let active = self.active_downloads.lock().unwrap().clone();
+        if !active.is_empty() {
+            for d in &active {
+                d.control.pause();
+            }
+            let mut p = self.progress.lock().unwrap();
+            p.status = "paused".to_string();
+            p.speed_bps = 0.0;
+            return;
+        }
         *self.stop_flag.lock().unwrap() = Some("paused".to_string());
         if let Some(c) = self.child.lock().unwrap().as_mut() {
             let _ = c.kill();
@@ -476,6 +821,9 @@ impl VideoJob {
     pub fn cancel(&self) {
         let _spawn_guard = self.spawn_lock.lock().unwrap();
         *self.stop_flag.lock().unwrap() = Some("cancelled".to_string());
+        for d in self.active_downloads.lock().unwrap().iter() {
+            d.control.cancel();
+        }
         if let Some(c) = self.child.lock().unwrap().as_mut() {
             let _ = c.kill();
         }
@@ -483,6 +831,17 @@ impl VideoJob {
     }
 
     pub fn resume(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
+        {
+            let active = self.active_downloads.lock().unwrap().clone();
+            if !active.is_empty() {
+                *self.stop_flag.lock().unwrap() = None;
+                for d in &active {
+                    d.control.resume();
+                }
+                self.progress.lock().unwrap().status = "downloading".to_string();
+                return Ok(());
+            }
+        }
         let running = self
             .child
             .lock()

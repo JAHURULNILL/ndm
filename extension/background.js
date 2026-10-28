@@ -189,6 +189,37 @@ function probeWithNdm(url, cookies) {
   return Promise.race([attempt, timeout]);
 }
 
+function probeFileWithNdm(url, pageUrl, cookies) {
+  const msg = { type: 'probe_file', url, pageUrl, cookies };
+  const attempt = new Promise(resolve => {
+    try {
+      chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message || 'Host error' });
+          return;
+        }
+        resolve(response || { ok: false });
+      });
+    } catch (e) {
+      resolve({ ok: false, error: String(e) });
+    }
+  });
+  const timeout = new Promise(r => setTimeout(() => r({ ok: false, error: 'timeout' }), 15000));
+  return Promise.race([attempt, timeout]);
+}
+
+function showAppWithNdm() {
+  return new Promise(resolve => {
+    try {
+      chrome.runtime.sendNativeMessage(HOST_NAME, { type: 'show_app' }, response => {
+        resolve(!!(response && response.ok));
+      });
+    } catch (e) {
+      resolve(false);
+    }
+  });
+}
+
 /* ------------------------------------------------------------------ */
 /* Context menus                                                       */
 /* ------------------------------------------------------------------ */
@@ -224,6 +255,15 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   if (info.menuItemId === MENU_LINK && info.linkUrl) {
     const kind = isVideoPageUrl(info.linkUrl) ? 'video' : 'file';
+    if (kind === 'file' && tab && tab.id != null) {
+      const opened = await openFileModalInTab(tab.id, {
+        url: info.linkUrl,
+        filename: '',
+        totalBytes: 0,
+        referrer: pageUrl,
+      });
+      if (opened) return;
+    }
     const cookies = await captureCookies(info.linkUrl, pageUrl);
     sendToNdm({ kind, url: info.linkUrl, pageUrl, title, cookies });
   }
@@ -231,10 +271,22 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === MENU_VIDEO) {
     const src = info.srcUrl || '';
     const url = src && !src.startsWith('blob:') ? src : pageUrl;
+    if (tab && tab.id != null) {
+      try {
+        const res = await chrome.tabs.sendMessage(tab.id, { action: 'ndm-open-video-modal' });
+        if (res && res.ok) return;
+      } catch (e) {}
+    }
     sendToNdm({ kind: 'video', url, pageUrl, title, cookies: await captureCookies(url, pageUrl) });
   }
 
   if (info.menuItemId === MENU_PAGE_VIDEO) {
+    if (tab && tab.id != null) {
+      try {
+        const res = await chrome.tabs.sendMessage(tab.id, { action: 'ndm-open-video-modal' });
+        if (res && res.ok) return;
+      } catch (e) {}
+    }
     const sniffed = tab && tab.id != null ? tabMediaStreams.get(tab.id) : '';
     const url = isVideoPageUrl(pageUrl) ? pageUrl : (sniffed || pageUrl);
     sendToNdm({ kind: 'video', url, pageUrl, title, cookies: await captureCookies(url, pageUrl) });
@@ -286,6 +338,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.action === 'ndm-show-app') {
+    showAppWithNdm().then(ok => sendResponse({ ok }));
+    return true;
+  }
+
+  if (message.action === 'ndm-probe-file') {
+    const pageUrl = message.pageUrl || (sender.tab && sender.tab.url) || '';
+    const targetUrl = message.url || '';
+    (async () => {
+      const cookies = await captureCookies(targetUrl, pageUrl);
+      const res = await probeFileWithNdm(targetUrl, pageUrl, cookies);
+      sendResponse(res);
+    })();
+    return true;
+  }
+
   if (message.action === 'ndm-probe') {
     const pageUrl = message.pageUrl || (sender.tab && sender.tab.url) || '';
     const targetUrl = message.url || pageUrl;
@@ -301,12 +369,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const pageUrl = message.pageUrl || (sender.tab && sender.tab.url) || '';
     const title = message.title || (sender.tab && sender.tab.title) || '';
     const targetUrl = message.url || pageUrl;
-    const kind =
-      message.kind === 'video_direct'
-        ? 'video_direct'
-        : message.kind === 'video'
-        ? 'video'
-        : 'file';
+    const validKinds = ['video_direct', 'file_direct', 'video', 'file'];
+    const kind = validKinds.includes(message.kind) ? message.kind : 'file';
     (async () => {
       const cookies = await captureCookies(targetUrl, pageUrl);
       const payload = {
@@ -316,7 +380,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         title,
         cookies,
       };
-      if (kind === 'video_direct') {
+      if (kind === 'video_direct' || kind === 'file_direct') {
         payload.selector = message.selector || '';
         payload.audio = !!message.audio;
         payload.dir = message.dir || '~/Downloads';
@@ -331,75 +395,116 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Browser download interception                                       */
+/* Browser download interception (0ms instant cancel + in-browser UI)  */
 /* ------------------------------------------------------------------ */
 
-const suggestedNames = new Map();
+let ndmInterceptEnabled = true;
+chrome.storage.local.get({ ndmIntercept: true }).then(v => {
+  ndmInterceptEnabled = v.ndmIntercept !== false;
+}).catch(() => {});
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.ndmIntercept) {
+    ndmInterceptEnabled = changes.ndmIntercept.newValue !== false;
+  }
+});
+
+async function openFileModalInTab(tabId, payload) {
+  if (tabId == null || tabId < 0) return false;
+  try {
+    const res = await chrome.tabs.sendMessage(tabId, {
+      action: 'ndm-open-file-modal',
+      ...payload,
+    });
+    return !!(res && res.ok);
+  } catch (e) {
+    return false;
+  }
+}
+
+const interceptedIds = new Set();
+
+function shouldInterceptItem(item) {
+  if (!ndmInterceptEnabled || !item) return false;
+  const url = item.finalUrl || item.url || '';
+  if (!/^https?:\/\//i.test(url)) return false;
+  const mimeHit =
+    !!item.mime &&
+    (item.mime.startsWith('application/') ||
+      item.mime.startsWith('video/') ||
+      item.mime.startsWith('audio/') ||
+      item.mime === 'binary/octet-stream') &&
+    item.mime !== 'application/xhtml+xml' &&
+    item.mime !== 'application/json' &&
+    item.mime !== 'application/javascript';
+  return (
+    isDownloadableFile(url) ||
+    isDownloadableFile(item.finalUrl || '') ||
+    isDownloadableFile(item.filename || '') ||
+    mimeHit
+  );
+}
+
+async function handleInterceptedDownload(item, suggestedFilename) {
+  if (!item || interceptedIds.has(item.id)) return;
+  interceptedIds.add(item.id);
+  if (interceptedIds.size > 500) {
+    interceptedIds.delete(interceptedIds.values().next().value);
+  }
+
+  // Cancel and erase the native browser download IMMEDIATELY (0ms delay)
+  // so the browser's download shelf / Save-As dialog never appears!
+  chrome.downloads.cancel(item.id).catch(() => {});
+  chrome.downloads.removeFile(item.id).catch(() => {});
+  chrome.downloads.erase({ id: item.id }).catch(() => {});
+
+  const url = item.finalUrl || item.url || '';
+  const rawName = (suggestedFilename || item.filename || '').split(/[\\/]/).pop() || '';
+  const cleanName = /^[0-9a-f-]{36}(\.tmp|\.crdownload)?$/i.test(rawName) ? '' : rawName;
+  const totalBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : 0;
+  const referrer = item.referrer || '';
+
+  // Try to open the IDM Download File Info popup right inside the active browser tab!
+  try {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    const activeTab = tabs && tabs[0];
+    if (activeTab && activeTab.id != null) {
+      const opened = await openFileModalInTab(activeTab.id, {
+        url,
+        filename: cleanName,
+        totalBytes,
+        referrer: referrer || activeTab.url || '',
+      });
+      if (opened) return;
+    }
+  } catch (e) {}
+
+  // Fallback if the active tab cannot host content scripts (e.g. blank new tab):
+  // start directly in NDM background without forcing the desktop window open.
+  const cookies = await captureCookies(url, referrer);
+  await sendToNdm({
+    kind: 'file',
+    url,
+    pageUrl: referrer,
+    title: cleanName,
+    cookies,
+  });
+}
+
 if (chrome.downloads.onDeterminingFilename) {
-  chrome.downloads.onDeterminingFilename.addListener(item => {
-    if (item && item.id != null && item.filename) {
-      suggestedNames.set(item.id, item.filename);
-      if (suggestedNames.size > 200) {
-        suggestedNames.delete(suggestedNames.keys().next().value);
-      }
+  chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    if (shouldInterceptItem(item)) {
+      const suggested = (item && item.filename) || '';
+      try {
+        suggest({ filename: suggested || 'ndm-intercept.tmp', conflictAction: 'uniquify' });
+      } catch (e) {}
+      handleInterceptedDownload(item, suggested);
+      return;
     }
   });
 }
 
-chrome.downloads.onCreated.addListener(async item => {
-  try {
-    const { ndmIntercept } = await chrome.storage.local.get({
-      ndmIntercept: true,
-    });
-    if (ndmIntercept === false) return;
-
-    const url = item.finalUrl || item.url || '';
-    if (!/^https?:\/\//i.test(url)) return;
-    const mimeHit =
-      !!item.mime &&
-      (item.mime.startsWith('application/') ||
-        item.mime.startsWith('video/') ||
-        item.mime.startsWith('audio/')) &&
-      item.mime !== 'application/xhtml+xml' &&
-      item.mime !== 'application/json';
-    const looksLikeFile =
-      isDownloadableFile(url) ||
-      isDownloadableFile(item.filename || '') ||
-      mimeHit;
-    if (!looksLikeFile) return;
-
-    await chrome.downloads.pause(item.id).catch(() => {});
-    await new Promise(r => setTimeout(r, 250));
-    let suggested = suggestedNames.get(item.id) || item.filename || '';
-    suggestedNames.delete(item.id);
-    try {
-      const [fresh] = await chrome.downloads.search({ id: item.id });
-      if (
-        fresh &&
-        fresh.filename &&
-        !/^[0-9a-f-]{36}$/i.test(
-          fresh.filename.split(/[\\/]/).pop().replace(/\.[^.]*$/, '')
-        )
-      ) {
-        suggested = fresh.filename;
-      }
-    } catch (e) {}
-    const baseName = suggested.split(/[\\/]/).pop() || '';
-    const accepted = await sendToNdm({
-      kind: 'file',
-      url,
-      pageUrl: item.referrer || '',
-      title: baseName,
-      cookies: await captureCookies(url, item.referrer || ''),
-    });
-    if (accepted) {
-      await chrome.downloads.cancel(item.id).catch(() => {});
-      await chrome.downloads.removeFile(item.id).catch(() => {});
-      await chrome.downloads.erase({ id: item.id }).catch(() => {});
-    } else {
-      await chrome.downloads.resume(item.id).catch(() => {});
-    }
-  } catch (e) {
-    console.warn('NDM interception failed:', e);
+chrome.downloads.onCreated.addListener(item => {
+  if (shouldInterceptItem(item)) {
+    handleInterceptedDownload(item, item.filename || '');
   }
 });

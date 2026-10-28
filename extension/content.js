@@ -246,8 +246,131 @@
     cardEl.style.top = Math.max(4, r.top + 12) + 'px';
   }
 
+  const localProbeCache = new Map(); // canonicalUrl -> info
+  const inFlightProbes = new Map();  // canonicalUrl -> Promise<res>
+  let lastPreProbedUrl = '';
+  let onInstantInfoCallback = null;
+
+  function canonicalVideoKey(urlStr) {
+    try {
+      const u = new URL(urlStr || location.href);
+      if (u.hostname.includes('youtube.com')) {
+        const v = u.searchParams.get('v');
+        if (v) return `https://www.youtube.com/watch?v=${v}`;
+        if (u.pathname.startsWith('/shorts/')) {
+          const id = u.pathname.split('/shorts/')[1]?.split(/[/?#]/)[0];
+          if (id) return `https://www.youtube.com/shorts/${id}`;
+        }
+      }
+      if (u.hostname === 'youtu.be') {
+        const id = u.pathname.slice(1).split(/[/?#]/)[0];
+        if (id) return `https://www.youtube.com/watch?v=${id}`;
+      }
+      return u.href;
+    } catch (e) {
+      return urlStr || location.href;
+    }
+  }
+
+  window.addEventListener('message', e => {
+    if (e.source !== window || !e.data || e.data.source !== 'ndm-page-hook') return;
+    if (e.data.type === 'ndm-player-info' && e.data.info) {
+      const info = e.data.info;
+      if (info.options && info.options.length) {
+        if (info.url) localProbeCache.set(canonicalVideoKey(info.url), info);
+        if (e.data.pageUrl) localProbeCache.set(canonicalVideoKey(e.data.pageUrl), info);
+        localProbeCache.set(canonicalVideoKey(location.href), info);
+        if (typeof onInstantInfoCallback === 'function') {
+          onInstantInfoCallback(info);
+        }
+      }
+    }
+  });
+
+  function requestMainWorldPlayerInfo() {
+    try {
+      window.postMessage({ source: 'ndm-content', type: 'ndm-request-player-info' }, '*');
+    } catch (e) {}
+  }
+
+  function fetchOrReuseProbe(targetUrl) {
+    const key = canonicalVideoKey(targetUrl);
+    if (localProbeCache.has(key)) {
+      return Promise.resolve({ ok: true, info: localProbeCache.get(key) });
+    }
+    if (inFlightProbes.has(key)) {
+      return inFlightProbes.get(key);
+    }
+    const p = chrome.runtime
+      .sendMessage({
+        action: 'ndm-probe',
+        url: key,
+        pageUrl: location.href,
+      })
+      .then(res => {
+        inFlightProbes.delete(key);
+        if (res && res.ok && res.info && (res.info.options || res.info.qualities || []).length) {
+          localProbeCache.set(key, res.info);
+        }
+        return res;
+      })
+      .catch(err => {
+        inFlightProbes.delete(key);
+        throw err;
+      });
+    inFlightProbes.set(key, p);
+    return p;
+  }
+
+  async function backgroundPreProbe() {
+    requestMainWorldPlayerInfo();
+    const curAnchor = anchor || pickAnchor();
+    if (!curAnchor && !isKnownVideoSite()) return;
+    const targetUrl = await resolveVideoUrl(curAnchor);
+    const key = canonicalVideoKey(targetUrl);
+    if (!key || key === lastPreProbedUrl || localProbeCache.has(key)) return;
+    lastPreProbedUrl = key;
+    // Wait briefly for MAIN-world page-hook on YouTube; if not populated, warm cache via ndm-host
+    setTimeout(() => {
+      if (!localProbeCache.has(key)) {
+        fetchOrReuseProbe(key).catch(() => {});
+      }
+    }, 120);
+  }
+
+  function showBrowserToast(title, qualityLabel, sizeLabel, later) {
+    if (!shadowRoot) return;
+    const old = shadowRoot.querySelector('.ndm-toast');
+    if (old) old.remove();
+    const toast = document.createElement('div');
+    toast.className = 'ndm-toast';
+    const badge = later ? '⏸ Queued in NDM' : '⬇ Downloading in NDM';
+    const sub = [qualityLabel, sizeLabel].filter(Boolean).join(' • ');
+    toast.innerHTML = `
+      <div class="ndm-toast-icon">${later ? '⏸' : '⬇'}</div>
+      <div class="ndm-toast-body">
+        <div class="ndm-toast-head">${escapeHtml(badge)}</div>
+        <div class="ndm-toast-title">${escapeHtml(title)}</div>
+        ${sub ? `<div class="ndm-toast-sub">${escapeHtml(sub)}</div>` : ''}
+      </div>
+      <button class="ndm-toast-open" type="button">Show in NDM</button>
+    `;
+    for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'click']) {
+      toast.addEventListener(evt, e => e.stopPropagation());
+    }
+    toast.querySelector('.ndm-toast-open').addEventListener('click', () => {
+      chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
+      toast.remove();
+    });
+    shadowRoot.appendChild(toast);
+    setTimeout(() => {
+      if (toast.isConnected) toast.remove();
+    }, 4500);
+  }
+
   function closeBrowserModal() {
     activeProbeToken++;
+    onInstantInfoCallback = null;
     modalOpen = false;
     if (modalEl) {
       modalEl.remove();
@@ -262,8 +385,10 @@
     modalOpen = true;
     const myToken = ++activeProbeToken;
 
+    requestMainWorldPlayerInfo();
     const currentAnchor = anchor || pickAnchor();
-    const targetUrl = await resolveVideoUrl(currentAnchor);
+    const rawTargetUrl = await resolveVideoUrl(currentAnchor);
+    const targetUrl = canonicalVideoKey(rawTargetUrl);
     const fallbackTitle = cleanPageTitle();
     const fallbackThumb = guessFallbackThumbnail(targetUrl, currentAnchor);
 
@@ -363,7 +488,6 @@
     titleIn.value = fallbackTitle;
     dirIn.value = savedDir;
 
-    // Prevent host page keyboard shortcuts (e.g. YouTube 'k', 'f', 'm', Space) from firing while typing in modal
     backdrop.addEventListener('keydown', e => {
       e.stopPropagation();
       if (e.key === 'Escape') {
@@ -394,7 +518,6 @@
     btnClose.addEventListener('click', closeBrowserModal);
     btnCancel.addEventListener('click', closeBrowserModal);
 
-    // Fallback: open directly in NDM app's own video dialog
     btnApp.addEventListener('click', async () => {
       btnApp.disabled = true;
       btnApp.textContent = 'Opening NDM…';
@@ -428,6 +551,26 @@
     }
 
     let selectedOption = null;
+    let renderedAlready = false;
+
+    function applyVideoInfo(info) {
+      if (!info) return;
+      renderedAlready = true;
+      if (info.title && (!titleIn.value || titleIn.value === fallbackTitle)) {
+        titleIn.value = info.title;
+      }
+      if (info.thumbnail) {
+        showThumbnail(info.thumbnail);
+      }
+      if (info.duration) {
+        durBadge.textContent = fmtDuration(info.duration);
+        durBadge.style.display = 'inline-block';
+      }
+      if (info.uploader) {
+        uploaderEl.textContent = info.uploader + ' · ';
+      }
+      renderQualities(info.options || info.qualities || []);
+    }
 
     function renderQualities(qualities) {
       qListEl.innerHTML = '';
@@ -458,7 +601,6 @@
         ];
       }
 
-      // Default select first specific HD/standard resolution (e.g. 1080p or 720p) or first item
       selectedOption = qualities.find(q => q.height === 1080) ||
         qualities.find(q => q.height === 720) ||
         qualities[0];
@@ -519,6 +661,8 @@
       if (!selectedOption) return;
       const chosenDir = dirIn.value.trim() || '~/Downloads';
       const chosenTitle = titleIn.value.trim() || fallbackTitle;
+      const qLabel = selectedOption.label || '';
+      const szLabel = selectedOption.size_text || (selectedOption.size_bytes ? fmtBytes(selectedOption.size_bytes) : '');
       try {
         chrome.storage.local.set({ ndmSaveDir: chosenDir }).catch(() => {});
       } catch (e) {}
@@ -554,6 +698,7 @@
           true,
           later ? 'Paused in NDM ✓' : 'Downloading in NDM ✓'
         );
+        showBrowserToast(chosenTitle, qLabel, szLabel, later);
       } else {
         showError('NDM could not be started. Make sure the NDM desktop app is installed.');
         btnStart.disabled = false;
@@ -565,42 +710,270 @@
     btnStart.addEventListener('click', () => triggerDownload(false));
     btnLater.addEventListener('click', () => triggerDownload(true));
 
-    // Probe the video qualities + sizes via ndm-host
+    // 1. Check instant cache (0ms on YouTube or pre-probed pages!)
+    const cached = localProbeCache.get(targetUrl) || localProbeCache.get(canonicalVideoKey(location.href));
+    if (cached && (cached.options || cached.qualities || []).length) {
+      applyVideoInfo(cached);
+      return;
+    }
+
+    // 2. Listen for MAIN-world page-hook response if it arrives within milliseconds
+    onInstantInfoCallback = info => {
+      if (myToken !== activeProbeToken || renderedAlready) return;
+      applyVideoInfo(info);
+    };
+
+    // 3. Otherwise await in-flight or fresh native probe
     try {
-      const res = await chrome.runtime.sendMessage({
-        action: 'ndm-probe',
-        url: targetUrl,
-        pageUrl: location.href,
-      });
-      if (myToken !== activeProbeToken) return;
+      const res = await fetchOrReuseProbe(targetUrl);
+      if (myToken !== activeProbeToken || renderedAlready) return;
       if (res && res.ok && res.info) {
-        const info = res.info;
-        if (info.title && (!titleIn.value || titleIn.value === fallbackTitle)) {
-          titleIn.value = info.title;
-        }
-        if (info.thumbnail) {
-          showThumbnail(info.thumbnail);
-        }
-        if (info.duration) {
-          durBadge.textContent = fmtDuration(info.duration);
-          durBadge.style.display = 'inline-block';
-        }
-        if (info.uploader) {
-          uploaderEl.textContent = info.uploader + ' · ';
-        }
-        renderQualities(info.options || info.qualities || []);
+        applyVideoInfo(res.info);
       } else {
-        // Even if probe returned an error, provide default Best MP4 + Audio MP3 options
-        // so the user can still download immediately with 1 click!
         renderQualities([]);
         if (res && res.error) {
           showError(res.error + ' — You can still start with automatic best quality below.');
         }
       }
     } catch (e) {
-      if (myToken !== activeProbeToken) return;
+      if (myToken !== activeProbeToken || renderedAlready) return;
       renderQualities([]);
       showError('Could not probe exact sizes — you can still start download below.');
+    }
+  }
+
+  function defaultFileNameFromUrl(url) {
+    try {
+      const u = new URL(url);
+      const tail = decodeURIComponent(u.pathname.split('/').pop() || '').trim();
+      if (tail && tail !== '/') return tail;
+    } catch (e) {}
+    return 'download.bin';
+  }
+
+  function categoryForName(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz'].includes(ext)) return 'Compressed';
+    if (['exe', 'msi', 'deb', 'rpm', 'dmg', 'pkg', 'appimage', 'apk', 'bin', 'iso', 'img', 'flatpakref'].includes(ext)) return 'Programs';
+    if (['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'wmv', 'm4v', 'ts'].includes(ext)) return 'Video';
+    if (['mp3', 'm4a', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma'].includes(ext)) return 'Music';
+    if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'csv', 'epub', 'mobi'].includes(ext)) return 'Documents';
+    return 'General';
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* In-Browser IDM Download File Info Modal (.iso, .zip, .exe, etc.) */
+  /* ---------------------------------------------------------------- */
+
+  async function openBrowserFileModal(opts) {
+    if (!panelHost || !panelHost.isConnected || !shadowRoot) {
+      buildPanel();
+    }
+    closeBrowserModal();
+    modalOpen = true;
+    const myToken = ++activeProbeToken;
+    const targetUrl = (opts && opts.url) || '';
+    const pageReferrer = (opts && opts.referrer) || location.href;
+    let initialName = (opts && opts.filename) ? opts.filename.trim() : '';
+    if (!initialName) initialName = defaultFileNameFromUrl(targetUrl);
+    let currentBytes = Number(opts && opts.totalBytes) || 0;
+    let currentCat = categoryForName(initialName);
+
+    let savedDir = '~/Downloads';
+    try {
+      const st = await chrome.storage.local.get({ ndmSaveDir: '~/Downloads' });
+      if (st && st.ndmSaveDir) savedDir = st.ndmSaveDir;
+    } catch (e) {}
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'ndm-modal-backdrop';
+    for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'click', 'dblclick', 'keydown', 'keyup']) {
+      backdrop.addEventListener(evt, e => e.stopPropagation());
+    }
+
+    const dialog = document.createElement('div');
+    dialog.className = 'ndm-modal';
+    dialog.innerHTML = `
+      <div class="ndm-m-head">
+        <div class="ndm-m-brand">
+          <span class="ndm-m-logo">⬇</span>
+          <span>Download File Info — NDM</span>
+        </div>
+        <button class="ndm-m-x" type="button" title="Close">×</button>
+      </div>
+      <div class="ndm-m-body">
+        <div class="ndm-m-folder-row">
+          <label class="ndm-m-lbl">URL</label>
+          <input class="ndm-m-input ndm-f-url" type="text" readonly />
+        </div>
+        <div class="ndm-f-summary">
+          <span class="ndm-q-badge video ndm-f-cat">${escapeHtml(currentCat)}</span>
+          <span class="ndm-f-size">${currentBytes > 0 ? escapeHtml(fmtBytes(currentBytes)) : 'Checking size…'}</span>
+          <span class="ndm-f-resume">Resumable · 32 parallel streams</span>
+        </div>
+        <div class="ndm-m-folder-row">
+          <label class="ndm-m-lbl">Save file as</label>
+          <input class="ndm-m-input ndm-f-name" type="text" spellcheck="false" />
+        </div>
+        <div class="ndm-m-folder-row">
+          <label class="ndm-m-lbl">Save to folder</label>
+          <input class="ndm-m-input ndm-f-dir" type="text" placeholder="~/Downloads" />
+        </div>
+        <div class="ndm-m-status" style="display:none"></div>
+      </div>
+      <div class="ndm-m-foot">
+        <button class="ndm-btn ndm-btn-ghost ndm-btn-app" type="button" title="Open this download in the NDM desktop app window">Open in NDM App</button>
+        <div class="ndm-m-foot-right">
+          <button class="ndm-btn ndm-btn-secondary ndm-btn-cancel" type="button">Cancel</button>
+          <button class="ndm-btn ndm-btn-secondary ndm-btn-later" type="button">Download Later</button>
+          <button class="ndm-btn ndm-btn-primary ndm-btn-start" type="button">⬇ Start Download${currentBytes > 0 ? ' (' + escapeHtml(fmtBytes(currentBytes)) + ')' : ''}</button>
+        </div>
+      </div>
+    `;
+
+    backdrop.appendChild(dialog);
+    shadowRoot.appendChild(backdrop);
+    modalEl = backdrop;
+    syncHostParent();
+    panelHost.style.display = 'block';
+
+    const urlIn = dialog.querySelector('.ndm-f-url');
+    const catEl = dialog.querySelector('.ndm-f-cat');
+    const sizeEl = dialog.querySelector('.ndm-f-size');
+    const resumeEl = dialog.querySelector('.ndm-f-resume');
+    const nameIn = dialog.querySelector('.ndm-f-name');
+    const dirIn = dialog.querySelector('.ndm-f-dir');
+    const statusEl = dialog.querySelector('.ndm-m-status');
+    const btnClose = dialog.querySelector('.ndm-m-x');
+    const btnCancel = dialog.querySelector('.ndm-btn-cancel');
+    const btnApp = dialog.querySelector('.ndm-btn-app');
+    const btnLater = dialog.querySelector('.ndm-btn-later');
+    const btnStart = dialog.querySelector('.ndm-btn-start');
+
+    urlIn.value = targetUrl;
+    nameIn.value = initialName;
+    dirIn.value = savedDir;
+
+    let userEditedName = false;
+    nameIn.addEventListener('input', () => {
+      userEditedName = true;
+      catEl.textContent = categoryForName(nameIn.value.trim());
+    });
+
+    backdrop.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeBrowserModal();
+      } else if (e.key === 'Enter' && !btnStart.disabled) {
+        e.preventDefault();
+        triggerFileDownload(false);
+      }
+    });
+
+    btnClose.addEventListener('click', closeBrowserModal);
+    btnCancel.addEventListener('click', closeBrowserModal);
+
+    btnApp.addEventListener('click', async () => {
+      btnApp.disabled = true;
+      btnApp.textContent = 'Opening NDM…';
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'ndm-download',
+          kind: 'file',
+          url: targetUrl,
+          pageUrl: pageReferrer,
+          title: nameIn.value.trim() || initialName,
+        });
+        if (resp && resp.ok) {
+          closeBrowserModal();
+        } else {
+          btnApp.disabled = false;
+          btnApp.textContent = 'Open in NDM App';
+        }
+      } catch (e) {
+        btnApp.disabled = false;
+        btnApp.textContent = 'Open in NDM App';
+      }
+    });
+
+    async function triggerFileDownload(later) {
+      const chosenDir = dirIn.value.trim() || '~/Downloads';
+      const chosenName = nameIn.value.trim() || initialName;
+      const szLabel = currentBytes > 0 ? fmtBytes(currentBytes) : '';
+      try {
+        chrome.storage.local.set({ ndmSaveDir: chosenDir }).catch(() => {});
+      } catch (e) {}
+
+      btnStart.disabled = true;
+      btnLater.disabled = true;
+      btnStart.textContent = later ? 'Queueing in NDM…' : 'Starting in NDM…';
+
+      let ok = false;
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'ndm-download',
+          kind: 'file_direct',
+          url: targetUrl,
+          pageUrl: pageReferrer,
+          title: chosenName,
+          dir: chosenDir,
+          later: !!later,
+          total: currentBytes,
+        });
+        ok = !!(resp && resp.ok);
+      } catch (e) {
+        ok = false;
+      }
+
+      if (ok) {
+        closeBrowserModal();
+        showBrowserToast(chosenName, catEl.textContent || 'File', szLabel, later);
+      } else {
+        statusEl.style.display = 'block';
+        statusEl.className = 'ndm-m-status err';
+        statusEl.textContent = 'NDM could not be started. Make sure the NDM desktop app is installed.';
+        btnStart.disabled = false;
+        btnLater.disabled = false;
+        btnStart.textContent = currentBytes > 0
+          ? `⬇ Start Download (${fmtBytes(currentBytes)})`
+          : '⬇ Start Download';
+      }
+    }
+
+    btnStart.addEventListener('click', () => triggerFileDownload(false));
+    btnLater.addEventListener('click', () => triggerFileDownload(true));
+
+    // Probe exact file size, resumability & Content-Disposition filename in background
+    try {
+      const res = await chrome.runtime.sendMessage({
+        action: 'ndm-probe-file',
+        url: targetUrl,
+        pageUrl: pageReferrer,
+      });
+      if (myToken !== activeProbeToken) return;
+      if (res && res.ok) {
+        if (res.total && res.total > 0) {
+          currentBytes = res.total;
+          sizeEl.textContent = fmtBytes(res.total);
+          btnStart.textContent = `⬇ Start Download (${fmtBytes(res.total)})`;
+        } else {
+          sizeEl.textContent = 'Stream / Unknown size';
+        }
+        if (res.suggested_name && !userEditedName) {
+          nameIn.value = res.suggested_name;
+          catEl.textContent = res.category || categoryForName(res.suggested_name);
+        }
+        resumeEl.textContent = res.resumable !== false
+          ? 'Resumable · 32 parallel streams'
+          : 'Single-stream download';
+      } else if (currentBytes <= 0) {
+        sizeEl.textContent = 'Ready to download';
+      }
+    } catch (e) {
+      if (myToken === activeProbeToken && currentBytes <= 0) {
+        sizeEl.textContent = 'Ready to download';
+      }
     }
   }
 
@@ -680,7 +1053,7 @@
       }
       .close:hover { color: #fff; }
 
-      /* In-Browser IDM Video Quality Modal */
+      /* In-Browser IDM Video & File Modal */
       .ndm-modal-backdrop {
         position: fixed; inset: 0; pointer-events: auto;
         background: rgba(8, 15, 28, .62);
@@ -778,6 +1151,19 @@
       .ndm-m-sub {
         font-size: 11.5px; color: #566e8a;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ndm-f-summary {
+        display: flex; align-items: center; gap: 10px;
+        background: #fff; border: 1px solid #c5d4e6;
+        border-radius: 7px; padding: 8px 11px;
+        font-size: 12.5px;
+      }
+      .ndm-f-size {
+        font-weight: 700; color: #0d47a1;
+        font-variant-numeric: tabular-nums;
+      }
+      .ndm-f-resume {
+        margin-left: auto; font-size: 11.5px; font-weight: 600; color: #1b6e39;
       }
       .ndm-m-qhead {
         display: flex; align-items: center; justify-content: space-between;
@@ -915,6 +1301,58 @@
       .ndm-btn-ghost:hover:not(:disabled) {
         background: rgba(255,255,255,.65);
       }
+
+      /* Non-intrusive Bottom-Right Background Download Toast */
+      .ndm-toast {
+        position: fixed; right: 18px; bottom: 18px;
+        pointer-events: auto;
+        display: flex; align-items: center; gap: 10px;
+        max-width: 390px;
+        background: linear-gradient(180deg, rgba(16, 28, 48, .95), rgba(10, 18, 32, .98));
+        color: #fff;
+        border: 1px solid rgba(100, 210, 150, .5);
+        border-radius: 10px;
+        padding: 10px 12px;
+        box-shadow: 0 14px 36px rgba(0, 0, 0, .45);
+        font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+        opacity: 0; transform: translateY(10px);
+        transition: opacity .18s ease, transform .18s ease;
+      }
+      .ndm-toast.on {
+        opacity: 1; transform: translateY(0);
+      }
+      .ndm-toast-icon {
+        width: 28px; height: 28px; border-radius: 50%; flex: none;
+        background: linear-gradient(180deg, #34d399, #059669);
+        color: #fff; font-weight: 800; font-size: 14px;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .ndm-toast-body {
+        flex: 1; min-width: 0;
+      }
+      .ndm-toast-title {
+        font-size: 12.5px; font-weight: 700; color: #ecfdf5;
+      }
+      .ndm-toast-sub {
+        font-size: 11.5px; color: #cbd5e1;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        margin-top: 2px;
+      }
+      .ndm-toast-open {
+        background: rgba(255, 255, 255, .14);
+        border: 1px solid rgba(255, 255, 255, .28);
+        color: #fff; border-radius: 5px;
+        padding: 4px 8px; font-size: 11.5px; font-weight: 600;
+        cursor: pointer; white-space: nowrap;
+      }
+      .ndm-toast-open:hover {
+        background: rgba(255, 255, 255, .24);
+      }
+      .ndm-toast-x {
+        background: none; border: none; color: rgba(255, 255, 255, .65);
+        font-size: 16px; cursor: pointer; padding: 0 2px; line-height: 1;
+      }
+      .ndm-toast-x:hover { color: #fff; }
     `;
 
     const pill = document.createElement('div');
@@ -970,22 +1408,105 @@
 
   function refresh() {
     if (dismissed) return;
-    if (videoDetected() || modalOpen) {
+    const hasVid = videoDetected();
+    if (hasVid || modalOpen) {
       if (!panelHost || !panelHost.isConnected) buildPanel();
-      anchor = pickAnchor();
-      place();
+      if (hasVid) {
+        anchor = pickAnchor();
+        place();
+        backgroundPreProbe();
+      } else if (cardEl) {
+        cardEl.style.display = 'none';
+      }
     } else {
       removePanel();
     }
   }
 
-  // Listen for request from extension popup ("Download Video on This Page")
+  /* ---------------------------------------------------------------- */
+  /* Synchronous <a href="..."> click interceptor for .iso / files    */
+  /* Prevents the browser's native Save-As / download bar from ever   */
+  /* appearing and opens NDM's in-browser file dialog at 0ms!         */
+  /* ---------------------------------------------------------------- */
+
+  const INTERCEPT_EXTS = new Set([
+    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz',
+    'exe', 'msi', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'appimage', 'flatpakref',
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'epub', 'mobi',
+    'mp3', 'flac', 'aac', 'ogg', 'm4a', 'opus', 'wav',
+    'mkv', 'avi', 'mov', 'torrent',
+  ]);
+
+  let ndmInterceptActive = true;
+  try {
+    chrome.storage.local.get({ ndmIntercept: true }).then(v => {
+      ndmInterceptActive = v.ndmIntercept !== false;
+    }).catch(() => {});
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes.ndmIntercept) {
+        ndmInterceptActive = changes.ndmIntercept.newValue !== false;
+      }
+    });
+  } catch (e) {}
+
+  function isDirectDownloadLink(a) {
+    if (!a || !a.href) return false;
+    if (!/^https?:\/\//i.test(a.href)) return false;
+    try {
+      const u = new URL(a.href);
+      const cleanPath = u.pathname.toLowerCase();
+      const dot = cleanPath.lastIndexOf('.');
+      const ext = dot >= 0 ? cleanPath.slice(dot + 1) : '';
+      if (INTERCEPT_EXTS.has(ext)) return true;
+      if (a.hasAttribute('download')) {
+        const dlAttr = (a.getAttribute('download') || '').toLowerCase();
+        const dlDot = dlAttr.lastIndexOf('.');
+        const dlExt = dlDot >= 0 ? dlAttr.slice(dlDot + 1) : '';
+        if (INTERCEPT_EXTS.has(dlExt) || dlExt === 'mp4' || dlExt === 'webm') return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  document.addEventListener(
+    'click',
+    e => {
+      if (!ndmInterceptActive) return;
+      if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+      const target = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+      if (!target || !isDirectDownloadLink(target)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const dlName = (target.getAttribute('download') || '').trim();
+      openBrowserFileModal({
+        url: target.href,
+        filename: dlName,
+        totalBytes: 0,
+        referrer: location.href,
+      });
+    },
+    true
+  );
+
+  // Listen for requests from extension popup or background script
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg && msg.action === 'ndm-open-video-modal') {
+    if (!msg) return;
+    if (msg.action === 'ndm-open-video-modal') {
       dismissed = false;
       if (!panelHost || !panelHost.isConnected) buildPanel();
       const btn = cardEl ? cardEl.querySelector('.label') : null;
       openBrowserModal(btn, cardEl);
+      sendResponse({ ok: true });
+      return false;
+    }
+    if (msg.action === 'ndm-open-file-modal') {
+      dismissed = false;
+      openBrowserFileModal({
+        url: msg.url || '',
+        filename: msg.filename || '',
+        totalBytes: msg.totalBytes || 0,
+        referrer: msg.referrer || location.href,
+      });
       sendResponse({ ok: true });
       return false;
     }

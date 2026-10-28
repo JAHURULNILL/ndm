@@ -113,6 +113,40 @@ pub fn default_components_dir() -> Option<PathBuf> {
     }
 }
 
+fn cookie_file_has_real_session(file: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let mut has_youtube = false;
+    let mut has_non_youtube = false;
+    for line in text.lines() {
+        let l = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+        if l.starts_with('#') || l.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = l.split('\t').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+        let domain = parts[0];
+        let name = parts[5];
+        if domain.contains("youtube.com") || domain.contains("google.com") {
+            has_youtube = true;
+            if matches!(
+                name,
+                "LOGIN_INFO" | "SID" | "HSID" | "SSID" | "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID"
+            ) {
+                return true;
+            }
+        } else {
+            has_non_youtube = true;
+        }
+    }
+    // If the cookie file is for a non-YouTube site (Facebook, Instagram, TikTok, etc.), keep it;
+    // if it only has anonymous YouTube tracking cookies, skip it so yt-dlp uses its full client pool.
+    has_non_youtube && !has_youtube
+}
+
 pub fn base_args(components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--newline".into(),
@@ -120,6 +154,8 @@ pub fn base_args(components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
         "--no-warnings".into(),
         "--socket-timeout".into(),
         "15".into(),
+        "--extractor-args".into(),
+        "youtube:player_client=default,tv_embedded,web_embedded,mweb".into(),
     ];
     if cfg!(debug_assertions) && std::env::var("NDM_INSECURE").is_ok() {
         args.push("--no-check-certificates".into());
@@ -130,7 +166,7 @@ pub fn base_args(components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
         args.push(proxy);
     }
     if let Some(file) = cookies {
-        if file.is_file() {
+        if file.is_file() && cookie_file_has_real_session(file) {
             args.push("--cookies".into());
             args.push(file.to_string_lossy().into_owned());
         }

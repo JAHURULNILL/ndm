@@ -79,10 +79,104 @@ fn handle(message: &Value) -> Value {
     match message.get("type").and_then(Value::as_str) {
         Some("ping") => json!({ "ok": true, "pong": true }),
         Some("probe") => handle_probe(message),
+        Some("probe_file") => handle_probe_file(message),
+        Some("show_app") => handle_show_app(),
         Some("download") => handle_download(message),
         Some(other) => json!({ "ok": false, "error": format!("unknown type: {other}") }),
         None => json!({ "ok": false, "error": "missing type" }),
     }
+}
+
+fn cookie_header_from_netscape(text: &str) -> Option<String> {
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() >= 7 {
+            pairs.push(format!("{}={}", f[5], f[6]));
+        }
+    }
+    if pairs.is_empty() {
+        None
+    } else {
+        Some(pairs.join("; "))
+    }
+}
+
+fn category_for_name(name: &str) -> &'static str {
+    let ext = name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "tgz" | "tbz2" | "txz" => {
+            "Compressed"
+        }
+        "exe" | "msi" | "deb" | "rpm" | "dmg" | "pkg" | "appimage" | "apk" | "bin" | "iso"
+        | "img" | "flatpakref" => "Programs",
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "wmv" | "m4v" | "ts" => "Video",
+        "mp3" | "m4a" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" => "Music",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv"
+        | "epub" | "mobi" => "Documents",
+        _ => "General",
+    }
+}
+
+fn default_file_name(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let tail = path.rsplit('/').next().unwrap_or("download.bin").trim();
+    if tail.is_empty() {
+        "download.bin".to_string()
+    } else {
+        tail.to_string()
+    }
+}
+
+fn handle_probe_file(message: &Value) -> Value {
+    let url = message.get("url").and_then(Value::as_str).unwrap_or("").trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return json!({ "ok": false, "error": "url must be a non-empty http(s) URL" });
+    }
+    let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
+    let cookies_str = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
+    let referer = message
+        .get("pageUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let auth = ndm::Auth {
+        cookie: cookie_header_from_netscape(cookies_str),
+        referer,
+    };
+    match ndm::probe_with_auth(url, &auth) {
+        Ok(probe) => {
+            let suggested = probe
+                .suggested_name
+                .unwrap_or_else(|| default_file_name(url));
+            let category = category_for_name(&suggested);
+            json!({
+                "ok": true,
+                "total": probe.total,
+                "resumable": probe.range_ok,
+                "unknown_size": probe.unknown_size,
+                "suggested_name": suggested,
+                "category": category,
+            })
+        }
+        Err(e) => json!({ "ok": false, "error": e }),
+    }
+}
+
+fn handle_show_app() -> Value {
+    let obj = json!({ "kind": "show_app", "url": "https://ndm.local/show" });
+    let _ = append_to_queue(obj, "");
+    ensure_app_running(false);
+    json!({ "ok": true })
 }
 
 fn handle_probe(message: &Value) -> Value {
@@ -99,7 +193,7 @@ fn handle_probe(message: &Value) -> Value {
     };
     let components_dir = base_dir.join("components");
     if ndm::video_probe::find_tool("yt-dlp", &components_dir).is_none() {
-        ensure_app_running();
+        ensure_app_running(true);
         return json!({
             "ok": false,
             "error": "Video engine is being set up by NDM — please wait a few seconds and click again."
@@ -129,8 +223,8 @@ fn handle_probe(message: &Value) -> Value {
 
 fn handle_download(message: &Value) -> Value {
     let kind = message.get("kind").and_then(Value::as_str).unwrap_or("");
-    if kind != "video" && kind != "file" && kind != "video_direct" {
-        return json!({ "ok": false, "error": "kind must be \"video\", \"video_direct\", or \"file\"" });
+    if kind != "video" && kind != "file" && kind != "video_direct" && kind != "file_direct" {
+        return json!({ "ok": false, "error": "kind must be \"video\", \"video_direct\", \"file\", or \"file_direct\"" });
     }
     let url = message.get("url").and_then(Value::as_str).unwrap_or("");
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -152,7 +246,7 @@ fn handle_download(message: &Value) -> Value {
         "title": title,
         "pageUrl": page_url,
     });
-    if kind == "video_direct" {
+    if kind == "video_direct" || kind == "file_direct" {
         let selector = message
             .get("selector")
             .and_then(Value::as_str)
@@ -180,9 +274,10 @@ fn handle_download(message: &Value) -> Value {
         obj["total"] = json!(total);
     }
 
+    let is_direct = kind == "video_direct" || kind == "file_direct";
     match append_to_queue(obj, cookies) {
         Ok(()) => {
-            ensure_app_running();
+            ensure_app_running(is_direct);
             json!({ "ok": true })
         }
         Err(e) => {
@@ -193,11 +288,10 @@ fn handle_download(message: &Value) -> Value {
 }
 
 /// Launch `ndm-app` detached if it is not already running.
-/// Verifies candidate binaries actually exist on disk before spawning and
-/// detaches via `process_group(0)` so `spawn()` only succeeds when `ndm-app`
-/// itself is executed (fixing the old `setsid` false-positive bug).
+/// When `background` is true, passes `--background` so `ndm-app` starts
+/// hidden in the background without stealing focus from the user's browser.
 #[cfg(unix)]
-fn ensure_app_running() {
+fn ensure_app_running(background: bool) {
     use std::os::unix::process::CommandExt;
     let running = std::fs::read_dir("/proc")
         .map(|rd| {
@@ -238,7 +332,11 @@ fn ensure_app_running() {
         if !cand.is_file() {
             continue;
         }
-        if std::process::Command::new(&cand)
+        let mut cmd = std::process::Command::new(&cand);
+        if background {
+            cmd.arg("--background");
+        }
+        if cmd
             .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -250,7 +348,11 @@ fn ensure_app_running() {
         }
     }
     // Last fallback: PATH lookup
-    let _ = std::process::Command::new("ndm-app")
+    let mut cmd = std::process::Command::new("ndm-app");
+    if background {
+        cmd.arg("--background");
+    }
+    let _ = cmd
         .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -259,14 +361,18 @@ fn ensure_app_running() {
 }
 
 #[cfg(windows)]
-fn ensure_app_running() {
+fn ensure_app_running(background: bool) {
     use std::os::windows::process::CommandExt;
     const DETACHED: u32 = 0x0000_0208; // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let cand = dir.join("ndm-app.exe");
             if cand.is_file() {
-                let _ = std::process::Command::new(&cand)
+                let mut cmd = std::process::Command::new(&cand);
+                if background {
+                    cmd.arg("--background");
+                }
+                let _ = cmd
                     .creation_flags(DETACHED)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
@@ -278,7 +384,7 @@ fn ensure_app_running() {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn ensure_app_running() {}
+fn ensure_app_running(_background: bool) {}
 
 fn read_message(input: &mut impl Read) -> io::Result<Option<Result<Value, String>>> {
     let mut len_buf = [0u8; 4];

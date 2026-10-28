@@ -41,7 +41,7 @@ const rowsEl = $('rows'), detailEl = $('detail');
 
 /* ---------- settings ---------- */
 const DEFAULT_SETTINGS = {
-  default_dir: '~/Downloads', max_connections: 16, speed_limit_bps: 0,
+  default_dir: '~/Downloads', max_connections: 32, speed_limit_bps: 0,
   max_simultaneous: 0, auto_resume: false, scheduler_enabled: false,
   sched_start: '22:00', sched_stop: '06:00', video_quality: 'best', proxy: '',
 };
@@ -107,11 +107,21 @@ function render() {
       <td>${st === 'finished' ? '—' : fmtLeft(left)}</td>
       <td>${st === 'downloading' ? fmtRate(d.speed_bps) : '—'}</td>
       <td>${escapeHtml(d.added || '')}</td>`;
-    tr.addEventListener('click', () => select(d.id, true));
+    // Single-click ONLY selects the row in the full-height table (like IDM)
+    tr.addEventListener('click', () => select(d.id, false));
+    // Double-click opens a finished file, or opens the floating Download Status dialog for active/paused items (like IDM)
     tr.addEventListener('dblclick', () => {
+      if (d.status === 'finished') {
+        select(d.id, false);
+        openSelected(false);
+      } else {
+        select(d.id, true);
+      }
+    });
+    // Right-click opens the floating Download Status / Details dialog for any row
+    tr.addEventListener('contextmenu', e => {
+      e.preventDefault();
       select(d.id, true);
-      // like IDM: double-clicking a finished download opens it
-      if (d.status === 'finished') openSelected(false);
     });
     rowsEl.appendChild(tr);
   }
@@ -128,18 +138,26 @@ function render() {
   const dl = all.filter(d => d.status === 'downloading');
   $('sideStatus').textContent = `${all.length} files (${dl.length} downloading)`;
   $('totalSpeed').textContent = 'Total speed: ' + fmtRate(dl.reduce((a, d) => a + d.speed_bps, 0)).replace('—', '0 B/s');
-  renderDetail();
+  if (!detailEl.classList.contains('hidden')) {
+    renderDetail();
+  }
 }
 
 function renderDetail() {
   const d = items.get(selectedId);
   if (!d) {
+    if ($('dTitle')) $('dTitle').textContent = 'Download Status';
     $('dUrl').textContent = $('dStatus').textContent = $('dSize').textContent = '—';
     $('dDone').textContent = $('dRate').textContent = $('dLeft').textContent = $('dResume').textContent = '—';
     $('dBarFill').style.width = '0%'; $('dBarText').textContent = '0.0%';
     $('dOpen').disabled = $('dOpenFolder').disabled = $('dRefresh').disabled = true;
     drawSegMap('');
     return;
+  }
+  if ($('dTitle')) {
+    $('dTitle').textContent = d.name
+      ? `${pctOf(d).toFixed(0)}% — ${d.name}`
+      : 'Download Status';
   }
   $('dOpen').disabled = $('dOpenFolder').disabled = d.status === 'queued';
   $('dRefresh').disabled = d.status === 'downloading';
@@ -200,7 +218,7 @@ $('themeToggle').onclick = () => {
   document.documentElement.dataset.theme = next;
   try { localStorage.setItem('ndm-theme', next); } catch (e) { /* private mode */ }
   syncThemeButton();
-  renderDetail();
+  if (!detailEl.classList.contains('hidden')) renderDetail();
 };
 syncThemeButton();
 
@@ -228,7 +246,10 @@ function scheduleRender() {
 
 function select(id, openDetail) {
   selectedId = id;
-  if (openDetail) detailEl.classList.remove('hidden');
+  if (openDetail) {
+    detailEl.classList.remove('hidden');
+    requestAnimationFrame(() => renderDetail());
+  }
   render();
 }
 
@@ -249,12 +270,22 @@ $('btnDelete').onclick = async () => {
     deletedIds.add(d.id); // a late progress emit must not resurrect the row
     items.delete(d.id);
     if (selectedId === d.id) selectedId = items.keys().next().value || null;
+    if (!selectedId) detailEl.classList.add('hidden');
     render();
   } else demoRemove(d.id);
 };
+if ($('btnStatus')) {
+  $('btnStatus').onclick = () => {
+    if (!selectedId && items.size > 0) selectedId = items.keys().next().value;
+    if (!selectedId) { toast('Select a download first'); return; }
+    select(selectedId, true);
+  };
+}
 $('dPause').onclick = $('btnPause').onclick;
 $('dResumeBtn').onclick = $('btnResume').onclick;
 $('dHide').onclick = () => detailEl.classList.add('hidden');
+if ($('dModalClose')) $('dModalClose').onclick = () => detailEl.classList.add('hidden');
+detailEl.addEventListener('click', e => { if (e.target === detailEl) detailEl.classList.add('hidden'); });
 $('btnStopAll').onclick = async () => {
   for (const d of items.values()) {
     if (d.status !== 'downloading') continue;

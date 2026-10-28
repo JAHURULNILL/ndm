@@ -96,6 +96,7 @@
   <button id="btnPause" class="tool">⏸ Pause</button>
   <button id="btnStopAll" class="tool">⏹ Stop All</button>
   <button id="btnDelete" class="tool">🗑 Delete</button>
+  <button id="btnStatus" class="tool" title="Show Download Status &amp; Details (or double-click / right-click a row)">📊 Status</button>
   <span class="tool-sep"></span>
   <button id="btnScheduler" class="tool">🗓 Scheduler</button>
   <button id="btnOptions" class="tool">⚙ Options</button>
@@ -133,37 +134,40 @@
     </table>
     </div>
     <div id="emptyMsg" class="empty">No downloads yet — click “Add URL” to start one.</div>
-
-    <section id="detail" class="detail">
-      <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabCompletion">Options on completion</span></div>
-      <div class="detail-body" id="panelStatus">
-        <dl class="kv">
-          <dt>URL:</dt><dd id="dUrl">—</dd>
-          <dt>Status:</dt><dd id="dStatus">—</dd>
-          <dt>File size:</dt><dd id="dSize">—</dd>
-          <dt>Downloaded:</dt><dd id="dDone">—</dd>
-          <dt>Transfer rate:</dt><dd id="dRate">—</dd>
-          <dt>Time left:</dt><dd id="dLeft">—</dd>
-          <dt>Resume capability:</dt><dd id="dResume">—</dd>
-        </dl>
-        <div class="bar"><div id="dBarFill"></div><span id="dBarText">0.0%</span></div>
-        <div class="seg-label">Download progress by connection:</div>
-        <canvas id="segMap" width="760" height="86"></canvas>
-        <div class="detail-btns">
-          <button id="dPause">Pause</button><button id="dResumeBtn">Resume</button>
-          <button id="dHide">Hide</button><button id="dOpen">Open</button><button id="dOpenFolder">Open Folder</button><button id="dRefresh">↻ Refresh URL</button>
-        </div>
-      </div>
-      <div class="detail-body hidden" id="panelCompletion">
-        <p class="comp-note">When the selected download finishes:</p>
-        <label class="comp-opt"><input type="radio" name="compAct" value=""> Do nothing</label>
-        <label class="comp-opt"><input type="radio" name="compAct" value="open_file"> Open the file</label>
-        <label class="comp-opt"><input type="radio" name="compAct" value="open_folder"> Open the folder</label>
-        <p class="comp-note dim">Applies to the selected download only, and is remembered across restarts.</p>
-      </div>
-    </section>
   </section>
 </main>
+
+<div id="detail" class="modal hidden">
+  <div class="modal-card detail-modal">
+    <div class="modal-head"><span id="dTitle">Download Status</span> <span id="dModalClose">×</span></div>
+    <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabCompletion">Options on completion</span></div>
+    <div class="detail-body" id="panelStatus">
+      <dl class="kv">
+        <dt>URL:</dt><dd id="dUrl">—</dd>
+        <dt>Status:</dt><dd id="dStatus">—</dd>
+        <dt>File size:</dt><dd id="dSize">—</dd>
+        <dt>Downloaded:</dt><dd id="dDone">—</dd>
+        <dt>Transfer rate:</dt><dd id="dRate">—</dd>
+        <dt>Time left:</dt><dd id="dLeft">—</dd>
+        <dt>Resume capability:</dt><dd id="dResume">—</dd>
+      </dl>
+      <div class="bar"><div id="dBarFill"></div><span id="dBarText">0.0%</span></div>
+      <div class="seg-label">Download progress by connection:</div>
+      <canvas id="segMap" width="760" height="86"></canvas>
+      <div class="detail-btns">
+        <button id="dPause">Pause</button><button id="dResumeBtn">Resume</button>
+        <button id="dHide">Hide</button><button id="dOpen">Open</button><button id="dOpenFolder">Open Folder</button><button id="dRefresh">↻ Refresh URL</button>
+      </div>
+    </div>
+    <div class="detail-body hidden" id="panelCompletion">
+      <p class="comp-note">When the selected download finishes:</p>
+      <label class="comp-opt"><input type="radio" name="compAct" value=""> Do nothing</label>
+      <label class="comp-opt"><input type="radio" name="compAct" value="open_file"> Open the file</label>
+      <label class="comp-opt"><input type="radio" name="compAct" value="open_folder"> Open the folder</label>
+      <p class="comp-note dim">Applies to the selected download only, and is remembered across restarts.</p>
+    </div>
+  </div>
+</div>
 
 <div id="modal" class="modal hidden">
   <div class="modal-card">
