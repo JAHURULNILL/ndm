@@ -58,6 +58,8 @@ struct SavedEntry {
     selector: String,
     #[serde(default)]
     audio: bool,
+    #[serde(default)]
+    expect_audio: bool,
     /// token naming this entry's captured browser-cookies file
     /// (app-data cookies/<token>.txt); "" = the browser sent none
     #[serde(default)]
@@ -261,6 +263,7 @@ struct Entry {
     kind: String,
     selector: String,
     audio: bool,
+    expect_audio: bool,
     cookies: String,
     referer: String,
     restored: Mutex<Option<Restored>>,
@@ -524,6 +527,7 @@ fn persist(state: &AppState) {
                 kind: e.kind.clone(),
                 selector: e.selector.clone(),
                 audio: e.audio,
+                expect_audio: e.expect_audio,
                 cookies: e.cookies.clone(),
                 referer: e.referer.clone(),
                 completion: e.completion.lock().unwrap().clone(),
@@ -675,6 +679,7 @@ fn swap_live(
         cookies: stub.cookies.clone(),
         referer: stub.referer.clone(),
         audio: false,
+        expect_audio: false,
         restored: Mutex::new(None),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), done0, 0.0)),
@@ -920,6 +925,7 @@ fn register_http_stub(
         cookies: cookies_token.to_string(),
         referer: referer.to_string(),
         audio: false,
+        expect_audio: false,
         restored: Mutex::new(None),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -990,6 +996,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             &entry.out_path,
             &entry.selector,
             entry.audio,
+            entry.expect_audio,
             state.cookies_path(&entry.cookies),
             &state.components(),
         ) {
@@ -1014,6 +1021,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 cookies: entry.cookies.clone(),
                 referer: entry.referer.clone(),
                 audio: entry.audio,
+                expect_audio: entry.expect_audio,
                 restored: Mutex::new(None),
                 queued: AtomicBool::new(false),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -1360,6 +1368,7 @@ async fn resume_download(
                 &entry.out_path,
                 &entry.selector,
                 entry.audio,
+                entry.expect_audio,
                 state.cookies_path(&entry.cookies),
                 &state.components(),
             ) {
@@ -1383,6 +1392,7 @@ async fn resume_download(
                 cookies: entry.cookies.clone(),
                 referer: entry.referer.clone(),
                 audio: entry.audio,
+                expect_audio: entry.expect_audio,
                 restored: Mutex::new(None),
                 queued: AtomicBool::new(false),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -1794,6 +1804,7 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         cookies: entry.cookies.clone(),
         referer: entry.referer.clone(),
         audio: entry.audio,
+        expect_audio: entry.expect_audio,
         restored: Mutex::new(Some(Restored {
             total,
             done_bytes: 0,
@@ -1856,10 +1867,14 @@ async fn add_video(
     dir: String,
     selector: String,
     audio: bool,
+    has_audio: bool,
     title: String,
     cookies: Option<String>,
 ) -> Result<String, String> {
     let dir = resolve_dir(&dir);
+    // the finish path's promise: a video from a page WITH sound must
+    // not "finish" as a silent file (audio-only jobs are exempt)
+    let expect_audio = has_audio && !audio;
     // a cookies token is honoured only while its captured file exists;
     // anything else (typed, stale, forged) means "no cookies"
     let cookies_token = cookies
@@ -1905,6 +1920,7 @@ async fn add_video(
             cookies: cookies_token.clone(),
             referer: String::new(),
             audio,
+            expect_audio,
             restored: Mutex::new(Some(Restored {
                 total: 0,
                 done_bytes: 0,
@@ -1935,6 +1951,7 @@ async fn add_video(
         &dir,
         &selector,
         audio,
+        expect_audio,
         state.cookies_path(&cookies_token),
         &state.components(),
     )?;
@@ -1952,6 +1969,7 @@ async fn add_video(
         cookies: cookies_token.clone(),
         referer: String::new(),
         audio,
+        expect_audio,
         restored: Mutex::new(None),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -2065,6 +2083,7 @@ fn restore_saved(state: &AppState) {
                 cookies: s.cookies.clone(),
                 referer: s.referer.clone(),
                 audio: s.audio,
+                expect_audio: s.expect_audio,
                 restored: Mutex::new(Some(Restored {
                     total: s.total,
                     done_bytes: done,
@@ -2159,6 +2178,7 @@ fn restore_saved(state: &AppState) {
             cookies: s.cookies.clone(),
             referer: s.referer.clone(),
             audio: false,
+            expect_audio: false,
             restored: Mutex::new(Some(restored)),
             queued: AtomicBool::new(s_queued),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -2174,10 +2194,57 @@ fn restore_saved(state: &AppState) {
     state.seq.store(max_seq + 1, Ordering::Relaxed);
 }
 
+/// Ack ids arrive from the host through the queue file: keep only
+/// filename-safe characters before one becomes a file name.
+fn sanitize_ack_id(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(64)
+        .collect()
+}
+
+/// Tell the waiting host "the app has this one": an `acks/<id>.ack`
+/// marker beside the queue file; the host deletes it as it reads it.
+/// Without the marker the browser must not claim the hand-off
+/// actually reached the app.
+fn write_ack(queue_dir: &Path, id: &str) {
+    if id.is_empty() {
+        return;
+    }
+    let dir = queue_dir.join("acks");
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(dir.join(format!("{id}.ack")), b"");
+    }
+}
+
+/// Markers whose host timed out (the app was down) would otherwise
+/// pile up forever; drop any older than an hour.
+fn prune_acks(queue_dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(queue_dir.join("acks")) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for e in rd.flatten() {
+        let stale = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| {
+                now.duration_since(t)
+                    .map(|d| d.as_secs() > 3600)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// Process the browser extension's incoming queue file. A leftover
 /// `incoming.processing` from a crashed run is drained first, so queued
 /// links are never silently lost.
 fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
+    prune_acks(queue_dir);
     let queue = queue_dir.join("incoming.jsonl");
     let processing = queue_dir.join("incoming.processing");
     if !processing.exists() {
@@ -2193,7 +2260,7 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
     };
     let lines: Vec<&str> = text.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
-        handle_incoming_line(handle, line);
+        handle_incoming_line(handle, queue_dir, line);
         // drop the processed line from the file before moving on: a
         // crash mid-drain then re-delivers only unprocessed lines
         // (at-least-once) instead of losing the rest of the queue
@@ -2208,10 +2275,14 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
 
 /// One queued extension link: a file goes straight into the list (with
 /// the user's settings applied); a video is handed to the frontend.
-fn handle_incoming_line(handle: &AppHandle, line: &str) {
+fn handle_incoming_line(handle: &AppHandle, queue_dir: &Path, line: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return;
     };
+    // the host holds its reply until this entry's ack appears: write
+    // it only once the entry is truly surfaced below, never for a
+    // line that gets dropped here
+    let ack_id = v["id"].as_str().map(sanitize_ack_id).unwrap_or_default();
     let kind = v["kind"].as_str().unwrap_or("file");
     let url = v["url"].as_str().unwrap_or("");
     if url.is_empty() {
@@ -2257,6 +2328,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         let state = handle.state::<AppState>();
         state.pending_videos.lock().unwrap().push(payload.clone());
         let _ = handle.emit("incoming_video", payload);
+        write_ack(queue_dir, &ack_id);
         return;
     }
     // a caught file download is presented exactly like IDM's: the
@@ -2277,6 +2349,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
     let state = handle.state::<AppState>();
     state.pending_files.lock().unwrap().push(payload.clone());
     let _ = handle.emit("incoming_file", payload);
+    write_ack(queue_dir, &ack_id);
 }
 
 /// The installed ndm-host binary, resolved from this app's own path:
