@@ -300,6 +300,10 @@ struct AppState {
     /// video links from the extension that arrived before the webview
     /// was listening; the frontend drains this once on load
     pending_videos: Mutex<Vec<serde_json::Value>>,
+    /// recent probe results by page URL (10 min): a yt-dlp extraction
+    /// takes seconds and a page's formats do not change minute to
+    /// minute — the browser panel and the dialog share this cache
+    probe_cache: Mutex<HashMap<String, (Instant, video::VideoInfo)>>,
     pending_files: Mutex<Vec<serde_json::Value>>,
     /// a first-run video-component setup is currently downloading
     components_busy: AtomicBool,
@@ -1840,19 +1844,42 @@ fn list_downloads(state: State<'_, AppState>) -> Vec<ProgressPayload> {
         .collect()
 }
 
+/// Ten-minute probe cache: re-clicking a video (the pill, the
+/// dialog's Fetch button) must not pay the multi-second yt-dlp
+/// extraction again for an answer nothing could have changed.
+fn probe_cache_get(state: &AppState, url: &str) -> Option<video::VideoInfo> {
+    let cache = state.probe_cache.lock().unwrap();
+    let (at, info) = cache.get(url)?;
+    (at.elapsed() < std::time::Duration::from_secs(600)).then(|| info.clone())
+}
+
+fn probe_cache_put(state: &AppState, url: &str, info: &video::VideoInfo) {
+    state
+        .probe_cache
+        .lock()
+        .unwrap()
+        .insert(url.to_string(), (Instant::now(), info.clone()));
+}
+
 #[tauri::command]
 async fn probe_video(
     state: State<'_, AppState>,
     url: String,
     cookies: Option<String>,
 ) -> Result<video::VideoInfo, String> {
+    if let Some(info) = probe_cache_get(&state, &url) {
+        return Ok(info);
+    }
     let components = state.components();
     let cookies = state.cookies_path(cookies.as_deref().unwrap_or(""));
-    tauri::async_runtime::spawn_blocking(move || {
-        video::probe(&url, &components, cookies.as_deref())
+    let url2 = url.clone();
+    let info = tauri::async_runtime::spawn_blocking(move || {
+        video::probe(&url2, &components, cookies.as_deref())
     })
-        .await
-        .map_err(|e| format!("internal join error: {e}"))?
+    .await
+    .map_err(|e| format!("internal join error: {e}"))??;
+    probe_cache_put(&state, &url, &info);
+    Ok(info)
 }
 
 #[tauri::command]
@@ -1880,6 +1907,35 @@ async fn add_video(
     let cookies_token = cookies
         .filter(|t| state.cookies_path(t).is_some())
         .unwrap_or_default();
+    start_video_download(
+        app,
+        state,
+        url,
+        dir,
+        selector,
+        audio,
+        expect_audio,
+        title,
+        cookies_token,
+    )
+}
+
+/// Create the list entry and (slot permitting) the live job for one
+/// video download. Shared by the add_video command and the browser
+/// panel's background start (queue "start" entries): the two paths
+/// differ only in where their inputs come from.
+#[allow(clippy::too_many_arguments)]
+fn start_video_download(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+    dir: PathBuf,
+    selector: String,
+    audio: bool,
+    expect_audio: bool,
+    title: String,
+    cookies_token: String,
+) -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
     // two entries for the same video in the same folder would run two
     // yt-dlp processes writing the same .part files (and a finished
@@ -2217,25 +2273,44 @@ fn write_ack(queue_dir: &Path, id: &str) {
     }
 }
 
-/// Markers whose host timed out (the app was down) would otherwise
-/// pile up forever; drop any older than an hour.
-fn prune_acks(queue_dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(queue_dir.join("acks")) else {
+/// The host relays this file's content back to the browser panel as
+/// its reply (probe results, start verdicts): written via a temp
+/// name + rename so the host can never read a half-written result.
+fn write_result(queue_dir: &Path, id: &str, body: &serde_json::Value) {
+    if id.is_empty() {
         return;
-    };
+    }
+    let dir = queue_dir.join("results");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tmp = dir.join(format!("{id}.tmp"));
+    if std::fs::write(&tmp, body.to_string()).is_ok() {
+        let _ = std::fs::rename(&tmp, &dir.join(format!("{id}.json")));
+    }
+}
+
+/// Markers and results whose host timed out (the app was down) would
+/// otherwise pile up forever; drop any older than an hour.
+fn prune_acks(queue_dir: &Path) {
     let now = std::time::SystemTime::now();
-    for e in rd.flatten() {
-        let stale = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .map(|t| {
-                now.duration_since(t)
-                    .map(|d| d.as_secs() > 3600)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
-        if stale {
-            let _ = std::fs::remove_file(e.path());
+    for sub in ["acks", "results"] {
+        let Ok(rd) = std::fs::read_dir(queue_dir.join(sub)) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let stale = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    now.duration_since(t)
+                        .map(|d| d.as_secs() > 3600)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
 }
@@ -2309,6 +2384,13 @@ fn handle_incoming_line(handle: &AppHandle, queue_dir: &Path, line: &str) {
             token = candidate;
         }
     }
+    if kind == "probe" || kind == "start" {
+        // the in-page panel's requests: answered through a result
+        // file the host relays back into the page — the window is
+        // never raised and the dialog never opens for these
+        handle_panel_line(handle, queue_dir, &v, &ack_id, &token);
+        return;
+    }
     if kind == "video" {
         // IDM raises its download dialog over the browser; our dialog
         // lives in the main window, so bring that window forward first
@@ -2350,6 +2432,90 @@ fn handle_incoming_line(handle: &AppHandle, queue_dir: &Path, line: &str) {
     state.pending_files.lock().unwrap().push(payload.clone());
     let _ = handle.emit("incoming_file", payload);
     write_ack(queue_dir, &ack_id);
+}
+
+/// One browser-panel request. "probe" answers with the page's
+/// quality list; "start" begins the chosen download in the
+/// background (default folder, the user's simultaneous cap and
+/// dedupe rules all apply exactly as for the dialog). Both write
+/// their answer to results/<id>.json BEFORE the ack, so when the
+/// host sees the ack the result is already complete on disk.
+fn handle_panel_line(
+    handle: &AppHandle,
+    queue_dir: &Path,
+    v: &serde_json::Value,
+    ack_id: &str,
+    token: &str,
+) {
+    let state = handle.state::<AppState>();
+    let kind = v["kind"].as_str().unwrap_or("");
+    let url = v["url"].as_str().unwrap_or("");
+    if kind == "probe" {
+        let cookies = state.cookies_path(token);
+        let info = match probe_cache_get(&state, url) {
+            Some(info) => Ok(info),
+            None => {
+                let r = video::probe(url, &state.components(), cookies.as_deref());
+                if let Ok(info) = &r {
+                    probe_cache_put(&state, url, info);
+                }
+                r
+            }
+        };
+        let body = match info {
+            Ok(info) => {
+                // a live entry for this page is reported, not
+                // re-probed into a dead end: the panel shows
+                // "already in NDM" instead of options the app
+                // would refuse at start time (errored entries do
+                // not block a fresh attempt, so they don't count)
+                let entries = state.entries.lock().unwrap();
+                let already = entries
+                    .values()
+                    .find(|e| {
+                        e.kind == "video" && e.url == url && payload_of(e).status != "error"
+                    })
+                    .map(|e| payload_of(e).status);
+                serde_json::json!({
+                    "title": info.title,
+                    "duration": info.duration,
+                    "has_audio": info.has_audio,
+                    "already": already,
+                    "options": serde_json::to_value(&info.options).unwrap_or_default(),
+                })
+            }
+            Err(e) => serde_json::json!({ "error": e }),
+        };
+        write_result(queue_dir, ack_id, &body);
+        write_ack(queue_dir, ack_id);
+        return;
+    }
+    // kind == "start"
+    let selector = v["selector"].as_str().unwrap_or("").to_string();
+    let body = if selector.is_empty() {
+        serde_json::json!({ "started": false, "reason": "no quality was selected" })
+    } else {
+        let audio = v["audio"].as_bool().unwrap_or(false);
+        let expect_audio = v["hasAudio"].as_bool().unwrap_or(false) && !audio;
+        let title = v["title"].as_str().unwrap_or("").to_string();
+        let dir = resolve_dir(&current_settings(&state).default_dir);
+        match start_video_download(
+            handle.clone(),
+            state,
+            url.to_string(),
+            dir,
+            selector,
+            audio,
+            expect_audio,
+            title,
+            token.to_string(),
+        ) {
+            Ok(_) => serde_json::json!({ "started": true }),
+            Err(e) => serde_json::json!({ "started": false, "reason": e }),
+        }
+    };
+    write_result(queue_dir, ack_id, &body);
+    write_ack(queue_dir, ack_id);
 }
 
 /// The installed ndm-host binary, resolved from this app's own path:
@@ -2441,6 +2607,7 @@ fn main() {
             settings_file: Mutex::new(PathBuf::new()),
             sched_override: AtomicBool::new(false),
             pending_videos: Mutex::new(Vec::new()),
+            probe_cache: Mutex::new(HashMap::new()),
             pending_files: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
             pending_update: Mutex::new(None),
