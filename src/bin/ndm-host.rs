@@ -54,7 +54,14 @@ fn data_home() -> io::Result<PathBuf> {
     Ok(PathBuf::from(home).join(".local").join("share"))
 }
 
-fn append_to_queue(kind: &str, url: &str, title: &str, page_url: &str, cookies: &str) -> io::Result<String> {
+fn append_to_queue(
+    kind: &str,
+    url: &str,
+    title: &str,
+    page_url: &str,
+    cookies: &str,
+    extra: &[(&str, Value)],
+) -> io::Result<String> {
     let path = queue_path()?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -63,6 +70,9 @@ fn append_to_queue(kind: &str, url: &str, title: &str, page_url: &str, cookies: 
     // One buffer, one write: two host processes (Chrome + Firefox) appending
     // at the same moment must never interleave into a corrupt queue line.
     let mut obj = json!({ "id": id, "kind": kind, "url": url, "title": title, "pageUrl": page_url });
+    for (k, v) in extra {
+        obj[*k] = v.clone();
+    }
     // the browser's captured session for this page (video downloads);
     // the app persists it under a token and feeds it to yt-dlp
     if !cookies.is_empty() {
@@ -81,10 +91,10 @@ fn append_to_queue(kind: &str, url: &str, title: &str, page_url: &str, cookies: 
 /// dialog", and claiming otherwise left users staring at a green
 /// "Sent ✓" with no dialog anywhere. 10 s covers a cold app launch;
 /// the extension's own reply timeout is 25 s.
-fn wait_for_ack(id: &str) -> bool {
+fn wait_for_ack(id: &str, budget_secs: u64) -> bool {
     let Ok(dir) = queue_dir() else { return false };
     let ack = dir.join("acks").join(format!("{id}.ack"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget_secs);
     loop {
         if ack.exists() {
             let _ = std::fs::remove_file(&ack);
@@ -97,13 +107,77 @@ fn wait_for_ack(id: &str) -> bool {
     }
 }
 
+/// The result file the app wrote for one panel request (it lands
+/// BEFORE the ack, so by the time wait_for_ack returns it is
+/// complete). Read once and removed — results are single-use.
+fn read_result(id: &str) -> Option<Value> {
+    let dir = queue_dir().ok()?;
+    let path = dir.join("results").join(format!("{id}.json"));
+    let text = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_str(&text).ok()
+}
+
 /// Handles one parsed message; returns the reply object to frame back.
 fn handle(message: &Value) -> Value {
     match message.get("type").and_then(Value::as_str) {
         Some("ping") => json!({ "ok": true, "pong": true }),
-        Some("download") => handle_download(message),
+        Some("download") => match message.get("kind").and_then(Value::as_str) {
+            // the in-page panel's two requests: the reply carries
+            // the app's own result payload back into the page
+            Some("probe") => handle_panel(message, true),
+            Some("start") => handle_panel(message, false),
+            _ => handle_download(message),
+        },
         Some(other) => json!({ "ok": false, "error": format!("unknown type: {other}") }),
         None => json!({ "ok": false, "error": "missing type" }),
+    }
+}
+
+/// A panel request round trip: queue the entry, make sure the app
+/// is up, then wait for the app to answer (ack + result file) and
+/// relay the result. The probe budget is generous — a cold app
+/// launch plus a real yt-dlp extraction takes seconds; the start
+/// budget only covers creating the entry.
+fn handle_panel(message: &Value, is_probe: bool) -> Value {
+    let kind = if is_probe { "probe" } else { "start" };
+    let url = message.get("url").and_then(Value::as_str).unwrap_or("");
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return json!({ "ok": false, "error": "url must be a non-empty http(s) URL" });
+    }
+    let clean = |s: &str, n: usize| -> String {
+        s.replace(['\r', '\n'], " ").chars().take(n).collect()
+    };
+    let title = clean(message.get("title").and_then(Value::as_str).unwrap_or(""), 300);
+    let page_url = clean(message.get("pageUrl").and_then(Value::as_str).unwrap_or(""), 2048);
+    let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
+    let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
+    let mut extra: Vec<(&str, Value)> = Vec::new();
+    if !is_probe {
+        let selector = message.get("selector").and_then(Value::as_str).unwrap_or("");
+        if selector.is_empty() || selector.len() > 2000 {
+            return json!({ "ok": false, "error": "a quality selector is required" });
+        }
+        extra.push(("selector", json!(selector)));
+        extra.push(("audio", json!(message.get("audio").and_then(Value::as_bool).unwrap_or(false))));
+        extra.push(("hasAudio", json!(message.get("hasAudio").and_then(Value::as_bool).unwrap_or(false))));
+    }
+    match append_to_queue(kind, url, &title, &page_url, cookies, &extra) {
+        Ok(id) => {
+            ensure_app_running();
+            let budget = if is_probe { 40 } else { 15 };
+            if !wait_for_ack(&id, budget) {
+                return json!({ "ok": false, "error": "the NDM app did not respond" });
+            }
+            match read_result(&id) {
+                Some(result) => json!({ "ok": true, "result": result }),
+                None => json!({ "ok": false, "error": "the NDM app sent no result" }),
+            }
+        }
+        Err(e) => {
+            eprintln!("ndm-host: cannot write queue: {e}");
+            json!({ "ok": false, "error": "cannot write queue file" })
+        }
     }
 }
 
@@ -130,7 +204,7 @@ fn handle_download(message: &Value) -> Value {
     let page_url = page_url.as_str();
     let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
     let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
-    match append_to_queue(kind, url, title, page_url, cookies) {
+    match append_to_queue(kind, url, title, page_url, cookies, &[]) {
         Ok(id) => {
             ensure_app_running();
             if kind == "video" {
@@ -139,7 +213,7 @@ fn handle_download(message: &Value) -> Value {
                 // Files keep the instant reply: the browser's
                 // interception verdict waits on it, and a caught file
                 // makes no on-screen promise the pill must police.
-                let picked = wait_for_ack(&id);
+                let picked = wait_for_ack(&id, 10);
                 json!({ "ok": true, "picked": picked })
             } else {
                 json!({ "ok": true })

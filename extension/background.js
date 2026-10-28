@@ -208,8 +208,51 @@ async function captureCookies(url) {
 /* Messages from the content script and the popup                      */
 /* ------------------------------------------------------------------ */
 
+/* The in-page panel's round trip: unlike sendToNdm, this resolves
+   the host's FULL reply, because the app answers through it (the
+   probe result rides back in `result`). The timeout is generous:
+   a cold app launch plus a real page probe takes seconds, and a
+   cut-off reply would strand the panel on its spinner. */
+function sendNativeFull(message, timeoutMs) {
+  const msg = { type: 'download', ...message };
+  const attempt = new Promise(resolve => {
+    try {
+      chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
+        if (chrome.runtime.lastError) { resolve(null); return; }
+        resolve(response || null);
+      });
+    } catch (e) { resolve(null); }
+  });
+  const timeout = new Promise(r => setTimeout(() => r(null), timeoutMs));
+  return Promise.race([attempt, timeout]);
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (!message || message.action !== 'ndm-download') return;
+  if (!message) return;
+  if (message.action === 'ndm-panel-probe' || message.action === 'ndm-panel-start') {
+    const targetUrl = message.url || (sender.tab && sender.tab.url) || '';
+    (async () => {
+      const cookies = await captureCookies(targetUrl);
+      const base = {
+        url: targetUrl,
+        pageUrl: message.pageUrl || targetUrl,
+        title: message.title || '',
+        cookies,
+      };
+      const resp = message.action === 'ndm-panel-probe'
+        ? await sendNativeFull({ kind: 'probe', ...base }, 50000)
+        : await sendNativeFull({
+          kind: 'start',
+          ...base,
+          selector: message.selector || '',
+          audio: !!message.audio,
+          hasAudio: !!message.hasAudio,
+        }, 25000);
+      sendResponse(resp || { ok: false, error: 'NDM is not reachable' });
+    })();
+    return true; // async sendResponse
+  }
+  if (message.action !== 'ndm-download') return;
 
   const pageUrl = message.pageUrl
     || (sender.tab && sender.tab.url)
