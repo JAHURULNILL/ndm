@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NDM — Nill Download Manager</title>
+<style>
+  body {
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    width: 280px; margin: 0; padding: 14px;
+    background: #ffffff; color: #1f2933;
+  }
+  .logo { font-size: 17px; font-weight: 700; }
+  .logo .arrow { color: #1f6fd0; }
+  .sub { font-size: 11.5px; color: #68737e; margin: 2px 0 12px; }
+  .status {
+    border: 1px solid #d7dee5; border-radius: 8px; padding: 9px 10px;
+    font-size: 12.5px; margin-bottom: 10px; background: #f5f8fb;
+  }
+  .status.ok { border-color: #bfe3cf; background: #f0faf4; }
+  .status.bad { border-color: #f0d3b8; background: #fdf6ee; }
+  .hint { font-size: 11px; color: #68737e; margin-top: 4px; }
+  label.opt {
+    display: flex; gap: 7px; align-items: center;
+    font-size: 12.5px; margin: 10px 0; cursor: pointer;
+  }
+  button.main {
+    width: 100%; background: #1f6fd0; color: #fff; border: none;
+    border-radius: 7px; padding: 9px; font-size: 13.5px; font-weight: 600;
+    cursor: pointer;
+  }
+  button.main:hover:not(:disabled) { background: #1a61b8; }
+  button.main:disabled { opacity: .45; cursor: default; }
+  button.main.sent { background: #2e9e63; }
+</style>
+</head>
+<body>
+  <div class="logo"><span class="arrow">⬇</span> NDM</div>
+  <div class="sub">Nill Download Manager</div>
+
+  <div id="statusBox" class="status">Checking connection…</div>
+
+  <button id="btnVideo" class="main" disabled>Download current page video</button>
+
+  <label class="opt">
+    <input type="checkbox" id="chkIntercept">
+    <span>Intercept browser downloads (send files to NDM)</span>
+  </label>
+
+  <script src="popup.js"></script>
+</body>
+</html>
