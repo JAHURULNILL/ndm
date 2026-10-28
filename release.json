@@ -1,7 +1,7 @@
 {
-  "version": "1.5.3",
-  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.5.3/NDM_1.5.3_amd64.deb",
-  "deb_sha256": "a1cfc5e2a6ce0e2d37c17202a2543eed7a2c4202339edb832cf68f0b248d4765",
+  "version": "1.6.0",
+  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.6.0/NDM_1.6.0_amd64.deb",
+  "deb_sha256": "24ea6c78931778eae9c200f7156d3df71627f8e57e5050ec3b40b03cde18498f",
   "min_supported": "1.0.0",
-  "notes": "NDM 1.5.3 — the IDM way: clicking Download now opens a small panel right on the video page, with the video thumbnail, title and quality list — pick a quality and the download starts in NDM in the background, without leaving the page. Repeat clicks are instant (probe results are cached for 10 minutes), and a video that is already in your list says so in the panel instead of failing at the end. The in-app dialog flow is unchanged as a fallback."
+  "notes": "NDM 1.6.0 \u2014 Instant on every site, the IDM way. The extension now watches what your browser actually plays: clicking Download opens the panel with the real quality list instantly (720p, 360p, with bitrates), straight from the stream \u2014 HLS, DASH and plain video files on any site, not just YouTube. HLS sound that travels as a separate audio track is downloaded and joined automatically, so the finished file always has sound. The in-app dialog remains as a fallback."
 }
