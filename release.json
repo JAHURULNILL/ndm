@@ -1,1 +1,7 @@
-{"deb_sha256":"613c83674a623e62b7f3f42cbcf87c1c26e403ba8dc13cde8aadb82954ee73f9","deb_url":"https://github.com/JAHURULNILL/ndm/releases/download/v1.5.1/NDM_1.5.1_amd64.deb","min_supported":"1.0.0","notes":"NDM 1.5.1 - small privacy fix on top of 1.5.0 (menus, silent background setup, in-app updates). The install counter is now owner-private: nothing in the app shows it.","version":"1.5.1"}
+{
+  "deb_sha256": "37a41560e05316a84c58661b1ae59d9872df0ee4fc3afbff7c73a7d83fc82375",
+  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.5.2/NDM_1.5.2_amd64.deb",
+  "min_supported": "1.0.0",
+  "notes": "NDM 1.5.2 — three fixes. (1) The browser bridge could fail to open the app when it was closed (a launcher false-success in the .deb layout); the app now opens every time. (2) \"Sent to NDM\" is now honest: the pill turns green only when the app itself confirms it showed the download dialog — otherwise it says Queued. (3) A finished video is now checked for sound: if the merged file lost its audio track, the download is marked as an error instead of Finished.",
+  "version": "1.5.2"
+}
