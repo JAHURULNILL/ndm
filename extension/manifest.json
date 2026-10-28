@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "NDM \u2014 Nill Download Manager",
+  "version": "1.5.1",
+  "description": "Send downloads and online videos from your browser to NDM \u2014 Nill Download Manager, a fast desktop download manager.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "contextMenus",
+    "downloads",
+    "activeTab",
+    "storage",
+    "cookies"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ndm@nill.download"
+    }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtR7uOVX5Y8qjrohHa7u5XsteLBXcQ8RVkVGw8rIu7TjJdngHONHgPV3n0CuZi8vhuI8OOenJrJRj1IoQdE/FIVHyWlBLrvIUMx9ZsNjShiskywL32nX2dfDAn5u8Y4UxVJmSmXP3B4wD/z7OuA0GApx8DKTkzg9gdXrk4RFUvxpqgjRbLC2MYr6thPdRmVeihV1PJMRqltDZMnDS2dpWRc2wL2NetFkKbHqvYVGspNKJ6RO4pK2fAwhxO4ozdgmdU9OE971p7bL4brYDR2YxUJvBT5GvF9OIX1ketT9UE7AP2aCqYd/bJJ3xBXSerufv4woRlX5mx/afrGLuz2W0swIDAQAB"
+}
