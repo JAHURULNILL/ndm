@@ -1,0 +1,13 @@
+/target
+src-tauri/target
+node_modules
+*.deb
+/tools/
+/*.png
+src-tauri/gen/schemas/
+# download artefacts the CLI/examples drop in the working directory
+*.ndm.json*
+*.bin
+*.part
+/downloads/
+.pkg-tmp/
