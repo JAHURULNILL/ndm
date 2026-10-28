@@ -139,6 +139,7 @@
         box-shadow: inset 0 1px 0 rgba(255,255,255,.5);
       }
       .pill.sent { background: rgba(18, 96, 48, .86); }
+      .pill.queued { background: rgba(146, 104, 26, .94); }
       .pill.error { background: rgba(146, 30, 30, .88); }
       .label { cursor: pointer; background: none; border: none; color: inherit;
         font: inherit; padding: 0; }
@@ -164,6 +165,7 @@
       if (btn.disabled) return;
       btn.disabled = true;
       let ok = false;
+      let picked = false;
       try {
         const resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
@@ -173,17 +175,23 @@
           title: document.title,
         });
         ok = !!(resp && resp.ok);
+        // green only on the APP's own confirmation (via the host's
+        // ack wait); queued-but-unsurfaced is its own honest state
+        picked = ok && resp.picked !== false;
       } catch (e) { /* extension context can vanish on reload */ }
-      pill.classList.toggle('sent', ok);
+      pill.classList.toggle('sent', ok && picked);
+      pill.classList.toggle('queued', ok && !picked);
       pill.classList.toggle('error', !ok);
-      btn.textContent = ok ? 'Sent to NDM ✓' : 'NDM is not reachable — open the app';
+      btn.textContent = !ok
+        ? 'NDM is not reachable — open the app'
+        : picked ? 'Sent to NDM ✓' : 'Queued — open NDM';
       place();
       setTimeout(() => {
-        pill.classList.remove('sent', 'error');
+        pill.classList.remove('sent', 'queued', 'error');
         btn.textContent = 'Download with NDM';
         btn.disabled = false;
         place();
-      }, 2600);
+      }, ok && picked ? 2600 : 5200);
     });
 
     const close = document.createElement('button');

@@ -70,8 +70,12 @@ function setHostStatus(status) {
   }).catch(() => { /* storage may be unavailable in odd states */ });
 }
 
-/* Resolves true only when the host replied { ok: true } — an error reply
-   from the host (bad kind, unwritable queue) is a failure, not a success. */
+/* Resolves { ok, picked }: ok = the host accepted the hand-off into
+   the queue; picked = the APP confirmed it surfaced the entry (the
+   host waits for the app's ack before replying to a video send).
+   An error reply from the host (bad kind, unwritable queue) is a
+   failure, not a success. Older hosts omit `picked` — treat that as
+   picked so an app-only update never degrades the pill to amber. */
 function sendToNdm(message) {
   const msg = { type: 'download', ...message };
   const attempt = new Promise(resolve => {
@@ -84,18 +88,18 @@ function sendToNdm(message) {
           const missing = /not found|No such native/i.test(text);
           setHostStatus(missing ? 'host-missing' : 'fail');
           console.warn('NDM host error:', text);
-          resolve(false);
+          resolve({ ok: false, picked: false });
           return;
         }
         const ok = !!(response && response.ok);
         setHostStatus(ok ? 'ok' : 'fail');
         if (!ok) console.warn('NDM host rejected the download:', response);
-        resolve(ok);
+        resolve({ ok, picked: ok && response.picked !== false });
       });
     } catch (e) {
       setHostStatus('host-missing');
       console.warn('NDM send failed:', e);
-      resolve(false);
+      resolve({ ok: false, picked: false });
     }
   });
   // a bridge that accepts the connection but never answers would
@@ -105,7 +109,7 @@ function sendToNdm(message) {
   // for a hand-off that actually landed — for an intercepted file
   // that means the browser resumes its copy while NDM also queues
   // one (a duplicate). 25 s covers a cold app launch comfortably.
-  const timeout = new Promise(r => setTimeout(() => r(false), 25000));
+  const timeout = new Promise(r => setTimeout(() => r({ ok: false, picked: false }), 25000));
   return Promise.race([attempt, timeout]);
 }
 
@@ -219,8 +223,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const targetUrl = message.url || pageUrl;
   (async () => {
     const cookies = await captureCookies(targetUrl);
-    const ok = await sendToNdm({ kind, url: targetUrl, pageUrl, title, cookies });
-    sendResponse({ ok });
+    const res = await sendToNdm({ kind, url: targetUrl, pageUrl, title, cookies });
+    sendResponse({ ok: res.ok, picked: res.picked });
   })();
   return true;
 });
@@ -290,10 +294,10 @@ chrome.downloads.onCreated.addListener(async item => {
     // only the bare file name travels: the full browser path would
     // leak the user's folder layout into the queue file for no gain
     const baseName = suggested.split(/[\\/]/).pop() || '';
-    const accepted = await sendToNdm({
+    const accepted = (await sendToNdm({
       kind: 'file', url, pageUrl: item.referrer || '', title: baseName,
       cookies: await captureCookies(url),
-    });
+    })).ok;
     if (accepted) {
       // IDM removes the browser's own copy after a takeover: cancel,
       // delete any bytes it already fetched, then drop the record —

@@ -60,6 +60,7 @@ async function init() {
     btn.disabled = false;
     btn.addEventListener('click', async () => {
       let ok = false;
+      let picked = false;
       try {
         const resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
@@ -69,11 +70,14 @@ async function init() {
           title: tab.title || '',
         });
         ok = !!(resp && resp.ok);
+        picked = ok && resp.picked !== false;
       } catch (e) { /* ignore: reported below as unreachable */ }
-      if (ok) {
+      if (ok && picked) {
         btn.classList.add('sent');
         btn.textContent = 'Sent to NDM ✓';
         setTimeout(() => window.close(), 700);
+      } else if (ok) {
+        btn.textContent = 'Queued — open NDM';
       } else {
         btn.textContent = 'NDM is not reachable — open the app';
       }
