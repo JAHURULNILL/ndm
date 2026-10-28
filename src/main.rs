@@ -60,8 +60,6 @@ fn main() {
             }
         }
     }
-    let out = out.unwrap_or_else(|| PathBuf::from(ndm::file_name_of(&url)));
-
     let probed = match ndm::probe(&url) {
         Ok(p) => p,
         Err(e) => {
@@ -69,6 +67,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let out = out.unwrap_or_else(|| {
+        PathBuf::from(
+            probed
+                .suggested_name
+                .clone()
+                .unwrap_or_else(|| ndm::file_name_of(&url)),
+        )
+    });
     println!(
         "[ndm] size {:.1} MiB | range support: {}",
         fmt_mb(probed.total),

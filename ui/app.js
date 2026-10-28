@@ -80,9 +80,10 @@ function visibleItems() {
   if (currentCat === 'Finished') out = all.filter(d => d.status === 'finished');
   else if (currentCat === 'Unfinished') out = all.filter(d => d.status !== 'finished');
   else if (currentCat !== 'All Downloads') out = all.filter(d => d.category === currentCat);
+  const numId = id => parseInt(String(id).replace(/\D+/g, ''), 10) || 0;
   const by = {
     name: (a, b) => a.name.localeCompare(b.name),
-    date: (a, b) => String(a.id).localeCompare(String(b.id)),
+    date: (a, b) => numId(a.id) - numId(b.id),
     size: (a, b) => (b.total || 0) - (a.total || 0),
     status: (a, b) => a.status.localeCompare(b.status),
   }[sortKey];
@@ -299,18 +300,68 @@ function pumpFileLinks() {
   const next = fileLinkQueue.shift();
   if (next) openFileDialog(next);
 }
+let fileProbeSeq = 0;
+let fileProbeTimer = null;
+
+function resetFileProbeUi() {
+  $('fCat').textContent = '—';
+  $('fSize').textContent = '—';
+  $('fResume').textContent = '—';
+  $('fResume').className = '';
+}
+
+async function runFileProbe() {
+  const url = $('inUrl').value.trim();
+  if (!/^https?:\/\//i.test(url) || !TAURI) {
+    resetFileProbeUi();
+    return;
+  }
+  const mySeq = ++fileProbeSeq;
+  $('fSize').textContent = 'Checking…';
+  $('fResume').textContent = '…';
+  $('fResume').className = '';
+  try {
+    const cookies = (presentedFile && presentedFile.url === url)
+      ? (presentedFile.cookies || null) : null;
+    const referer = (presentedFile && presentedFile.url === url)
+      ? (presentedFile.referer || null) : null;
+    const info = await invoke('probe_file', { url, cookies, referer });
+    if (mySeq !== fileProbeSeq || $('inUrl').value.trim() !== url) return;
+    $('fCat').textContent = info.category || 'General';
+    $('fSize').textContent = info.total > 0 ? fmtSize(info.total) : 'Unknown';
+    $('fResume').textContent = info.resumable ? 'Yes' : 'No';
+    $('fResume').className = info.resumable ? 'yes' : 'no';
+    if (!$('inName').value.trim() && info.suggested_name) {
+      $('inName').value = info.suggested_name;
+    }
+  } catch (e) {
+    if (mySeq !== fileProbeSeq) return;
+    $('fSize').textContent = '—';
+    $('fResume').textContent = '—';
+  }
+}
+
+$('inUrl').addEventListener('input', () => {
+  clearTimeout(fileProbeTimer);
+  fileProbeTimer = setTimeout(runFileProbe, 350);
+});
+
 function openFileDialog(payload) {
   presentedFile = payload
     ? { url: payload.url, cookies: payload.cookies || '', referer: payload.pageUrl || '' }
     : null;
+  resetFileProbeUi();
   if (payload) {
     $('inUrl').value = payload.url;
     $('inName').value = (payload.title || '').split(/[\\/]/).pop() || '';
   }
   modal.classList.remove('hidden');
   $('inUrl').focus();
+  if ($('inUrl').value.trim()) runFileProbe();
 }
 function closeFileDialog() {
+  fileProbeSeq++;
+  clearTimeout(fileProbeTimer);
   const abandoned = (presentedFile && presentedFile.cookies) ? presentedFile.cookies : '';
   presentedFile = null;
   modal.classList.add('hidden');
@@ -358,7 +409,7 @@ $('btnLater').onclick = () => submitAdd(true);
 
 /* ---------- Add Video modal ---------- */
 const vmodal = $('vmodal');
-let vInfo = null; // last probe result {title, duration, options, url}
+let vInfo = null; // last probe result {title, duration, options/qualities, url}
 let probeSeq = 0;  // bumped on every probe start and every URL edit
 
 /* Browser-extension video links can arrive in bursts — an event per
@@ -411,7 +462,10 @@ vmodal.addEventListener('click', e => { if (e.target === vmodal) closeVideoModal
 /* Which quality option starts selected, per the default in Options. */
 function pickQualityIndex(options) {
   const q = settings.video_quality || 'best';
-  if (q === 'best') return 0;
+  if (q === 'best') {
+    const hd = options.findIndex(o => !o.audio && (o.height === 1080 || o.label.startsWith('1080p')));
+    return hd >= 0 ? hd : 0;
+  }
   if (q === 'audio') {
     const i = options.findIndex(o => o.audio);
     return i >= 0 ? i : 0;
@@ -421,7 +475,7 @@ function pickQualityIndex(options) {
   if (i >= 0) return i;
   // otherwise the first height at or below the target (list is best-first)
   i = options.findIndex(o => {
-    const h = parseInt(o.label, 10);
+    const h = o.height || parseInt(o.label, 10);
     return !o.audio && !isNaN(h) && h <= target;
   });
   return i >= 0 ? i : 0;
@@ -449,9 +503,6 @@ async function gateComponents() {
     if (st && st.ready) {
       componentsReady = true;
       if (st.ffmpeg === false && !ffmpegNoteShown) {
-        // downloads work, but split-stream videos cannot be merged
-        // without ffmpeg — say so once, in place, instead of failing
-        // mysteriously at the end of a download
         ffmpegNoteShown = true;
         $('vSetup').classList.remove('hidden');
         $('vSetupBar').parentElement.style.display = 'none';
@@ -474,8 +525,6 @@ function onComponentsProgress(p) {
     $('vSetupText').textContent = p.total
       ? `Setting up the video engine — ${p.name}: ${mb(p.downloaded)} of ${mb(p.total)} MB`
       : `Setting up the video engine — ${p.name}: ${mb(p.downloaded)} MB`;
-    // set the fill through the DOM: this WebKit drops percentage
-    // widths written into inline style attributes via innerHTML
     if (p.total) bar.style.width = Math.min(100, (p.downloaded / p.total) * 100) + '%';
   } else if (p.phase === 'verifying' || p.phase === 'extracting') {
     $('vSetupText').textContent = `Setting up the video engine — ${p.name}: ${p.phase}…`;
@@ -514,45 +563,87 @@ async function fetchVideoInfo() {
     st.classList.add('error');
     return;
   }
-  st.textContent = 'Reading the page…';
+  st.textContent = 'Reading video qualities & file sizes…';
   st.classList.remove('error');
   $('vInfo').classList.add('hidden');
   $('vStart').disabled = true;
+  if ($('vLater')) $('vLater').disabled = true;
   vInfo = null;
   const mySeq = ++probeSeq;
   try {
     const info = await invoke('probe_video', {
       url,
-      // the browser's captured session belongs to the page it was
-      // captured on: only send the token while the field still
-      // holds exactly that page's URL
       cookies: (presentedVideoUrl && url === presentedVideoUrl)
         ? (presentedVideoCookies || null) : null,
     });
-    // the address may have been edited while yt-dlp was reading the
-    // page (probes can take seconds): this result belongs to the URL
-    // that produced it and must never be installed for another one
     if (mySeq !== probeSeq || $('vInUrl').value.trim() !== url) return;
-    if (!info.options.length) {
+    const opts = info.qualities || info.options || [];
+    if (!opts.length) {
       st.textContent = 'No downloadable formats found for this page';
       st.classList.add('error');
       return;
     }
-    vInfo = { ...info, url };
-    $('vTitle').textContent = info.title;
-    $('vMeta').textContent = [fmtDuration(info.duration), `${info.options.length} quality options`]
-      .filter(Boolean).join(' • ');
+    vInfo = { ...info, options: opts, url };
+    $('vTitle').textContent = info.title || '';
+    if ($('vTitleInput')) $('vTitleInput').value = info.title || '';
+    const durText = fmtDuration(info.duration);
+    if ($('vDur')) {
+      if (durText) {
+        $('vDur').textContent = durText;
+        $('vDur').classList.remove('hidden');
+      } else {
+        $('vDur').classList.add('hidden');
+      }
+    }
+    if ($('vThumb')) {
+      if (info.thumbnail) {
+        $('vThumb').onload = () => {
+          $('vThumb').classList.remove('hidden');
+          if ($('vThumbPh')) $('vThumbPh').classList.add('hidden');
+        };
+        $('vThumb').onerror = () => {
+          $('vThumb').classList.add('hidden');
+          if ($('vThumbPh')) $('vThumbPh').classList.remove('hidden');
+        };
+        $('vThumb').src = info.thumbnail;
+      } else {
+        $('vThumb').classList.add('hidden');
+        if ($('vThumbPh')) $('vThumbPh').classList.remove('hidden');
+      }
+    }
+    $('vMeta').textContent = [
+      info.uploader || '',
+      durText,
+      `${opts.length} quality options`,
+    ].filter(Boolean).join(' • ');
     const box = $('vOptions');
     box.innerHTML = '';
-    const preselect = pickQualityIndex(info.options);
-    info.options.forEach((o, i) => {
+    const preselect = pickQualityIndex(opts);
+    opts.forEach((o, i) => {
       const lab = document.createElement('label');
+      if (i === preselect) lab.classList.add('sel');
+      const extBadge = (o.ext || (o.audio ? 'MP3' : 'MP4')).toUpperCase();
+      const sizeStr = o.size_text || (o.size_bytes ? fmtSize(o.size_bytes) : (o.id === 'best' ? 'Auto' : 'Stream'));
+      const noteOnly = (o.note || '').split('•').filter(p => !/MB|GB|KB/i.test(p)).join('•').trim();
       lab.innerHTML = `<input type="radio" name="vq" value="${i}" ${i === preselect ? 'checked' : ''}>
-        <span>${escapeHtml(o.label)}</span><span class="q-note">${escapeHtml(o.note)}</span>`;
+        <span class="q-badge ${o.audio ? 'audio' : ''}">${escapeHtml(extBadge)}</span>
+        <span class="q-label">${escapeHtml(o.label)}</span>
+        ${noteOnly ? `<span class="q-note">${escapeHtml(noteOnly)}</span>` : ''}
+        <span class="q-size ${o.size_bytes ? 'exact' : ''}">${escapeHtml(sizeStr)}</span>`;
+      lab.addEventListener('change', () => {
+        box.querySelectorAll('label').forEach(el => el.classList.remove('sel'));
+        lab.classList.add('sel');
+      });
+      lab.addEventListener('dblclick', () => {
+        const inp = lab.querySelector('input');
+        if (inp) inp.checked = true;
+        submitVideo(false);
+      });
       box.appendChild(lab);
     });
     $('vInfo').classList.remove('hidden');
     $('vStart').disabled = false;
+    if ($('vLater')) $('vLater').disabled = false;
     st.textContent = '';
   } catch (e) {
     st.textContent = String(e);
@@ -560,41 +651,49 @@ async function fetchVideoInfo() {
   }
 }
 $('vFetch').onclick = fetchVideoInfo;
-// editing the address invalidates the last probe: the title and quality
-// options on screen belong to the previous URL and must not be submitted
 $('vInUrl').addEventListener('input', () => {
-  probeSeq++; // an in-flight probe for the old text is now stale
+  probeSeq++;
   if (!vInfo) return;
   vInfo = null;
   $('vInfo').classList.add('hidden');
   $('vStart').disabled = true;
+  if ($('vLater')) $('vLater').disabled = true;
   $('vStatus').textContent = '';
 });
 
-$('vStart').onclick = async () => {
+async function submitVideo(later) {
   if (!vInfo) return;
   const url = $('vInUrl').value.trim();
-  if (vInfo.url !== url) return; // probe and field disagree — never submit a mix
+  if (vInfo.url !== url) return;
   const sel = document.querySelector('input[name="vq"]:checked');
   const opt = vInfo.options[sel ? Number(sel.value) : 0];
   if (!opt) return;
   const dir = $('vInDir').value.trim() || '~/Downloads';
-  // capture the session token BEFORE closing: closeVideoModal clears
-  // the presented-page state this token belongs to
+  const customTitle = ($('vTitleInput') && $('vTitleInput').value.trim()) || vInfo.title || '';
   const cookies = (presentedVideoUrl && url === presentedVideoUrl)
     ? (presentedVideoCookies || null) : null;
-  if (cookies) presentedTokenConsumed = true; // the entry owns the session now
+  if (cookies) presentedTokenConsumed = true;
   closeVideoModal();
   if (TAURI) {
     try {
       await invoke('add_video', {
-        url, dir, selector: opt.selector, audio: opt.audio, title: vInfo.title,
-        hasAudio: !!vInfo.has_audio,
+        url,
+        dir,
+        selector: opt.selector,
+        audio: !!opt.audio,
+        title: customTitle,
         cookies,
+        later: !!later,
+        total: Number(opt.size_bytes) || 0,
       });
-    } catch (e) { console.error('add_video failed', e); toast('Could not add the video: ' + e); }
+    } catch (e) {
+      console.error('add_video failed', e);
+      toast('Could not add the video: ' + e);
+    }
   }
-};
+}
+$('vStart').onclick = () => submitVideo(false);
+if ($('vLater')) $('vLater').onclick = () => submitVideo(true);
 
 /* ---------- Options modal ---------- */
 const omodal = $('omodal');
@@ -945,11 +1044,11 @@ async function initTauri() {
   });
   // a video link sent from the browser extension opens the video dialog
   await listen('incoming_video', e => {
+    invoke('take_pending_videos').catch(() => {});
     queueVideoLink(e.payload.url || '', e.payload.cookies || '');
   });
   // links that arrived before the listener was registered are held by
-  // the backend; pull them now so none are silently lost. The backend
-  // ALSO emits them, so both channels feed the deduping queue.
+  // the backend; pull them now so none are silently lost.
   try {
     const pending = await invoke('take_pending_videos');
     for (const p of pending || []) queueVideoLink(p.url || '', p.cookies || '');
@@ -958,7 +1057,10 @@ async function initTauri() {
   await listen('update_available', e => { showUpdate(e.payload || {}); });
   await listen('update_progress', e => { onUpdateProgress(e.payload || {}); });
   // file downloads caught by the extension open the Add URL dialog
-  await listen('incoming_file', e => { queueFileLink(e.payload || {}); });
+  await listen('incoming_file', e => {
+    invoke('take_pending_files').catch(() => {});
+    queueFileLink(e.payload || {});
+  });
   try {
     const pendingFiles = await invoke('take_pending_files');
     for (const p of pendingFiles || []) queueFileLink(p);

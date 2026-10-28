@@ -1,24 +1,27 @@
 'use strict';
-/* NDM popup: connection status, interception toggle, one-click video send. */
+/* NDM popup: connection status, interception toggle, one-click video modal trigger. */
 
-// Keep in sync with VIDEO_HOST_PATTERNS in background.js.
 const VIDEO_HOST_PATTERNS = [
-  /(^|\.)youtube\.com\/(watch|shorts\/)/,
+  /(^|\.)youtube\.com\/(watch|shorts\/|live\/|embed\/)/,
   /(^|\.)youtu\.be\//,
-  /(^|\.)facebook\.com\/.*(\/videos\/|\/watch|\/reel\/|watch\/?\?v=)/,
+  /(^|\.)facebook\.com\/.*(\/videos\/|\/watch|\/reel\/|\/share\/(r|v)\/|watch\/?\?v=)/,
+  /(^|\.)fb\.watch\//,
   /(^|\.)vimeo\.com\/\d+/,
   /(^|\.)dailymotion\.com\/video\//,
-  /(^|\.)instagram\.com\/(reel|p)\//,
-  /(^|\.)tiktok\.com\/@[^/]+\/video\//,
+  /(^|\.)instagram\.com\/(reel|p|tv)\//,
+  /(^|\.)tiktok\.com\/(@[^/]+\/video\/|t\/)/,
+  /(^|\.)(twitter|x)\.com\/[^/]+\/status\/\d+/,
+  /(^|\.)twitch\.tv\/(videos\/\d+|[^/]+\/clip\/)/,
+  /(^|\.)reddit\.com\/r\/[^/]+\/comments\//,
+  /(^|\.)bilibili\.com\/video\//,
 ];
 
 function isVideoPageUrl(url) {
   if (!url) return false;
-  // host + path only — see background.js for why the raw URL is unsafe
   let s;
   try {
     const u = new URL(url);
-    s = u.hostname + u.pathname;
+    s = u.hostname + u.pathname + u.search;
   } catch (e) {
     return false;
   }
@@ -30,14 +33,10 @@ async function init() {
   const chk = document.getElementById('chkIntercept');
   const btn = document.getElementById('btnVideo');
 
-  // --- connection status: probed live on open — a stored "ok" from
-  // an old send goes stale if the app/bridge is later removed. The
-  // host answers ANY message (even an error reply proves it exists);
-  // only a missing/broken bridge rejects. ---
   let stored = {};
   try {
     stored = await chrome.storage.local.get(['ndmIntercept']);
-  } catch (e) { /* storage unavailable: fall back to defaults below */ }
+  } catch (e) {}
   try {
     await chrome.runtime.sendNativeMessage('com.ndm.host', { type: 'ping' });
     statusBox.className = 'status ok';
@@ -48,19 +47,28 @@ async function init() {
       + '<div class="hint">Is NDM installed and the bridge set up?</div>';
   }
 
-  // --- interception toggle (default on) ---
   chk.checked = stored.ndmIntercept !== false;
   chk.addEventListener('change', () => {
     chrome.storage.local.set({ ndmIntercept: chk.checked });
   });
 
-  // --- "download current page video" button ---
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab && isVideoPageUrl(tab.url)) {
+  if (tab && tab.url && /^https?:\/\//i.test(tab.url)) {
     btn.disabled = false;
+    btn.textContent = isVideoPageUrl(tab.url)
+      ? 'Choose Quality & Download Video'
+      : 'Download Video on This Page';
     btn.addEventListener('click', async () => {
+      try {
+        const opened = await chrome.tabs.sendMessage(tab.id, {
+          action: 'ndm-open-video-modal',
+        });
+        if (opened && opened.ok) {
+          window.close();
+          return;
+        }
+      } catch (e) {}
       let ok = false;
-      let picked = false;
       try {
         const resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
@@ -70,14 +78,11 @@ async function init() {
           title: tab.title || '',
         });
         ok = !!(resp && resp.ok);
-        picked = ok && resp.picked !== false;
-      } catch (e) { /* ignore: reported below as unreachable */ }
-      if (ok && picked) {
+      } catch (e) {}
+      if (ok) {
         btn.classList.add('sent');
-        btn.textContent = 'Sent to NDM ✓';
+        btn.textContent = 'Opened in NDM ✓';
         setTimeout(() => window.close(), 700);
-      } else if (ok) {
-        btn.textContent = 'Queued — open NDM';
       } else {
         btn.textContent = 'NDM is not reachable — open the app';
       }

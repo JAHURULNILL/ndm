@@ -37,6 +37,7 @@ fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
 
 pub mod components;
 pub mod updater;
+pub mod video_probe;
 
 pub const DEFAULT_BLOCK: u64 = 1 << 20; // 1 MiB block map, per engine spec A
 const SAVE_EVERY_BYTES: u64 = 4 << 20;
@@ -86,7 +87,7 @@ pub fn global_proxy() -> String {
 
 
 /// Attach the configured proxy (if any and parseable) to an agent builder.
-fn apply_proxy(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
+pub(crate) fn apply_proxy(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
     let url = global_proxy();
     if url.is_empty() {
         return builder;
@@ -258,9 +259,79 @@ pub struct Probe {
     pub unknown_size: bool,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    pub suggested_name: Option<String>,
 }
 
-const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+/// Extract a clean filename from a `Content-Disposition` header value
+/// (`filename*=UTF-8''...` or `filename="..."`) or, failing that, from
+/// the final post-redirect URL when it differs from `original_url`.
+fn extract_suggested_name(resp: &ureq::Response, original_url: &str) -> Option<String> {
+    if let Some(cd) = resp.header("Content-Disposition") {
+        // 1. RFC 5987 filename*=UTF-8''...
+        for part in cd.split(';').map(|s| s.trim()) {
+            if let Some(rest) = part
+                .strip_prefix("filename*=")
+                .or_else(|| part.strip_prefix("FILENAME*="))
+            {
+                let val = rest.trim().trim_matches('"');
+                let encoded = val
+                    .split_once("''")
+                    .map(|(_, r)| r)
+                    .unwrap_or(val);
+                let decoded = percent_decode(encoded);
+                let cleaned = sanitize_suggested_name(&decoded);
+                if !cleaned.is_empty() {
+                    return Some(cleaned);
+                }
+            }
+        }
+        // 2. Standard filename="..."
+        for part in cd.split(';').map(|s| s.trim()) {
+            if let Some(rest) = part
+                .strip_prefix("filename=")
+                .or_else(|| part.strip_prefix("FILENAME="))
+            {
+                let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+                let decoded = percent_decode(val);
+                let cleaned = sanitize_suggested_name(&decoded);
+                if !cleaned.is_empty() {
+                    return Some(cleaned);
+                }
+            }
+        }
+    }
+    let final_url = resp.get_url();
+    if !final_url.is_empty() && final_url != original_url {
+        let from_final = file_name_of(final_url);
+        if from_final != "index" {
+            return Some(from_final);
+        }
+    }
+    None
+}
+
+fn sanitize_suggested_name(raw: &str) -> String {
+    let tail = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let cleaned: String = tail
+        .chars()
+        .filter(|c| !c.is_control())
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '%' | '^' | '&') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim().trim_matches('.');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
 
 /// Extra request headers captured from the user's own browser session
@@ -287,13 +358,21 @@ fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
 
 fn build_agent() -> ureq::Agent {
     apply_proxy(ureq::AgentBuilder::new())
-        .timeout(Duration::from_secs(60))
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .max_idle_connections(256)
+        .max_idle_connections_per_host(64)
         .user_agent(BROWSER_UA)
         .build()
 }
 
 pub fn probe(url: &str) -> Result<Probe, String> {
     probe_with(&probe_agent(), url, &Auth::default())
+}
+
+pub fn probe_with_auth(url: &str, auth: &Auth) -> Result<Probe, String> {
+    probe_with(&probe_agent(), url, auth)
 }
 
 /// Probing must not hang a download start for minutes: a dedicated agent
@@ -346,9 +425,11 @@ fn verify_range(agent: &ureq::Agent, url: &str, total: u64, header_claim: bool, 
 }
 
 fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, String> {
+    let mut head_suggested: Option<String> = None;
     if let Ok(resp) = apply_auth(agent.head(url), auth).set("Accept-Encoding", "identity").call() {
         let etag = resp.header("ETag").map(|x| x.to_string());
         let last_modified = resp.header("Last-Modified").map(|x| x.to_string());
+        let suggested_name = extract_suggested_name(&resp, url);
         if let Some(total) = resp
             .header("Content-Length")
             .and_then(|v| v.parse::<u64>().ok())
@@ -365,6 +446,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                     unknown_size: false,
                     etag,
                     last_modified,
+                    suggested_name,
                 });
             }
             // HEAD said Content-Length: 0 — some frameworks/proxies report
@@ -372,6 +454,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
             // trusted: fall through to the GET probe below (416 there is
             // what actually proves the file is empty)
         }
+        head_suggested = suggested_name;
     }
     let resp = match apply_auth(agent.get(url), auth)
         .set("Range", "bytes=0-0")
@@ -388,10 +471,12 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                 unknown_size: false,
                 etag: None,
                 last_modified: None,
+                suggested_name: head_suggested,
             });
         }
         Err(e) => return Err(format!("probe failed: {e}")),
     };
+    let suggested_name = extract_suggested_name(&resp, url).or(head_suggested);
     if resp.status() == 206 {
         let (s, _e, total) = resp
             .header("Content-Range")
@@ -408,6 +493,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
             unknown_size: false,
             etag: resp.header("ETag").map(|s| s.to_string()),
             last_modified: resp.header("Last-Modified").map(|s| s.to_string()),
+            suggested_name,
         });
     }
     let etag = resp.header("ETag").map(|s| s.to_string());
@@ -426,6 +512,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                 unknown_size: true,
                 etag,
                 last_modified,
+                suggested_name,
             });
         }
     };
@@ -435,6 +522,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
         unknown_size: false,
         etag,
         last_modified,
+        suggested_name,
     })
 }
 
@@ -450,12 +538,17 @@ fn download_block(
     file: &File,
     start: u64,
     end: u64,
+    pos: &mut u64,
     shared: &Shared,
     worker_id: usize,
 ) -> Result<(), BlockError> {
+    if *pos > end {
+        return Ok(());
+    }
+    let req_start = *pos;
     let total = shared.state.lock().unwrap().total;
     let resp = apply_auth(agent.get(url), &shared.auth)
-        .set("Range", &format!("bytes={start}-{end}"))
+        .set("Range", &format!("bytes={req_start}-{end}"))
         .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| {
@@ -478,7 +571,7 @@ fn download_block(
     let range_ok = resp
         .header("Content-Range")
         .and_then(parse_content_range)
-        .map(|(s, e, t)| s == start && e == end && t == total)
+        .map(|(s, e, t)| s == req_start && e == end && t == total)
         .unwrap_or(false);
     if !range_ok {
         return Err(BlockError::Retry(
@@ -486,8 +579,7 @@ fn download_block(
         ));
     }
     let mut reader = resp.into_reader();
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut pos = start;
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
         if shared.control.cancelled.load(Ordering::Relaxed) {
             return Err(BlockError::Cancelled);
@@ -499,7 +591,7 @@ fn download_block(
         // than the requested range would otherwise overwrite the NEXT
         // block's region (possibly already marked done) or grow the file
         // past its true size — silent corruption
-        let remaining = end + 1 - pos;
+        let remaining = end + 1 - *pos;
         if remaining == 0 {
             break;
         }
@@ -511,17 +603,17 @@ fn download_block(
         if n == 0 {
             break;
         }
-        write_at(file, &buf[..n], pos).map_err(|e| BlockError::Retry(format!("write: {e}")))?;
-        pos += n as u64;
-        shared.partial[worker_id].store(pos - start, Ordering::Relaxed);
+        write_at(file, &buf[..n], *pos).map_err(|e| BlockError::Retry(format!("write: {e}")))?;
+        *pos += n as u64;
+        shared.partial[worker_id].store(*pos - start, Ordering::Relaxed);
         shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
         shared.since_save.fetch_add(n as u64, Ordering::Relaxed);
         throttle_global(n as u64, read_at);
     }
-    if pos != end + 1 {
+    if *pos != end + 1 {
         return Err(BlockError::Retry(format!(
             "short block: got {} of {} bytes",
-            pos - start,
+            *pos - start,
             end - start + 1
         )));
     }
@@ -585,9 +677,10 @@ fn worker(
             (start, end)
         };
         shared.block_state[idx].store(2, Ordering::Relaxed);
+        let mut cur_pos = start;
         let mut attempt = 0;
         loop {
-            match download_block(&agent, &url, &file, start, end, &shared, id) {
+            match download_block(&agent, &url, &file, start, end, &mut cur_pos, &shared, id) {
                 Ok(()) => {
                     shared.partial[id].store(0, Ordering::Relaxed);
                     {
@@ -602,10 +695,11 @@ fn worker(
                 Err(BlockError::Paused) => {
                     shared.block_state[idx].store(0, Ordering::Relaxed);
                     if !wait_while_paused(&shared) {
+                        shared.partial[id].store(0, Ordering::Relaxed);
                         return;
                     }
                     shared.block_state[idx].store(2, Ordering::Relaxed);
-                    // retry the same block; a pause is not a failure attempt
+                    // retry the same block from cur_pos; a pause is not a failure attempt
                 }
                 Err(BlockError::Cancelled) => {
                     shared.block_state[idx].store(0, Ordering::Relaxed);
@@ -615,6 +709,7 @@ fn worker(
                 Err(BlockError::Retry(e)) => {
                     attempt += 1;
                     if attempt >= 5 {
+                        shared.partial[id].store(0, Ordering::Relaxed);
                         let mut err = shared.error.lock().unwrap();
                         *err = Some(format!("block {idx}: {e}"));
                         shared.failed.store(true, Ordering::Relaxed);
@@ -790,6 +885,39 @@ fn start_impl(
         return start_single_stream(url, out, probed, control, state_path, auth);
     }
 
+    let existing_state = std::fs::read(&state_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<State>(&raw).ok())
+        .filter(|s| {
+            s.url == url
+                && s.total == probed.total
+                && s.block_size > 0
+                && s.block_size <= 64 * 1024 * 1024
+                && (s.block_size == block_size || block_size == DEFAULT_BLOCK)
+                && s.done.len() == s.total.div_ceil(s.block_size) as usize
+                && (s.etag.is_none() || probed.etag.is_none() || s.etag == probed.etag)
+                && (s.last_modified.is_none()
+                    || probed.last_modified.is_none()
+                    || s.last_modified == probed.last_modified)
+                && out.exists()
+        });
+
+    let block_size = match &existing_state {
+        Some(s) => s.block_size,
+        None if block_size == DEFAULT_BLOCK => {
+            if probed.total > 0 && probed.total < (max_conn as u64) * DEFAULT_BLOCK {
+                ((probed.total / max_conn as u64) & !(64 * 1024 - 1)).max(256 * 1024)
+            } else if probed.total >= 2 * 1024 * 1024 * 1024 {
+                4 * 1024 * 1024
+            } else if probed.total >= 512 * 1024 * 1024 {
+                2 * 1024 * 1024
+            } else {
+                DEFAULT_BLOCK
+            }
+        }
+        None => block_size,
+    };
+
     let total_blocks = probed.total.div_ceil(block_size) as usize;
     // the total comes from the network: a hostile or broken server can
     // claim an absurd size, and the block map below allocates from it —
@@ -802,20 +930,7 @@ fn start_impl(
         ));
     }
     let mut resumed_blocks = 0usize;
-    let state = match std::fs::read(&state_path)
-        .ok()
-        .and_then(|raw| serde_json::from_slice::<State>(&raw).ok())
-        .filter(|s| {
-            s.url == url
-                && s.total == probed.total
-                && s.block_size == block_size
-                && s.done.len() == total_blocks
-                && (s.etag.is_none() || probed.etag.is_none() || s.etag == probed.etag)
-                && (s.last_modified.is_none()
-                    || probed.last_modified.is_none()
-                    || s.last_modified == probed.last_modified)
-                && out.exists()
-        }) {
+    let state = match existing_state {
         Some(s) => {
             resumed_blocks = s.done.iter().filter(|&&b| b == 1).count();
             s
@@ -859,7 +974,7 @@ fn start_impl(
         fetched_session: AtomicU64::new(0),
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
-        active_limit: AtomicUsize::new(1),
+        active_limit: AtomicUsize::new(max_conn.min(total_blocks).max(1)),
         throttle_events: AtomicU64::new(0),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
@@ -1033,7 +1148,7 @@ fn start_single_stream(
                 .map_err(|e| format!("http: {e}"))?;
             let mut reader = resp.into_reader();
             let f = File::create(&out).map_err(|e| format!("create: {e}"))?;
-            let mut buf = vec![0u8; 64 * 1024];
+            let mut buf = vec![0u8; 256 * 1024];
             let mut pos = 0u64;
             loop {
                 if shared.control.cancelled.load(Ordering::Relaxed) {

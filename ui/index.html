@@ -167,10 +167,15 @@
 
 <div id="modal" class="modal hidden">
   <div class="modal-card">
-    <div class="modal-head">Add URL <span id="modalClose">×</span></div>
+    <div class="modal-head">Download File Info <span id="modalClose">×</span></div>
     <label>Download URL
       <input id="inUrl" type="text" placeholder="https://example.com/file.zip" spellcheck="false">
     </label>
+    <div id="fProbeBox" class="f-probe-box">
+      <div class="f-probe-item"><span>Category</span><b id="fCat">—</b></div>
+      <div class="f-probe-item"><span>File Size</span><b id="fSize">—</b></div>
+      <div class="f-probe-item"><span>Resume Support</span><b id="fResume">—</b></div>
+    </div>
     <label>File name
       <input id="inName" type="text" placeholder="(taken from the address)" spellcheck="false">
     </label>
@@ -178,7 +183,7 @@
       <input id="inDir" type="text" value="~/Downloads" spellcheck="false">
     </label>
     <div class="modal-btns">
-      <button id="btnStart" class="tool primary">Start Download</button>
+      <button id="btnStart" class="tool primary">⬇ Start Download</button>
       <button id="btnLater" class="tool">Download Later</button>
       <button id="btnCancel" class="tool">Cancel</button>
     </div>
@@ -187,7 +192,7 @@
 
 <div id="vmodal" class="modal hidden">
   <div class="modal-card wide">
-    <div class="modal-head">Add Video <span id="vModalClose">×</span></div>
+    <div class="modal-head">Download Video <span id="vModalClose">×</span></div>
     <label>Video page URL — YouTube, Facebook, and 1,700+ sites
       <input id="vInUrl" type="text" placeholder="https://www.youtube.com/watch?v=…" spellcheck="false">
     </label>
@@ -203,12 +208,29 @@
       <div class="pbar"><i id="vSetupBar"></i></div>
     </div>
     <div id="vInfo" class="v-info hidden">
-      <div id="vTitle" class="v-title"></div>
-      <div id="vMeta" class="v-meta"></div>
+      <div class="v-preview">
+        <div id="vThumbWrap" class="v-thumb-wrap">
+          <img id="vThumb" class="v-thumb hidden" alt="">
+          <div id="vThumbPh" class="v-thumb-ph">🎬</div>
+          <span id="vDur" class="v-dur hidden"></span>
+        </div>
+        <div class="v-preview-meta">
+          <label class="v-title-lbl">Video Title / File Name
+            <input id="vTitleInput" type="text" spellcheck="false" placeholder="Video title">
+          </label>
+          <div id="vTitle" class="v-title hidden"></div>
+          <div id="vMeta" class="v-meta"></div>
+        </div>
+      </div>
+      <div class="v-qhead">
+        <span>Select Quality &amp; Format</span>
+        <span>File Size</span>
+      </div>
       <div id="vOptions" class="v-options"></div>
     </div>
     <div class="modal-btns">
-      <button id="vStart" class="tool primary" disabled>Start Download</button>
+      <button id="vStart" class="tool primary" disabled>⬇ Start Download</button>
+      <button id="vLater" class="tool" disabled>Download Later</button>
       <button id="vCancel" class="tool">Cancel</button>
     </div>
   </div>

@@ -1,14 +1,14 @@
 'use strict';
 /* NDM — Nill Download Manager: content script.
  *
- * When a page looks like it contains a downloadable video, show one
- * small glass pill — "⬇ Download with NDM" — attached to the video
- * player itself, at its top-right corner, the way IDM parks its panel
- * on the player. Clicking it asks the background worker to hand the
- * page URL to the NDM desktop app via the native messaging host.
- *
- * The panel lives in a shadow root so page CSS can neither break it nor be
- * broken by it. DRM streaming sites are excluded by design: no panel there.
+ * Shows the IDM-style "⬇ Download with NDM" floating button at the top-right
+ * corner of any downloadable video player. Clicking it opens an IDM-style
+ * Video Download dialog RIGHT INSIDE THE BROWSER (inside a closed Shadow DOM)
+ * displaying:
+ *   - Video Thumbnail, Duration, and Channel/Uploader
+ *   - Editable Title / File Name
+ *   - Quality & Format Selection List with exact/estimated MB sizes
+ *   - Save to Folder + Start Download / Download Later buttons
  */
 
 (() => {
@@ -18,73 +18,76 @@
     'primevideo.com',
     'disneyplus.com',
     'hotstar.com',
+    'open.spotify.com',
   ];
 
   const host = location.hostname.toLowerCase();
   if (DRM_HOSTS.some(d => host === d || host.endsWith('.' + d))) return;
 
-  let panelHost = null;   // shadow-DOM host element, once created
-  let cardEl = null;      // the pill element inside the shadow root
+  let panelHost = null;   // shadow-DOM host element
+  let shadowRoot = null;  // closed shadow root
+  let cardEl = null;      // the floating pill element
+  let modalEl = null;     // the in-browser IDM quality modal backdrop
   let anchor = null;      // the <video> the pill is attached to
-  let dismissed = false;  // user closed the panel on this page
-  // the IDM-style download card that opens under the pill: thumbnail,
-  // title and the quality list live IN the page, so the user never
-  // has to leave the video to start a download
-  let pillBtnEl = null;   // the pill's label button (classic hand-off feedback)
-  let panelEl = null;     // the card element inside the shadow root
-  let panelBody = null;   // the card's swappable body region
-  let pThumbEl = null;
-  let pTitleEl = null;
-  let pSubEl = null;
-  let panelOpen = false;
-  let probeData = null;   // the app's last probe answer for this page
-  let sniffData = null;   // a stream the browser itself already fetched
-  let manifestData = null; // its parsed quality ladder, when it has one
+  let dismissed = false;  // user closed the pill on this page
+  let modalOpen = false;  // whether the in-browser modal is currently open
+  let activeProbeToken = 0;
 
-  function isYouTubeVideo() {
-    return (host === 'youtube.com' || host.endsWith('.youtube.com'))
-      && (location.pathname.startsWith('/watch')
-        || location.pathname.startsWith('/shorts/'));
-  }
-
-  function isFacebookVideo() {
-    return (host === 'facebook.com' || host.endsWith('.facebook.com'))
-      && (location.pathname.includes('/videos/')
-        || location.pathname.startsWith('/watch')
-        || location.pathname.startsWith('/reel/'));
-  }
-
-  function hasVideoElement() {
-    for (const v of document.querySelectorAll('video')) {
-      const src = v.currentSrc || v.src || '';
-      if (src && !src.startsWith('blob:')) return true;
-      const s = v.querySelector('source[src]');
-      if (s && !(s.getAttribute('src') || '').startsWith('blob:')) return true;
-      // No size-only fallback: hero/background <video> elements on ordinary
-      // pages are not downloadable videos, and blob: players on unknown
-      // sites cannot be resolved from the element anyway. Known video
-      // pages (YouTube/Facebook) are detected by URL above.
+  function isKnownVideoSite() {
+    if (
+      (host === 'youtube.com' || host.endsWith('.youtube.com')) &&
+      (location.pathname.startsWith('/watch') ||
+        location.pathname.startsWith('/shorts/') ||
+        location.pathname.startsWith('/live/') ||
+        location.pathname.startsWith('/embed/'))
+    ) {
+      return true;
+    }
+    if (host === 'youtu.be') return true;
+    if (host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'fb.watch') {
+      return document.querySelector('video') !== null ||
+        location.pathname.includes('/videos/') ||
+        location.pathname.startsWith('/watch') ||
+        location.pathname.startsWith('/reel/');
+    }
+    if (
+      host.endsWith('instagram.com') ||
+      host.endsWith('tiktok.com') ||
+      host.endsWith('vimeo.com') ||
+      host.endsWith('dailymotion.com') ||
+      host === 'x.com' ||
+      host.endsWith('.x.com') ||
+      host === 'twitter.com' ||
+      host.endsWith('.twitter.com') ||
+      host.endsWith('twitch.tv') ||
+      host.endsWith('reddit.com') ||
+      host.endsWith('bilibili.com')
+    ) {
+      return document.querySelector('video') !== null;
     }
     return false;
   }
 
-  function isFacebookPageWithVideo() {
-    // Facebook's player streams via blob: URLs, so hasVideoElement()
-    // cannot see it — but on facebook.com the PAGE URL is what yt-dlp
-    // resolves, so any <video> element is enough: feed, groups, profiles
-    // and private posts included. A login wall shows no player at all.
-    return (host === 'facebook.com' || host.endsWith('.facebook.com'))
-      && document.querySelector('video') !== null;
+  function hasPlayableVideoElement() {
+    for (const v of document.querySelectorAll('video')) {
+      const r = v.getBoundingClientRect();
+      if (r.width < 180 || r.height < 100) continue;
+      const src = v.currentSrc || v.src || '';
+      if (src && !src.startsWith('blob:')) return true;
+      const s = v.querySelector('source[src]');
+      if (s && !(s.getAttribute('src') || '').startsWith('blob:')) return true;
+      // Visible substantial video player that has loaded metadata or is playing
+      if (r.width >= 240 && r.height >= 135 && (v.readyState >= 1 || !v.paused || v.duration > 3)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function videoDetected() {
-    return isYouTubeVideo() || isFacebookVideo() || isFacebookPageWithVideo()
-      || hasVideoElement();
+    return isKnownVideoSite() || hasPlayableVideoElement();
   }
 
-  // The pill rides on the biggest visible video on the page — on
-  // YouTube that is the player, on Facebook the feed/post player the
-  // user is looking at. Recomputed on every refresh and placement.
   function pickAnchor() {
     let best = null;
     let bestArea = 0;
@@ -94,135 +97,831 @@
       const visW = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
       const visH = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
       const area = visW * visH;
-      if (area > bestArea) { best = v; bestArea = area; }
+      if (area > bestArea) {
+        best = v;
+        bestArea = area;
+      }
     }
     return best;
   }
 
-  // Park the pill at the anchor player's top-right corner, inside the
-  // player. Called on refresh, on scroll/resize and on a slow tick, so
-  // the pill follows the player — including into fullscreen, where the
-  // player's rect simply becomes the screen.
-  function place() {
-    if (!panelHost || !cardEl) return;
-    if (!anchor || !anchor.isConnected) anchor = pickAnchor();
-    if (!anchor) { panelHost.style.display = 'none'; return; }
-    const r = anchor.getBoundingClientRect();
-    if (r.width < 160 || r.bottom < 48 || r.top > innerHeight - 24) {
-      panelHost.style.display = 'none';
-      return;
+  /* Resolve the exact permalink for the video player the user clicked on,
+     especially when browsing a feed (Facebook Feed/Watch, Instagram, TikTok, X)
+     or a generic site with a direct <video> stream. */
+  async function resolveVideoUrl(videoEl) {
+    const href = location.href;
+    // 1. If already on a dedicated video permalink, use it directly
+    if (
+      /youtube\.com\/(watch|shorts\/|live\/|embed\/)/i.test(href) ||
+      /youtu\.be\//i.test(href) ||
+      /facebook\.com\/.*(\/videos\/|\/reel\/|\/share\/(r|v)\/|watch\/?\?v=)/i.test(href) ||
+      /instagram\.com\/(reel|p|tv)\//i.test(href) ||
+      /tiktok\.com\/@[^/]+\/video\//i.test(href)
+    ) {
+      return href;
     }
-    panelHost.style.display = 'block';
-    const w = cardEl.offsetWidth || 196;
-    cardEl.style.left = Math.max(4, r.right - w - 12) + 'px';
-    cardEl.style.top = Math.max(4, r.top + 12) + 'px';
-    if (panelEl && panelOpen) {
-      panelEl.style.left = Math.max(4, r.right - 336 - 12) + 'px';
-      panelEl.style.top = (r.top + 12 + (cardEl.offsetHeight || 32) + 8) + 'px';
+
+    // 2. Walk up from the <video> element to find a post/reel/video permalink
+    if (videoEl) {
+      let cur = videoEl;
+      for (let depth = 0; depth < 16 && cur && cur !== document.body; depth++, cur = cur.parentElement) {
+        const links = cur.querySelectorAll ? cur.querySelectorAll('a[href]') : [];
+        for (const a of links) {
+          const h = a.href || '';
+          if (
+            /facebook\.com\/.*(\/reel\/\d+|\/videos\/\d+|watch\/?\?v=\d+|\/share\/(r|v)\/)/i.test(h) ||
+            /instagram\.com\/(reel|p|tv)\/[^/?#]+/i.test(h) ||
+            /tiktok\.com\/@[^/]+\/video\/\d+/i.test(h) ||
+            /(twitter|x)\.com\/[^/]+\/status\/\d+/i.test(h) ||
+            /youtube\.com\/(watch\?v=|shorts\/)/i.test(h)
+          ) {
+            return h.split('&__cft__')[0];
+          }
+        }
+      }
+    }
+
+    // 3. For generic sites: if the <video> has a direct http(s) media URL, or
+    //    if the background worker sniffed an .m3u8 / .mpd / .mp4 stream, use it
+    if (!isKnownVideoSite() && videoEl) {
+      const direct = videoEl.currentSrc || videoEl.src || '';
+      if (/^https?:\/\//i.test(direct)) return direct;
+      const sourceEl = videoEl.querySelector('source[src]');
+      const sUrl = sourceEl ? sourceEl.getAttribute('src') || '' : '';
+      if (/^https?:\/\//i.test(sUrl)) {
+        try {
+          return new URL(sUrl, href).href;
+        } catch (e) {}
+      }
+      try {
+        const mediaResp = await chrome.runtime.sendMessage({ action: 'ndm-tab-media' });
+        if (mediaResp && mediaResp.streamUrl) return mediaResp.streamUrl;
+      } catch (e) {}
+    }
+
+    return href;
+  }
+
+  function guessFallbackThumbnail(targetUrl, videoEl) {
+    if (videoEl && videoEl.poster && /^https?:|^data:/i.test(videoEl.poster)) {
+      return videoEl.poster;
+    }
+    try {
+      const u = new URL(targetUrl);
+      let ytId = u.searchParams.get('v');
+      if (!ytId && u.pathname.startsWith('/shorts/')) {
+        ytId = u.pathname.split('/')[2];
+      }
+      if (ytId && /^[\w-]{11}$/.test(ytId)) {
+        return `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`;
+      }
+    } catch (e) {}
+    const og = document.querySelector('meta[property="og:image"]');
+    if (og && og.content) return og.content;
+    return '';
+  }
+
+  function fmtDuration(sec) {
+    const s = Math.max(0, Math.round(Number(sec) || 0));
+    if (!s) return '';
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    const pad = n => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(r)}` : `${m}:${pad(r)}`;
+  }
+
+  function fmtBytes(n) {
+    const b = Number(n) || 0;
+    if (b <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let v = b;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return `${v.toFixed(i >= 2 ? 1 : 0)} ${units[i]}`;
+  }
+
+  function cleanPageTitle() {
+    return (document.title || 'video')
+      .replace(/^\(\d+\)\s*/, '')
+      .replace(/\s*[-|•]\s*(YouTube|Facebook|Instagram|TikTok|Vimeo|Dailymotion|X|Twitch).*$/i, '')
+      .trim() || 'video';
+  }
+
+  /* Ensure panelHost is attached inside fullscreenElement when the player enters
+     HTML5 Fullscreen so the NDM button and modal stay visible on top of the video. */
+  function syncHostParent() {
+    if (!panelHost) return;
+    const targetParent = document.fullscreenElement || document.documentElement;
+    if (targetParent && panelHost.parentNode !== targetParent) {
+      targetParent.appendChild(panelHost);
     }
   }
 
+  function place() {
+    if (!panelHost || !cardEl) return;
+    syncHostParent();
+    if (modalOpen) {
+      panelHost.style.display = 'block';
+    }
+    if (!anchor || !anchor.isConnected) anchor = pickAnchor();
+    if (!anchor) {
+      if (!modalOpen) panelHost.style.display = 'none';
+      cardEl.style.display = 'none';
+      return;
+    }
+    const r = anchor.getBoundingClientRect();
+    if (r.width < 160 || r.bottom < 48 || r.top > innerHeight - 24) {
+      if (!modalOpen) panelHost.style.display = 'none';
+      cardEl.style.display = 'none';
+      return;
+    }
+    panelHost.style.display = 'block';
+    cardEl.style.display = 'flex';
+    const w = cardEl.offsetWidth || 196;
+    cardEl.style.left = Math.max(4, r.right - w - 12) + 'px';
+    cardEl.style.top = Math.max(4, r.top + 12) + 'px';
+  }
+
+  function closeBrowserModal() {
+    activeProbeToken++;
+    modalOpen = false;
+    if (modalEl) {
+      modalEl.remove();
+      modalEl = null;
+    }
+    place();
+  }
+
+  async function openBrowserModal(pillBtn, pillContainer) {
+    if (!shadowRoot) return;
+    closeBrowserModal();
+    modalOpen = true;
+    const myToken = ++activeProbeToken;
+
+    const currentAnchor = anchor || pickAnchor();
+    const targetUrl = await resolveVideoUrl(currentAnchor);
+    const fallbackTitle = cleanPageTitle();
+    const fallbackThumb = guessFallbackThumbnail(targetUrl, currentAnchor);
+
+    let savedDir = '~/Downloads';
+    try {
+      const st = await chrome.storage.local.get({ ndmSaveDir: '~/Downloads' });
+      if (st && st.ndmSaveDir) savedDir = st.ndmSaveDir;
+    } catch (e) {}
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'ndm-modal-backdrop';
+    for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'dblclick']) {
+      backdrop.addEventListener(evt, e => e.stopPropagation());
+    }
+    backdrop.addEventListener('click', e => {
+      e.stopPropagation();
+      if (e.target === backdrop) closeBrowserModal();
+    });
+
+    const dialog = document.createElement('div');
+    dialog.className = 'ndm-modal';
+    dialog.innerHTML = `
+      <div class="ndm-m-head">
+        <div class="ndm-m-brand">
+          <span class="ndm-m-logo">⬇</span>
+          <span>Download Video with NDM</span>
+        </div>
+        <button class="ndm-m-x" type="button" title="Close">×</button>
+      </div>
+      <div class="ndm-m-body">
+        <div class="ndm-m-preview">
+          <div class="ndm-m-thumb-wrap">
+            <img class="ndm-m-thumb" alt="" style="display:none" />
+            <div class="ndm-m-thumb-ph">🎬</div>
+            <span class="ndm-m-dur" style="display:none"></span>
+          </div>
+          <div class="ndm-m-meta">
+            <label class="ndm-m-lbl">Video Title / File Name</label>
+            <input class="ndm-m-input ndm-m-title" type="text" value="" placeholder="Video title" />
+            <div class="ndm-m-sub">
+              <span class="ndm-m-uploader"></span>
+              <span class="ndm-m-host">${location.hostname}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="ndm-m-qhead">
+          <span>Select Quality &amp; Format</span>
+          <span class="ndm-m-qhint">File Size</span>
+        </div>
+        <div class="ndm-m-qlist">
+          <div class="ndm-m-loading">
+            <div class="ndm-spinner"></div>
+            <div>
+              <div class="ndm-m-load-title">Reading video qualities &amp; calculating MB sizes…</div>
+              <div class="ndm-m-load-sub">Fetching stream manifest via NDM high-speed engine</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ndm-m-folder-row">
+          <label class="ndm-m-lbl">Save to folder</label>
+          <input class="ndm-m-input ndm-m-dir" type="text" value="" placeholder="~/Downloads" />
+        </div>
+        <div class="ndm-m-status" style="display:none"></div>
+      </div>
+      <div class="ndm-m-foot">
+        <button class="ndm-btn ndm-btn-ghost ndm-btn-app" type="button" title="Open this video in the NDM desktop app window">Open in NDM App</button>
+        <div class="ndm-m-foot-right">
+          <button class="ndm-btn ndm-btn-secondary ndm-btn-cancel" type="button">Cancel</button>
+          <button class="ndm-btn ndm-btn-secondary ndm-btn-later" type="button" disabled>Download Later</button>
+          <button class="ndm-btn ndm-btn-primary ndm-btn-start" type="button" disabled>⬇ Start Download</button>
+        </div>
+      </div>
+    `;
+
+    backdrop.appendChild(dialog);
+    shadowRoot.appendChild(backdrop);
+    modalEl = backdrop;
+    syncHostParent();
+    panelHost.style.display = 'block';
+
+    const titleIn = dialog.querySelector('.ndm-m-title');
+    const dirIn = dialog.querySelector('.ndm-m-dir');
+    const thumbImg = dialog.querySelector('.ndm-m-thumb');
+    const thumbPh = dialog.querySelector('.ndm-m-thumb-ph');
+    const durBadge = dialog.querySelector('.ndm-m-dur');
+    const uploaderEl = dialog.querySelector('.ndm-m-uploader');
+    const qListEl = dialog.querySelector('.ndm-m-qlist');
+    const statusEl = dialog.querySelector('.ndm-m-status');
+    const btnClose = dialog.querySelector('.ndm-m-x');
+    const btnCancel = dialog.querySelector('.ndm-btn-cancel');
+    const btnApp = dialog.querySelector('.ndm-btn-app');
+    const btnLater = dialog.querySelector('.ndm-btn-later');
+    const btnStart = dialog.querySelector('.ndm-btn-start');
+
+    titleIn.value = fallbackTitle;
+    dirIn.value = savedDir;
+
+    // Prevent host page keyboard shortcuts (e.g. YouTube 'k', 'f', 'm', Space) from firing while typing in modal
+    backdrop.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeBrowserModal();
+      } else if (e.key === 'Enter' && !btnStart.disabled) {
+        e.preventDefault();
+        triggerDownload(false);
+      }
+    });
+
+    function showThumbnail(src) {
+      if (!src) return;
+      thumbImg.onload = () => {
+        thumbImg.style.display = 'block';
+        thumbPh.style.display = 'none';
+      };
+      thumbImg.onerror = () => {
+        if (src !== fallbackThumb && fallbackThumb) {
+          thumbImg.src = fallbackThumb;
+        }
+      };
+      thumbImg.src = src;
+    }
+
+    if (fallbackThumb) showThumbnail(fallbackThumb);
+
+    btnClose.addEventListener('click', closeBrowserModal);
+    btnCancel.addEventListener('click', closeBrowserModal);
+
+    // Fallback: open directly in NDM app's own video dialog
+    btnApp.addEventListener('click', async () => {
+      btnApp.disabled = true;
+      btnApp.textContent = 'Opening NDM…';
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'ndm-download',
+          kind: 'video',
+          url: targetUrl,
+          pageUrl: location.href,
+          title: titleIn.value.trim() || fallbackTitle,
+        });
+        if (resp && resp.ok) {
+          closeBrowserModal();
+          flashPill(pillBtn, pillContainer, true, 'Opened in NDM ✓');
+        } else {
+          showError('Could not reach NDM desktop app. Please make sure NDM is installed.');
+          btnApp.disabled = false;
+          btnApp.textContent = 'Open in NDM App';
+        }
+      } catch (e) {
+        showError('Could not reach NDM desktop app.');
+        btnApp.disabled = false;
+        btnApp.textContent = 'Open in NDM App';
+      }
+    });
+
+    function showError(msg) {
+      statusEl.style.display = 'block';
+      statusEl.className = 'ndm-m-status err';
+      statusEl.textContent = msg;
+    }
+
+    let selectedOption = null;
+
+    function renderQualities(qualities) {
+      qListEl.innerHTML = '';
+      if (!qualities || !qualities.length) {
+        qualities = [
+          {
+            id: 'best',
+            label: 'Best available quality (Auto)',
+            selector: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
+            audio: false,
+            ext: 'MP4',
+            size_bytes: null,
+            size_text: 'Auto',
+            height: 1080,
+            note: 'MP4 video + AAC audio',
+          },
+          {
+            id: 'audio',
+            label: 'Audio only (MP3)',
+            selector: 'ba/b',
+            audio: true,
+            ext: 'MP3',
+            size_bytes: null,
+            size_text: 'Audio',
+            height: 0,
+            note: 'High quality MP3 audio',
+          },
+        ];
+      }
+
+      // Default select first specific HD/standard resolution (e.g. 1080p or 720p) or first item
+      selectedOption = qualities.find(q => q.height === 1080) ||
+        qualities.find(q => q.height === 720) ||
+        qualities[0];
+
+      for (const q of qualities) {
+        const row = document.createElement('div');
+        const isSel = q === selectedOption;
+        row.className = 'ndm-q-row' + (isSel ? ' sel' : '');
+        const extBadge = (q.ext || (q.audio ? 'MP3' : 'MP4')).toUpperCase();
+        const sizeLabel = q.size_text || (q.size_bytes ? fmtBytes(q.size_bytes) : (q.id === 'best' ? 'Auto' : 'Stream'));
+        const cleanNote = (q.note || '')
+          .split('•')
+          .map(p => p.trim())
+          .filter(p => p && p.toUpperCase() !== extBadge && !/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i.test(p))
+          .join(' · ');
+        const noteText = cleanNote ? `<span class="ndm-q-note">${escapeHtml(cleanNote)}</span>` : '';
+
+        row.innerHTML = `
+          <div class="ndm-q-left">
+            <span class="ndm-q-radio"></span>
+            <span class="ndm-q-badge ${q.audio ? 'audio' : 'video'}">${escapeHtml(extBadge)}</span>
+            <span class="ndm-q-label">${escapeHtml(q.label)}</span>
+            ${noteText}
+          </div>
+          <div class="ndm-q-right">
+            <span class="ndm-q-size ${q.size_bytes ? 'exact' : ''}">${escapeHtml(sizeLabel)}</span>
+          </div>
+        `;
+        row.addEventListener('click', () => {
+          selectedOption = q;
+          for (const el of qListEl.querySelectorAll('.ndm-q-row')) {
+            el.classList.remove('sel');
+          }
+          row.classList.add('sel');
+          updateStartButtonLabel();
+        });
+        row.addEventListener('dblclick', () => {
+          selectedOption = q;
+          triggerDownload(false);
+        });
+        qListEl.appendChild(row);
+      }
+
+      btnStart.disabled = false;
+      btnLater.disabled = false;
+      updateStartButtonLabel();
+    }
+
+    function updateStartButtonLabel() {
+      if (!selectedOption) return;
+      const sz = selectedOption.size_text || (selectedOption.size_bytes ? fmtBytes(selectedOption.size_bytes) : '');
+      btnStart.textContent = sz
+        ? `⬇ Start Download (${sz})`
+        : '⬇ Start Download';
+    }
+
+    async function triggerDownload(later) {
+      if (!selectedOption) return;
+      const chosenDir = dirIn.value.trim() || '~/Downloads';
+      const chosenTitle = titleIn.value.trim() || fallbackTitle;
+      try {
+        chrome.storage.local.set({ ndmSaveDir: chosenDir }).catch(() => {});
+      } catch (e) {}
+
+      btnStart.disabled = true;
+      btnLater.disabled = true;
+      btnStart.textContent = later ? 'Queueing in NDM…' : 'Starting in NDM…';
+
+      let ok = false;
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'ndm-download',
+          kind: 'video_direct',
+          url: targetUrl,
+          pageUrl: location.href,
+          title: chosenTitle,
+          selector: selectedOption.selector,
+          audio: !!selectedOption.audio,
+          dir: chosenDir,
+          later: !!later,
+          total: Number(selectedOption.size_bytes) || 0,
+        });
+        ok = !!(resp && resp.ok);
+      } catch (e) {
+        ok = false;
+      }
+
+      if (ok) {
+        closeBrowserModal();
+        flashPill(
+          pillBtn,
+          pillContainer,
+          true,
+          later ? 'Paused in NDM ✓' : 'Downloading in NDM ✓'
+        );
+      } else {
+        showError('NDM could not be started. Make sure the NDM desktop app is installed.');
+        btnStart.disabled = false;
+        btnLater.disabled = false;
+        updateStartButtonLabel();
+      }
+    }
+
+    btnStart.addEventListener('click', () => triggerDownload(false));
+    btnLater.addEventListener('click', () => triggerDownload(true));
+
+    // Probe the video qualities + sizes via ndm-host
+    try {
+      const res = await chrome.runtime.sendMessage({
+        action: 'ndm-probe',
+        url: targetUrl,
+        pageUrl: location.href,
+      });
+      if (myToken !== activeProbeToken) return;
+      if (res && res.ok && res.info) {
+        const info = res.info;
+        if (info.title && (!titleIn.value || titleIn.value === fallbackTitle)) {
+          titleIn.value = info.title;
+        }
+        if (info.thumbnail) {
+          showThumbnail(info.thumbnail);
+        }
+        if (info.duration) {
+          durBadge.textContent = fmtDuration(info.duration);
+          durBadge.style.display = 'inline-block';
+        }
+        if (info.uploader) {
+          uploaderEl.textContent = info.uploader + ' · ';
+        }
+        renderQualities(info.options || info.qualities || []);
+      } else {
+        // Even if probe returned an error, provide default Best MP4 + Audio MP3 options
+        // so the user can still download immediately with 1 click!
+        renderQualities([]);
+        if (res && res.error) {
+          showError(res.error + ' — You can still start with automatic best quality below.');
+        }
+      }
+    } catch (e) {
+      if (myToken !== activeProbeToken) return;
+      renderQualities([]);
+      showError('Could not probe exact sizes — you can still start download below.');
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function flashPill(btn, pill, ok, text) {
+    if (!btn || !pill) return;
+    pill.classList.toggle('sent', ok);
+    pill.classList.toggle('error', !ok);
+    btn.textContent = text;
+    place();
+    setTimeout(() => {
+      pill.classList.remove('sent', 'error');
+      btn.innerHTML = '<span>Download with NDM</span><span class="caret">▾</span>';
+      btn.disabled = false;
+      place();
+    }, 2800);
+  }
+
   function buildPanel() {
-    if (panelHost) panelHost.remove(); // drop a detached/stale host first
+    if (panelHost) panelHost.remove();
     panelHost = document.createElement('div');
     panelHost.id = 'ndm-panel-host';
     panelHost.style.cssText =
       'position:fixed;inset:0;pointer-events:none;z-index:2147483647;';
-    const shadow = panelHost.attachShadow({ mode: 'closed' });
+    shadowRoot = panelHost.attachShadow({ mode: 'closed' });
 
     const style = document.createElement('style');
     style.textContent = `
+      * { box-sizing: border-box; }
       .pill {
         position: absolute; pointer-events: auto;
         display: flex; align-items: center; justify-content: center;
-        min-width: 178px; box-sizing: border-box; gap: 7px;
-        background: rgba(13, 22, 38, .78); color: #fff;
-        -webkit-backdrop-filter: blur(10px) saturate(1.35);
-        backdrop-filter: blur(10px) saturate(1.35);
-        border: 1px solid rgba(255, 255, 255, .28);
-        border-radius: 999px; padding: 4px 11px 4px 4px;
-        box-shadow: 0 8px 24px rgba(2, 10, 24, .38);
-        font-family: "Segoe UI", Roboto, Arial, sans-serif;
+        min-width: 184px; gap: 7px;
+        background: linear-gradient(180deg, rgba(16, 28, 48, .88), rgba(10, 18, 32, .92));
+        color: #fff;
+        -webkit-backdrop-filter: blur(10px) saturate(1.4);
+        backdrop-filter: blur(10px) saturate(1.4);
+        border: 1px solid rgba(110, 190, 255, .38);
+        border-radius: 999px; padding: 4px 12px 4px 4px;
+        box-shadow: 0 8px 24px rgba(2, 10, 24, .45);
+        font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
         font-size: 13px; font-weight: 600; white-space: nowrap;
-        opacity: 0; transition: opacity .18s ease;
+        opacity: 0; transition: opacity .18s ease, transform .15s ease, background .15s ease;
       }
       .pill.on { opacity: 1; }
-      .pill:hover { background: rgba(13, 22, 38, .9); }
+      .pill:hover {
+        background: linear-gradient(180deg, rgba(20, 38, 66, .95), rgba(12, 24, 44, .98));
+        border-color: rgba(130, 205, 255, .65);
+        transform: translateY(-1px);
+      }
       .chip {
-        width: 23px; height: 23px; border-radius: 50%; flex: none;
+        width: 24px; height: 24px; border-radius: 50%; flex: none;
         display: flex; align-items: center; justify-content: center;
         background: linear-gradient(180deg, #55c1ff, #1f6fd0);
         color: #fff; font-size: 13px; line-height: 1;
         box-shadow: inset 0 1px 0 rgba(255,255,255,.5);
       }
-      .pill.sent { background: rgba(18, 96, 48, .86); }
-      .pill.queued { background: rgba(146, 104, 26, .94); }
-      .pill.error { background: rgba(146, 30, 30, .88); }
-      .label { cursor: pointer; background: none; border: none; color: inherit;
-        font: inherit; padding: 0; }
+      .pill.sent { background: rgba(18, 106, 52, .92); border-color: rgba(100, 230, 140, .55); }
+      .pill.error { background: rgba(156, 30, 30, .92); border-color: rgba(255, 130, 130, .55); }
+      .label {
+        cursor: pointer; background: none; border: none; color: inherit;
+        font: inherit; padding: 0; display: flex; align-items: center; gap: 5px;
+      }
+      .caret {
+        font-size: 10px; opacity: .8; margin-left: 2px;
+      }
       .close {
-        background: none; border: none; color: rgba(255,255,255,.75);
-        cursor: pointer; font-size: 14px; line-height: 1; padding: 0 0 0 2px;
+        background: none; border: none; color: rgba(255,255,255,.72);
+        cursor: pointer; font-size: 15px; line-height: 1; padding: 0 0 0 4px;
       }
       .close:hover { color: #fff; }
-      .panel {
-        position: absolute; width: 336px; box-sizing: border-box;
-        pointer-events: auto; display: none;
-        background: rgba(13, 22, 38, .92); color: #fff;
-        -webkit-backdrop-filter: blur(14px) saturate(1.35);
-        backdrop-filter: blur(14px) saturate(1.35);
-        border: 1px solid rgba(255, 255, 255, .28);
-        border-radius: 14px; box-shadow: 0 16px 40px rgba(2, 10, 24, .45);
-        font-family: "Segoe UI", Roboto, Arial, sans-serif;
-        overflow: hidden;
+
+      /* In-Browser IDM Video Quality Modal */
+      .ndm-modal-backdrop {
+        position: fixed; inset: 0; pointer-events: auto;
+        background: rgba(8, 15, 28, .62);
+        -webkit-backdrop-filter: blur(4px);
+        backdrop-filter: blur(4px);
+        display: flex; align-items: center; justify-content: center;
+        padding: 16px;
+        font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif;
+        color: #162334;
+        animation: ndmFadeIn .15s ease-out;
       }
-      .panel.open { display: block; }
-      .p-head { display: flex; gap: 10px; padding: 10px 10px 8px; align-items: flex-start; }
-      .p-thumb { width: 104px; height: 59px; object-fit: cover; border-radius: 8px;
-        flex: none; background: rgba(255,255,255,.08); }
-      .p-meta { flex: 1; min-width: 0; }
-      .p-title { font-size: 13px; font-weight: 600; line-height: 1.35;
-        display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-        overflow: hidden; }
-      .p-sub { font-size: 11.5px; color: rgba(255,255,255,.62); margin-top: 3px; }
-      .p-close { background: none; border: none; color: rgba(255,255,255,.75);
-        cursor: pointer; font-size: 15px; line-height: 1; padding: 0; flex: none; }
-      .p-close:hover { color: #fff; }
-      .p-body { padding: 2px 6px 8px; }
-      .p-load { display: flex; align-items: center; gap: 9px;
-        padding: 10px 8px 12px; font-size: 12.5px; color: rgba(255,255,255,.85); }
-      .spin { width: 15px; height: 15px; flex: none; border-radius: 50%;
-        border: 2px solid rgba(255,255,255,.25); border-top-color: #55c1ff;
-        animation: ndmspin .8s linear infinite; }
-      @keyframes ndmspin { to { transform: rotate(360deg); } }
-      .p-list { max-height: 240px; overflow-y: auto; }
-      .row { display: flex; align-items: baseline; justify-content: space-between;
-        gap: 10px; width: 100%; box-sizing: border-box;
-        background: none; border: none; color: #fff; font: inherit;
-        text-align: left; cursor: pointer; padding: 7px 8px; border-radius: 8px; }
-      .row:hover { background: rgba(255,255,255,.09); }
-      .r-label { font-size: 13px; font-weight: 600; white-space: nowrap; }
-      .r-note { font-size: 11.5px; color: rgba(255,255,255,.6); text-align: right;
-        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .p-note { margin: 4px 8px 2px; padding: 9px 10px; border-radius: 9px;
-        font-size: 12.5px; line-height: 1.45; }
-      .p-note.ok { background: rgba(24, 110, 55, .35); }
-      .p-note.err { background: rgba(150, 35, 35, .35); }
-      .p-hint { padding: 2px 10px 6px; font-size: 11.5px; color: rgba(255,255,255,.62); }
-      .p-actions { display: flex; gap: 8px; padding: 6px 8px 4px; }
-      .p-btn { flex: 1; background: rgba(255,255,255,.1);
-        border: 1px solid rgba(255,255,255,.22); color: #fff; font: inherit;
-        font-size: 12.5px; font-weight: 600; padding: 6px 0; border-radius: 8px;
-        cursor: pointer; }
-      .p-btn:hover { background: rgba(255,255,255,.18); }
-      .p-link { display: block; margin: 4px auto 2px; background: none; border: none;
-        color: rgba(255,255,255,.65); font: inherit; font-size: 11.5px;
-        cursor: pointer; text-decoration: underline; }
-      .p-link:hover { color: #fff; }
+      @keyframes ndmFadeIn {
+        from { opacity: 0; transform: scale(.98); }
+        to { opacity: 1; transform: scale(1); }
+      }
+      .ndm-modal {
+        width: 540px; max-width: 100%;
+        background: #f5f8fc;
+        border: 1px solid #8ea8c6;
+        border-radius: 10px;
+        box-shadow: 0 22px 60px rgba(0, 0, 0, .48), 0 0 0 1px rgba(255,255,255,.6) inset;
+        overflow: hidden;
+        display: flex; flex-direction: column;
+      }
+      .ndm-m-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 14px;
+        background: linear-gradient(180deg, #e7f0fa 0%, #cfe0f3 100%);
+        border-bottom: 1px solid #9eb5d0;
+        font-size: 14px; font-weight: 700; color: #122842;
+      }
+      .ndm-m-brand {
+        display: flex; align-items: center; gap: 8px;
+      }
+      .ndm-m-logo {
+        width: 22px; height: 22px; border-radius: 6px;
+        background: linear-gradient(180deg, #4db8ff, #1b66c9);
+        color: #fff; display: inline-flex; align-items: center; justify-content: center;
+        font-size: 12px; box-shadow: inset 0 1px 0 rgba(255,255,255,.45);
+      }
+      .ndm-m-x {
+        width: 26px; height: 26px; border-radius: 5px;
+        border: 1px solid transparent; background: transparent;
+        color: #344b66; font-size: 18px; line-height: 1; cursor: pointer;
+      }
+      .ndm-m-x:hover {
+        background: #e81123; color: #fff;
+      }
+      .ndm-m-body {
+        padding: 14px;
+        display: flex; flex-direction: column; gap: 12px;
+      }
+      .ndm-m-preview {
+        display: flex; gap: 12px; align-items: center;
+        background: #fff; border: 1px solid #c5d4e6;
+        border-radius: 8px; padding: 10px;
+      }
+      .ndm-m-thumb-wrap {
+        position: relative; width: 136px; height: 78px; flex: none;
+        border-radius: 6px; overflow: hidden;
+        background: linear-gradient(135deg, #1b2b42, #0f1826);
+        border: 1px solid #b0c2d8;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .ndm-m-thumb {
+        width: 100%; height: 100%; object-fit: cover; display: block;
+      }
+      .ndm-m-thumb-ph {
+        font-size: 26px; opacity: .7;
+      }
+      .ndm-m-dur {
+        position: absolute; right: 5px; bottom: 5px;
+        background: rgba(0, 0, 0, .82); color: #fff;
+        font-size: 11px; font-weight: 700; padding: 1px 5px;
+        border-radius: 4px; font-variant-numeric: tabular-nums;
+      }
+      .ndm-m-meta {
+        flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 5px;
+      }
+      .ndm-m-lbl {
+        font-size: 11px; font-weight: 700; color: #465d78;
+        text-transform: uppercase; letter-spacing: .3px;
+      }
+      .ndm-m-input {
+        width: 100%; height: 32px; padding: 0 9px;
+        border: 1px solid #9eb4ce; border-radius: 5px;
+        background: #fff; color: #122338;
+        font: 600 13px "Segoe UI", system-ui, sans-serif;
+        outline: none;
+      }
+      .ndm-m-input:focus {
+        border-color: #1f6fd0;
+        box-shadow: 0 0 0 2px rgba(31, 111, 208, .2);
+      }
+      .ndm-m-sub {
+        font-size: 11.5px; color: #566e8a;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ndm-m-qhead {
+        display: flex; align-items: center; justify-content: space-between;
+        font-size: 11.5px; font-weight: 700; color: #3d5570;
+        text-transform: uppercase; letter-spacing: .3px;
+        padding: 0 2px;
+      }
+      .ndm-m-qlist {
+        background: #fff; border: 1px solid #b8cae0;
+        border-radius: 7px; max-height: 225px; overflow-y: auto;
+        divide-y: 1px solid #edf2f8;
+      }
+      .ndm-m-loading {
+        display: flex; align-items: center; gap: 12px;
+        padding: 24px 16px; color: #2b4460;
+      }
+      .ndm-spinner {
+        width: 22px; height: 22px; border-radius: 50%; flex: none;
+        border: 2.5px solid #cfe0f5; border-top-color: #1b66c9;
+        animation: ndmSpin .75s linear infinite;
+      }
+      @keyframes ndmSpin {
+        to { transform: rotate(360deg); }
+      }
+      .ndm-m-load-title {
+        font-size: 13px; font-weight: 600; color: #162b44;
+      }
+      .ndm-m-load-sub {
+        font-size: 11.5px; color: #5c7490; margin-top: 2px;
+      }
+      .ndm-q-row {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 8px 11px; cursor: pointer;
+        border-bottom: 1px solid #eef3f9;
+        transition: background .1s ease;
+      }
+      .ndm-q-row:last-child { border-bottom: none; }
+      .ndm-q-row:hover { background: #f0f6ff; }
+      .ndm-q-row.sel {
+        background: linear-gradient(180deg, #dcebff 0%, #c8e0ff 100%);
+        color: #0b2545;
+      }
+      .ndm-q-left {
+        display: flex; align-items: center; gap: 8px; min-width: 0;
+      }
+      .ndm-q-radio {
+        width: 15px; height: 15px; border-radius: 50%; flex: none;
+        border: 2px solid #7f97b2; background: #fff;
+        position: relative;
+      }
+      .ndm-q-row.sel .ndm-q-radio {
+        border-color: #155fc0;
+      }
+      .ndm-q-row.sel .ndm-q-radio::after {
+        content: ""; position: absolute; inset: 2px;
+        border-radius: 50%; background: #155fc0;
+      }
+      .ndm-q-badge {
+        font-size: 10.5px; font-weight: 800; padding: 2px 6px;
+        border-radius: 4px; letter-spacing: .3px; flex: none;
+      }
+      .ndm-q-badge.video {
+        background: #e1effe; color: #1456b0; border: 1px solid #b5d3f8;
+      }
+      .ndm-q-badge.audio {
+        background: #fef3c7; color: #92400e; border: 1px solid #fde68a;
+      }
+      .ndm-q-label {
+        font-size: 13px; font-weight: 600; color: #13263c;
+      }
+      .ndm-q-note {
+        font-size: 11px; color: #5b728c;
+      }
+      .ndm-q-right {
+        flex: none; margin-left: 8px;
+      }
+      .ndm-q-size {
+        display: inline-block; min-width: 68px; text-align: right;
+        font-size: 12.5px; font-weight: 700; color: #47607c;
+        font-variant-numeric: tabular-nums;
+        background: #eef3f9; padding: 2px 8px; border-radius: 999px;
+      }
+      .ndm-q-size.exact {
+        background: #e3f2fd; color: #0d47a1; border: 1px solid #bbdefb;
+      }
+      .ndm-q-row.sel .ndm-q-size {
+        background: #155fc0; color: #fff; border-color: #155fc0;
+      }
+      .ndm-m-folder-row {
+        display: flex; flex-direction: column; gap: 4px;
+      }
+      .ndm-m-status {
+        font-size: 12px; padding: 7px 10px; border-radius: 6px;
+      }
+      .ndm-m-status.err {
+        background: #fff1f2; border: 1px solid #fecdd3; color: #9f1239;
+      }
+      .ndm-m-foot {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 14px;
+        background: #e9eff7; border-top: 1px solid #b8cae0;
+        gap: 8px;
+      }
+      .ndm-m-foot-right {
+        display: flex; align-items: center; gap: 7px;
+      }
+      .ndm-btn {
+        height: 32px; padding: 0 12px; border-radius: 5px;
+        font: 600 12.5px "Segoe UI", system-ui, sans-serif;
+        cursor: pointer; transition: filter .12s ease, opacity .12s ease;
+        white-space: nowrap;
+      }
+      .ndm-btn:disabled {
+        opacity: .55; cursor: not-allowed;
+      }
+      .ndm-btn-primary {
+        background: linear-gradient(180deg, #2b84ea 0%, #155fc0 100%);
+        border: 1px solid #0e4a9a; color: #fff;
+        box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
+      }
+      .ndm-btn-primary:hover:not(:disabled) {
+        filter: brightness(1.07);
+      }
+      .ndm-btn-secondary {
+        background: linear-gradient(180deg, #ffffff 0%, #e6eef7 100%);
+        border: 1px solid #96aec9; color: #1c314a;
+      }
+      .ndm-btn-secondary:hover:not(:disabled) {
+        background: #f5f9ff;
+      }
+      .ndm-btn-ghost {
+        background: transparent; border: 1px solid #9fb6d0;
+        color: #294566;
+      }
+      .ndm-btn-ghost:hover:not(:disabled) {
+        background: rgba(255,255,255,.65);
+      }
     `;
 
     const pill = document.createElement('div');
     pill.className = 'pill';
+    for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'dblclick']) {
+      pill.addEventListener(evt, e => e.stopPropagation());
+    }
 
     const chip = document.createElement('span');
     chip.className = 'chip';
@@ -230,19 +929,19 @@
 
     const btn = document.createElement('button');
     btn.className = 'label';
-    btn.textContent = 'Download with NDM';
-    btn.title = 'Download this video with NDM — Nill Download Manager';
-    // IDM's way: the click opens the download card right here on the
-    // page (thumbnail + qualities); the app only enters the picture
-    // when the user falls back to it from inside the card
-    btn.addEventListener('click', () => { openPanel(); });
-    pillBtnEl = btn;
+    btn.innerHTML = '<span>Download with NDM</span><span class="caret">▾</span>';
+    btn.title = 'Choose video quality & download with NDM';
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      openBrowserModal(btn, pill);
+    });
 
     const close = document.createElement('button');
     close.className = 'close';
     close.textContent = '×';
-    close.title = 'Hide';
-    close.addEventListener('click', () => {
+    close.title = 'Hide button on this page';
+    close.addEventListener('click', e => {
+      e.stopPropagation();
       dismissed = true;
       removePanel();
     });
@@ -250,427 +949,28 @@
     pill.appendChild(chip);
     pill.appendChild(btn);
     pill.appendChild(close);
-    shadow.appendChild(style);
-    shadow.appendChild(pill);
+    shadowRoot.appendChild(style);
+    shadowRoot.appendChild(pill);
     cardEl = pill;
-
-    const panel = document.createElement('div');
-    panel.className = 'panel';
-    const head = document.createElement('div');
-    head.className = 'p-head';
-    const thumb = document.createElement('img');
-    thumb.className = 'p-thumb';
-    thumb.alt = '';
-    const meta = document.createElement('div');
-    meta.className = 'p-meta';
-    const ttl = document.createElement('div');
-    ttl.className = 'p-title';
-    const sub = document.createElement('div');
-    sub.className = 'p-sub';
-    sub.textContent = 'NDM — Nill Download Manager';
-    meta.appendChild(ttl);
-    meta.appendChild(sub);
-    const pClose = document.createElement('button');
-    pClose.className = 'p-close';
-    pClose.textContent = '×';
-    pClose.title = 'Close';
-    pClose.addEventListener('click', () => closePanel());
-    head.appendChild(thumb);
-    head.appendChild(meta);
-    head.appendChild(pClose);
-    const body = document.createElement('div');
-    body.className = 'p-body';
-    panel.appendChild(head);
-    panel.appendChild(body);
-    shadow.appendChild(panel);
-    panelEl = panel;
-    panelBody = body;
-    pThumbEl = thumb;
-    pTitleEl = ttl;
-    pSubEl = sub;
-    document.documentElement.appendChild(panelHost);
+    (document.fullscreenElement || document.documentElement).appendChild(panelHost);
     place();
     requestAnimationFrame(() => pill.classList.add('on'));
   }
 
-  function fmtDur(sec) {
-    if (!sec) return '';
-    const s = Math.round(sec);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const ss = String(s % 60).padStart(2, '0');
-    return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
-  }
-
-  function thumbUrl() {
-    const yt = location.href.match(/[?&]v=([\w-]{11})/)
-      || location.pathname.match(/\/shorts\/([\w-]{11})/);
-    if (yt) return `https://i.ytimg.com/vi/${yt[1]}/hqdefault.jpg`;
-    const og = document.querySelector('meta[property="og:image"]');
-    return og ? og.content : '';
-  }
-
-  function pageTitle() {
-    const og = document.querySelector('meta[property="og:title"]');
-    const t = (og && og.content) || document.title || '';
-    return t.replace(/\s*-\s*YouTube$/, '');
-  }
-
-  function clearBody() {
-    while (panelBody && panelBody.firstChild) panelBody.firstChild.remove();
-  }
-
-  function setBodyLoading(text) {
-    if (!panelBody) return;
-    clearBody();
-    const load = document.createElement('div');
-    load.className = 'p-load';
-    const spin = document.createElement('span');
-    spin.className = 'spin';
-    load.appendChild(spin);
-    load.appendChild(document.createTextNode(text));
-    panelBody.appendChild(load);
-  }
-
-  function setBodyNote(kind, text, hint) {
-    if (!panelBody) return;
-    clearBody();
-    const note = document.createElement('div');
-    note.className = 'p-note ' + kind;
-    note.textContent = text;
-    panelBody.appendChild(note);
-    if (hint) {
-      const h = document.createElement('div');
-      h.className = 'p-hint';
-      h.textContent = hint;
-      panelBody.appendChild(h);
-    }
-  }
-
-  function setBodyError(msg) {
-    if (!panelBody) return;
-    setBodyNote('err', msg);
-    const actions = document.createElement('div');
-    actions.className = 'p-actions';
-    const retry = document.createElement('button');
-    retry.className = 'p-btn';
-    retry.textContent = 'Retry';
-    retry.addEventListener('click', () => { probeData = null; openPanel(true); });
-    const inApp = document.createElement('button');
-    inApp.className = 'p-btn';
-    inApp.textContent = 'Open in NDM app';
-    inApp.addEventListener('click', () => classicHandoff());
-    actions.appendChild(retry);
-    actions.appendChild(inApp);
-    panelBody.appendChild(actions);
-  }
-
-  function setBodyAlready(status) {
-    const names = {
-      finished: 'Finished', downloading: 'Downloading now',
-      paused: 'Paused', queued: 'Queued', 'in list': '',
-    };
-    const suffix = names[status] ? ' — ' + names[status] : '';
-    setBodyNote('ok', 'Already in your NDM list' + suffix,
-      'To download it again, remove the entry in the NDM app first.');
-  }
-
-  function setBodyOptions(options, onPick) {
-    if (!panelBody) return;
-    clearBody();
-    const list = document.createElement('div');
-    list.className = 'p-list';
-    for (const opt of options) {
-      const row = document.createElement('button');
-      row.className = 'row';
-      const label = document.createElement('span');
-      label.className = 'r-label';
-      label.textContent = (opt.audio ? '♪ ' : '') + (opt.label || 'Quality');
-      const note = document.createElement('span');
-      note.className = 'r-note';
-      note.textContent = opt.note || '';
-      row.appendChild(label);
-      row.appendChild(note);
-      row.addEventListener('click', () => onPick(opt));
-      list.appendChild(row);
-    }
-    panelBody.appendChild(list);
-    const link = document.createElement('button');
-    link.className = 'p-link';
-    link.textContent = 'Open in NDM app instead';
-    link.addEventListener('click', () => classicHandoff());
-    panelBody.appendChild(link);
-  }
-
-  async function openPanel(retry) {
-    if (!panelEl) return;
-    if (panelOpen && !retry) { closePanel(); return; }
-    panelOpen = true;
-    probeData = null;
-    panelEl.classList.add('open');
-    pTitleEl.textContent = pageTitle();
-    const th = thumbUrl();
-    if (th) { pThumbEl.src = th; pThumbEl.style.display = ''; }
-    else { pThumbEl.style.display = 'none'; pThumbEl.removeAttribute('src'); }
-    pSubEl.textContent = 'NDM — Nill Download Manager';
-    setBodyLoading('Looking for the video…');
-    place();
-    // Sniffed streams first (IDM's way): if the browser already
-    // fetched this page's media, the offer is instant — no probe.
-    let sniff = null;
-    try {
-      sniff = await chrome.runtime.sendMessage({ action: 'ndm-sniff' });
-    } catch (e) { /* extension context can vanish on reload */ }
-    if (!panelOpen) return;
-    if (sniff && sniff.found && sniff.kind === 'file') {
-      sniffData = sniff;
-      setBodyFile(sniff);
-      return;
-    }
-    if (sniff && sniff.found) {
-      let man = null;
-      try {
-        man = await chrome.runtime.sendMessage({ action: 'ndm-manifest', url: sniff.url });
-      } catch (e) { /* unreadable manifest: the probe decides */ }
-      if (!panelOpen) return;
-      if (man && man.ok && Array.isArray(man.options) && man.options.length) {
-        sniffData = sniff;
-        manifestData = man;
-        setBodyManifest(man);
-        return;
-      }
-    }
-    await probePhase();
-  }
-
-  // The full scan: the app resolves the page itself (yt-dlp). Slower
-  // than a sniffed answer, but it understands pages whose streams
-  // never crossed the network in a sniffable shape.
-  async function probePhase() {
-    if (!panelOpen) return;
-    setBodyLoading('Getting qualities from NDM…');
-    let resp = null;
-    try {
-      resp = await chrome.runtime.sendMessage({
-        action: 'ndm-panel-probe',
-        url: location.href,
-        pageUrl: location.href,
-        title: pageTitle(),
-      });
-    } catch (e) { /* extension context can vanish on reload */ }
-    if (!panelOpen) return; // closed while the app was answering
-    if (!resp || !resp.ok) {
-      setBodyError((resp && resp.error) || 'NDM is not reachable — is the app installed and running?');
-      return;
-    }
-    const r = resp.result || {};
-    if (r.error) { setBodyError(r.error); return; }
-    probeData = r;
-    if (r.title) pTitleEl.textContent = r.title;
-    const dur = fmtDur(r.duration);
-    pSubEl.textContent = dur ? dur + ' • NDM' : 'NDM';
-    if (r.already) setBodyAlready(r.already);
-    else if (Array.isArray(r.options) && r.options.length) setBodyOptions(r.options, startWith);
-    else setBodyError('NDM found no downloadable qualities for this page.');
-  }
-
-  function setBodyManifest(man) {
-    const rows = man.options.map(o => ({
-      label: o.height ? o.height + 'p' : 'Original quality',
-      note: o.bandwidth ? '~' + (o.bandwidth / 1000000).toFixed(1) + ' Mbps' : 'as served',
-      audio: false,
-      _direct: o,
-    }));
-    setBodyOptions(rows, opt => startDirect(opt._direct));
-  }
-
-  function setBodyFile(sniff) {
-    if (!panelBody) return;
-    clearBody();
-    const name = fileNameOf(sniff.url);
-    const size = sniff.contentLength ? fmtBytes2(sniff.contentLength) : '';
-    const note = document.createElement('div');
-    note.className = 'p-note ok';
-    note.textContent = 'This page is playing a video file' + (size ? ' (' + size + ')' : '') + ' — NDM can grab it directly.';
-    panelBody.appendChild(note);
-    const hint = document.createElement('div');
-    hint.className = 'p-hint';
-    hint.textContent = name;
-    panelBody.appendChild(hint);
-    const actions = document.createElement('div');
-    actions.className = 'p-actions';
-    const dl = document.createElement('button');
-    dl.className = 'p-btn';
-    dl.textContent = 'Download this file';
-    dl.addEventListener('click', () => startFile());
-    actions.appendChild(dl);
-    panelBody.appendChild(actions);
-    const link = document.createElement('button');
-    link.className = 'p-link';
-    link.textContent = 'More options — scan with NDM instead';
-    link.addEventListener('click', () => { probePhase(); });
-    panelBody.appendChild(link);
-  }
-
-  function fileNameOf(url) {
-    try {
-      const tail = new URL(url).pathname.split('/').pop() || '';
-      return decodeURIComponent(tail) || 'video';
-    } catch (e) {
-      return 'video';
-    }
-  }
-
-  function fmtBytes2(n) {
-    if (!n) return '';
-    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
-    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
-  }
-
-  // Every start path (probe choice, sniffed manifest, sniffed file)
-  // ends here: the app's verdict becomes the panel's final state.
-  function finishStart(resp) {
-    if (!panelOpen) return;
-    const r = resp && resp.result;
-    if (resp && resp.ok && r && r.started) {
-      setBodyNote('ok', 'Downloading in NDM ✓', 'Progress lives in the NDM app.');
-      setTimeout(() => closePanel(), 2600);
-      return;
-    }
-    const reason = (r && r.reason) || (resp && resp.error) || 'NDM did not answer.';
-    if (/already in the download list/.test(reason)) setBodyAlready('in list');
-    else setBodyError(reason);
-  }
-
-  async function startWith(opt) {
-    if (!probeData) return;
-    setBodyLoading('Starting the download…');
-    let resp = null;
-    try {
-      resp = await chrome.runtime.sendMessage({
-        action: 'ndm-panel-start',
-        url: location.href,
-        pageUrl: location.href,
-        title: probeData.title || pageTitle(),
-        selector: opt.selector,
-        audio: !!opt.audio,
-        hasAudio: !!probeData.has_audio,
-      });
-    } catch (e) { /* extension context can vanish on reload */ }
-    finishStart(resp);
-  }
-
-  async function startDirect(opt) {
-    if (!sniffData) return;
-    setBodyLoading('Starting the download…');
-    let resp = null;
-    try {
-      resp = await chrome.runtime.sendMessage({
-        action: 'ndm-panel-start',
-        mode: 'manifest',
-        url: location.href,
-        pageUrl: location.href,
-        title: pageTitle(),
-        // always the MASTER manifest, never the variant playlist:
-        // a variant alone has no audio rendition to merge, while
-        // the master + a height cap lets the app pick video+audio.
-        // The worker's manifest walk reports back the URL that
-        // actually held the ladder, which may differ from the pick.
-        directUrl: (manifestData && manifestData.url) || sniffData.url,
-        height: (opt && opt.height) || 0,
-        hasAudio: !!(manifestData && manifestData.hasAudio),
-        // separate HLS audio rendition (yt-dlp cannot pair it with
-        // the variant on its own — the app downloads and muxes it)
-        audioUrl: (manifestData && manifestData.audioUri) || '',
-      });
-    } catch (e) { /* extension context can vanish on reload */ }
-    finishStart(resp);
-  }
-
-  async function startFile() {
-    if (!sniffData) return;
-    setBodyLoading('Starting the download…');
-    let resp = null;
-    try {
-      resp = await chrome.runtime.sendMessage({
-        action: 'ndm-panel-start',
-        mode: 'file',
-        url: location.href,
-        pageUrl: location.href,
-        title: pageTitle(),
-        directUrl: sniffData.url,
-        fileName: fileNameOf(sniffData.url),
-      });
-    } catch (e) { /* extension context can vanish on reload */ }
-    finishStart(resp);
-  }
-
-  function closePanel() {
-    panelOpen = false;
-    probeData = null;
-    sniffData = null;
-    manifestData = null;
-    if (panelEl) panelEl.classList.remove('open');
-  }
-
-  // The pre-panel behaviour, kept as the card's fallback: hand the
-  // page to the app and let its dialog take over. The pill itself
-  // carries the verdict (green only on the app's own confirmation).
-  async function classicHandoff() {
-    closePanel();
-    const pill = cardEl;
-    const btn = pillBtnEl;
-    if (!pill || !btn || btn.disabled) return;
-    btn.disabled = true;
-    let ok = false;
-    let picked = false;
-    try {
-      const resp = await chrome.runtime.sendMessage({
-        action: 'ndm-download',
-        kind: 'video',
-        url: location.href,
-        pageUrl: location.href,
-        title: document.title,
-      });
-      ok = !!(resp && resp.ok);
-      picked = ok && resp.picked !== false;
-    } catch (e) { /* extension context can vanish on reload */ }
-    pill.classList.toggle('sent', ok && picked);
-    pill.classList.toggle('queued', ok && !picked);
-    pill.classList.toggle('error', !ok);
-    btn.textContent = !ok
-      ? 'NDM is not reachable — open the app'
-      : picked ? 'Sent to NDM ✓' : 'Queued — open NDM';
-    place();
-    setTimeout(() => {
-      pill.classList.remove('sent', 'queued', 'error');
-      btn.textContent = 'Download with NDM';
-      btn.disabled = false;
-      place();
-    }, ok && picked ? 2600 : 5200);
-  }
-
   function removePanel() {
+    closeBrowserModal();
     if (panelHost) {
       panelHost.remove();
       panelHost = null;
+      shadowRoot = null;
       cardEl = null;
       anchor = null;
-      panelEl = null;
-      panelBody = null;
-      pillBtnEl = null;
-      panelOpen = false;
-      probeData = null;
     }
   }
 
   function refresh() {
     if (dismissed) return;
-    if (videoDetected()) {
-      // isConnected: SPA frameworks and page sanitizers can detach our
-      // host node while panelHost still points at it — rebuild then,
-      // or the panel silently never appears again on this page
+    if (videoDetected() || modalOpen) {
       if (!panelHost || !panelHost.isConnected) buildPanel();
       anchor = pickAnchor();
       place();
@@ -679,30 +979,42 @@
     }
   }
 
-  // Initial check + SPA navigation handling: YouTube and Facebook change
-  // the URL without reloading, so re-check on an interval and whenever the
-  // DOM changes substantially.
+  // Listen for request from extension popup ("Download Video on This Page")
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg && msg.action === 'ndm-open-video-modal') {
+      dismissed = false;
+      if (!panelHost || !panelHost.isConnected) buildPanel();
+      const btn = cardEl ? cardEl.querySelector('.label') : null;
+      openBrowserModal(btn, cardEl);
+      sendResponse({ ok: true });
+      return false;
+    }
+  });
+
   refresh();
   let lastUrl = location.href;
   setInterval(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       dismissed = false;
-      closePanel(); // the open card belongs to the previous video
+      closeBrowserModal();
       refresh();
     } else {
       place();
     }
-  }, 800);
+  }, 600);
   addEventListener('scroll', place, { passive: true, capture: true });
   addEventListener('resize', place);
-  // Debounced: mutation-heavy pages (YouTube, Facebook) would otherwise
-  // trigger a full DOM scan on every mutation batch.
+  document.addEventListener('fullscreenchange', place);
+
   let refreshPending = false;
   function scheduleRefresh() {
     if (refreshPending) return;
     refreshPending = true;
-    setTimeout(() => { refreshPending = false; refresh(); }, 250);
+    setTimeout(() => {
+      refreshPending = false;
+      refresh();
+    }, 250);
   }
   const observer = new MutationObserver(scheduleRefresh);
   observer.observe(document.documentElement, { childList: true, subtree: true });

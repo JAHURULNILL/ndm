@@ -58,12 +58,6 @@ struct SavedEntry {
     selector: String,
     #[serde(default)]
     audio: bool,
-    #[serde(default)]
-    expect_audio: bool,
-    /// sniffed HLS with a separate audio rendition: its playlist
-    /// URL, downloaded and muxed in by the video job ("" = none)
-    #[serde(default)]
-    pair_audio_url: String,
     /// token naming this entry's captured browser-cookies file
     /// (app-data cookies/<token>.txt); "" = the browser sent none
     #[serde(default)]
@@ -267,8 +261,6 @@ struct Entry {
     kind: String,
     selector: String,
     audio: bool,
-    expect_audio: bool,
-    pair_audio_url: String,
     cookies: String,
     referer: String,
     restored: Mutex<Option<Restored>>,
@@ -305,10 +297,6 @@ struct AppState {
     /// video links from the extension that arrived before the webview
     /// was listening; the frontend drains this once on load
     pending_videos: Mutex<Vec<serde_json::Value>>,
-    /// recent probe results by page URL (10 min): a yt-dlp extraction
-    /// takes seconds and a page's formats do not change minute to
-    /// minute — the browser panel and the dialog share this cache
-    probe_cache: Mutex<HashMap<String, (Instant, video::VideoInfo)>>,
     pending_files: Mutex<Vec<serde_json::Value>>,
     /// a first-run video-component setup is currently downloading
     components_busy: AtomicBool,
@@ -414,15 +402,45 @@ fn synth_blocks(total: u64, done: u64, downloading: bool) -> String {
 fn payload_of(entry: &Entry) -> ProgressPayload {
     if let Some(job) = &entry.video {
         let p = job.progress.lock().unwrap().clone();
+        let (hint_total, hint_done) = entry
+            .restored
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| (r.total, r.done_bytes))
+            .unwrap_or((0, 0));
+        let total = if p.total > 0 { p.total } else { hint_total };
+        let done_bytes = if p.done > 0 {
+            p.done
+        } else if p.status == "downloading" && hint_done > 0 {
+            if total > 0 {
+                hint_done.min(total)
+            } else {
+                hint_done
+            }
+        } else {
+            p.done
+        };
+        let display_name = p
+            .final_path
+            .as_ref()
+            .and_then(|fp| fp.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| entry.name.clone());
         return ProgressPayload {
             id: entry.id.clone(),
-            name: entry.name.clone(),
+            name: display_name,
             url: entry.url.clone(),
-            total: p.total,
-            done_bytes: p.done,
+            total,
+            done_bytes,
             speed_bps: p.speed_bps,
-            conns: if p.status == "downloading" { 1 } else { 0 },
-            blocks: synth_blocks(p.total, p.done, p.status == "downloading"),
+            conns: if p.status == "downloading" {
+                ndm::global_connections().clamp(1, 16)
+            } else {
+                0
+            },
+            blocks: synth_blocks(total, done_bytes, p.status == "downloading"),
             status: p.status.clone(),
             category: entry.category.clone(),
             added: entry.added.clone(),
@@ -536,8 +554,6 @@ fn persist(state: &AppState) {
                 kind: e.kind.clone(),
                 selector: e.selector.clone(),
                 audio: e.audio,
-                expect_audio: e.expect_audio,
-                pair_audio_url: e.pair_audio_url.clone(),
                 cookies: e.cookies.clone(),
                 referer: e.referer.clone(),
                 completion: e.completion.lock().unwrap().clone(),
@@ -598,13 +614,77 @@ fn open_target(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot open: {e}"))
 }
 
+fn resolve_video_file(entry: &Entry) -> PathBuf {
+    if let Some(job) = &entry.video {
+        if let Some(fp) = job
+            .progress
+            .lock()
+            .unwrap()
+            .final_path
+            .clone()
+            .filter(|p| p.is_file())
+        {
+            return fp;
+        }
+    }
+    if entry.out_path.is_file() {
+        return entry.out_path.clone();
+    }
+    let want_ext = if entry.audio { "mp3" } else { "mp4" };
+    // Check direct filename match first (e.g. after app restart when entry.name holds the file or stem)
+    if !entry.name.is_empty() && !entry.name.contains(['/', '\\']) {
+        let direct = entry.out_path.join(&entry.name);
+        if direct.is_file() {
+            return direct;
+        }
+    }
+    let stem = video::safe_filename_stem(&entry.name);
+    if !stem.is_empty() {
+        for ext in [want_ext, "mkv", "webm", "m4a"] {
+            let cand = entry.out_path.join(format!("{stem}.{ext}"));
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    let total = payload_of(entry).total;
+    if let Ok(rd) = std::fs::read_dir(&entry.out_path) {
+        let mut by_size: Option<PathBuf> = None;
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_file() {
+                continue;
+            }
+            let ext = p
+                .extension()
+                .map(|x| x.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            if ext != want_ext && ext != "mkv" && ext != "webm" && ext != "m4a" {
+                continue;
+            }
+            if total > 0 && e.metadata().map(|m| m.len()).unwrap_or(0) == total {
+                by_size = Some(p);
+                break;
+            }
+        }
+        if let Some(p) = by_size {
+            return p;
+        }
+    }
+    entry.out_path.clone()
+}
+
 /// The per-download "Options on completion" action, run once at finish.
-/// For video entries out_path is the folder (the final file name comes
-/// from yt-dlp), so both actions open the folder there.
 fn run_completion_action(entry: &Entry) {
     let action = entry.completion.lock().unwrap().clone();
     let target = match action.as_str() {
-        "open_file" => entry.out_path.clone(),
+        "open_file" => {
+            if entry.kind == "video" {
+                resolve_video_file(entry)
+            } else {
+                entry.out_path.clone()
+            }
+        }
         "open_folder" => {
             if entry.kind == "video" {
                 entry.out_path.clone()
@@ -689,8 +769,6 @@ fn swap_live(
         cookies: stub.cookies.clone(),
         referer: stub.referer.clone(),
         audio: false,
-        expect_audio: false,
-        pair_audio_url: String::new(),
         restored: Mutex::new(None),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), done0, 0.0)),
@@ -936,8 +1014,6 @@ fn register_http_stub(
         cookies: cookies_token.to_string(),
         referer: referer.to_string(),
         audio: false,
-        expect_audio: false,
-        pair_audio_url: String::new(),
         restored: Mutex::new(None),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -1008,8 +1084,6 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             &entry.out_path,
             &entry.selector,
             entry.audio,
-            entry.expect_audio,
-            &entry.pair_audio_url,
             &entry.name,
             state.cookies_path(&entry.cookies),
             &state.components(),
@@ -1021,6 +1095,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             // Check and insert happen under the SAME lock — a delete
             // landing between them would otherwise strand a live job
             // in the map with no list row able to reach it.
+            let prev_restored = entry.restored.lock().unwrap().clone();
             let live = Arc::new(Entry {
                 id: entry.id.clone(),
                 name: entry.name.clone(),
@@ -1035,9 +1110,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 cookies: entry.cookies.clone(),
                 referer: entry.referer.clone(),
                 audio: entry.audio,
-                expect_audio: entry.expect_audio,
-                pair_audio_url: entry.pair_audio_url.clone(),
-                restored: Mutex::new(None),
+                restored: Mutex::new(prev_restored),
                 queued: AtomicBool::new(false),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
                 emitting: AtomicBool::new(false),
@@ -1262,13 +1335,25 @@ async fn add_download(
         referer.as_deref().unwrap_or(""),
     )?;
     let id = stub.id.clone();
+    let is_later = later.unwrap_or(false);
     let max = current_settings(&state).max_simultaneous;
-    let must_queue =
-        later.unwrap_or(false) || (max > 0 && count_active(&state) >= max);
-    if must_queue {
-        // "Download Later" or no free slot: register as queued; the pump
-        // (or the scheduler) starts it when a slot frees up
-        stub.queued.store(true, Ordering::Relaxed);
+    let must_wait =
+        is_later || scheduler_blocks(&state) || (max > 0 && count_active(&state) >= max);
+    if must_wait {
+        if is_later {
+            // "Download Later" stays paused until the user explicitly starts/resumes it
+            stub.queued.store(false, Ordering::Relaxed);
+            *stub.restored.lock().unwrap() = Some(Restored {
+                total: 0,
+                done_bytes: 0,
+                blocks: Vec::new(),
+                resumable: true,
+                status: "paused".to_string(),
+            });
+        } else {
+            // Scheduler or simultaneous cap: register as queued so the pump starts it when a slot frees up
+            stub.queued.store(true, Ordering::Relaxed);
+        }
         let _ = app.emit("progress", payload_of(&stub));
         persist(&state);
         return Ok(id);
@@ -1383,8 +1468,6 @@ async fn resume_download(
                 &entry.out_path,
                 &entry.selector,
                 entry.audio,
-                entry.expect_audio,
-                &entry.pair_audio_url,
                 &entry.name,
                 state.cookies_path(&entry.cookies),
                 &state.components(),
@@ -1395,6 +1478,7 @@ async fn resume_download(
                     return Err(e);
                 }
             };
+            let prev_restored = entry.restored.lock().unwrap().clone();
             let live = Arc::new(Entry {
                 id: entry.id.clone(),
                 name: entry.name.clone(),
@@ -1409,9 +1493,7 @@ async fn resume_download(
                 cookies: entry.cookies.clone(),
                 referer: entry.referer.clone(),
                 audio: entry.audio,
-                expect_audio: entry.expect_audio,
-                pair_audio_url: entry.pair_audio_url.clone(),
-                restored: Mutex::new(None),
+                restored: Mutex::new(prev_restored),
                 queued: AtomicBool::new(false),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
                 emitting: AtomicBool::new(false),
@@ -1482,7 +1564,11 @@ fn remove_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Re
 fn open_path(state: State<'_, AppState>, id: String, folder: bool) -> Result<(), String> {
     let entry = state.get(&id).ok_or("unknown download id")?;
     let target = if entry.kind == "video" {
-        entry.out_path.clone() // a video entry's out_path is its folder
+        if folder {
+            entry.out_path.clone()
+        } else {
+            resolve_video_file(&entry)
+        }
     } else if folder {
         entry
             .out_path
@@ -1822,8 +1908,6 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         cookies: entry.cookies.clone(),
         referer: entry.referer.clone(),
         audio: entry.audio,
-        expect_audio: entry.expect_audio,
-        pair_audio_url: entry.pair_audio_url.clone(),
         restored: Mutex::new(Some(Restored {
             total,
             done_bytes: 0,
@@ -1859,21 +1943,39 @@ fn list_downloads(state: State<'_, AppState>) -> Vec<ProgressPayload> {
         .collect()
 }
 
-/// Ten-minute probe cache: re-clicking a video (the pill, the
-/// dialog's Fetch button) must not pay the multi-second yt-dlp
-/// extraction again for an answer nothing could have changed.
-fn probe_cache_get(state: &AppState, url: &str) -> Option<video::VideoInfo> {
-    let cache = state.probe_cache.lock().unwrap();
-    let (at, info) = cache.get(url)?;
-    (at.elapsed() < std::time::Duration::from_secs(600)).then(|| info.clone())
-}
-
-fn probe_cache_put(state: &AppState, url: &str, info: &video::VideoInfo) {
-    state
-        .probe_cache
-        .lock()
-        .unwrap()
-        .insert(url.to_string(), (Instant::now(), info.clone()));
+#[tauri::command]
+async fn probe_file(
+    state: State<'_, AppState>,
+    url: String,
+    cookies: Option<String>,
+    referer: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let url_trimmed = url.trim().to_string();
+    if !(url_trimmed.starts_with("http://") || url_trimmed.starts_with("https://")) {
+        return Err("URL must start with http:// or https://".to_string());
+    }
+    let cookie = cookies
+        .as_deref()
+        .and_then(|t| state.cookies_path(t))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| cookie_header_from_netscape(&text));
+    let referer = referer.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+    let auth = ndm::Auth { cookie, referer };
+    let u2 = url_trimmed.clone();
+    let probe = tauri::async_runtime::spawn_blocking(move || ndm::probe_with_auth(&u2, &auth))
+        .await
+        .map_err(|e| format!("internal join error: {e}"))??;
+    let suggested = probe
+        .suggested_name
+        .unwrap_or_else(|| file_name_for(&url_trimmed));
+    let category = category_for(&suggested).to_string();
+    Ok(serde_json::json!({
+        "total": probe.total,
+        "resumable": probe.range_ok,
+        "unknown_size": probe.unknown_size,
+        "suggested_name": suggested,
+        "category": category,
+    }))
 }
 
 #[tauri::command]
@@ -1882,121 +1984,51 @@ async fn probe_video(
     url: String,
     cookies: Option<String>,
 ) -> Result<video::VideoInfo, String> {
-    if let Some(info) = probe_cache_get(&state, &url) {
-        return Ok(info);
-    }
     let components = state.components();
     let cookies = state.cookies_path(cookies.as_deref().unwrap_or(""));
-    let url2 = url.clone();
-    let info = tauri::async_runtime::spawn_blocking(move || {
-        video::probe(&url2, &components, cookies.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        video::probe(&url, &components, cookies.as_deref())
     })
-    .await
-    .map_err(|e| format!("internal join error: {e}"))??;
-    probe_cache_put(&state, &url, &info);
-    Ok(info)
+        .await
+        .map_err(|e| format!("internal join error: {e}"))?
 }
 
-#[tauri::command]
-// a Tauri command's parameters ARE its IPC surface (url, folder,
-// format choice, captured-session token) — eight named inputs is the
-// honest shape here, not a code smell
 #[allow(clippy::too_many_arguments)]
-async fn add_video(
-    app: AppHandle,
-    state: State<'_, AppState>,
+fn do_add_video(
+    app: &AppHandle,
+    state: &AppState,
     url: String,
     dir: String,
     selector: String,
     audio: bool,
-    has_audio: bool,
     title: String,
     cookies: Option<String>,
+    later: bool,
+    total_hint: u64,
 ) -> Result<String, String> {
+    if state.update_required.load(Ordering::SeqCst) {
+        return Err("please install the required update before starting new downloads".to_string());
+    }
     let dir = resolve_dir(&dir);
-    // the finish path's promise: a video from a page WITH sound must
-    // not "finish" as a silent file (audio-only jobs are exempt)
-    let expect_audio = has_audio && !audio;
-    // a cookies token is honoured only while its captured file exists;
-    // anything else (typed, stale, forged) means "no cookies"
     let cookies_token = cookies
         .filter(|t| state.cookies_path(t).is_some())
         .unwrap_or_default();
-    start_video_download(
-        app,
-        state,
-        url,
-        dir,
-        selector,
-        audio,
-        expect_audio,
-        String::new(),
-        title,
-        cookies_token,
-    )
-}
-
-/// Two videos with the same display name in one folder would write
-/// the same output file — and the second yt-dlp would even skip,
-/// seeing its target "already downloaded". Suffix like a browser
-/// does ("name (2)"), checking both the folder and the live list.
-fn uniquify_video_name(state: &AppState, dir: &Path, name: String, audio: bool) -> String {
-    let ext = if audio { "mp3" } else { "mp4" };
-    let taken = |candidate: &str| -> bool {
-        if dir
-            .join(format!("{}.{}", video::file_stem(candidate), ext))
-            .is_file()
-        {
-            return true;
-        }
-        let entries = state.entries.lock().unwrap();
-        entries
-            .values()
-            .any(|e| e.kind == "video" && e.out_path == *dir && e.name == candidate)
-    };
-    if !taken(&name) {
-        return name;
-    }
-    for n in 2..1000 {
-        let candidate = format!("{name} ({n})");
-        if !taken(&candidate) {
-            return candidate;
-        }
-    }
-    name
-}
-
-/// Create the list entry and (slot permitting) the live job for one
-/// video download. Shared by the add_video command and the browser
-/// panel's background start (queue "start" entries): the two paths
-/// differ only in where their inputs come from.
-#[allow(clippy::too_many_arguments)]
-fn start_video_download(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    url: String,
-    dir: PathBuf,
-    selector: String,
-    audio: bool,
-    expect_audio: bool,
-    pair_audio_url: String,
-    title: String,
-    cookies_token: String,
-) -> Result<String, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
-    // two entries for the same video in the same folder would run two
-    // yt-dlp processes writing the same .part files (and a finished
-    // dupe would fake-complete off the existing file) — refuse it
     {
         let entries = state.entries.lock().unwrap();
         let dupe = entries.values().any(|e| {
             e.kind == "video"
                 && e.url == url
                 && e.out_path == dir
-                && payload_of(e).status != "error"
+                && e.selector == selector
+                && e.audio == audio
+                && !matches!(
+                    payload_of(e).status.as_str(),
+                    "error" | "finished" | "cancelled"
+                )
         });
         if dupe {
-            return Err("this video is already in the download list".to_string());
+            return Err("this video quality is already in the download list".to_string());
         }
     }
     let name = if title.trim().is_empty() {
@@ -2004,36 +2036,38 @@ fn start_video_download(
     } else {
         title.trim().to_string()
     };
-    let name = uniquify_video_name(&state, &dir, name, audio);
+    let category = if audio {
+        "Music".to_string()
+    } else {
+        "Video".to_string()
+    };
     let id = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
-    // videos honour the same simultaneous cap as files: with no free slot
-    // the entry waits in the queue and the pump starts its job later
-    let max = current_settings(&state).max_simultaneous;
-    if max > 0 && count_active(&state) >= max {
+    let max = current_settings(state).max_simultaneous;
+    let should_wait = later || scheduler_blocks(state) || (max > 0 && count_active(state) >= max);
+    if should_wait {
+        let initial_status = if later { "paused" } else { "queued" };
         let entry = Arc::new(Entry {
             id: id.clone(),
             name,
             url,
             out_path: dir,
-            category: "Video".to_string(),
+            category,
             added: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
             download: None,
             video: None,
             kind: "video".to_string(),
             selector,
-            cookies: cookies_token.clone(),
+            cookies: cookies_token,
             referer: String::new(),
             audio,
-            expect_audio,
-            pair_audio_url: pair_audio_url.clone(),
             restored: Mutex::new(Some(Restored {
-                total: 0,
+                total: total_hint,
                 done_bytes: 0,
                 blocks: Vec::new(),
                 resumable: true,
-                status: "queued".to_string(),
+                status: initial_status.to_string(),
             })),
-            queued: AtomicBool::new(true),
+            queued: AtomicBool::new(!later),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
             emitting: AtomicBool::new(false),
             starting: AtomicBool::new(false),
@@ -2048,7 +2082,7 @@ fn start_video_download(
             .insert(id.clone(), entry.clone());
         state.order.lock().unwrap().push(id.clone());
         let _ = app.emit("progress", payload_of(&entry));
-        persist(&state);
+        persist(state);
         return Ok(id);
     }
     let job = video::VideoJob::start(
@@ -2056,29 +2090,36 @@ fn start_video_download(
         &dir,
         &selector,
         audio,
-        expect_audio,
-        &pair_audio_url,
         &name,
         state.cookies_path(&cookies_token),
         &state.components(),
     )?;
+    let initial_restored = if total_hint > 0 {
+        Some(Restored {
+            total: total_hint,
+            done_bytes: 0,
+            blocks: Vec::new(),
+            resumable: true,
+            status: "downloading".to_string(),
+        })
+    } else {
+        None
+    };
     let entry = Arc::new(Entry {
         id: id.clone(),
         name,
         url,
         out_path: dir,
-        category: "Video".to_string(),
+        category,
         added: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         download: None,
         video: Some(job),
         kind: "video".to_string(),
         selector,
-        cookies: cookies_token.clone(),
+        cookies: cookies_token,
         referer: String::new(),
         audio,
-        expect_audio,
-        pair_audio_url,
-        restored: Mutex::new(None),
+        restored: Mutex::new(initial_restored),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
         emitting: AtomicBool::new(false),
@@ -2093,9 +2134,40 @@ fn start_video_download(
         .unwrap()
         .insert(id.clone(), entry.clone());
     state.order.lock().unwrap().push(id.clone());
-    spawn_emit_loop(app, entry);
-    persist(&state);
+    spawn_emit_loop(app.clone(), entry);
+    persist(state);
     Ok(id)
+}
+
+#[tauri::command]
+// a Tauri command's parameters ARE its IPC surface (url, folder,
+// format choice, captured-session token) — named inputs are the
+// honest shape here, not a code smell
+#[allow(clippy::too_many_arguments)]
+async fn add_video(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    url: String,
+    dir: String,
+    selector: String,
+    audio: bool,
+    title: String,
+    cookies: Option<String>,
+    later: Option<bool>,
+    total: Option<u64>,
+) -> Result<String, String> {
+    do_add_video(
+        &app,
+        &state,
+        url,
+        dir,
+        selector,
+        audio,
+        title,
+        cookies,
+        later.unwrap_or(false),
+        total.unwrap_or(0),
+    )
 }
 
 #[derive(Clone, Serialize)]
@@ -2191,8 +2263,6 @@ fn restore_saved(state: &AppState) {
                 cookies: s.cookies.clone(),
                 referer: s.referer.clone(),
                 audio: s.audio,
-                expect_audio: s.expect_audio,
-                pair_audio_url: s.pair_audio_url.clone(),
                 restored: Mutex::new(Some(Restored {
                     total: s.total,
                     done_bytes: done,
@@ -2287,8 +2357,6 @@ fn restore_saved(state: &AppState) {
             cookies: s.cookies.clone(),
             referer: s.referer.clone(),
             audio: false,
-            expect_audio: false,
-            pair_audio_url: String::new(),
             restored: Mutex::new(Some(restored)),
             queued: AtomicBool::new(s_queued),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -2304,76 +2372,10 @@ fn restore_saved(state: &AppState) {
     state.seq.store(max_seq + 1, Ordering::Relaxed);
 }
 
-/// Ack ids arrive from the host through the queue file: keep only
-/// filename-safe characters before one becomes a file name.
-fn sanitize_ack_id(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-        .take(64)
-        .collect()
-}
-
-/// Tell the waiting host "the app has this one": an `acks/<id>.ack`
-/// marker beside the queue file; the host deletes it as it reads it.
-/// Without the marker the browser must not claim the hand-off
-/// actually reached the app.
-fn write_ack(queue_dir: &Path, id: &str) {
-    if id.is_empty() {
-        return;
-    }
-    let dir = queue_dir.join("acks");
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(dir.join(format!("{id}.ack")), b"");
-    }
-}
-
-/// The host relays this file's content back to the browser panel as
-/// its reply (probe results, start verdicts): written via a temp
-/// name + rename so the host can never read a half-written result.
-fn write_result(queue_dir: &Path, id: &str, body: &serde_json::Value) {
-    if id.is_empty() {
-        return;
-    }
-    let dir = queue_dir.join("results");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let tmp = dir.join(format!("{id}.tmp"));
-    if std::fs::write(&tmp, body.to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, &dir.join(format!("{id}.json")));
-    }
-}
-
-/// Markers and results whose host timed out (the app was down) would
-/// otherwise pile up forever; drop any older than an hour.
-fn prune_acks(queue_dir: &Path) {
-    let now = std::time::SystemTime::now();
-    for sub in ["acks", "results"] {
-        let Ok(rd) = std::fs::read_dir(queue_dir.join(sub)) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let stale = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .map(|t| {
-                    now.duration_since(t)
-                        .map(|d| d.as_secs() > 3600)
-                        .unwrap_or(false)
-                })
-                .unwrap_or(false);
-            if stale {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
-}
-
 /// Process the browser extension's incoming queue file. A leftover
 /// `incoming.processing` from a crashed run is drained first, so queued
 /// links are never silently lost.
 fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
-    prune_acks(queue_dir);
     let queue = queue_dir.join("incoming.jsonl");
     let processing = queue_dir.join("incoming.processing");
     if !processing.exists() {
@@ -2389,7 +2391,7 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
     };
     let lines: Vec<&str> = text.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
-        handle_incoming_line(handle, queue_dir, line);
+        handle_incoming_line(handle, line);
         // drop the processed line from the file before moving on: a
         // crash mid-drain then re-delivers only unprocessed lines
         // (at-least-once) instead of losing the rest of the queue
@@ -2402,80 +2404,108 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
     }
 }
 
-/// One queued extension link: a file goes straight into the list (with
-/// the user's settings applied); a video is handed to the frontend.
-fn handle_incoming_line(handle: &AppHandle, queue_dir: &Path, line: &str) {
+/// Reliably raise the main NDM window above the browser on X11 & Wayland.
+fn raise_main_window(handle: &AppHandle) {
+    if let Some(w) = handle.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_always_on_top(true);
+        let _ = w.set_focus();
+        let w2 = w.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(600));
+            let _ = w2.set_always_on_top(false);
+        });
+    }
+}
+
+/// One queued extension link:
+/// - `video_direct`: user already selected quality & folder inside the
+///   in-browser IDM video popup, so start (or queue) the video download
+///   immediately and raise the NDM window.
+/// - `video`: open the in-app Video Download dialog.
+/// - `file`: open the in-app File Download Info dialog.
+fn handle_incoming_line(handle: &AppHandle, line: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return;
     };
-    // the host holds its reply until this entry's ack appears: write
-    // it only once the entry is truly surfaced below, never for a
-    // line that gets dropped here
-    let ack_id = v["id"].as_str().map(sanitize_ack_id).unwrap_or_default();
     let kind = v["kind"].as_str().unwrap_or("file");
     let url = v["url"].as_str().unwrap_or("");
     if url.is_empty() {
         return;
     }
-    // The extension may attach the browser's own cookies for this
-    // download (Netscape format), captured at click time — that is what
-    // lets login-gated files and videos (private Facebook posts,
-    // members-only file hosts, …) download with no setup at all.
-    // Persist them under an app-generated token; the frontend hands the
-    // token back when the user starts the download, never the values.
     let mut token = String::new();
     if let Some(text) = v["cookies"].as_str().filter(|t| !t.is_empty() && t.len() <= 600_000) {
         let state = handle.state::<AppState>();
         let dir = state.cookies_dir();
         let candidate = format!("ck{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
         let file = dir.join(format!("{candidate}.txt"));
-        if std::fs::create_dir_all(&dir).is_ok() && std::fs::write(&file, text).is_ok() {
+        if std::fs::create_dir_all(&dir).is_ok() {
             #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600));
+            let written = {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&file)
+                    .and_then(|mut f| f.write_all(text.as_bytes()))
+                    .is_ok()
+            };
+            #[cfg(not(unix))]
+            let written = std::fs::write(&file, text).is_ok();
+            if written {
+                token = candidate;
             }
-            token = candidate;
         }
     }
-    if kind == "probe" || kind == "start" {
-        // the in-page panel's requests: answered through a result
-        // file the host relays back into the page — the window is
-        // never raised and the dialog never opens for these
-        handle_panel_line(handle, queue_dir, &v, &ack_id, &token);
+    if kind == "video_direct" {
+        raise_main_window(handle);
+        let state = handle.state::<AppState>();
+        let dir = v["dir"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("~/Downloads")
+            .to_string();
+        let selector = v["selector"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b")
+            .to_string();
+        let audio = v["audio"].as_bool().unwrap_or(false);
+        let later = v["later"].as_bool().unwrap_or(false);
+        let total_hint = v["total"].as_u64().unwrap_or(0);
+        let title = v["title"].as_str().unwrap_or("").to_string();
+        let cookies_opt = if token.is_empty() { None } else { Some(token) };
+        let _ = do_add_video(
+            handle,
+            &state,
+            url.to_string(),
+            dir,
+            selector,
+            audio,
+            title,
+            cookies_opt,
+            later,
+            total_hint,
+        );
         return;
     }
     if kind == "video" {
-        // IDM raises its download dialog over the browser; our dialog
-        // lives in the main window, so bring that window forward first
-        // — a dialog opening inside a background window is invisible.
-        if let Some(w) = handle.get_webview_window("main") {
-            let _ = w.unminimize();
-            let _ = w.show();
-            let _ = w.set_focus();
-        }
+        raise_main_window(handle);
         let payload = serde_json::json!({
             "url": url,
             "title": v["title"].as_str().unwrap_or(""),
             "cookies": token,
         });
-        // the webview may not be listening yet at startup: also keep the
-        // link in a pending list the frontend pulls once it is ready
         let state = handle.state::<AppState>();
         state.pending_videos.lock().unwrap().push(payload.clone());
         let _ = handle.emit("incoming_video", payload);
-        write_ack(queue_dir, &ack_id);
         return;
     }
-    // a caught file download is presented exactly like IDM's: the
-    // app comes forward with its download dialog prefilled (address,
-    // the browser's suggested file name, the captured session), and
-    // the user presses Start — nothing downloads behind their back
-    if let Some(w) = handle.get_webview_window("main") {
-        let _ = w.unminimize();
-        let _ = w.show();
-        let _ = w.set_focus();
-    }
+    raise_main_window(handle);
     let payload = serde_json::json!({
         "url": url,
         "title": v["title"].as_str().unwrap_or(""),
@@ -2485,178 +2515,6 @@ fn handle_incoming_line(handle: &AppHandle, queue_dir: &Path, line: &str) {
     let state = handle.state::<AppState>();
     state.pending_files.lock().unwrap().push(payload.clone());
     let _ = handle.emit("incoming_file", payload);
-    write_ack(queue_dir, &ack_id);
-}
-
-/// One browser-panel request. "probe" answers with the page's
-/// quality list; "start" begins the chosen download in the
-/// background (default folder, the user's simultaneous cap and
-/// dedupe rules all apply exactly as for the dialog). Both write
-/// their answer to results/<id>.json BEFORE the ack, so when the
-/// host sees the ack the result is already complete on disk.
-fn handle_panel_line(
-    handle: &AppHandle,
-    queue_dir: &Path,
-    v: &serde_json::Value,
-    ack_id: &str,
-    token: &str,
-) {
-    let state = handle.state::<AppState>();
-    let kind = v["kind"].as_str().unwrap_or("");
-    let url = v["url"].as_str().unwrap_or("");
-    if kind == "probe" {
-        let cookies = state.cookies_path(token);
-        let info = match probe_cache_get(&state, url) {
-            Some(info) => Ok(info),
-            None => {
-                let r = video::probe(url, &state.components(), cookies.as_deref());
-                if let Ok(info) = &r {
-                    probe_cache_put(&state, url, info);
-                }
-                r
-            }
-        };
-        let body = match info {
-            Ok(info) => {
-                // a live entry for this page is reported, not
-                // re-probed into a dead end: the panel shows
-                // "already in NDM" instead of options the app
-                // would refuse at start time (errored entries do
-                // not block a fresh attempt, so they don't count)
-                let entries = state.entries.lock().unwrap();
-                let already = entries
-                    .values()
-                    .find(|e| {
-                        e.kind == "video" && e.url == url && payload_of(e).status != "error"
-                    })
-                    .map(|e| payload_of(e).status);
-                serde_json::json!({
-                    "title": info.title,
-                    "duration": info.duration,
-                    "has_audio": info.has_audio,
-                    "already": already,
-                    "options": serde_json::to_value(&info.options).unwrap_or_default(),
-                })
-            }
-            Err(e) => serde_json::json!({ "error": e }),
-        };
-        write_result(queue_dir, ack_id, &body);
-        write_ack(queue_dir, ack_id);
-        return;
-    }
-    // kind == "start": three shapes — a probed page pick (selector),
-    // a sniffed manifest pick (mode "manifest"), or a sniffed plain
-    // file (mode "file")
-    let mode = v["mode"].as_str().unwrap_or("page");
-    let title = v["title"].as_str().unwrap_or("").to_string();
-    let body = if mode == "file" {
-        panel_start_file(handle, state, v, token)
-    } else if mode == "manifest" {
-        panel_start_manifest(handle, state, v, &title, token)
-    } else {
-        let selector = v["selector"].as_str().unwrap_or("").to_string();
-        if selector.is_empty() {
-            serde_json::json!({ "started": false, "reason": "no quality was selected" })
-        } else {
-            let audio = v["audio"].as_bool().unwrap_or(false);
-            let expect_audio = v["hasAudio"].as_bool().unwrap_or(false) && !audio;
-            let dir = resolve_dir(&current_settings(&state).default_dir);
-            match start_video_download(
-                handle.clone(),
-                state,
-                url.to_string(),
-                dir,
-                selector,
-                audio,
-                expect_audio,
-                String::new(),
-                title,
-                token.to_string(),
-            ) {
-                Ok(_) => serde_json::json!({ "started": true }),
-                Err(e) => serde_json::json!({ "started": false, "reason": e }),
-            }
-        }
-    };
-    write_result(queue_dir, ack_id, &body);
-    write_ack(queue_dir, ack_id);
-}
-
-/// Panel start for a sniffed plain media file: the browser already
-/// found the file itself, so this is an ordinary HTTP download —
-/// started through the same command path (update gate, naming,
-/// simultaneous cap) as a hand-added URL.
-fn panel_start_file(
-    handle: &AppHandle,
-    state: State<'_, AppState>,
-    v: &serde_json::Value,
-    token: &str,
-) -> serde_json::Value {
-    let direct = v["directUrl"].as_str().unwrap_or("");
-    if direct.is_empty() {
-        return serde_json::json!({ "started": false, "reason": "no file address was captured" });
-    }
-    let name = v["fileName"].as_str().unwrap_or("").trim().to_string();
-    let referer = v["pageUrl"].as_str().unwrap_or("").to_string();
-    let dir = current_settings(&state).default_dir.clone();
-    let res = tauri::async_runtime::block_on(add_download(
-        handle.clone(),
-        state,
-        direct.to_string(),
-        dir,
-        None,
-        None,
-        if name.is_empty() { None } else { Some(name) },
-        Some(token.to_string()),
-        if referer.is_empty() { None } else { Some(referer) },
-    ));
-    match res {
-        Ok(_) => serde_json::json!({ "started": true }),
-        Err(e) => serde_json::json!({ "started": false, "reason": e }),
-    }
-}
-
-/// Panel start for a sniffed HLS/DASH manifest: yt-dlp resolves a
-/// manifest URL directly (no page extraction), with the height cap
-/// the user picked. A manifest whose ladder has an audio rendition
-/// arms the same no-silent-file guard as a probed download.
-fn panel_start_manifest(
-    handle: &AppHandle,
-    state: State<'_, AppState>,
-    v: &serde_json::Value,
-    title: &str,
-    token: &str,
-) -> serde_json::Value {
-    let direct = v["directUrl"].as_str().unwrap_or("");
-    if direct.is_empty() {
-        return serde_json::json!({ "started": false, "reason": "no stream address was captured" });
-    }
-    let h = v["height"].as_u64().unwrap_or(0);
-    let selector = if h > 0 {
-        format!("bv*[height<={h}]+ba/b[height<={h}][acodec!=none]")
-    } else {
-        "bv*+ba/b[acodec!=none]".to_string()
-    };
-    let expect_audio = v["hasAudio"].as_bool().unwrap_or(false);
-    // separate HLS audio rendition: yt-dlp cannot pair it with the
-    // chosen variant by itself, so the job downloads and muxes it in
-    let pair_audio_url = v["audioUrl"].as_str().unwrap_or("").to_string();
-    let dir = resolve_dir(&current_settings(&state).default_dir);
-    match start_video_download(
-        handle.clone(),
-        state,
-        direct.to_string(),
-        dir,
-        selector,
-        false,
-        expect_audio,
-        pair_audio_url,
-        title.to_string(),
-        token.to_string(),
-    ) {
-        Ok(_) => serde_json::json!({ "started": true }),
-        Err(e) => serde_json::json!({ "started": false, "reason": e }),
-    }
 }
 
 /// The installed ndm-host binary, resolved from this app's own path:
@@ -2748,7 +2606,6 @@ fn main() {
             settings_file: Mutex::new(PathBuf::new()),
             sched_override: AtomicBool::new(false),
             pending_videos: Mutex::new(Vec::new()),
-            probe_cache: Mutex::new(HashMap::new()),
             pending_files: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
             pending_update: Mutex::new(None),
@@ -2882,13 +2739,16 @@ fn main() {
                 persist(&state);
             });
             // incoming queue from the browser extension (via ndm-host):
-            // video links open the video dialog in the UI; file links are
-            // added straight to the list
+            // drain immediately on startup and poll every 200ms so browser
+            // clicks feel instantaneous
             let handle2 = app.handle().clone();
             let queue_dir = dir.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(2));
+            std::thread::spawn(move || {
                 drain_incoming(&handle2, &queue_dir);
+                loop {
+                    std::thread::sleep(Duration::from_millis(200));
+                    drain_incoming(&handle2, &queue_dir);
+                }
             });
             Ok(())
         })
@@ -2898,6 +2758,7 @@ fn main() {
             resume_download,
             remove_download,
             list_downloads,
+            probe_file,
             probe_video,
             add_video,
             grab_page,
