@@ -1,0 +1,24 @@
+[package]
+name = "ndm-app"
+version = "1.5.1"
+edition = "2021"
+description = "NDM — IDM-class download manager (Tauri shell over the ndm engine)"
+license = "MIT OR Apache-2.0"
+authors = ["Nill"]
+
+[[bin]]
+name = "ndm-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+ndm = { path = ".." }
+
+[profile.release]
+opt-level = 3
