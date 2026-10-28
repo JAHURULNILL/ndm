@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NDM — Nill Download Manager</title>
+<script>
+  // apply the saved theme before first paint (default: light)
+  try {
+    document.documentElement.dataset.theme = localStorage.getItem('ndm-theme') || 'light';
+  } catch (e) { /* storage blocked in this webview: keep the default */ }
+</script>
+<style>
+  /* first-paint background: without this the webview shows its own
+     black default for a beat before styles.css arrives — the theme
+     script above has already set data-theme, so paint THAT theme's
+     background immediately */
+  html { background: #eceff2; }
+  html[data-theme="dark"] { background: #232629; }
+  body { background: inherit; }
+</style>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="titlebar">
+  <div class="app-title"><span class="logo">⬇</span> NDM — Nill Download Manager</div>
+  <div class="title-right">
+    <div class="title-stats">
+      <span id="totalSpeed">Total speed: 0 B/s</span>
+      <span class="sep">|</span>
+      <span id="limiterLabel">Speed Limiter: <b>OFF</b></span>
+    </div>
+    <button id="themeToggle" class="theme-toggle" title="Switch theme">🌙 Dark</button>
+  </div>
+</header>
+
+<nav class="menubar" id="menubar">
+  <div class="menu">
+    <button class="menu-btn" data-menu="file">File</button>
+    <div class="menu-drop hidden" id="menu-file">
+      <button data-act="add">Add New Download…<span class="mkey">Ctrl+N</span></button>
+      <button data-act="video">Add Video…<span class="mkey">Ctrl+Shift+V</span></button>
+      <button data-act="batch">Add Batch Download…</button>
+      <button data-act="import">Import Downloads…</button>
+      <button data-act="export">Export Downloads</button>
+      <div class="menu-sep"></div>
+      <button data-act="quit">Exit<span class="mkey">Ctrl+Q</span></button>
+    </div>
+  </div>
+  <div class="menu">
+    <button class="menu-btn" data-menu="downloads">Downloads</button>
+    <div class="menu-drop hidden" id="menu-downloads">
+      <button data-act="startall">Start All</button>
+      <button data-act="pauseall">Pause All</button>
+      <button data-act="stopall">Stop All</button>
+      <div class="menu-sep"></div>
+      <button data-act="del">Delete Selected</button>
+      <button data-act="deldone">Delete All Completed</button>
+      <div class="menu-sep"></div>
+      <button data-act="grabber">Site Grabber</button>
+      <button data-act="scheduler">Scheduler</button>
+      <button data-act="options">Options</button>
+    </div>
+  </div>
+  <div class="menu">
+    <button class="menu-btn" data-menu="view">View</button>
+    <div class="menu-drop hidden" id="menu-view">
+      <button data-act="theme">Dark Theme</button>
+      <button data-act="sidebar">Categories Sidebar</button>
+      <div class="menu-sep"></div>
+      <button data-act="sort-name">Sort by Name</button>
+      <button data-act="sort-date">Sort by Date Added</button>
+      <button data-act="sort-size">Sort by Size</button>
+      <button data-act="sort-status">Sort by Status</button>
+      <div class="menu-sep"></div>
+      <button data-act="refresh">Refresh List<span class="mkey">F5</span></button>
+    </div>
+  </div>
+  <div class="menu">
+    <button class="menu-btn" data-menu="help">Help</button>
+    <div class="menu-drop hidden" id="menu-help">
+      <button data-act="update">Check for Updates…</button>
+      <button data-act="shortcuts">Keyboard Shortcuts</button>
+      <div class="menu-sep"></div>
+      <button data-act="about">About NDM</button>
+    </div>
+  </div>
+</nav>
+
+<div class="toolbar">
+  <button id="btnAdd" class="tool primary">＋ Add URL</button>
+  <button id="btnVideo" class="tool">🎬 Add Video</button>
+  <button id="btnGrabber" class="tool">🕸 Site Grabber</button>
+  <button id="btnResume" class="tool">▶ Resume</button>
+  <button id="btnPause" class="tool">⏸ Pause</button>
+  <button id="btnStopAll" class="tool">⏹ Stop All</button>
+  <button id="btnDelete" class="tool">🗑 Delete</button>
+  <span class="tool-sep"></span>
+  <button id="btnScheduler" class="tool">🗓 Scheduler</button>
+  <button id="btnOptions" class="tool">⚙ Options</button>
+</div>
+
+<div id="flashMsg" class="flash hidden"></div>
+
+<main class="layout">
+  <aside class="sidebar">
+    <div class="side-head">CATEGORIES</div>
+    <ul id="catList">
+      <li data-cat="All Downloads" class="active">◎ All Downloads</li>
+      <li data-cat="Compressed">🗜 Compressed</li>
+      <li data-cat="Documents">📄 Documents</li>
+      <li data-cat="Music">🎵 Music</li>
+      <li data-cat="Programs">⚙ Programs</li>
+      <li data-cat="Video">🎬 Video</li>
+      <li data-cat="Unfinished">▸ Unfinished</li>
+      <li data-cat="Finished">✓ Finished</li>
+      <li data-cat="Grabber">↗ Grabber projects</li>
+    </ul>
+    <div id="sideStatus" class="side-status">0 files (0 downloading)</div>
+  </aside>
+
+  <section class="content">
+    <div class="grid-wrap">
+    <table class="grid">
+      <thead>
+        <tr>
+          <th class="c-name">File Name</th><th>Size</th><th>Status</th>
+          <th>Time Left</th><th>Transfer Rate</th><th>Added</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    </div>
+    <div id="emptyMsg" class="empty">No downloads yet — click “Add URL” to start one.</div>
+
+    <section id="detail" class="detail">
+      <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabCompletion">Options on completion</span></div>
+      <div class="detail-body" id="panelStatus">
+        <dl class="kv">
+          <dt>URL:</dt><dd id="dUrl">—</dd>
+          <dt>Status:</dt><dd id="dStatus">—</dd>
+          <dt>File size:</dt><dd id="dSize">—</dd>
+          <dt>Downloaded:</dt><dd id="dDone">—</dd>
+          <dt>Transfer rate:</dt><dd id="dRate">—</dd>
+          <dt>Time left:</dt><dd id="dLeft">—</dd>
+          <dt>Resume capability:</dt><dd id="dResume">—</dd>
+        </dl>
+        <div class="bar"><div id="dBarFill"></div><span id="dBarText">0.0%</span></div>
+        <div class="seg-label">Download progress by connection:</div>
+        <canvas id="segMap" width="760" height="86"></canvas>
+        <div class="detail-btns">
+          <button id="dPause">Pause</button><button id="dResumeBtn">Resume</button>
+          <button id="dHide">Hide</button><button id="dOpen">Open</button><button id="dOpenFolder">Open Folder</button><button id="dRefresh">↻ Refresh URL</button>
+        </div>
+      </div>
+      <div class="detail-body hidden" id="panelCompletion">
+        <p class="comp-note">When the selected download finishes:</p>
+        <label class="comp-opt"><input type="radio" name="compAct" value=""> Do nothing</label>
+        <label class="comp-opt"><input type="radio" name="compAct" value="open_file"> Open the file</label>
+        <label class="comp-opt"><input type="radio" name="compAct" value="open_folder"> Open the folder</label>
+        <p class="comp-note dim">Applies to the selected download only, and is remembered across restarts.</p>
+      </div>
+    </section>
+  </section>
+</main>
+
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Add URL <span id="modalClose">×</span></div>
+    <label>Download URL
+      <input id="inUrl" type="text" placeholder="https://example.com/file.zip" spellcheck="false">
+    </label>
+    <label>File name
+      <input id="inName" type="text" placeholder="(taken from the address)" spellcheck="false">
+    </label>
+    <label>Save to folder
+      <input id="inDir" type="text" value="~/Downloads" spellcheck="false">
+    </label>
+    <div class="modal-btns">
+      <button id="btnStart" class="tool primary">Start Download</button>
+      <button id="btnLater" class="tool">Download Later</button>
+      <button id="btnCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="vmodal" class="modal hidden">
+  <div class="modal-card wide">
+    <div class="modal-head">Add Video <span id="vModalClose">×</span></div>
+    <label>Video page URL — YouTube, Facebook, and 1,700+ sites
+      <input id="vInUrl" type="text" placeholder="https://www.youtube.com/watch?v=…" spellcheck="false">
+    </label>
+    <label>Save to folder
+      <input id="vInDir" type="text" value="~/Downloads" spellcheck="false">
+    </label>
+    <div class="modal-btns left">
+      <button id="vFetch" class="tool primary">Fetch Info</button>
+      <span id="vStatus" class="v-status"></span>
+    </div>
+    <div id="vSetup" class="v-setup hidden">
+      <div id="vSetupText">Setting up the video engine…</div>
+      <div class="pbar"><i id="vSetupBar"></i></div>
+    </div>
+    <div id="vInfo" class="v-info hidden">
+      <div id="vTitle" class="v-title"></div>
+      <div id="vMeta" class="v-meta"></div>
+      <div id="vOptions" class="v-options"></div>
+    </div>
+    <div class="modal-btns">
+      <button id="vStart" class="tool primary" disabled>Start Download</button>
+      <button id="vCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="omodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Options <span id="oModalClose">×</span></div>
+    <div class="opt-row"><span>Default download folder</span><input id="oDir" type="text" spellcheck="false"></div>
+    <div class="opt-row"><span>Max connections per download</span><input id="oConns" type="number" min="1" max="32"></div>
+    <label class="opt-check"><input id="oLimitOn" type="checkbox"> Limit download speed</label>
+    <div class="opt-row"><span>Speed limit</span><input id="oLimitVal" type="number" min="0.5" step="0.5"><span class="opt-unit">MB/s</span></div>
+    <div class="opt-row"><span>Max simultaneous downloads</span><input id="oSimul" type="number" min="0" max="10"></div>
+    <div class="opt-note">0 = unlimited simultaneous downloads.</div>
+    <label class="opt-check"><input id="oAutoResume" type="checkbox"> Auto-resume unfinished downloads on start</label>
+    <label class="opt-check"><input id="oAutoUpdate" type="checkbox"> Automatically check for updates</label>
+    <div class="opt-row"><span>Video engine</span><span id="oEngine" class="opt-unit">—</span></div>
+    <div class="opt-row"><span>Default video quality</span>
+      <select id="oVideoQ">
+        <option value="best">Best quality</option>
+        <option value="2160">2160p (4K)</option>
+        <option value="1440">1440p</option>
+        <option value="1080">1080p</option>
+        <option value="720">720p</option>
+        <option value="480">480p</option>
+        <option value="360">360p</option>
+        <option value="240">240p</option>
+        <option value="audio">Audio only (MP3)</option>
+      </select>
+    </div>
+    <div class="opt-row"><span>Proxy (optional)</span><input id="oProxy" type="text" placeholder="http://127.0.0.1:8080" spellcheck="false"></div>
+    <div class="opt-note">Applies to new connections — files, the grabber and video. Empty = direct connection.</div>
+    <div class="modal-btns">
+      <button id="oSave" class="tool primary">Save</button>
+      <button id="oCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="smodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Scheduler <span id="sModalClose">×</span></div>
+    <label class="opt-check"><input id="sEnabled" type="checkbox"> Enable scheduler</label>
+    <div class="opt-row"><span>Start downloads at</span><input id="sStart" type="time"></div>
+    <div class="opt-row"><span>Stop downloads at</span><input id="sStop" type="time"></div>
+    <div class="opt-note">Max simultaneous downloads: <b id="sSimulVal">—</b> (set in Options)</div>
+    <div class="modal-btns left">
+      <button id="sStartNow" class="tool">▶ Start Queue Now</button>
+      <button id="sStopNow" class="tool">⏸ Stop Queue Now</button>
+    </div>
+    <div id="sStatus" class="s-status"></div>
+    <div class="modal-btns">
+      <button id="sSave" class="tool primary">Save</button>
+      <button id="sCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="gmodal" class="modal hidden">
+  <div class="modal-card wide grabber">
+    <div class="modal-head">Site Grabber <span id="gModalClose">×</span></div>
+    <span class="grab-cap">Page URL</span>
+    <div class="grab-row">
+      <input id="gUrl" type="text" placeholder="https://example.com/page.html" spellcheck="false">
+      <button id="gFetch" class="tool primary">Explore</button>
+    </div>
+    <div class="grab-field">
+      <span class="grab-cap">Save to folder</span>
+      <input id="gDir" type="text" spellcheck="false">
+    </div>
+    <div id="gStatus" class="v-status">Enter a page URL and click Explore</div>
+    <div id="gKinds" class="grab-kinds"></div>
+    <input id="gFilter" type="text" placeholder="Filter by name or URL…" spellcheck="false">
+    <div class="grab-selrow">
+      <button id="gSelAll" class="tool">Select All</button>
+      <button id="gSelNone" class="tool">Select None</button>
+      <span id="gCount">0 selected</span>
+    </div>
+    <div id="gList" class="grab-list"></div>
+    <div class="modal-btns">
+      <button id="gDownload" class="tool primary" disabled>Download Selected</button>
+      <button id="gCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="rmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Refresh download address <span id="rModalClose">×</span></div>
+    <label>New URL for the same file
+      <input id="rUrl" type="text" placeholder="https://…fresh link…" spellcheck="false">
+    </label>
+    <p class="comp-note">Download addresses often expire. Paste a fresh one for the <b>same file</b> — the download restarts from the new address.</p>
+    <div class="modal-btns">
+      <button id="rSave" class="tool primary">Refresh</button>
+      <button id="rCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="bmodal" class="modal hidden">
+  <div class="modal-card wide">
+    <div class="modal-head">Add Batch Download <span id="bModalClose">×</span></div>
+    <label>One download link per line
+      <textarea id="bUrls" class="ta" rows="8" placeholder="https://example.com/file1.zip&#10;https://example.com/file2.pdf" spellcheck="false"></textarea>
+    </label>
+    <label>Save to folder
+      <input id="bDir" type="text" spellcheck="false">
+    </label>
+    <div id="bStatus" class="v-status"></div>
+    <div class="modal-btns">
+      <button id="bAdd" class="tool primary">Add All</button>
+      <button id="bCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="imodal" class="modal hidden">
+  <div class="modal-card wide">
+    <div class="modal-head">Import Downloads <span id="iModalClose">×</span></div>
+    <label>Paste an exported NDM downloads list (JSON)
+      <textarea id="iText" class="ta" rows="8" placeholder='[{"url": "https://…", "dir": "~/Downloads"}]' spellcheck="false"></textarea>
+    </label>
+    <div id="iStatus" class="v-status"></div>
+    <div class="modal-btns">
+      <button id="iGo" class="tool primary">Import</button>
+      <button id="iCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="kmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Keyboard Shortcuts <span id="kModalClose">×</span></div>
+    <div class="shortcuts">
+      <div><b>Ctrl+N</b><span>Add New Download</span></div>
+      <div><b>Ctrl+Shift+V</b><span>Add Video</span></div>
+      <div><b>F5</b><span>Refresh List</span></div>
+      <div><b>Esc</b><span>Close Dialog / Menu</span></div>
+      <div><b>Ctrl+Q</b><span>Exit NDM</span></div>
+    </div>
+    <div class="modal-btns"><button id="sOk" class="tool primary">OK</button></div>
+  </div>
+</div>
+
+<div id="amodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">About NDM <span id="aModalClose">×</span></div>
+    <div class="about">
+      <div class="about-logo">⬇</div>
+      <div class="about-name">NDM — Nill Download Manager</div>
+      <div id="aVersion" class="v-meta">Version —</div>
+      <div id="aEngine" class="v-meta">Video engine: —</div>
+      <p class="about-note">Fast, resumable downloads with browser integration for files and videos from 1,700+ sites. Video engine components (yt-dlp, deno) are downloaded automatically on first use and verified by SHA-256.</p>
+    </div>
+    <div class="modal-btns"><button id="aOk" class="tool primary">OK</button></div>
+  </div>
+</div>
+
+<div id="umodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">NDM Update <span id="uModalClose">×</span></div>
+    <div id="uTitle" class="v-title">A new version is available</div>
+    <div id="uNotes" class="v-meta"></div>
+    <div id="uBarWrap" class="hidden">
+      <div class="pbar"><i id="uBar"></i></div>
+      <div id="uBarText" class="v-meta"></div>
+    </div>
+    <div class="modal-btns">
+      <button id="uUpdate" class="tool primary">Update Now</button>
+      <button id="uRestart" class="tool primary hidden">Restart NDM</button>
+      <button id="uLater" class="tool">Later</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
