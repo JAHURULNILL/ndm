@@ -38,6 +38,8 @@
   let pSubEl = null;
   let panelOpen = false;
   let probeData = null;   // the app's last probe answer for this page
+  let sniffData = null;   // a stream the browser itself already fetched
+  let manifestData = null; // its parsed quality ladder, when it has one
 
   function isYouTubeVideo() {
     return (host === 'youtube.com' || host.endsWith('.youtube.com'))
@@ -373,7 +375,7 @@
       'To download it again, remove the entry in the NDM app first.');
   }
 
-  function setBodyOptions(options) {
+  function setBodyOptions(options, onPick) {
     if (!panelBody) return;
     clearBody();
     const list = document.createElement('div');
@@ -389,7 +391,7 @@
       note.textContent = opt.note || '';
       row.appendChild(label);
       row.appendChild(note);
-      row.addEventListener('click', () => startWith(opt));
+      row.addEventListener('click', () => onPick(opt));
       list.appendChild(row);
     }
     panelBody.appendChild(list);
@@ -411,8 +413,42 @@
     if (th) { pThumbEl.src = th; pThumbEl.style.display = ''; }
     else { pThumbEl.style.display = 'none'; pThumbEl.removeAttribute('src'); }
     pSubEl.textContent = 'NDM — Nill Download Manager';
-    setBodyLoading('Getting qualities from NDM…');
+    setBodyLoading('Looking for the video…');
     place();
+    // Sniffed streams first (IDM's way): if the browser already
+    // fetched this page's media, the offer is instant — no probe.
+    let sniff = null;
+    try {
+      sniff = await chrome.runtime.sendMessage({ action: 'ndm-sniff' });
+    } catch (e) { /* extension context can vanish on reload */ }
+    if (!panelOpen) return;
+    if (sniff && sniff.found && sniff.kind === 'file') {
+      sniffData = sniff;
+      setBodyFile(sniff);
+      return;
+    }
+    if (sniff && sniff.found) {
+      let man = null;
+      try {
+        man = await chrome.runtime.sendMessage({ action: 'ndm-manifest', url: sniff.url });
+      } catch (e) { /* unreadable manifest: the probe decides */ }
+      if (!panelOpen) return;
+      if (man && man.ok && Array.isArray(man.options) && man.options.length) {
+        sniffData = sniff;
+        manifestData = man;
+        setBodyManifest(man);
+        return;
+      }
+    }
+    await probePhase();
+  }
+
+  // The full scan: the app resolves the page itself (yt-dlp). Slower
+  // than a sniffed answer, but it understands pages whose streams
+  // never crossed the network in a sniffable shape.
+  async function probePhase() {
+    if (!panelOpen) return;
+    setBodyLoading('Getting qualities from NDM…');
     let resp = null;
     try {
       resp = await chrome.runtime.sendMessage({
@@ -434,8 +470,77 @@
     const dur = fmtDur(r.duration);
     pSubEl.textContent = dur ? dur + ' • NDM' : 'NDM';
     if (r.already) setBodyAlready(r.already);
-    else if (Array.isArray(r.options) && r.options.length) setBodyOptions(r.options);
+    else if (Array.isArray(r.options) && r.options.length) setBodyOptions(r.options, startWith);
     else setBodyError('NDM found no downloadable qualities for this page.');
+  }
+
+  function setBodyManifest(man) {
+    const rows = man.options.map(o => ({
+      label: o.height ? o.height + 'p' : 'Original quality',
+      note: o.bandwidth ? '~' + (o.bandwidth / 1000000).toFixed(1) + ' Mbps' : 'as served',
+      audio: false,
+      _direct: o,
+    }));
+    setBodyOptions(rows, opt => startDirect(opt._direct));
+  }
+
+  function setBodyFile(sniff) {
+    if (!panelBody) return;
+    clearBody();
+    const name = fileNameOf(sniff.url);
+    const size = sniff.contentLength ? fmtBytes2(sniff.contentLength) : '';
+    const note = document.createElement('div');
+    note.className = 'p-note ok';
+    note.textContent = 'This page is playing a video file' + (size ? ' (' + size + ')' : '') + ' — NDM can grab it directly.';
+    panelBody.appendChild(note);
+    const hint = document.createElement('div');
+    hint.className = 'p-hint';
+    hint.textContent = name;
+    panelBody.appendChild(hint);
+    const actions = document.createElement('div');
+    actions.className = 'p-actions';
+    const dl = document.createElement('button');
+    dl.className = 'p-btn';
+    dl.textContent = 'Download this file';
+    dl.addEventListener('click', () => startFile());
+    actions.appendChild(dl);
+    panelBody.appendChild(actions);
+    const link = document.createElement('button');
+    link.className = 'p-link';
+    link.textContent = 'More options — scan with NDM instead';
+    link.addEventListener('click', () => { probePhase(); });
+    panelBody.appendChild(link);
+  }
+
+  function fileNameOf(url) {
+    try {
+      const tail = new URL(url).pathname.split('/').pop() || '';
+      return decodeURIComponent(tail) || 'video';
+    } catch (e) {
+      return 'video';
+    }
+  }
+
+  function fmtBytes2(n) {
+    if (!n) return '';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+    return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  }
+
+  // Every start path (probe choice, sniffed manifest, sniffed file)
+  // ends here: the app's verdict becomes the panel's final state.
+  function finishStart(resp) {
+    if (!panelOpen) return;
+    const r = resp && resp.result;
+    if (resp && resp.ok && r && r.started) {
+      setBodyNote('ok', 'Downloading in NDM ✓', 'Progress lives in the NDM app.');
+      setTimeout(() => closePanel(), 2600);
+      return;
+    }
+    const reason = (r && r.reason) || (resp && resp.error) || 'NDM did not answer.';
+    if (/already in the download list/.test(reason)) setBodyAlready('in list');
+    else setBodyError(reason);
   }
 
   async function startWith(opt) {
@@ -453,21 +558,59 @@
         hasAudio: !!probeData.has_audio,
       });
     } catch (e) { /* extension context can vanish on reload */ }
-    if (!panelOpen) return;
-    const r = resp && resp.result;
-    if (resp && resp.ok && r && r.started) {
-      setBodyNote('ok', 'Downloading in NDM ✓', 'Progress lives in the NDM app.');
-      setTimeout(() => closePanel(), 2600);
-      return;
-    }
-    const reason = (r && r.reason) || (resp && resp.error) || 'NDM did not answer.';
-    if (/already in the download list/.test(reason)) setBodyAlready('in list');
-    else setBodyError(reason);
+    finishStart(resp);
+  }
+
+  async function startDirect(opt) {
+    if (!sniffData) return;
+    setBodyLoading('Starting the download…');
+    let resp = null;
+    try {
+      resp = await chrome.runtime.sendMessage({
+        action: 'ndm-panel-start',
+        mode: 'manifest',
+        url: location.href,
+        pageUrl: location.href,
+        title: pageTitle(),
+        // always the MASTER manifest, never the variant playlist:
+        // a variant alone has no audio rendition to merge, while
+        // the master + a height cap lets the app pick video+audio.
+        // The worker's manifest walk reports back the URL that
+        // actually held the ladder, which may differ from the pick.
+        directUrl: (manifestData && manifestData.url) || sniffData.url,
+        height: (opt && opt.height) || 0,
+        hasAudio: !!(manifestData && manifestData.hasAudio),
+        // separate HLS audio rendition (yt-dlp cannot pair it with
+        // the variant on its own — the app downloads and muxes it)
+        audioUrl: (manifestData && manifestData.audioUri) || '',
+      });
+    } catch (e) { /* extension context can vanish on reload */ }
+    finishStart(resp);
+  }
+
+  async function startFile() {
+    if (!sniffData) return;
+    setBodyLoading('Starting the download…');
+    let resp = null;
+    try {
+      resp = await chrome.runtime.sendMessage({
+        action: 'ndm-panel-start',
+        mode: 'file',
+        url: location.href,
+        pageUrl: location.href,
+        title: pageTitle(),
+        directUrl: sniffData.url,
+        fileName: fileNameOf(sniffData.url),
+      });
+    } catch (e) { /* extension context can vanish on reload */ }
+    finishStart(resp);
   }
 
   function closePanel() {
     panelOpen = false;
     probeData = null;
+    sniffData = null;
+    manifestData = null;
     if (panelEl) panelEl.classList.remove('open');
   }
 

@@ -1,4 +1,9 @@
 'use strict';
+/* Pure sniffing helpers (classification + HLS/DASH parsers). Loaded
+ * defensively: where importScripts is unavailable the sniff actions
+ * simply report "nothing found" and the probe path carries on. */
+try { importScripts('sniff.js'); } catch (e) { /* probe-only mode */ }
+
 /* NDM — Nill Download Manager: background service worker.
  *
  * Sends download requests to the desktop app through the Native Messaging
@@ -227,8 +232,129 @@ function sendNativeFull(message, timeoutMs) {
   return Promise.race([attempt, timeout]);
 }
 
+/* ---- media sniffing (the IDM trick, generalized) ----
+ * Watch every tab's responses; remember anything that classifies
+ * as a stream manifest or a plain media file. The panel asks for
+ * the tab's best candidate when it opens, so media the browser has
+ * ALREADY fetched can be offered instantly — no fresh extraction.
+ * Registry is memory-only and per tab; a fresh navigation wipes it
+ * (the streams belong to the page that fetched them). */
+const sniffByTab = new Map(); // tabId -> Map<key, entry>
+const SNIFF_TTL_MS = 15 * 60 * 1000;
+
+function sniffNote(tabId, entry) {
+  let tab = sniffByTab.get(tabId);
+  if (!tab) { tab = new Map(); sniffByTab.set(tabId, tab); }
+  tab.set(entry.kind + '|' + entry.url, entry);
+  // keep only the newest dozen — a long streaming session would
+  // otherwise grow this without bound
+  if (tab.size > 12) {
+    const sorted = [...tab.entries()].sort((a, b) => a[1].ts - b[1].ts);
+    for (const [k] of sorted.slice(0, tab.size - 12)) tab.delete(k);
+  }
+}
+
+function sniffBest(tabId) {
+  const tab = sniffByTab.get(tabId);
+  if (!tab) return { found: false };
+  const now = Date.now();
+  const fresh = [...tab.values()].filter(e => now - e.ts < SNIFF_TTL_MS);
+  if (!fresh.length) return { found: false };
+  const manifests = fresh
+    .filter(e => e.kind === 'hls' || e.kind === 'dash')
+    .sort((a, b) => b.ts - a.ts);
+  if (manifests.length) return { found: true, ...manifests[0] };
+  const files = fresh.filter(e => e.kind === 'file');
+  if (!files.length) return { found: false };
+  // a playable file the browser committed to: prefer a known, real
+  // size; otherwise the newest sighting
+  const sized = files
+    .filter(e => e.contentLength && e.contentLength >= 200 * 1024)
+    .sort((a, b) => b.contentLength - a.contentLength);
+  if (sized.length) return { found: true, ...sized[0] };
+  files.sort((a, b) => b.ts - a.ts);
+  return { found: true, ...files[0] };
+}
+
+if (typeof NDM_SNIFF !== 'undefined' && chrome.webRequest) {
+  const headerOf = (headers, name) => {
+    const h = (headers || []).find(x => x.name.toLowerCase() === name);
+    return h ? h.value : '';
+  };
+  chrome.webRequest.onHeadersReceived.addListener(details => {
+    if (details.tabId < 0) return;
+    const kind = NDM_SNIFF.classify(
+      details.url, headerOf(details.responseHeaders, 'content-type'));
+    if (!kind) return;
+    const len = parseInt(headerOf(details.responseHeaders, 'content-length') || '', 10);
+    sniffNote(details.tabId, {
+      kind,
+      url: details.url,
+      contentLength: Number.isFinite(len) ? len : null,
+      ts: Date.now(),
+    });
+  }, { urls: ['<all_urls>'] }, ['responseHeaders']);
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === 'loading' && changeInfo.url) {
+      sniffByTab.delete(tabId);
+    }
+  });
+  chrome.tabs.onRemoved.addListener(tabId => sniffByTab.delete(tabId));
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message) return;
+  if (message.action === 'ndm-sniff') {
+    const tabId = sender.tab && sender.tab.id;
+    sendResponse(typeof tabId === 'number' ? sniffBest(tabId) : { found: false });
+    return;
+  }
+  if (message.action === 'ndm-manifest') {
+    // fetch + parse a sniffed manifest HERE (the worker's fetch
+    // carries the browser's cookies for that origin, which is what
+    // makes login-gated streams readable) and hand back the ladder.
+    // A player fetches the MASTER first and one variant (media)
+    // playlist right after, so the newest sniffed manifest is
+    // usually the WRONG one: walk the tab's manifests until one
+    // parses as a real master (it carries the variant ladder);
+    // only when none does, fall back to the first parse.
+    (async () => {
+      try {
+        if (typeof NDM_SNIFF === 'undefined') { sendResponse({ ok: false }); return; }
+        const urls = [message.url || ''];
+        const tabId = sender.tab && sender.tab.id;
+        if (typeof tabId === 'number' && sniffByTab.has(tabId)) {
+          const rest = [...sniffByTab.get(tabId).values()]
+            .filter(e => (e.kind === 'hls' || e.kind === 'dash') && e.url !== urls[0])
+            .sort((a, b) => b.ts - a.ts)
+            .map(e => e.url);
+          urls.push(...rest);
+        }
+        let firstParsed = null;
+        for (const url of urls.slice(0, 4)) {
+          if (!url) continue;
+          const resp = await fetch(url, { credentials: 'include' }).catch(() => null);
+          if (!resp || !resp.ok) continue;
+          const text = await resp.text();
+          const isDash = /\.mpd($|\?)/i.test(url)
+            || (resp.headers.get('content-type') || '').includes('dash+xml');
+          const parsed = isDash
+            ? NDM_SNIFF.parseMpd(text, url)
+            : NDM_SNIFF.parseHls(text, url);
+          // the panel starts the download from the URL that
+          // actually held this ladder, which may not be the pick
+          parsed.url = url;
+          if (!firstParsed) firstParsed = parsed;
+          if (parsed.master) { sendResponse({ ok: true, ...parsed }); return; }
+        }
+        if (firstParsed) { sendResponse({ ok: true, ...firstParsed }); return; }
+        sendResponse({ ok: false });
+      } catch (e) {
+        sendResponse({ ok: false });
+      }
+    })();
+    return true; // async sendResponse
+  }
   if (message.action === 'ndm-panel-probe' || message.action === 'ndm-panel-start') {
     const targetUrl = message.url || (sender.tab && sender.tab.url) || '';
     (async () => {
@@ -247,6 +373,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           selector: message.selector || '',
           audio: !!message.audio,
           hasAudio: !!message.hasAudio,
+          // sniffed direct starts: the stream the browser already
+          // fetched, instead of a page to re-resolve
+          ...(message.mode ? {
+            mode: message.mode,
+            directUrl: message.directUrl || '',
+            height: message.height || 0,
+            audioUrl: message.audioUrl || '',
+            fileName: message.fileName || '',
+          } : {}),
         }, 25000);
       sendResponse(resp || { ok: false, error: 'NDM is not reachable' });
     })();
