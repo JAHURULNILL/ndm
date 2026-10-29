@@ -16,7 +16,8 @@
     "tabs",
     "webRequest",
     "storage",
-    "cookies"
+    "cookies",
+    "scripting"
   ],
   "host_permissions": [
     "<all_urls>"

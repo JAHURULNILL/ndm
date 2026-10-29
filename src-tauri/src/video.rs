@@ -624,12 +624,8 @@ impl VideoJob {
             ]);
         } else {
             ff_args.extend([
-                "-c:v".into(),
+                "-c".into(),
                 "copy".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                "192k".into(),
                 "-movflags".into(),
                 "+faststart".into(),
             ]);

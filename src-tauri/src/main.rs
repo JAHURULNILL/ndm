@@ -740,6 +740,7 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                 "paused" | "queued" => {
                     let state = app.state::<AppState>();
                     persist(&state);
+                    pump_queue(&app);
                     break;
                 }
                 _ => {}
@@ -1208,8 +1209,12 @@ fn scheduler_blocks(state: &AppState) -> bool {
 /// Fill free simultaneous-download slots from the queue (Settings cap).
 fn pump_queue(app: &AppHandle) {
     let state = app.state::<AppState>();
+    if scheduler_blocks(&state) {
+        return;
+    }
     let max = current_settings(&state).max_simultaneous;
-    if max == 0 || scheduler_blocks(&state) {
+    if max == 0 {
+        start_all_queued(app);
         return;
     }
     let mut active = count_active(&state);
@@ -1433,6 +1438,7 @@ fn pause_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
     }
     let _ = app.emit("progress", payload_of(&entry));
     persist(&state);
+    pump_queue(&app);
     Ok(())
 }
 
@@ -2805,9 +2811,11 @@ fn main() {
             update_busy: AtomicBool::new(false),
         })
         .setup(|app| {
-            if std::env::args().any(|a| a == "--background") {
-                if let Some(w) = app.get_webview_window("main") {
+            if let Some(w) = app.get_webview_window("main") {
+                if std::env::args().any(|a| a == "--background") {
                     let _ = w.hide();
+                } else {
+                    let _ = w.show();
                 }
             }
             let dir = app.path().app_data_dir()?;

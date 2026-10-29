@@ -1,7 +1,7 @@
 {
   "version": "1.8.0",
   "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.8.0/NDM_1.8.0_amd64.deb",
-  "deb_sha256": "8127533f94a1e3f5ee623d1dcb270e1f6dea21dca8d01ae4a9defdbc5ffb7e17",
+  "deb_sha256": "9a6641be34a06e08d6c9b7e112fd5eea835f6e08f459a8e34852d6b23535dadc",
   "min_supported": "1.0.0",
-  "notes": "NDM 1.8.0 — IDM-parity release: Native host ACK and real-time start verification, duplicate title uniquification, Speed Limiter tab and complete connection grid visualization, preserved user connection settings, hardened origin and YouTube DOM security, real live download state persistence, and automated regression test suite."
+  "notes": "NDM 1.8.0 — IDM-parity release: Instant 0ms browser download interception preventing native Save dialogs, silent background downloads without app window focus stealing, high-speed multi-connection TCP streaming (up to 256MB contiguous chunks), Native host ACK and real-time start verification, duplicate title uniquification, Speed Limiter tab and complete connection grid visualization, preserved user connection settings, hardened origin and YouTube DOM security, real live download state persistence, and automated regression test suite."
 }

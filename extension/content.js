@@ -706,6 +706,7 @@
       btnStart.textContent = later ? 'Queueing in NDM…' : 'Starting in NDM…';
 
       let ok = false;
+      let resp = null;
       try {
         resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
@@ -1535,6 +1536,9 @@
       return false;
     }
     if (msg.action === 'ndm-open-file-modal') {
+      if (window.self !== window.top) {
+        return false;
+      }
       dismissed = false;
       openBrowserFileModal({
         url: msg.url || '',

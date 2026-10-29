@@ -1088,6 +1088,14 @@ $('rSave').onclick = async () => {
 // Escape closes the topmost open modal; Enter submits the URL field of
 // the Add / Refresh dialogs and probes in the Add Video dialog
 document.addEventListener('keydown', e => {
+  if (e.key === 'Delete' || e.key === 'Del') {
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+    if (selectedId && !document.querySelector('.modal:not(.hidden)')) {
+      $('btnDelete').click();
+    }
+    return;
+  }
   if (e.key !== 'Escape') return;
   const open = [...document.querySelectorAll('.modal:not(.hidden)')]
     // a mandatory update dialog cannot be dismissed, not even by Esc

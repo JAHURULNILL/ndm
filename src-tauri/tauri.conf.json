@@ -13,6 +13,7 @@
         "minHeight": 540,
         "minWidth": 860,
         "title": "NDM — Nill Download Manager",
+        "visible": false,
         "width": 1120
       }
     ],

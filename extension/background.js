@@ -45,11 +45,11 @@ function isVideoPageUrl(url) {
 
 // Known downloadable file extensions for browser-download interception.
 const FILE_EXTENSIONS = [
-  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz',
-  'exe', 'msi', 'deb', 'rpm', 'dmg', 'iso', 'img', 'apk', 'bin', 'appimage', 'flatpakref',
-  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'epub', 'mobi',
-  'mp3', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flac', 'aac', 'ogg', 'm4a', 'opus', 'wav',
-  'torrent',
+  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz', 'cab',
+  'exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'run', 'appimage', 'flatpakref',
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'txt', 'rtf', 'epub', 'mobi',
+  'mp3', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flac', 'aac', 'ogg', 'm4a', 'm4b', 'opus', 'wav', 'wma', 'flv', 'wmv', '3gp', 'm4v', 'ts',
+  'torrent', 'jar', 'war', 'whl', 'vmdk', 'qcow2', 'vdi',
 ];
 
 function extensionOf(urlOrName) {
@@ -60,8 +60,22 @@ function extensionOf(urlOrName) {
   return clean.slice(dot + 1).toLowerCase();
 }
 
+function filenameFromUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    for (const [k, v] of u.searchParams.entries()) {
+      if (/file|name|attachment|download/i.test(k) && v.includes('.')) {
+        return v;
+      }
+    }
+  } catch (e) {}
+  return '';
+}
+
 function isDownloadableFile(urlOrName) {
-  return FILE_EXTENSIONS.includes(extensionOf(urlOrName));
+  if (!urlOrName) return false;
+  return FILE_EXTENSIONS.includes(extensionOf(urlOrName)) ||
+    FILE_EXTENSIONS.includes(extensionOf(filenameFromUrl(urlOrName)));
 }
 
 /* ------------------------------------------------------------------ */
@@ -430,9 +444,23 @@ async function openFileModalInTab(tabId, payload) {
     const res = await chrome.tabs.sendMessage(tabId, {
       action: 'ndm-open-file-modal',
       ...payload,
-    });
+    }, { frameId: 0 });
     return !!(res && res.ok);
   } catch (e) {
+    // Tab might not have content script injected yet (e.g. opened before extension installed/reloaded)
+    try {
+      if (chrome.scripting && chrome.scripting.executeScript) {
+        await chrome.scripting.executeScript({
+          target: { tabId },
+          files: ['content.js'],
+        });
+        const res = await chrome.tabs.sendMessage(tabId, {
+          action: 'ndm-open-file-modal',
+          ...payload,
+        }, { frameId: 0 });
+        return !!(res && res.ok);
+      }
+    } catch (e2) {}
     return false;
   }
 }
@@ -469,9 +497,11 @@ async function handleInterceptedDownload(item, suggestedFilename) {
 
   // Cancel and erase the native browser download IMMEDIATELY (0ms delay)
   // so the browser's download shelf / Save-As dialog never appears!
-  chrome.downloads.cancel(item.id).catch(() => {});
-  chrome.downloads.removeFile(item.id).catch(() => {});
-  chrome.downloads.erase({ id: item.id }).catch(() => {});
+  try {
+    chrome.downloads.cancel(item.id, () => {
+      chrome.downloads.erase({ id: item.id }, () => {});
+    });
+  } catch (e) {}
 
   const url = item.finalUrl || item.url || '';
   const rawName = (suggestedFilename || item.filename || '').split(/[\\/]/).pop() || '';
@@ -481,7 +511,13 @@ async function handleInterceptedDownload(item, suggestedFilename) {
 
   // Try to open the IDM Download File Info popup right inside the active browser tab!
   try {
-    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (!tabs || !tabs.length) {
+      tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    }
+    if (!tabs || !tabs.length) {
+      tabs = await chrome.tabs.query({ active: true });
+    }
     const activeTab = tabs && tabs[0];
     if (activeTab && activeTab.id != null) {
       const opened = await openFileModalInTab(activeTab.id, {
@@ -494,25 +530,36 @@ async function handleInterceptedDownload(item, suggestedFilename) {
     }
   } catch (e) {}
 
-  // Fallback if the active tab cannot host content scripts (e.g. blank new tab):
-  // start directly in NDM background without forcing the desktop window open.
+  // Fallback if the active tab cannot host content scripts (e.g. blank new tab or restricted page):
+  // start directly in NDM background without forcing the desktop window open or stealing focus!
   const cookies = await captureCookies(url, referrer);
   await sendToNdm({
-    kind: 'file',
+    kind: 'file_direct',
     url,
     pageUrl: referrer,
     title: cleanName,
     cookies,
+    dir: '~/Downloads',
+    later: false,
+    total: totalBytes,
   });
 }
 
 if (chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     if (shouldInterceptItem(item)) {
+      // 1. Cancel and erase IMMEDIATELY BEFORE calling suggest() so Chrome never displays the Save As dialog or shelf!
+      try {
+        chrome.downloads.cancel(item.id, () => {
+          chrome.downloads.erase({ id: item.id }, () => {});
+        });
+      } catch (e) {}
+      // 2. Call suggest to satisfy Chrome's API requirement
       const suggested = (item && item.filename) || '';
       try {
         suggest({ filename: suggested || 'ndm-intercept.tmp', conflictAction: 'uniquify' });
       } catch (e) {}
+      // 3. Delegate to NDM in-page modal / direct start
       handleInterceptedDownload(item, suggested);
       return;
     }
@@ -521,6 +568,11 @@ if (chrome.downloads.onDeterminingFilename) {
 
 chrome.downloads.onCreated.addListener(item => {
   if (shouldInterceptItem(item)) {
+    try {
+      chrome.downloads.cancel(item.id, () => {
+        chrome.downloads.erase({ id: item.id }, () => {});
+      });
+    } catch (e) {}
     handleInterceptedDownload(item, item.filename || '');
   }
 });

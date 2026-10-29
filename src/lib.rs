@@ -325,7 +325,7 @@ fn sanitize_suggested_name(raw: &str) -> String {
         .chars()
         .filter(|c| !c.is_control())
         .map(|c| {
-            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '%' | '^' | '&') {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
                 '_'
             } else {
                 c
@@ -394,15 +394,14 @@ fn probe_agent() -> ureq::Agent {
 }
 
 /// Parse a `Content-Range: bytes <start>-<end>/<total>` header value.
-fn parse_content_range(v: &str) -> Option<(u64, u64, u64)> {
+fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let v = v.trim().strip_prefix("bytes ")?.trim_start();
     let (range, total) = v.split_once('/')?;
     let (start, end) = range.split_once('-')?;
-    Some((
-        start.trim().parse().ok()?,
-        end.trim().parse().ok()?,
-        total.trim().parse().ok()?,
-    ))
+    let start_num: u64 = start.trim().parse().ok()?;
+    let end_num: u64 = end.trim().parse().ok()?;
+    let total_num: Option<u64> = total.trim().parse().ok();
+    Some((start_num, end_num, total_num))
 }
 
 /// Confirm with a real 1-byte request that the server honours Range —
@@ -423,7 +422,7 @@ fn verify_range(agent: &ureq::Agent, url: &str, total: u64, header_claim: bool, 
             // from a different offset is not range-capable for our use
             resp.header("Content-Range")
                 .and_then(parse_content_range)
-                .map(|(s, e, t)| s == 0 && e == 0 && t == total)
+                .map(|(s, e, t)| s == 0 && e == 0 && (t.is_none() || t == Some(total)))
                 .unwrap_or(false)
         }
         // a definitive HTTP refusal settles it (the claim is false); only
@@ -487,7 +486,7 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
     let resolved = resp.get_url().to_string();
     let suggested_name = extract_suggested_name(&resp, url).or(head_suggested);
     if resp.status() == 206 {
-        let (s, _e, total) = resp
+        let (s, _e, total_opt) = resp
             .header("Content-Range")
             .and_then(parse_content_range)
             .ok_or("probe: no usable Content-Range")?;
@@ -496,10 +495,17 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                 "probe: server answered a range request from the wrong offset".to_string(),
             );
         }
+        let (total, range_ok, unknown_size) = match total_opt {
+            Some(t) => (t, true, false),
+            None => {
+                let cl = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
+                if cl > 0 { (cl, true, false) } else { (0, false, true) }
+            }
+        };
         return Ok(Probe {
             total,
-            range_ok: true,
-            unknown_size: false,
+            range_ok,
+            unknown_size,
             etag: resp.header("ETag").map(|s| s.to_string()),
             last_modified: resp.header("Last-Modified").map(|s| s.to_string()),
             suggested_name,
@@ -600,7 +606,7 @@ fn download_block_run(
         let range_ok = resp
             .header("Content-Range")
             .and_then(parse_content_range)
-            .map(|(s, e, t)| s == req_start && e == end && t == total)
+            .map(|(s, e, t)| s == req_start && e == end && (t.is_none() || t == Some(total)))
             .unwrap_or(false);
         if !range_ok {
             return Err(BlockError::Retry(
@@ -728,7 +734,7 @@ fn worker(
             return;
         }
         let rem_blocks = total_blocks.saturating_sub(cur_next);
-        let run_len = (rem_blocks / (active * 2)).clamp(1, 16);
+        let run_len = (rem_blocks / active).clamp(1, 256);
         let claim_start = shared.next_block.fetch_add(run_len, Ordering::Relaxed);
         if claim_start >= total_blocks {
             return;
@@ -1134,6 +1140,8 @@ fn start_impl(
                 let _ = std::fs::remove_file(&s.state_path);
             } else if s.control.cancelled.load(Ordering::Relaxed) {
                 set_status(&s, Status::Cancelled);
+            } else if s.control.paused.load(Ordering::Relaxed) {
+                set_status(&s, Status::Paused);
             } else {
                 set_status(&s, Status::Error);
                 let mut err = s.error.lock().unwrap();
@@ -1255,13 +1263,14 @@ fn start_single_stream(
     std::thread::spawn(move || {
         let agent = build_agent();
         let result: Result<(), String> = (|| {
+            shared.active_workers.store(1, Ordering::Relaxed);
             let resp = apply_auth(agent.get(&url), &auth)
                 .set("Accept-Encoding", "identity")
                 .call()
                 .map_err(|e| format!("http: {e}"))?;
             let mut reader = resp.into_reader();
             let f = File::create(&out).map_err(|e| format!("create: {e}"))?;
-            let mut buf = vec![0u8; 256 * 1024];
+            let mut buf = vec![0u8; 512 * 1024];
             let mut pos = 0u64;
             loop {
                 if shared.control.cancelled.load(Ordering::Relaxed) {
@@ -1304,12 +1313,17 @@ fn start_single_stream(
         })();
         match result {
             Ok(()) => {
+                shared.active_workers.store(0, Ordering::Relaxed);
                 if !shared.control.cancelled.load(Ordering::Relaxed) {
                     shared.done_count.store(1, Ordering::Relaxed);
+                    if let Some(b) = shared.block_state.first() {
+                        b.store(1, Ordering::Relaxed);
+                    }
                     set_status(&shared, Status::Finished);
                 }
             }
             Err(e) => {
+                shared.active_workers.store(0, Ordering::Relaxed);
                 let mut err = shared.error.lock().unwrap();
                 *err = Some(e);
                 shared.failed.store(true, Ordering::Relaxed);
@@ -1827,6 +1841,28 @@ mod tests {
         assert_eq!(p.conns, 0);
         assert!(!p.blocks.is_empty());
         assert!(p.blocks.iter().all(|&b| b == 1));
+    }
+
+    #[test]
+    fn parse_content_range_handles_known_and_indeterminate_totals() {
+        assert_eq!(
+            parse_content_range("bytes 0-1048575/104857600"),
+            Some((0, 1048575, Some(104857600)))
+        );
+        assert_eq!(parse_content_range("bytes 0-512/*"), Some((0, 512, None)));
+        assert_eq!(parse_content_range("invalid"), None);
+    }
+
+    #[test]
+    fn sanitize_suggested_name_preserves_legal_special_chars() {
+        assert_eq!(
+            sanitize_suggested_name("Document & Report (100% complete).pdf"),
+            "Document & Report (100% complete).pdf"
+        );
+        assert_eq!(
+            sanitize_suggested_name("../../bad:file*name?.txt"),
+            "bad_file_name_.txt"
+        );
     }
 }
 
