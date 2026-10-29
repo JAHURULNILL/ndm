@@ -69,6 +69,10 @@ struct SavedEntry {
     /// "", "open_file" or "open_folder" — runs when the download finishes
     #[serde(default)]
     completion: String,
+    /// why the entry last failed — shown in the list and the status
+    /// dialog, and kept across restarts so "Error" is never a dead end
+    #[serde(default)]
+    error: String,
 }
 
 fn default_kind() -> String {
@@ -247,6 +251,7 @@ struct Restored {
     blocks: Vec<u8>,
     resumable: bool,
     status: String,
+    error: String,
 }
 
 struct Entry {
@@ -485,7 +490,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 r.status.clone(),
                 downsample_blocks(&r.blocks),
                 r.resumable,
-                String::new(),
+                r.error.clone(),
             ),
             None => (
                 0,
@@ -562,6 +567,7 @@ fn persist(state: &AppState) {
                 cookies: e.cookies.clone(),
                 referer: e.referer.clone(),
                 completion: e.completion.lock().unwrap().clone(),
+                error: p.error.clone(),
             }
         })
         .collect();
@@ -715,6 +721,7 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
         return;
     }
     std::thread::spawn(move || {
+        let mut last_persist = Instant::now();
         loop {
             if entry.removed.load(Ordering::Relaxed) {
                 break;
@@ -743,7 +750,16 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                     pump_queue(&app);
                     break;
                 }
-                _ => {}
+                _ => {
+                    // keep the on-disk snapshot fresh while bytes are
+                    // moving, not only at the end: a crash or kill
+                    // mid-download should restore close to the truth
+                    if last_persist.elapsed() >= Duration::from_secs(2) {
+                        let state = app.state::<AppState>();
+                        persist(&state);
+                        last_persist = Instant::now();
+                    }
+                }
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -1058,6 +1074,32 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
         dl.control.resume();
         return;
     }
+    if entry.kind == "video"
+        && video::find_tool("yt-dlp", &app.state::<AppState>().components()).is_none()
+    {
+        // The video engine itself is still downloading in the
+        // background. Dying here with an error helps nobody — wait in
+        // the queue instead; the setup worker pumps the queue the
+        // moment the engine lands.
+        entry.queued.store(true, Ordering::Relaxed);
+        {
+            let mut r = entry.restored.lock().unwrap();
+            if r.is_none() {
+                *r = Some(Restored {
+                    total: 0,
+                    done_bytes: 0,
+                    blocks: Vec::new(),
+                    resumable: false,
+                    status: "queued".to_string(),
+                    error: String::new(),
+                });
+            }
+        }
+        let state = app.state::<AppState>();
+        let _ = app.emit("progress", payload_of(&entry));
+        persist(&state);
+        return;
+    }
     if let Some(job) = &entry.video {
         let state = app.state::<AppState>();
         match job.resume(&state.components()) {
@@ -1150,16 +1192,18 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             spawn_emit_loop(app.clone(), live);
             persist(&state);
             }
-            Err(_) => {
+            Err(e) => {
                 entry.starting.store(false, Ordering::SeqCst);
                 // mirror the HTTP path: a failed start must surface as a
-                // visible error, not sit silently on a stale status
+                // visible error, not sit silently on a stale status —
+                // with the reason attached, so the user can act on it
                 *entry.restored.lock().unwrap() = Some(Restored {
                     total: 0,
                     done_bytes: 0,
                     blocks: Vec::new(),
                     resumable: false,
                     status: "error".to_string(),
+                    error: e,
                 });
                 let _ = app.emit("progress", payload_of(&entry));
                 persist(&state);
@@ -1169,7 +1213,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
     }
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        if start_engine(app.clone(), &entry).await.is_err() {
+        if let Err(start_err) = start_engine(app.clone(), &entry).await {
             // a failed start must not sit on "Queued" forever: surface it
             // as an error the user can see and retry (the engine's state
             // file survives, so a retry still resumes). Only ever touch
@@ -1185,6 +1229,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                         blocks: Vec::new(),
                         resumable: false,
                         status: "error".to_string(),
+                        error: start_err,
                     });
                     let _ = app.emit("progress", payload_of(&e));
                 }
@@ -1359,6 +1404,7 @@ async fn add_download(
                 blocks: Vec::new(),
                 resumable: true,
                 status: "paused".to_string(),
+                error: String::new(),
             });
         } else {
             // Scheduler or simultaneous cap: register as queued so the pump starts it when a slot frees up
@@ -1422,6 +1468,7 @@ fn pause_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
                         blocks: Vec::new(),
                         resumable: false,
                         status: "paused".to_string(),
+                        error: String::new(),
                     })
                 }
             }
@@ -1677,6 +1724,11 @@ fn run_component_setup(app: AppHandle) {
         };
         let state = app.state::<AppState>();
         state.components_busy.store(false, Ordering::SeqCst);
+        if result.is_ok() {
+            // video downloads that arrived while the engine was still
+            // downloading are waiting in the queue — start them now
+            pump_queue(&app);
+        }
         let payload = match result {
             Ok(()) => serde_json::json!({ "phase": "done" }),
             Err(e) => serde_json::json!({ "phase": "error", "message": e }),
@@ -1925,6 +1977,7 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
             blocks: Vec::new(),
             resumable: true,
             status: "paused".to_string(),
+            error: String::new(),
         })),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -2091,7 +2144,14 @@ fn do_add_video(
     };
     let id = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
     let max = current_settings(state).max_simultaneous;
-    let should_wait = later || scheduler_blocks(state) || (max > 0 && count_active(state) >= max);
+    // A video that arrives while the engine itself is still
+    // downloading waits in the queue like any other not-now download —
+    // it must not be rejected for a condition the user cannot fix.
+    let engine_missing = video::find_tool("yt-dlp", &state.components()).is_none();
+    let should_wait = later
+        || engine_missing
+        || scheduler_blocks(state)
+        || (max > 0 && count_active(state) >= max);
     if should_wait {
         let initial_status = if later { "paused" } else { "queued" };
         let entry = Arc::new(Entry {
@@ -2114,6 +2174,7 @@ fn do_add_video(
                 blocks: Vec::new(),
                 resumable: true,
                 status: initial_status.to_string(),
+                error: String::new(),
             })),
             queued: AtomicBool::new(!later),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -2149,6 +2210,7 @@ fn do_add_video(
             blocks: Vec::new(),
             resumable: true,
             status: "downloading".to_string(),
+            error: String::new(),
         })
     } else {
         None
@@ -2325,6 +2387,7 @@ fn restore_saved(state: &AppState) {
                     } else {
                         "paused".to_string()
                     },
+                    error: s.error.clone(),
                 })),
                 queued: AtomicBool::new(s.status == "queued" && !finished),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
@@ -2358,6 +2421,7 @@ fn restore_saved(state: &AppState) {
                 blocks: vec![1u8; nblocks],
                 resumable: true,
                 status: "finished".to_string(),
+                error: s.error.clone(),
             }
         } else {
             match ndm::peek_state(&s.url, &out_path) {
@@ -2373,6 +2437,7 @@ fn restore_saved(state: &AppState) {
                     } else {
                         "paused".to_string()
                     },
+                    error: s.error.clone(),
                 },
                 None => Restored {
                     total: s.total,
@@ -2386,6 +2451,7 @@ fn restore_saved(state: &AppState) {
                     } else {
                         "paused".to_string()
                     },
+                    error: s.error.clone(),
                 },
             }
         };
@@ -2660,6 +2726,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
                             blocks: Vec::new(),
                             resumable: true,
                             status: "paused".to_string(),
+                            error: String::new(),
                         });
                     } else {
                         stub.queued.store(true, Ordering::Relaxed);
@@ -3095,6 +3162,7 @@ mod tests {
                 blocks: vec![1, 0],
                 resumable: true,
                 status: "downloading".to_string(),
+                error: String::new(),
             })),
             queued: AtomicBool::new(false),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
