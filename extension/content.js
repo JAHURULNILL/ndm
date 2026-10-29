@@ -844,7 +844,7 @@
         <div class="ndm-f-summary">
           <span class="ndm-q-badge video ndm-f-cat">${escapeHtml(currentCat)}</span>
           <span class="ndm-f-size">${currentBytes > 0 ? escapeHtml(fmtBytes(currentBytes)) : 'Checking size…'}</span>
-          <span class="ndm-f-resume">Resumable · 32 parallel streams</span>
+          <span class="ndm-f-resume">Checking…</span>
         </div>
         <div class="ndm-m-folder-row">
           <label class="ndm-m-lbl">Save file as</label>
@@ -1001,7 +1001,7 @@
           catEl.textContent = res.category || categoryForName(res.suggested_name);
         }
         resumeEl.textContent = res.resumable !== false
-          ? 'Resumable · 32 parallel streams'
+          ? 'Resumable'
           : 'Single-stream download';
       } else if (currentBytes <= 0) {
         sizeEl.textContent = 'Ready to download';

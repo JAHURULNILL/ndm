@@ -359,6 +359,87 @@ pub fn best_selector() -> String {
         .into()
 }
 
+/// Resolve a possibly-relative playlist URI against the URL of the
+/// manifest that referenced it.
+pub fn resolve_playlist_uri(base: &str, uri: &str) -> String {
+    let uri = uri.trim();
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return uri.to_string();
+    }
+    if let Some(stripped) = uri.strip_prefix("//") {
+        let scheme = base.split(':').next().unwrap_or("https");
+        return format!("{scheme}://{stripped}");
+    }
+    if uri.starts_with('/') {
+        // scheme + authority of the base
+        let after = base.split("://").nth(1).unwrap_or("");
+        let host = after.split('/').next().unwrap_or("");
+        let scheme = base.split(':').next().unwrap_or("https");
+        return format!("{scheme}://{host}{uri}");
+    }
+    match base.rfind('/') {
+        Some(i) => format!("{}{}", &base[..=i], uri),
+        None => uri.to_string(),
+    }
+}
+
+/// Parse an HLS *master* playlist and return the absolute URL of its
+/// default audio rendition (`#EXT-X-MEDIA:TYPE=AUDIO,...,DEFAULT=YES`),
+/// falling back to the first audio rendition when none is marked
+/// default. Returns `None` for media playlists and masters without a
+/// separate audio rendition. This is the piece yt-dlp's generic
+/// extractor does not surface: a variant can be downloaded perfectly
+/// and still be silent, because its sound lives at this URI.
+pub fn hls_default_audio_rendition(manifest: &str, base_url: &str) -> Option<String> {
+    if !manifest.contains("#EXT-X-STREAM-INF") {
+        return None; // not a master playlist
+    }
+    let mut first_audio: Option<String> = None;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if !line.starts_with("#EXT-X-MEDIA:") || !line.contains("TYPE=AUDIO") {
+            continue;
+        }
+        let uri = line
+            .split("URI=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("");
+        if uri.is_empty() {
+            continue;
+        }
+        let abs = resolve_playlist_uri(base_url, uri);
+        if line.contains("DEFAULT=YES") {
+            return Some(abs);
+        }
+        if first_audio.is_none() {
+            first_audio = Some(abs);
+        }
+    }
+    first_audio
+}
+
+/// Fetch a URL's body as text (small files only — HLS manifests).
+/// Follows one level of master-playlist indirection for the audio
+/// rendition search: when `url` itself is a master, its renditions
+/// are resolved against it.
+pub fn fetch_hls_default_audio(url: &str, referer: &str, cookie: &str) -> Option<String> {
+    let mut req = ureq::get(url)
+        .timeout(Duration::from_secs(15))
+        .set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
+    if !referer.is_empty() {
+        req = req.set("Referer", referer);
+    }
+    if !cookie.is_empty() {
+        req = req.set("Cookie", cookie);
+    }
+    let text = req.call().ok()?.into_string().ok()?;
+    if text.len() > 4 * 1024 * 1024 || !text.contains("#EXTM3U") {
+        return None;
+    }
+    hls_default_audio_rendition(&text, url)
+}
+
 pub fn probe(
     url: &str,
     components_dir: &Path,
@@ -655,6 +736,39 @@ mod tests {
         assert!(cookie_file_has_real_session(&f));
         assert!(cookie_file_usable_for_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &f));
         let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn hls_master_yields_default_audio_rendition() {
+        let master = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"main\",DEFAULT=YES,URI=\"aud/pl.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=800000,AUDIO=\"aud\"\n\
+            v360/prog.m3u8\n";
+        assert_eq!(
+            hls_default_audio_rendition(master, "http://x.test/hls/master.m3u8"),
+            Some("http://x.test/hls/aud/pl.m3u8".to_string())
+        );
+    }
+
+    #[test]
+    fn hls_media_playlist_has_no_rendition() {
+        let media = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg1.ts\n";
+        assert_eq!(
+            hls_default_audio_rendition(media, "http://x.test/v360/prog.m3u8"),
+            None
+        );
+    }
+
+    #[test]
+    fn hls_master_without_default_picks_first_audio() {
+        let master = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"alt\",DEFAULT=NO,URI=\"/abs/a.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO=\"a\"\n\
+            v/prog.m3u8\n";
+        assert_eq!(
+            hls_default_audio_rendition(master, "https://cdn.test:8443/h/master.m3u8"),
+            Some("https://cdn.test:8443/abs/a.m3u8".to_string())
+        );
     }
 
     #[test]

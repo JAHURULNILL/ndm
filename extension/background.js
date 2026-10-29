@@ -83,6 +83,8 @@ function isDownloadableFile(urlOrName) {
 /* ------------------------------------------------------------------ */
 
 const tabMediaStreams = new Map();
+const STREAM_TTL_MS = 15 * 60 * 1000;
+const STREAMS_PER_TAB = 12;
 
 function isSubVariantPlaylist(url) {
   return /(chunklist|variant|rendition|audio[_-]|video[_-]|segment|frag)/i.test(url);
@@ -93,14 +95,57 @@ function recordTabStream(tabId, url) {
   if (!/^https?:\/\//i.test(url)) return;
   // Ignore YouTube/Facebook raw segment requests because yt-dlp handles page URLs directly
   if (/googlevideo\.com\/videoplayback|fbcdn\.net.*bytestart=/i.test(url)) return;
-  const prev = tabMediaStreams.get(tabId);
-  if (prev && /\.m3u8(\?|$)/i.test(prev) && !isSubVariantPlaylist(prev) && isSubVariantPlaylist(url)) {
-    return;
+  let list = tabMediaStreams.get(tabId) || [];
+  list = list.filter(e => e.url !== url && Date.now() - e.ts < STREAM_TTL_MS);
+  // A master-looking manifest stays ahead of sub-variant playlists:
+  // the newest response is very often just one variant of the show.
+  if (isSubVariantPlaylist(url)) {
+    list.push({ url, ts: Date.now() });
+  } else {
+    list.unshift({ url, ts: Date.now() });
   }
-  tabMediaStreams.set(tabId, url);
+  tabMediaStreams.set(tabId, list.slice(0, STREAMS_PER_TAB));
   if (tabMediaStreams.size > 300) {
     tabMediaStreams.delete(tabMediaStreams.keys().next().value);
   }
+}
+
+function tabStreamList(tabId) {
+  const list = tabMediaStreams.get(tabId) || [];
+  return list
+    .filter(e => Date.now() - e.ts < STREAM_TTL_MS)
+    .map(e => e.url);
+}
+
+/* Pick the stream URL that actually describes the whole show: fetch
+   the candidate manifests and prefer the one whose CONTENT is a
+   master playlist (#EXT-X-STREAM-INF) — a variant URL handed to the
+   probe collapses the quality ladder to that single variant. */
+const masterPickCache = new Map();
+async function pickMasterStream(tabId) {
+  const list = tabStreamList(tabId);
+  if (!list.length) return '';
+  const manifests = list.filter(u => /\.m3u8(\?|$)/i.test(u.split('#')[0]));
+  if (!manifests.length) return list[0];
+  const cacheKey = tabId + '|' + manifests[0];
+  const cached = masterPickCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < 60 * 1000) return cached.url;
+  let fallback = '';
+  for (const u of manifests.slice(0, 4)) {
+    try {
+      const r = await fetch(u, { credentials: 'include' });
+      if (!r.ok) continue;
+      const text = await r.text();
+      if (!fallback) fallback = u;
+      if (text.includes('#EXT-X-STREAM-INF')) {
+        masterPickCache.set(cacheKey, { url: u, ts: Date.now() });
+        return u;
+      }
+    } catch (e) {}
+  }
+  const chosen = fallback || manifests[0];
+  masterPickCache.set(cacheKey, { url: chosen, ts: Date.now() });
+  return chosen;
 }
 
 if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
@@ -129,7 +174,21 @@ if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
 /* Native messaging                                                    */
 /* ------------------------------------------------------------------ */
 
+/* IDM parity: IDM never hands a download back to the browser, and its
+   integration module is simply inert when IDM itself is not there.
+   Mirror that: while the native host is KNOWN to be missing, the
+   extension does not intercept at all and the browser keeps its own
+   download — exactly as if the extension were absent. */
+let ndmHostMissing = false;
+chrome.storage.local
+  .get({ ndmHostStatus: '' })
+  .then(v => {
+    ndmHostMissing = v.ndmHostStatus === 'host-missing';
+  })
+  .catch(() => {});
+
 function setHostStatus(status) {
+  ndmHostMissing = status === 'host-missing';
   chrome.storage.local.set({
     ndmHostStatus: status,
     ndmHostStatusAt: Date.now(),
@@ -317,7 +376,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         if (res && res.ok) return;
       } catch (e) {}
     }
-    const sniffed = tab && tab.id != null ? tabMediaStreams.get(tab.id) : '';
+    const sniffed = tab && tab.id != null ? await pickMasterStream(tab.id) : '';
     const url = isVideoPageUrl(pageUrl) ? pageUrl : (sniffed || pageUrl);
     sendToNdm({ kind: 'video', url, pageUrl, title, cookies: await captureCookies(url, pageUrl) });
   }
@@ -364,8 +423,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === 'ndm-tab-media') {
     const tabId = sender && sender.tab ? sender.tab.id : null;
-    sendResponse({ streamUrl: (tabId != null && tabMediaStreams.get(tabId)) || '' });
-    return false;
+    if (tabId == null) {
+      sendResponse({ streamUrl: '' });
+      return false;
+    }
+    pickMasterStream(tabId)
+      .then(u => sendResponse({ streamUrl: u || '' }))
+      .catch(() => sendResponse({ streamUrl: '' }));
+    return true;
   }
 
   if (message.action === 'ndm-show-app') {
@@ -469,6 +534,8 @@ const interceptedIds = new Set();
 
 function shouldInterceptItem(item) {
   if (!ndmInterceptEnabled || !item) return false;
+  // Host known missing → stay inert like IDM's module without IDM.
+  if (ndmHostMissing) return false;
   const url = item.finalUrl || item.url || '';
   if (!/^https?:\/\//i.test(url)) return false;
   const mimeHit =
@@ -533,7 +600,7 @@ async function handleInterceptedDownload(item, suggestedFilename) {
   // Fallback if the active tab cannot host content scripts (e.g. blank new tab or restricted page):
   // start directly in NDM background without forcing the desktop window open or stealing focus!
   const cookies = await captureCookies(url, referrer);
-  await sendToNdm({
+  const sent = await sendToNdm({
     kind: 'file_direct',
     url,
     pageUrl: referrer,
@@ -542,7 +609,23 @@ async function handleInterceptedDownload(item, suggestedFilename) {
     dir: '~/Downloads',
     later: false,
     total: totalBytes,
-  });
+  }).catch(() => null);
+  if (!sent || !sent.ok) {
+    // IDM parity: a refused direct start is NEVER handed back to the
+    // browser (IDM never returns downloads). Escalate to the app
+    // itself instead — the entry lands in the app's list/dialog where
+    // the user decides, the way IDM's own dialog is always available.
+    await sendToNdm({
+      kind: 'file',
+      url,
+      pageUrl: referrer,
+      title: cleanName,
+      cookies,
+      dir: '~/Downloads',
+      later: false,
+      total: totalBytes,
+    }).catch(() => null);
+  }
 }
 
 if (chrome.downloads.onDeterminingFilename) {
