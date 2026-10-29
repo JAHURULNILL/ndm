@@ -103,7 +103,7 @@ function render() {
     tr.innerHTML = `
       <td class="name">${escapeHtml(d.name)}${d.status === 'downloading' && d.total === 0 ? '<div class="pbar ind"></div>' : `<div class="pbar"><i data-pct="${pctOf(d).toFixed(1)}"></i></div>`}</td>
       <td>${d.total > 0 || st === 'finished' ? fmtSize(d.total) : 'Unknown'}</td>
-      <td class="st-${st}">${cap(st)}${st !== 'finished' && d.total > 0 ? ' ' + pctOf(d).toFixed(0) + '%' : ''}</td>
+      <td class="st-${st}"${st === 'error' && d.error ? ` title="${escapeHtml(d.error)}"` : ''}>${cap(st)}${st !== 'finished' && d.total > 0 ? ' ' + pctOf(d).toFixed(0) + '%' : ''}${st === 'error' && d.error ? ' — ' + escapeHtml(d.error.length > 60 ? d.error.slice(0, 60) + '…' : d.error) : ''}</td>
       <td>${st === 'finished' ? '—' : fmtLeft(left)}</td>
       <td>${st === 'downloading' ? fmtRate(d.speed_bps) : '—'}</td>
       <td>${escapeHtml(d.added || '')}</td>`;

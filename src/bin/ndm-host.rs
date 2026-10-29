@@ -70,8 +70,33 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
         obj["cookies"] = json!(cookies);
     }
     let line = obj.to_string() + "\n";
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(line.as_bytes())
+    // Several browser processes can hand over downloads at the same
+    // moment; a bare append from each can interleave bytes and corrupt
+    // a queue line. Take a small lock file first (bounded spin — after
+    // ~2 s, fall back to the plain append rather than losing the job).
+    let lock_path = path.with_extension("lock");
+    let mut _guard: Option<std::fs::File> = None;
+    for _ in 0..40 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(f) => {
+                _guard = Some(f);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let result = (|| {
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        file.write_all(line.as_bytes())
+    })();
+    if _guard.is_some() {
+        let _ = std::fs::remove_file(&lock_path);
+    }
+    result
 }
 
 /// Handles one parsed message; returns the reply object to frame back.
