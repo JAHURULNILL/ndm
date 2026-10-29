@@ -218,7 +218,12 @@ function sendToNdm(message) {
         if (!ok) console.warn('NDM host rejected the download:', response);
         resolve({
           ok,
-          error: (response && response.error) || 'Download rejected by NDM.',
+          // the app's entry id and duplicate flag ride along: the
+          // in-page dialogs act on them (keep / pause / discard the
+          // entry that started while the dialog was open)
+          id: response && response.id,
+          dupe: !!(response && response.dupe),
+          error: ok ? '' : (response && response.error) || 'Download rejected by NDM.',
         });
       });
     } catch (e) {
@@ -232,6 +237,34 @@ function sendToNdm(message) {
       setHostStatus('fail');
       r({ ok: false, error: 'Timed out waiting for NDM app.' });
     }, 25000)
+  );
+  return Promise.race([attempt, timeout]);
+}
+
+/* Pause or discard one existing entry (the browser dialog's Later /
+   Cancel now that downloads start while the dialog is open). */
+function sendControl(type, entry) {
+  const attempt = new Promise(resolve => {
+    try {
+      chrome.runtime.sendNativeMessage(HOST_NAME, { type, entry }, response => {
+        if (chrome.runtime.lastError) {
+          const text = chrome.runtime.lastError.message || '';
+          const missing = /not found|No such native/i.test(text);
+          setHostStatus(missing ? 'host-missing' : 'fail');
+          resolve({ ok: false, error: text || 'Could not reach NDM native host.' });
+          return;
+        }
+        const ok = !!(response && response.ok);
+        setHostStatus(ok ? 'ok' : 'fail');
+        resolve({ ok, error: ok ? '' : (response && response.error) || 'NDM rejected the request.' });
+      });
+    } catch (e) {
+      setHostStatus('host-missing');
+      resolve({ ok: false, error: String(e) });
+    }
+  });
+  const timeout = new Promise(r =>
+    setTimeout(() => r({ ok: false, error: 'Timed out waiting for NDM app.' }), 20000)
   );
   return Promise.race([attempt, timeout]);
 }
@@ -298,13 +331,53 @@ function probeFileWithNdm(url, pageUrl, cookies) {
 }
 
 function showAppWithNdm() {
+  // Bounded like every other host call: an unresponsive host must not
+  // leave the "Show in NDM" button spinning forever.
   return new Promise(resolve => {
+    let settled = false;
+    const done = v => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    setTimeout(() => done(false), 10000);
     try {
       chrome.runtime.sendNativeMessage(HOST_NAME, { type: 'show_app' }, response => {
-        resolve(!!(response && response.ok));
+        done(!!(response && response.ok));
       });
     } catch (e) {
-      resolve(false);
+      done(false);
+    }
+  });
+}
+
+/* Ping the host AND record the outcome as the shared host status, so
+   the popup's connectivity check also refreshes the interception
+   gate (the popup used to ping on its own, leaving the gate stale
+   right after a fresh host install). */
+function pingHostAndRecord() {
+  return new Promise(resolve => {
+    let settled = false;
+    const done = (ok, status) => {
+      if (settled) return;
+      settled = true;
+      setHostStatus(status);
+      resolve({ ok, status });
+    };
+    setTimeout(() => done(false, 'fail'), 5000);
+    try {
+      chrome.runtime.sendNativeMessage(HOST_NAME, { type: 'ping' }, response => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          const missing = /not found|No such native/i.test(err.message || '');
+          done(false, missing ? 'host-missing' : 'fail');
+        } else {
+          done(!!(response && response.ok), response && response.ok ? 'ok' : 'fail');
+        }
+      });
+    } catch (e) {
+      done(false, 'host-missing');
     }
   });
 }
@@ -433,6 +506,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.action === 'ndm-host-ping') {
+    pingHostAndRecord().then(r => sendResponse(r));
+    return true;
+  }
+
+  if (message.action === 'ndm-pause-entry' || message.action === 'ndm-cancel-entry') {
+    const type = message.action === 'ndm-pause-entry' ? 'pause_entry' : 'cancel_entry';
+    sendControl(type, String(message.entry || '')).then(r => sendResponse(r));
+    return true;
+  }
+
   if (message.action === 'ndm-show-app') {
     showAppWithNdm().then(ok => sendResponse({ ok }));
     return true;
@@ -481,6 +565,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         payload.dir = message.dir || '~/Downloads';
         payload.later = !!message.later;
         payload.total = Number(message.total) || 0;
+        payload.force = !!message.force;
       }
       const res = await sendToNdm(payload);
       sendResponse(res);

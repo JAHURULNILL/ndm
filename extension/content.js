@@ -372,16 +372,16 @@
     }, 120);
   }
 
-  function showBrowserToast(title, qualityLabel, sizeLabel, later) {
+  function showBrowserToast(title, qualityLabel, sizeLabel, later, badgeText) {
     if (!shadowRoot) return;
     const old = shadowRoot.querySelector('.ndm-toast');
     if (old) old.remove();
     const toast = document.createElement('div');
     toast.className = 'ndm-toast';
-    const badge = later ? '⏸ Queued in NDM' : '⬇ Downloading in NDM';
+    const badge = badgeText || (later ? '⏸ Queued in NDM' : '⬇ Downloading in NDM');
     const sub = [qualityLabel, sizeLabel].filter(Boolean).join(' • ');
     toast.innerHTML = `
-      <div class="ndm-toast-icon">${later ? '⏸' : '⬇'}</div>
+      <div class="ndm-toast-icon">${badgeText ? '✓' : (later ? '⏸' : '⬇')}</div>
       <div class="ndm-toast-body">
         <div class="ndm-toast-head">${escapeHtml(badge)}</div>
         <div class="ndm-toast-title">${escapeHtml(title)}</div>
@@ -493,6 +493,7 @@
         <button class="ndm-btn ndm-btn-ghost ndm-btn-app" type="button" title="Open this video in the NDM desktop app window">Open in NDM App</button>
         <div class="ndm-m-foot-right">
           <button class="ndm-btn ndm-btn-secondary ndm-btn-cancel" type="button">Cancel</button>
+          <button class="ndm-btn ndm-btn-secondary ndm-btn-all" type="button" disabled title="Download every listed quality (IDM's Download all)">Download all</button>
           <button class="ndm-btn ndm-btn-secondary ndm-btn-later" type="button" disabled>Download Later</button>
           <button class="ndm-btn ndm-btn-primary ndm-btn-start" type="button" disabled>⬇ Start Download</button>
         </div>
@@ -517,6 +518,7 @@
     const btnCancel = dialog.querySelector('.ndm-btn-cancel');
     const btnApp = dialog.querySelector('.ndm-btn-app');
     const btnLater = dialog.querySelector('.ndm-btn-later');
+    const btnAll = dialog.querySelector('.ndm-btn-all');
     const btnStart = dialog.querySelector('.ndm-btn-start');
 
     titleIn.value = fallbackTitle;
@@ -526,10 +528,10 @@
       e.stopPropagation();
       if (e.key === 'Escape') {
         e.preventDefault();
-        closeBrowserModal();
+        dismissVideoCancel();
       } else if (e.key === 'Enter' && !btnStart.disabled) {
         e.preventDefault();
-        triggerDownload(false);
+        btnStart.click();
       }
     });
 
@@ -549,10 +551,21 @@
 
     if (fallbackThumb) showThumbnail(fallbackThumb);
 
-    btnClose.addEventListener('click', closeBrowserModal);
-    btnCancel.addEventListener('click', closeBrowserModal);
+    btnClose.addEventListener('click', () => dismissVideoCancel());
+    btnCancel.addEventListener('click', () => dismissVideoCancel());
 
     btnApp.addEventListener('click', async () => {
+      if (vspec.id) {
+        // already downloading in the app (started while this dialog
+        // was open): just show the app
+        vspec.closed = true;
+        closeBrowserModal();
+        flashPill(pillBtn, pillContainer, true, 'Opened in NDM ✓');
+        try {
+          await chrome.runtime.sendMessage({ action: 'ndm-show-app' });
+        } catch (e) {}
+        return;
+      }
       btnApp.disabled = true;
       btnApp.textContent = 'Opening NDM…';
       try {
@@ -670,27 +683,176 @@
           }
           row.classList.add('sel');
           updateStartButtonLabel();
+          // picking a quality is what starts it (IDM's panel pick
+          // opens the already-downloading File Info dialog)
+          vspecSwitch(q);
         });
         row.addEventListener('dblclick', () => {
           selectedOption = q;
-          triggerDownload(false);
+          btnStart.click();
         });
         qListEl.appendChild(row);
       }
 
+      allQualities = qualities;
+      btnAll.disabled = false;
       btnStart.disabled = false;
       btnLater.disabled = false;
       updateStartButtonLabel();
+      if (!vspec.started && !vspec.closed) vspecStart(selectedOption);
     }
 
     function updateStartButtonLabel() {
       if (!selectedOption) return;
+      if (vspec.id) {
+        btnStart.textContent = '✓ Keep downloading';
+        return;
+      }
       const sz = selectedOption.size_text || (selectedOption.size_bytes ? fmtBytes(selectedOption.size_bytes) : '');
       btnStart.textContent = sz
         ? `⬇ Start Download (${sz})`
         : '⬇ Start Download';
     }
 
+    let pendingForce = false; // set after a duplicate refusal: the
+    // next send is the user's explicit "download it again" (IDM asks
+    // about duplicate links instead of refusing silently)
+
+    /* ── IDM parity: the selected quality starts downloading while
+       this dialog is open (its File Info dialog behavior). Switching
+       quality restarts with the new one; Start = keep, Later =
+       pause in the app, Cancel = discard completely. A failed
+       speculative start falls back to the classic send-on-click. ── */
+    const vspec = {
+      started: false,
+      inflight: false,
+      id: null,
+      selector: null,
+      failed: false,
+      pending: null,
+      closed: false,
+    };
+    let allQualities = [];
+
+    async function vspecControl(action) {
+      if (!vspec.id) return;
+      try {
+        await chrome.runtime.sendMessage({ action, entry: vspec.id });
+      } catch (e) {}
+    }
+
+    function dismissVideoKeep() {
+      vspec.closed = true;
+      closeBrowserModal();
+      flashPill(pillBtn, pillContainer, true, 'Downloading in NDM ✓');
+      showBrowserToast(
+        titleIn.value.trim() || fallbackTitle,
+        selectedOption ? selectedOption.label || '' : '',
+        '',
+        false
+      );
+    }
+
+    async function dismissVideoLater() {
+      vspec.closed = true;
+      closeBrowserModal();
+      if (vspec.id) await vspecControl('ndm-pause-entry');
+      flashPill(pillBtn, pillContainer, true, 'Paused in NDM ✓');
+      showBrowserToast(
+        titleIn.value.trim() || fallbackTitle,
+        selectedOption ? selectedOption.label || '' : '',
+        '',
+        true
+      );
+    }
+
+    function dismissVideoCancel() {
+      if (vspec.closed) return;
+      vspec.closed = true;
+      if (vspec.id) {
+        vspecControl('ndm-cancel-entry');
+      } else if (vspec.inflight) {
+        vspec.pending = 'cancel';
+      }
+      closeBrowserModal();
+    }
+
+    async function vspecStart(q) {
+      if (!q || vspec.inflight) return;
+      vspec.inflight = true;
+      vspec.started = true;
+      vspec.selector = q.selector;
+      let resp = null;
+      try {
+        resp = await chrome.runtime.sendMessage({
+          action: 'ndm-download',
+          kind: 'video_direct',
+          url: targetUrl,
+          pageUrl: location.href,
+          title: titleIn.value.trim() || fallbackTitle,
+          selector: q.selector,
+          audio: !!q.audio,
+          dir: dirIn.value.trim() || '~/Downloads',
+          later: false,
+          total: Number(q.size_bytes) || 0,
+          force: false,
+        });
+      } catch (e) {}
+      vspec.inflight = false;
+      const gone = vspec.closed || myToken !== activeProbeToken;
+      if (resp && resp.ok && resp.id) {
+        vspec.id = resp.id;
+        if (gone) {
+          if (vspec.pending === 'cancel') vspecControl('ndm-cancel-entry');
+          else if (vspec.pending === 'later') vspecControl('ndm-pause-entry');
+          return;
+        }
+        if (vspec.pending === 'cancel') { dismissVideoCancel(); return; }
+        if (vspec.pending === 'later') { dismissVideoLater(); return; }
+        if (vspec.pending === 'keep') { dismissVideoKeep(); return; }
+        titleIn.disabled = true;
+        dirIn.disabled = true;
+        statusEl.style.display = 'block';
+        statusEl.className = 'ndm-m-status';
+        statusEl.textContent = '⬇ Downloading in NDM…';
+        btnStart.textContent = '✓ Keep downloading';
+      } else if (
+        resp &&
+        typeof resp.error === 'string' &&
+        resp.error.startsWith('duplicate:')
+      ) {
+        // this quality is already downloading: not ours to control —
+        // Start becomes the explicit "Download again" (force path)
+        vspec.failed = true;
+        pendingForce = true;
+        if (!gone) {
+          showError('This quality is already in your download list. Press "Download again" to save a second copy.');
+          btnStart.textContent = '⬇ Download again';
+        }
+      } else if (!gone) {
+        vspec.failed = true;
+      }
+    }
+
+    async function vspecSwitch(q) {
+      if (vspec.failed || pendingForce || vspec.closed) return;
+      if (!vspec.started) {
+        vspecStart(q);
+        return;
+      }
+      if (vspec.inflight) return;
+      if (vspec.id && vspec.selector !== q.selector) {
+        const old = vspec.id;
+        vspec.id = null;
+        vspec.selector = null;
+        titleIn.disabled = false;
+        dirIn.disabled = false;
+        try {
+          await chrome.runtime.sendMessage({ action: 'ndm-cancel-entry', entry: old });
+        } catch (e) {}
+        if (!vspec.closed) vspecStart(q);
+      }
+    }
     async function triggerDownload(later) {
       if (!selectedOption) return;
       const chosenDir = dirIn.value.trim() || '~/Downloads';
@@ -719,6 +881,7 @@
           dir: chosenDir,
           later: !!later,
           total: Number(selectedOption.size_bytes) || 0,
+          force: pendingForce,
         });
         ok = !!(resp && resp.ok);
       } catch (e) {
@@ -726,6 +889,7 @@
       }
 
       if (ok) {
+        pendingForce = false;
         closeBrowserModal();
         flashPill(
           pillBtn,
@@ -734,6 +898,12 @@
           later ? 'Paused in NDM ✓' : 'Downloading in NDM ✓'
         );
         showBrowserToast(chosenTitle, qLabel, szLabel, later);
+      } else if (resp && typeof resp.error === 'string' && resp.error.startsWith('duplicate:')) {
+        pendingForce = true;
+        showError('This quality is already in your download list. Press "Download again" to save a second copy.');
+        btnStart.disabled = false;
+        btnLater.disabled = false;
+        btnStart.textContent = '⬇ Download again';
       } else {
         showError((resp && resp.error) || 'NDM could not be started. Make sure the NDM desktop app is installed.');
         btnStart.disabled = false;
@@ -742,8 +912,66 @@
       }
     }
 
-    btnStart.addEventListener('click', () => triggerDownload(false));
-    btnLater.addEventListener('click', () => triggerDownload(true));
+    btnStart.addEventListener('click', () => {
+      if (vspec.id) {
+        dismissVideoKeep();
+      } else if (vspec.inflight) {
+        vspec.pending = 'keep';
+        btnStart.disabled = true;
+        btnLater.disabled = true;
+        btnStart.textContent = 'Starting in NDM…';
+      } else {
+        triggerDownload(false);
+      }
+    });
+    btnLater.addEventListener('click', () => {
+      if (vspec.id) {
+        dismissVideoLater();
+      } else if (vspec.inflight) {
+        vspec.pending = 'later';
+        btnStart.disabled = true;
+        btnLater.disabled = true;
+      } else {
+        triggerDownload(true);
+      }
+    });
+    btnAll.addEventListener('click', async () => {
+      if (!allQualities.length) return;
+      btnAll.disabled = true;
+      btnAll.textContent = 'Sending all…';
+      let sent = 0;
+      let skipped = 0;
+      for (const q of allQualities) {
+        try {
+          const r = await chrome.runtime.sendMessage({
+            action: 'ndm-download',
+            kind: 'video_direct',
+            url: targetUrl,
+            pageUrl: location.href,
+            title: titleIn.value.trim() || fallbackTitle,
+            selector: q.selector,
+            audio: !!q.audio,
+            dir: dirIn.value.trim() || '~/Downloads',
+            later: false,
+            total: Number(q.size_bytes) || 0,
+            force: false,
+          });
+          if (r && r.ok) sent++;
+          else skipped++;
+        } catch (e) {
+          skipped++;
+        }
+      }
+      vspec.closed = true;
+      closeBrowserModal();
+      flashPill(pillBtn, pillContainer, true, `Download all: ${sent} sent ✓`);
+      showBrowserToast(
+        titleIn.value.trim() || fallbackTitle,
+        `Download all — ${sent} qualities sent to NDM${skipped ? `, ${skipped} skipped` : ''}`,
+        '',
+        false
+      );
+    });
 
     // 1. Check instant cache (0ms on YouTube or pre-probed pages!)
     const cached = localProbeCache.get(targetUrl) || localProbeCache.get(canonicalVideoKey(location.href));
@@ -899,17 +1127,26 @@
       e.stopPropagation();
       if (e.key === 'Escape') {
         e.preventDefault();
-        closeBrowserModal();
+        dismissAsCancel();
       } else if (e.key === 'Enter' && !btnStart.disabled) {
         e.preventDefault();
-        triggerFileDownload(false);
+        btnStart.click();
       }
     });
 
-    btnClose.addEventListener('click', closeBrowserModal);
-    btnCancel.addEventListener('click', closeBrowserModal);
+    btnClose.addEventListener('click', () => dismissAsCancel());
+    btnCancel.addEventListener('click', () => dismissAsCancel());
 
     btnApp.addEventListener('click', async () => {
+      if (spec.id) {
+        // the download is already running in the app (it started
+        // while this dialog was open): just show the app
+        dismissAsKeep();
+        try {
+          await chrome.runtime.sendMessage({ action: 'ndm-show-app' });
+        } catch (e) {}
+        return;
+      }
       btnApp.disabled = true;
       btnApp.textContent = 'Opening NDM…';
       try {
@@ -933,6 +1170,7 @@
     });
 
     async function triggerFileDownload(later) {
+      spec.started = true; // the classic path replaces the speculative one
       const chosenDir = dirIn.value.trim() || '~/Downloads';
       const chosenName = nameIn.value.trim() || initialName;
       const szLabel = currentBytes > 0 ? fmtBytes(currentBytes) : '';
@@ -964,7 +1202,13 @@
 
       if (ok) {
         closeBrowserModal();
-        showBrowserToast(chosenName, catEl.textContent || 'File', szLabel, later);
+        if (resp && resp.dupe) {
+          // IDM asks about duplicates; the silent path just points
+          // at the entry that is already downloading
+          showBrowserToast(chosenName, 'This file is already in the download list', '', false, '✓ Already in NDM');
+        } else {
+          showBrowserToast(chosenName, catEl.textContent || 'File', szLabel, later);
+        }
       } else {
         statusEl.style.display = 'block';
         statusEl.className = 'ndm-m-status err';
@@ -977,8 +1221,165 @@
       }
     }
 
-    btnStart.addEventListener('click', () => triggerFileDownload(false));
-    btnLater.addEventListener('click', () => triggerFileDownload(true));
+    /* ── IDM's File Info behavior: the download starts while this
+       dialog is open. Start = keep it downloading, Download Later =
+       pause it inside the app, Cancel = discard it completely (the
+       click is consumed; the browser never takes the file). If the
+       speculative start fails, the buttons fall back to the classic
+       send-on-click behavior. ── */
+    const spec = {
+      started: false, // a start (speculative or classic) was kicked off
+      inflight: false, // the speculative send has not answered yet
+      id: null, // the app entry this dialog is bound to
+      owned: false, // this dialog created the entry
+      dupe: false, // the entry already existed (not ours to discard)
+      failed: false, // speculative start failed → classic buttons
+      pending: null, // 'keep' | 'later' | 'cancel' clicked mid-flight
+      closed: false,
+    };
+
+    function specNote(text) {
+      statusEl.style.display = 'block';
+      statusEl.className = 'ndm-m-status';
+      statusEl.textContent = text;
+    }
+
+    async function specControl(action) {
+      if (!spec.id) return;
+      try {
+        await chrome.runtime.sendMessage({ action, entry: spec.id });
+      } catch (e) {}
+    }
+
+    function dismissAsKeep() {
+      spec.closed = true;
+      closeBrowserModal();
+      showBrowserToast(
+        nameIn.value.trim() || initialName,
+        catEl.textContent || 'File',
+        currentBytes > 0 ? fmtBytes(currentBytes) : '',
+        false
+      );
+    }
+
+    async function dismissAsLater() {
+      spec.closed = true;
+      closeBrowserModal();
+      if (spec.owned) await specControl('ndm-pause-entry');
+      showBrowserToast(
+        nameIn.value.trim() || initialName,
+        catEl.textContent || 'File',
+        currentBytes > 0 ? fmtBytes(currentBytes) : '',
+        true
+      );
+    }
+
+    function dismissAsCancel() {
+      if (spec.closed) return;
+      spec.closed = true;
+      if (spec.owned && spec.id) {
+        specControl('ndm-cancel-entry');
+      } else if (spec.inflight) {
+        spec.pending = 'cancel';
+      }
+      closeBrowserModal();
+    }
+
+    async function specStart() {
+      if (spec.started || spec.closed) return;
+      spec.started = true;
+      spec.inflight = true;
+      const chosenDir = dirIn.value.trim() || '~/Downloads';
+      const chosenName = nameIn.value.trim() || initialName;
+      let resp = null;
+      try {
+        resp = await chrome.runtime.sendMessage({
+          action: 'ndm-download',
+          kind: 'file_direct',
+          url: targetUrl,
+          pageUrl: pageReferrer,
+          title: chosenName,
+          dir: chosenDir,
+          later: false,
+          total: currentBytes,
+        });
+      } catch (e) {}
+      spec.inflight = false;
+      const gone = spec.closed || myToken !== activeProbeToken;
+      if (resp && resp.ok && resp.id) {
+        spec.id = resp.id;
+        spec.dupe = !!resp.dupe;
+        spec.owned = !resp.dupe;
+        if (gone) {
+          // the user decided while the start was in flight
+          if (spec.pending === 'cancel' && spec.owned) {
+            specControl('ndm-cancel-entry');
+          } else if (spec.pending === 'later' && spec.owned) {
+            specControl('ndm-pause-entry');
+          }
+          return;
+        }
+        if (spec.pending === 'cancel') {
+          dismissAsCancel();
+          return;
+        }
+        if (spec.pending === 'later') {
+          dismissAsLater();
+          return;
+        }
+        if (spec.pending === 'keep') {
+          dismissAsKeep();
+          return;
+        }
+        if (spec.dupe) {
+          specNote('Already in your NDM download list — downloading there.');
+          btnStart.textContent = 'OK';
+          btnLater.disabled = true;
+        } else {
+          // lock the fields the running entry already took
+          nameIn.disabled = true;
+          dirIn.disabled = true;
+          specNote('⬇ Downloading in NDM…');
+          btnStart.textContent = '✓ Keep downloading';
+        }
+      } else if (!gone) {
+        spec.failed = true;
+      }
+    }
+
+    btnStart.addEventListener('click', () => {
+      if (spec.dupe) {
+        spec.closed = true;
+        closeBrowserModal();
+      } else if (spec.owned) {
+        dismissAsKeep();
+      } else if (spec.inflight) {
+        spec.pending = 'keep';
+        btnStart.disabled = true;
+        btnLater.disabled = true;
+        btnStart.textContent = 'Starting in NDM…';
+      } else {
+        triggerFileDownload(false);
+      }
+    });
+    btnLater.addEventListener('click', () => {
+      if (spec.dupe) {
+        spec.closed = true;
+        closeBrowserModal();
+      } else if (spec.owned) {
+        dismissAsLater();
+      } else if (spec.inflight) {
+        spec.pending = 'later';
+        btnStart.disabled = true;
+        btnLater.disabled = true;
+        btnLater.textContent = 'Queueing in NDM…';
+      } else {
+        triggerFileDownload(true);
+      }
+    });
+
+    // if the probe hangs, start anyway with what the page gave us
+    setTimeout(() => specStart(), 4000);
 
     // Probe exact file size, resumability & Content-Disposition filename in background
     try {
@@ -992,11 +1393,11 @@
         if (res.total && res.total > 0) {
           currentBytes = res.total;
           sizeEl.textContent = fmtBytes(res.total);
-          btnStart.textContent = `⬇ Start Download (${fmtBytes(res.total)})`;
+          if (!spec.id) btnStart.textContent = `⬇ Start Download (${fmtBytes(res.total)})`;
         } else {
           sizeEl.textContent = 'Stream / Unknown size';
         }
-        if (res.suggested_name && !userEditedName) {
+        if (res.suggested_name && !userEditedName && !spec.id) {
           nameIn.value = res.suggested_name;
           catEl.textContent = res.category || categoryForName(res.suggested_name);
         }
@@ -1011,6 +1412,9 @@
         sizeEl.textContent = 'Ready to download';
       }
     }
+    // the probe has settled (or failed): start the download now,
+    // while the dialog stays open — IDM's File Info behavior
+    specStart();
   }
 
   function escapeHtml(s) {
@@ -1465,22 +1869,36 @@
   /* appearing and opens NDM's in-browser file dialog at 0ms!         */
   /* ---------------------------------------------------------------- */
 
+  // ONE canonical extension list for the whole extension — identical
+  // to FILE_EXTENSIONS in background.js (IDM likewise has a single
+  // File Types list). The two layers must never drift apart again:
+  // a bare .mp4/.webm link click is only ever seen by THIS layer
+  // (the browser would otherwise just play the file in a tab).
   const INTERCEPT_EXTS = new Set([
-    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz',
-    'exe', 'msi', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'appimage', 'flatpakref',
-    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'epub', 'mobi',
-    'mp3', 'flac', 'aac', 'ogg', 'm4a', 'opus', 'wav',
-    'mkv', 'avi', 'mov', 'torrent',
+    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz', 'cab',
+    'exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'run', 'appimage', 'flatpakref',
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'txt', 'rtf', 'epub', 'mobi',
+    'mp3', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flac', 'aac', 'ogg', 'm4a', 'm4b', 'opus', 'wav', 'wma', 'flv', 'wmv', '3gp', 'm4v', 'ts',
+    'torrent', 'jar', 'war', 'whl', 'vmdk', 'qcow2', 'vdi',
   ]);
 
   let ndmInterceptActive = true;
+  // IDM parity, same as the background layer: while the native host
+  // is KNOWN to be missing the module stays inert — a click must
+  // behave as if the extension were not there at all.
+  let ndmHostKnownMissing = false;
   try {
-    chrome.storage.local.get({ ndmIntercept: true }).then(v => {
+    chrome.storage.local.get({ ndmIntercept: true, ndmHostStatus: '' }).then(v => {
       ndmInterceptActive = v.ndmIntercept !== false;
+      ndmHostKnownMissing = v.ndmHostStatus === 'host-missing';
     }).catch(() => {});
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area === 'local' && changes.ndmIntercept) {
+      if (area !== 'local') return;
+      if (changes.ndmIntercept) {
         ndmInterceptActive = changes.ndmIntercept.newValue !== false;
+      }
+      if (changes.ndmHostStatus) {
+        ndmHostKnownMissing = changes.ndmHostStatus.newValue === 'host-missing';
       }
     });
   } catch (e) {}
@@ -1498,7 +1916,7 @@
         const dlAttr = (a.getAttribute('download') || '').toLowerCase();
         const dlDot = dlAttr.lastIndexOf('.');
         const dlExt = dlDot >= 0 ? dlAttr.slice(dlDot + 1) : '';
-        if (INTERCEPT_EXTS.has(dlExt) || dlExt === 'mp4' || dlExt === 'webm') return true;
+        if (INTERCEPT_EXTS.has(dlExt)) return true;
       }
     } catch (e) {}
     return false;
@@ -1508,6 +1926,7 @@
     'click',
     e => {
       if (!ndmInterceptActive) return;
+      if (ndmHostKnownMissing) return;
       if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
       const target = e.target && e.target.closest ? e.target.closest('a[href]') : null;
       if (!target || !isDirectDownloadLink(target)) return;
