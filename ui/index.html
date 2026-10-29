@@ -118,6 +118,8 @@
       <li data-cat="Finished">✓ Finished</li>
       <li data-cat="Grabber">↗ Grabber projects</li>
     </ul>
+    <div class="side-head">QUEUES</div>
+    <ul id="queueList"></ul>
     <div id="sideStatus" class="side-status">0 files (0 downloading)</div>
   </aside>
 
@@ -154,6 +156,8 @@
       <div class="bar"><div id="dBarFill"></div><span id="dBarText">0.0%</span></div>
       <div class="seg-label">Download progress by connection:</div>
       <canvas id="segMap" width="760" height="86"></canvas>
+      <div id="dConns" class="d-conns"></div>
+      <div class="opt-row"><span>Queue</span><select id="dQueueSel"></select></div>
       <div class="detail-btns">
         <button id="dPause">Pause</button><button id="dResumeBtn">Resume</button>
         <button id="dHide">Hide</button><button id="dOpen">Open</button><button id="dOpenFolder">Open Folder</button><button id="dRefresh">↻ Refresh URL</button>
@@ -201,6 +205,18 @@
     <label>Save to folder
       <input id="inDir" type="text" value="~/Downloads" spellcheck="false">
     </label>
+    <label>Queue
+      <select id="inQueue"></select>
+    </label>
+    <label class="opt-check"><input id="inAuth" type="checkbox"> Use authorization (this download needs a login)</label>
+    <div id="inAuthBox" class="hidden">
+      <label>Login
+        <input id="inLogin" type="text" spellcheck="false" autocomplete="off">
+      </label>
+      <label>Password
+        <input id="inPassword" type="password" autocomplete="off">
+      </label>
+    </div>
     <div class="modal-btns">
       <button id="btnStart" class="tool primary">⬇ Start Download</button>
       <button id="btnLater" class="tool">Download Later</button>
@@ -217,6 +233,9 @@
     </label>
     <label>Save to folder
       <input id="vInDir" type="text" value="~/Downloads" spellcheck="false">
+    </label>
+    <label>Queue
+      <select id="vInQueue"></select>
     </label>
     <div class="modal-btns left">
       <button id="vFetch" class="tool primary">Fetch Info</button>
@@ -249,6 +268,7 @@
     </div>
     <div class="modal-btns">
       <button id="vStart" class="tool primary" disabled>⬇ Start Download</button>
+      <button id="vAll" class="tool" disabled title="Download every listed quality">Download all</button>
       <button id="vLater" class="tool" disabled>Download Later</button>
       <button id="vCancel" class="tool">Cancel</button>
     </div>
@@ -282,6 +302,21 @@
     </div>
     <div class="opt-row"><span>Proxy (optional)</span><input id="oProxy" type="text" placeholder="http://127.0.0.1:8080" spellcheck="false"></div>
     <div class="opt-note">Applies to new connections — files, the grabber and video. Empty = direct connection.</div>
+    <div class="opt-note" style="font-weight:600;color:inherit">Category folders — a category's own folder is used when a download would otherwise go to the default folder (like IDM's category rules). Empty = default folder.</div>
+    <div class="opt-row"><span>Compressed folder</span><input id="oCatCompressed" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Documents folder</span><input id="oCatDocuments" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Music folder</span><input id="oCatMusic" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Video folder</span><input id="oCatVideo" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Programs folder</span><input id="oCatPrograms" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>General folder</span><input id="oCatGeneral" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Per-server connections</span><input id="oConnExc" type="text" placeholder="Example: slow-server.com = 1, *.example.org = 2" spellcheck="false"></div>
+    <div class="opt-note">Servers listed here get fewer parallel connections than the global setting (IDM's connection exceptions). Separate entries with commas.</div>
+    <label class="opt-check"><input id="oExitDone" type="checkbox"> Exit NDM when all downloads finish</label>
+    <label class="opt-check"><input id="oSounds" type="checkbox"> Play a sound when a download completes or fails</label>
+    <label class="opt-check"><input id="oCompleteDlg" type="checkbox"> Show the "Download complete" dialog</label>
+    <label class="opt-check"><input id="oClipboard" type="checkbox"> Watch the clipboard for download links</label>
+    <div class="opt-row"><span>Download limit (MB per period, 0 = off)</span><input id="oQuotaMb" type="number" min="0" step="50"></div>
+    <div class="opt-row"><span>Limit period (hours)</span><input id="oQuotaHours" type="number" min="1" max="168"></div>
     <div class="modal-btns">
       <button id="oSave" class="tool primary">Save</button>
       <button id="oCancel" class="tool">Cancel</button>
@@ -289,13 +324,31 @@
   </div>
 </div>
 
+<div id="cmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Download complete <span id="cModalClose">×</span></div>
+    <div class="opt-row"><span id="cName" style="font-weight:600"></span></div>
+    <div class="opt-note" id="cPath" style="word-break:break-all"></div>
+    <div class="opt-note" id="cSize"></div>
+    <label class="opt-check"><input id="cDontShow" type="checkbox"> Don't show this dialog again</label>
+    <div class="modal-btns">
+      <button id="cOpen" class="tool primary">Open</button>
+      <button id="cOpenFolder" class="tool">Open folder</button>
+      <button id="cClose" class="tool">Close</button>
+    </div>
+  </div>
+</div>
+
 <div id="smodal" class="modal hidden">
   <div class="modal-card">
     <div class="modal-head">Scheduler <span id="sModalClose">×</span></div>
-    <label class="opt-check"><input id="sEnabled" type="checkbox"> Enable scheduler</label>
+    <div class="opt-row"><span>Queue</span><select id="schedQueueSel"></select></div>
+    <label class="opt-check"><input id="sEnabled" type="checkbox"> Enable scheduler for this queue</label>
     <div class="opt-row"><span>Start downloads at</span><input id="sStart" type="time"></div>
     <div class="opt-row"><span>Stop downloads at</span><input id="sStop" type="time"></div>
-    <div class="opt-note">Max simultaneous downloads: <b id="sSimulVal">—</b> (set in Options)</div>
+    <label class="opt-check"><input id="schedExitDone" type="checkbox"> Exit NDM when this queue finishes</label>
+    <div class="opt-note">Max simultaneous downloads per queue: <b id="sSimulVal">—</b> (set in Options)</div>
+    <div class="opt-row"><input id="schedNewName" type="text" placeholder="New queue name" spellcheck="false"><button id="schedNew" class="tool">New queue</button><button id="schedDelete" class="tool">Delete queue</button></div>
     <div class="modal-btns left">
       <button id="sStartNow" class="tool">▶ Start Queue Now</button>
       <button id="sStopNow" class="tool">⏸ Stop Queue Now</button>
