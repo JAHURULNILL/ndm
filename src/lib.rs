@@ -155,6 +155,9 @@ pub struct Progress {
     pub blocks: Vec<u8>,
     pub resumable: bool,
     pub error: Option<String>,
+    /// cumulative bytes fetched by each connection this session —
+    /// the data behind IDM's per-connection progress table
+    pub conn_bytes: Vec<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -218,6 +221,9 @@ struct Shared {
     /// (indexed by worker id) — lets progress show partial blocks without
     /// ever double-counting re-fetched bytes
     partial: Vec<AtomicU64>,
+    /// cumulative bytes fetched per worker this session (never reset
+    /// mid-session) — IDM's per-connection "Downloaded" column
+    conn_bytes: Vec<AtomicU64>,
 }
 
 fn save_state(shared: &Shared, force: bool) {
@@ -352,6 +358,9 @@ pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit
 pub struct Auth {
     pub cookie: Option<String>,
     pub referer: Option<String>,
+    /// full Authorization header value (e.g. "Basic …") from the
+    /// Add URL dialog's "Use authorization" fields (IDM parity)
+    pub authorization: Option<String>,
 }
 
 fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
@@ -361,6 +370,9 @@ fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
     }
     if let Some(r) = &auth.referer {
         req = req.set("Referer", r);
+    }
+    if let Some(a) = &auth.authorization {
+        req = req.set("Authorization", a);
     }
     req
 }
@@ -643,6 +655,9 @@ fn download_block_run(
         write_at(file, &buf[..n], *pos).map_err(|e| BlockError::Retry(format!("write: {e}")))?;
         *pos += n as u64;
         shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
+        if let Some(cb) = shared.conn_bytes.get(worker_id) {
+            cb.fetch_add(n as u64, Ordering::Relaxed);
+        }
         shared.since_save.fetch_add(n as u64, Ordering::Relaxed);
 
         // Mark any completed blocks in this contiguous run immediately
@@ -921,6 +936,12 @@ impl Download {
             blocks,
             resumable: self.resumable,
             error: self.shared.error.lock().unwrap().clone(),
+            conn_bytes: self
+                .shared
+                .conn_bytes
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .collect(),
         }
     }
 
@@ -1096,6 +1117,7 @@ fn start_impl(
         block_state,
         status: Mutex::new(Status::Downloading),
         partial: (0..max_conn).map(|_| AtomicU64::new(0)).collect(),
+        conn_bytes: (0..max_conn).map(|_| AtomicU64::new(0)).collect(),
         auth: auth.clone(),
     });
 
@@ -1203,6 +1225,7 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         block_state: vec![AtomicU8::new(1)],
         status: Mutex::new(Status::Finished),
         partial: vec![AtomicU64::new(0)],
+        conn_bytes: vec![AtomicU64::new(0)],
         auth: Auth::default(),
     });
     Arc::new(Download {
@@ -1247,6 +1270,7 @@ fn start_single_stream(
         block_state: vec![AtomicU8::new(0)],
         status: Mutex::new(Status::Downloading),
         partial: vec![AtomicU64::new(0)],
+        conn_bytes: vec![AtomicU64::new(0)],
         auth: auth.clone(),
     });
     let download = Arc::new(Download {
@@ -1301,6 +1325,9 @@ fn start_single_stream(
                     ));
                 }
                 shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
+                if let Some(cb) = shared.conn_bytes.first() {
+                    cb.fetch_add(n as u64, Ordering::Relaxed);
+                }
                 throttle_global(n as u64, read_at);
             }
             // a clean early EOF must not pose as a finished file
