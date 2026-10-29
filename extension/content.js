@@ -272,17 +272,51 @@
     }
   }
 
+  function getYouTubeVideoId(urlStr) {
+    try {
+      const u = new URL(urlStr || location.href);
+      if (u.hostname.includes('youtube.com')) {
+        if (u.pathname.startsWith('/shorts/')) {
+          return u.pathname.split('/shorts/')[1]?.split(/[/?#]/)[0] || '';
+        }
+        return u.searchParams.get('v') || '';
+      }
+      if (u.hostname === 'youtu.be') {
+        return u.pathname.slice(1).split(/[/?#]/)[0] || '';
+      }
+    } catch (e) {}
+    return '';
+  }
+
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || e.data.source !== 'ndm-page-hook') return;
     if (e.data.type === 'ndm-player-info' && e.data.info) {
+      // Validate origin: only trust YouTube pages
+      const host = location.hostname.toLowerCase();
+      if (!host.endsWith('youtube.com') && host !== 'youtube.com') return;
+
+      const expectedId = getYouTubeVideoId(location.href);
       const info = e.data.info;
-      if (info.options && info.options.length) {
-        if (info.url) localProbeCache.set(canonicalVideoKey(info.url), info);
-        if (e.data.pageUrl) localProbeCache.set(canonicalVideoKey(e.data.pageUrl), info);
-        localProbeCache.set(canonicalVideoKey(location.href), info);
-        if (typeof onInstantInfoCallback === 'function') {
-          onInstantInfoCallback(info);
-        }
+      if (!expectedId || info.videoId !== expectedId) return;
+
+      // Validate options format to prevent DOM event injection
+      if (!Array.isArray(info.options) || !info.options.length) return;
+      const validOptions = [];
+      const SAFE_SELECTOR_RE = /^[a-zA-Z0-9_\-*+/[\]=<>. ]+$/;
+      for (const opt of info.options) {
+        if (!opt || typeof opt !== 'object') continue;
+        if (typeof opt.selector !== 'string' || !SAFE_SELECTOR_RE.test(opt.selector)) continue;
+        if (typeof opt.ext !== 'string' || !/^[a-zA-Z0-9]{2,5}$/.test(opt.ext)) continue;
+        validOptions.push(opt);
+      }
+      if (!validOptions.length) return;
+      info.options = validOptions;
+
+      if (info.url) localProbeCache.set(canonicalVideoKey(info.url), info);
+      if (e.data.pageUrl) localProbeCache.set(canonicalVideoKey(e.data.pageUrl), info);
+      localProbeCache.set(canonicalVideoKey(location.href), info);
+      if (typeof onInstantInfoCallback === 'function') {
+        onInstantInfoCallback(info);
       }
     }
   });
@@ -673,7 +707,7 @@
 
       let ok = false;
       try {
-        const resp = await chrome.runtime.sendMessage({
+        resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
           kind: 'video_direct',
           url: targetUrl,
@@ -700,7 +734,7 @@
         );
         showBrowserToast(chosenTitle, qLabel, szLabel, later);
       } else {
-        showError('NDM could not be started. Make sure the NDM desktop app is installed.');
+        showError((resp && resp.error) || 'NDM could not be started. Make sure the NDM desktop app is installed.');
         btnStart.disabled = false;
         btnLater.disabled = false;
         updateStartButtonLabel();
@@ -910,8 +944,9 @@
       btnStart.textContent = later ? 'Queueing in NDM…' : 'Starting in NDM…';
 
       let ok = false;
+      let resp = null;
       try {
-        const resp = await chrome.runtime.sendMessage({
+        resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
           kind: 'file_direct',
           url: targetUrl,
@@ -932,7 +967,7 @@
       } else {
         statusEl.style.display = 'block';
         statusEl.className = 'ndm-m-status err';
-        statusEl.textContent = 'NDM could not be started. Make sure the NDM desktop app is installed.';
+        statusEl.textContent = (resp && resp.error) || 'NDM could not be started. Make sure the NDM desktop app is installed.';
         btnStart.disabled = false;
         btnLater.disabled = false;
         btnStart.textContent = currentBytes > 0

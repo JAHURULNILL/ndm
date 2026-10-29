@@ -221,6 +221,42 @@ fn handle_probe(message: &Value) -> Value {
     }
 }
 
+fn new_entry_id() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{nanos}-{n}", std::process::id())
+}
+
+fn wait_for_ack_and_result(id: &str, timeout_secs: u64) -> Value {
+    let Ok(base) = app_data_dir() else {
+        return json!({ "ok": false, "error": "cannot resolve app data directory" });
+    };
+    let ack_file = base.join("acks").join(format!("{id}.ack"));
+    let res_file = base.join("results").join(format!("{id}.json"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if ack_file.is_file() {
+            let _ = std::fs::remove_file(&ack_file);
+            if let Ok(raw) = std::fs::read_to_string(&res_file) {
+                let _ = std::fs::remove_file(&res_file);
+                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                    return v;
+                }
+            }
+            return json!({ "ok": true, "id": id });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    json!({
+        "ok": false,
+        "error": "NDM desktop app did not acknowledge the download in time"
+    })
+}
+
 fn handle_download(message: &Value) -> Value {
     let kind = message.get("kind").and_then(Value::as_str).unwrap_or("");
     if kind != "video" && kind != "file" && kind != "video_direct" && kind != "file_direct" {
@@ -240,7 +276,9 @@ fn handle_download(message: &Value) -> Value {
     let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
     let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
 
+    let id = new_entry_id();
     let mut obj = json!({
+        "id": id,
         "kind": kind,
         "url": url,
         "title": title,
@@ -278,7 +316,7 @@ fn handle_download(message: &Value) -> Value {
     match append_to_queue(obj, cookies) {
         Ok(()) => {
             ensure_app_running(is_direct);
-            json!({ "ok": true })
+            wait_for_ack_and_result(&id, 15)
         }
         Err(e) => {
             eprintln!("ndm-host: cannot write queue: {e}");

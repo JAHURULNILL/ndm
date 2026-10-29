@@ -2,6 +2,8 @@
 src-tauri/target
 node_modules
 *.deb
+*.zip
+ndm-*-linux-x86_64
 /tools/
 /*.png
 src-tauri/gen/schemas/

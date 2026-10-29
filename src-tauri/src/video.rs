@@ -6,7 +6,7 @@
 // Pause = stop the yt-dlp process (its .part files stay on disk); resume =
 // start it again with the same arguments, yt-dlp continues the partial files.
 
-pub use ndm::video_probe::{base_args, find_tool, probe, VideoInfo};
+pub use ndm::video_probe::{base_args_for_url, find_tool, probe, VideoInfo};
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -14,6 +14,40 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+
+/// Parse `ffmpeg -hide_banner -i <file>` stderr to check `(has_video, has_audio)`.
+pub fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
+    let mut video = false;
+    let mut audio = false;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("Stream #") {
+            if t.contains(": Video:") {
+                video = true;
+            } else if t.contains(": Audio:") {
+                audio = true;
+            }
+        }
+    }
+    (video, audio)
+}
+
+/// Inspect a finished media file with `ffmpeg -hide_banner -i <path>` to
+/// verify which stream types (`(has_video, has_audio)`) are actually present.
+#[allow(dead_code)]
+pub fn probe_streams(path: &Path, components_dir: &Path) -> Option<(bool, bool)> {
+    let ffmpeg = find_tool("ffmpeg", components_dir)?;
+    let out = Command::new(ffmpeg)
+        .args(["-hide_banner", "-i"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Some(streams_in_ffmpeg_info(&stderr))
+}
 
 /// (name -> (len, mtime)) for every file in `dir`, taken just before a
 /// download starts so the finished file can be recognised afterwards.
@@ -135,6 +169,7 @@ pub struct VideoProgress {
     pub total: u64,
     pub done: u64,
     pub speed_bps: f64,
+    pub conns: usize,
     pub final_path: Option<PathBuf>,
     pub error: Option<String>,
 }
@@ -146,6 +181,7 @@ impl Default for VideoProgress {
             total: 0,
             done: 0,
             speed_bps: 0.0,
+            conns: 0,
             final_path: None,
             error: None,
         }
@@ -188,6 +224,40 @@ pub fn safe_filename_stem(title: &str) -> String {
     trimmed[..end].trim().trim_matches('.').to_string()
 }
 
+/// Choose a non-colliding filename stem inside `dir` so two videos with the
+/// same title (or two qualities of the same video) never overwrite each other
+/// or collide on `.part` files.
+pub fn unique_stem_on_disk(dir: &Path, base_stem: &str) -> String {
+    let stem = safe_filename_stem(base_stem);
+    if stem.is_empty() {
+        return String::new();
+    }
+    let stem_taken = |cand: &str| -> bool {
+        for ext in ["mp4", "mp3", "m4a", "mkv", "webm"] {
+            if dir.join(format!("{cand}.{ext}")).exists() {
+                return true;
+            }
+            if dir
+                .join(format!(".{cand}.ndm_stream0.{ext}.part"))
+                .exists()
+            {
+                return true;
+            }
+        }
+        false
+    };
+    if !stem_taken(&stem) {
+        return stem;
+    }
+    for n in 1..10_000 {
+        let cand = format!("{stem} ({n})");
+        if !stem_taken(&cand) {
+            return cand;
+        }
+    }
+    stem
+}
+
 pub struct VideoJob {
     pub url: String,
     pub dir: PathBuf,
@@ -196,6 +266,7 @@ pub struct VideoJob {
     pub title: String,
     pub cookies: Option<PathBuf>,
     pub progress: Arc<Mutex<VideoProgress>>,
+    chosen_stem: Mutex<Option<String>>,
     child: Mutex<Option<Child>>,
     active_downloads: Mutex<Vec<Arc<ndm::Download>>>,
     stop_flag: Mutex<Option<String>>, // "paused" | "cancelled" when WE stopped it
@@ -221,14 +292,31 @@ impl VideoJob {
         cookies: Option<PathBuf>,
         components_dir: &Path,
     ) -> Result<Arc<VideoJob>, String> {
+        let initial_stem = {
+            let s = safe_filename_stem(title);
+            if s.is_empty() {
+                None
+            } else {
+                let final_exists = ["mp4", "mp3", "m4a", "mkv", "webm"]
+                    .iter()
+                    .any(|ext| dir.join(format!("{s}.{ext}")).exists());
+                if final_exists {
+                    Some(unique_stem_on_disk(dir, &s))
+                } else {
+                    Some(s)
+                }
+            }
+        };
+        let effective_title = initial_stem.clone().unwrap_or_else(|| title.to_string());
         let job = Arc::new(VideoJob {
             url: url.to_string(),
             dir: dir.to_path_buf(),
             selector: selector.to_string(),
             audio,
-            title: title.to_string(),
+            title: effective_title,
             cookies,
             progress: Arc::new(Mutex::new(VideoProgress::default())),
+            chosen_stem: Mutex::new(initial_stem),
             child: Mutex::new(None),
             active_downloads: Mutex::new(Vec::new()),
             stop_flag: Mutex::new(None),
@@ -237,6 +325,25 @@ impl VideoJob {
         });
         job.spawn(components_dir)?;
         Ok(job)
+    }
+
+    fn resolve_or_lock_stem(&self, fallback_title: &str) -> String {
+        let mut guard = self.chosen_stem.lock().unwrap();
+        if let Some(existing) = guard.as_ref() {
+            if !existing.is_empty() {
+                return existing.clone();
+            }
+        }
+        let raw = if !self.title.trim().is_empty() {
+            &self.title
+        } else {
+            fallback_title
+        };
+        let unique = unique_stem_on_disk(&self.dir, raw);
+        if !unique.is_empty() {
+            *guard = Some(unique.clone());
+        }
+        unique
     }
 
     /// Resolve direct HTTP(S) stream URLs via yt-dlp JSON so we can download
@@ -248,7 +355,7 @@ impl VideoJob {
         components_dir: &Path,
         sel: &str,
     ) -> Option<(String, Vec<DirectStream>)> {
-        let mut args = base_args(components_dir, self.cookies.as_deref());
+        let mut args = base_args_for_url(&self.url, components_dir, self.cookies.as_deref());
         args.push("-j".into());
         args.push("-f".into());
         args.push(sel.to_string());
@@ -331,14 +438,9 @@ impl VideoJob {
             return true;
         }
 
-        let title_source = if !self.title.trim().is_empty() {
-            &self.title
-        } else {
-            &resolved_title
-        };
-        let mut stem = safe_filename_stem(title_source);
+        let mut stem = self.resolve_or_lock_stem(&resolved_title);
         if stem.is_empty() {
-            stem = "video".to_string();
+            stem = unique_stem_on_disk(&self.dir, "video");
         }
         let final_ext = if self.audio {
             if sel.contains("m4a") && !sel.contains("mp3") {
@@ -351,9 +453,9 @@ impl VideoJob {
         };
         let final_path = self.dir.join(format!("{stem}.{final_ext}"));
 
-        let max_conn = ndm::global_connections().clamp(8, 32);
+        let max_conn = ndm::global_connections().clamp(1, 32);
         let per_stream_conn = if streams.len() > 1 {
-            (max_conn / 2).max(8)
+            (max_conn / 2).max(1)
         } else {
             max_conn
         };
@@ -408,6 +510,7 @@ impl VideoJob {
                     let mut p = self.progress.lock().unwrap();
                     p.status = "cancelled".to_string();
                     p.speed_bps = 0.0;
+                    p.conns = 0;
                     return true;
                 }
             }
@@ -415,6 +518,7 @@ impl VideoJob {
             let mut total_sum = 0u64;
             let mut done_sum = 0u64;
             let mut speed_sum = 0.0f64;
+            let mut conns_sum = 0usize;
             let mut all_finished = true;
             let mut any_error = false;
             let mut any_paused = false;
@@ -425,6 +529,7 @@ impl VideoJob {
                 done_sum = done_sum.saturating_add(pr.done_bytes);
                 if pr.status == ndm::Status::Downloading {
                     speed_sum += pr.speed_bps;
+                    conns_sum = conns_sum.saturating_add(pr.conns);
                 }
                 match pr.status {
                     ndm::Status::Finished => {}
@@ -449,6 +554,11 @@ impl VideoJob {
                 }
                 p.done = done_sum;
                 p.speed_bps = if any_paused { 0.0 } else { speed_sum };
+                p.conns = if any_paused || all_finished {
+                    0
+                } else {
+                    conns_sum.max(1)
+                };
                 p.status = if any_paused {
                     "paused".to_string()
                 } else {
@@ -471,7 +581,7 @@ impl VideoJob {
             if all_finished {
                 break;
             }
-            std::thread::sleep( std::time::Duration::from_millis(120));
+            std::thread::sleep(std::time::Duration::from_millis(120));
         }
 
         self.active_downloads.lock().unwrap().clear();
@@ -481,6 +591,7 @@ impl VideoJob {
                 p.done = p.total;
             }
             p.speed_bps = 0.0;
+            p.conns = 0;
         }
 
         // Merge / remux into final output file with ffmpeg
@@ -548,6 +659,7 @@ impl VideoJob {
             }
             p.status = "finished".to_string();
             p.speed_bps = 0.0;
+            p.conns = 0;
             p.final_path = Some(final_path);
             true
         } else {
@@ -581,12 +693,16 @@ impl VideoJob {
             .gen
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        self.progress.lock().unwrap().status = "downloading".to_string();
+        {
+            let mut p = self.progress.lock().unwrap();
+            p.status = "downloading".to_string();
+            p.conns = ndm::global_connections().clamp(1, 32);
+        }
 
         let job = self.clone();
         let comp_dir = components_dir.to_path_buf();
         std::thread::spawn(move || {
-            // 1. Try 32-connection parallel Rust engine download first
+            // 1. Try parallel multi-connection Rust engine download first
             if job.run_parallel_engine(&ytdlp, &ffmpeg, &comp_dir, &sel, my_gen) {
                 return;
             }
@@ -596,8 +712,8 @@ impl VideoJob {
                 return;
             }
 
-            // 2. Fallback to yt-dlp with 32 concurrent fragments for HLS/DASH streams
-            let mut args = base_args(&comp_dir, job.cookies.as_deref());
+            // 2. Fallback to yt-dlp with concurrent fragments for HLS/DASH streams
+            let mut args = base_args_for_url(&job.url, &comp_dir, job.cookies.as_deref());
             args.push("-f".into());
             args.push(sel.clone());
             if job.audio {
@@ -612,7 +728,7 @@ impl VideoJob {
                 args.push("--postprocessor-args".into());
                 args.push("Merger+ffmpeg_o1:-c:v copy -c:a aac -b:a 192k".into());
             }
-            let frags = ndm::global_connections().clamp(16, 32);
+            let frags = ndm::global_connections().clamp(1, 32);
             args.push("--concurrent-fragments".into());
             args.push(frags.to_string());
             args.push("--buffer-size".into());
@@ -620,8 +736,7 @@ impl VideoJob {
             args.push("--http-chunk-size".into());
             args.push("10M".into());
             args.push("--hls-prefer-native".into());
-            args.push("--trim-filenames".into());
-            args.push("60".into());
+            args.push("--no-overwrites".into());
 
             let limit = ndm::global_limit();
             if limit > 0 {
@@ -637,9 +752,9 @@ impl VideoJob {
                 "NDMPROG:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s"
                     .into(),
             );
-            let stem = safe_filename_stem(&job.title);
+            let stem = job.resolve_or_lock_stem("");
             let out_tmpl = if stem.is_empty() {
-                job.dir.join("%(title).150B.%(ext)s")
+                job.dir.join("%(title).150B [%(id)s].%(ext)s")
             } else {
                 job.dir.join(format!("{stem}.%(ext)s"))
             };
@@ -656,6 +771,7 @@ impl VideoJob {
             else {
                 let mut p = job.progress.lock().unwrap();
                 p.status = "error".to_string();
+                p.conns = 0;
                 p.error = Some("could not start yt-dlp".to_string());
                 return;
             };
@@ -708,6 +824,7 @@ impl VideoJob {
                         parts.get(i).and_then(|s| s.trim().parse::<f64>().ok())
                     };
                     let mut p = job.progress.lock().unwrap();
+                    p.conns = frags;
                     if let Some(d) = parse(0) {
                         let d = d as u64;
                         if cur_done > 262_144 && d + 262_144 < cur_done {
@@ -754,6 +871,7 @@ impl VideoJob {
                 None => None,
             };
             let mut p = job.progress.lock().unwrap();
+            p.conns = 0;
             if status.map(|s| s.success()).unwrap_or(false) {
                 let found = detected_final
                     .filter(|fp| fp.is_file())
@@ -805,6 +923,7 @@ impl VideoJob {
             let mut p = self.progress.lock().unwrap();
             p.status = "paused".to_string();
             p.speed_bps = 0.0;
+            p.conns = 0;
             return;
         }
         *self.stop_flag.lock().unwrap() = Some("paused".to_string());
@@ -815,6 +934,7 @@ impl VideoJob {
         if p.status == "downloading" {
             p.status = "paused".to_string();
             p.speed_bps = 0.0;
+            p.conns = 0;
         }
     }
 
@@ -827,7 +947,9 @@ impl VideoJob {
         if let Some(c) = self.child.lock().unwrap().as_mut() {
             let _ = c.kill();
         }
-        self.progress.lock().unwrap().status = "cancelled".to_string();
+        let mut p = self.progress.lock().unwrap();
+        p.status = "cancelled".to_string();
+        p.conns = 0;
     }
 
     pub fn resume(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
@@ -855,3 +977,67 @@ impl VideoJob {
         self.spawn(components_dir)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merged_mp4_reports_both_streams() {
+        let info = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'out.mp4':
+  Duration: 00:03:12.04, start: 0.000000, bitrate: 2145 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1920x1080, 1980 kb/s, 30 fps
+  Stream #0:1[0x2](eng): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 160 kb/s
+At least one output file must be specified";
+        assert_eq!(streams_in_ffmpeg_info(info), (true, true));
+    }
+
+    #[test]
+    fn video_only_file_reports_missing_audio() {
+        let info = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'silent.mp4':
+  Duration: 00:03:12.04, start: 0.000000, bitrate: 1980 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1920x1080, 1980 kb/s, 30 fps
+At least one output file must be specified";
+        assert_eq!(streams_in_ffmpeg_info(info), (true, false));
+    }
+
+    #[test]
+    fn audio_only_file_reports_no_video() {
+        let info = "\
+Input #0, mp3, from 'song.mp3':
+  Duration: 00:03:12.04, start: 0.025057, bitrate: 192 kb/s
+  Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 192 kb/s";
+        assert_eq!(streams_in_ffmpeg_info(info), (false, true));
+    }
+
+    #[test]
+    fn safe_filename_stem_preserves_full_title_without_truncating_at_60_chars() {
+        assert_eq!(
+            safe_filename_stem("Fixture Player — Test Video"),
+            "Fixture Player — Test Video"
+        );
+        assert_eq!(
+            safe_filename_stem("Fixture Player — Test Video.mp4"),
+            "Fixture Player — Test Video"
+        );
+    }
+
+    #[test]
+    fn unique_stem_on_disk_disambiguates_duplicate_titles() {
+        let dir = std::env::temp_dir().join(format!("ndm-uniq-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s0 = unique_stem_on_disk(&dir, "Fixture Player — Test Video");
+        assert_eq!(s0, "Fixture Player — Test Video");
+        std::fs::write(dir.join(format!("{s0}.mp4")), b"1").unwrap();
+        let s1 = unique_stem_on_disk(&dir, "Fixture Player — Test Video");
+        assert_eq!(s1, "Fixture Player — Test Video (1)");
+        std::fs::write(dir.join(format!("{s1}.mp4")), b"2").unwrap();
+        let s2 = unique_stem_on_disk(&dir, "Fixture Player — Test Video");
+        assert_eq!(s2, "Fixture Player — Test Video (2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

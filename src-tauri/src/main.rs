@@ -215,9 +215,6 @@ fn load_settings(state: &AppState) {
     }
     if let Ok(raw) = std::fs::read(&path) {
         if let Ok(mut s) = serde_json::from_slice::<Settings>(&raw) {
-            if s.max_connections == 16 || s.max_connections == 8 {
-                s.max_connections = 32;
-            }
             s.sanitize();
             ndm::set_global_limit(s.speed_limit_bps);
             ndm::set_global_connections(s.max_connections);
@@ -439,11 +436,19 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             done_bytes,
             speed_bps: p.speed_bps,
             conns: if p.status == "downloading" {
-                ndm::global_connections().clamp(1, 16)
+                if p.conns > 0 {
+                    p.conns
+                } else {
+                    ndm::global_connections().clamp(1, 32)
+                }
             } else {
                 0
             },
-            blocks: synth_blocks(total, done_bytes, p.status == "downloading"),
+            blocks: if p.status == "finished" {
+                "1".repeat(128)
+            } else {
+                synth_blocks(total, done_bytes, p.status == "downloading")
+            },
             status: p.status.clone(),
             category: entry.category.clone(),
             added: entry.added.clone(),
@@ -546,11 +551,8 @@ fn persist(state: &AppState) {
                 added: e.added.clone(),
                 total: p.total,
                 done_bytes: p.done_bytes,
-                // a live download is, from the next launch's perspective, paused
                 status: if e.queued.load(Ordering::Relaxed) {
                     "queued".to_string()
-                } else if p.status == "downloading" {
-                    "paused".to_string()
                 } else {
                     p.status
                 },
@@ -1996,6 +1998,42 @@ async fn probe_video(
         .map_err(|e| format!("internal join error: {e}"))?
 }
 
+fn unique_video_name(state: &AppState, dir: &Path, raw_title: &str) -> String {
+    let base_stem = video::safe_filename_stem(raw_title);
+    if base_stem.is_empty() {
+        return raw_title.trim().to_string();
+    }
+    let taken = |cand: &str| -> bool {
+        for ext in ["mp4", "mp3", "m4a", "mkv", "webm"] {
+            if dir.join(format!("{cand}.{ext}")).exists() {
+                return true;
+            }
+            if dir
+                .join(format!(".{cand}.ndm_stream0.{ext}.part"))
+                .exists()
+            {
+                return true;
+            }
+        }
+        state.entries.lock().unwrap().values().any(|e| {
+            e.kind == "video"
+                && e.out_path == dir
+                && !e.removed.load(Ordering::Relaxed)
+                && (e.name == cand || video::safe_filename_stem(&e.name) == cand)
+        })
+    };
+    if !taken(&base_stem) {
+        return base_stem;
+    }
+    for n in 1..10_000 {
+        let cand = format!("{base_stem} ({n})");
+        if !taken(&cand) {
+            return cand;
+        }
+    }
+    base_stem
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_add_video(
     app: &AppHandle,
@@ -2034,11 +2072,12 @@ fn do_add_video(
             return Err("this video quality is already in the download list".to_string());
         }
     }
-    let name = if title.trim().is_empty() {
+    let raw_name = if title.trim().is_empty() {
         file_name_for(&url)
     } else {
         title.trim().to_string()
     };
+    let name = unique_video_name(state, &dir, &raw_name);
     let category = if audio {
         "Music".to_string()
     } else {
@@ -2422,6 +2461,56 @@ fn raise_main_window(handle: &AppHandle) {
     }
 }
 
+fn sanitize_ack_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+    if trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn write_ack_and_result(handle: &AppHandle, ack_id: Option<&str>, result: serde_json::Value) {
+    let Some(id) = ack_id.and_then(sanitize_ack_id) else {
+        return;
+    };
+    let Ok(base) = handle.path().app_data_dir() else {
+        return;
+    };
+    let res_dir = base.join("results");
+    let ack_dir = base.join("acks");
+    let _ = std::fs::create_dir_all(&res_dir);
+    let _ = std::fs::create_dir_all(&ack_dir);
+    let _ = std::fs::write(res_dir.join(format!("{id}.json")), result.to_string());
+    let _ = std::fs::write(ack_dir.join(format!("{id}.ack")), b"ok");
+}
+
+fn prune_acks(queue_dir: &Path) {
+    let now = std::time::SystemTime::now();
+    for sub in ["acks", "results"] {
+        if let Ok(rd) = std::fs::read_dir(queue_dir.join(sub)) {
+            for e in rd.flatten() {
+                let stale = e
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d.as_secs() > 120)
+                    .unwrap_or(false);
+                if stale {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+}
+
 /// One queued extension link:
 /// - `video_direct` / `file_direct`: user already selected options inside
 ///   the in-browser IDM popup, so start (or queue) the download silently
@@ -2433,13 +2522,20 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return;
     };
+    let ack_id = v["id"].as_str().and_then(sanitize_ack_id);
     let kind = v["kind"].as_str().unwrap_or("file");
     if kind == "show_app" {
         raise_main_window(handle);
+        write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
         return;
     }
     let url = v["url"].as_str().unwrap_or("");
     if url.is_empty() {
+        write_ack_and_result(
+            handle,
+            ack_id.as_deref(),
+            serde_json::json!({ "ok": false, "error": "empty url" }),
+        );
         return;
     }
     let mut token = String::new();
@@ -2487,7 +2583,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         let total_hint = v["total"].as_u64().unwrap_or(0);
         let title = v["title"].as_str().unwrap_or("").to_string();
         let cookies_opt = if token.is_empty() { None } else { Some(token) };
-        let _ = do_add_video(
+        match do_add_video(
             handle,
             &state,
             url.to_string(),
@@ -2498,12 +2594,34 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             cookies_opt,
             later,
             total_hint,
-        );
+        ) {
+            Ok(entry_id) => write_ack_and_result(
+                handle,
+                ack_id.as_deref(),
+                serde_json::json!({ "ok": true, "id": entry_id }),
+            ),
+            Err(err) => write_ack_and_result(
+                handle,
+                ack_id.as_deref(),
+                serde_json::json!({ "ok": false, "error": err }),
+            ),
+        }
         return;
     }
     if kind == "file_direct" {
         // Run silently in the background — NEVER steal focus from the browser!
         let state = handle.state::<AppState>();
+        if state.update_required.load(Ordering::SeqCst) {
+            write_ack_and_result(
+                handle,
+                ack_id.as_deref(),
+                serde_json::json!({
+                    "ok": false,
+                    "error": "please install the required update before starting new downloads"
+                }),
+            );
+            return;
+        }
         let dir = v["dir"]
             .as_str()
             .filter(|s| !s.trim().is_empty())
@@ -2513,7 +2631,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         let title = v["title"].as_str().unwrap_or("").trim();
         let page_url = v["pageUrl"].as_str().unwrap_or("");
         let name_hint = if title.is_empty() { None } else { Some(title) };
-        if let Ok(stub) = register_http_stub(
+        match register_http_stub(
             &state,
             url,
             dir,
@@ -2522,26 +2640,41 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             &token,
             page_url,
         ) {
-            let max = current_settings(&state).max_simultaneous;
-            let must_wait =
-                later || scheduler_blocks(&state) || (max > 0 && count_active(&state) >= max);
-            if must_wait {
-                if later {
-                    stub.queued.store(false, Ordering::Relaxed);
-                    *stub.restored.lock().unwrap() = Some(Restored {
-                        total: total_hint,
-                        done_bytes: 0,
-                        blocks: Vec::new(),
-                        resumable: true,
-                        status: "paused".to_string(),
-                    });
+            Ok(stub) => {
+                let entry_id = stub.id.clone();
+                let max = current_settings(&state).max_simultaneous;
+                let must_wait =
+                    later || scheduler_blocks(&state) || (max > 0 && count_active(&state) >= max);
+                if must_wait {
+                    if later {
+                        stub.queued.store(false, Ordering::Relaxed);
+                        *stub.restored.lock().unwrap() = Some(Restored {
+                            total: total_hint,
+                            done_bytes: 0,
+                            blocks: Vec::new(),
+                            resumable: true,
+                            status: "paused".to_string(),
+                        });
+                    } else {
+                        stub.queued.store(true, Ordering::Relaxed);
+                    }
+                    let _ = handle.emit("progress", payload_of(&stub));
+                    persist(&state);
                 } else {
-                    stub.queued.store(true, Ordering::Relaxed);
+                    start_entry(handle, stub);
                 }
-                let _ = handle.emit("progress", payload_of(&stub));
-                persist(&state);
-            } else {
-                start_entry(handle, stub);
+                write_ack_and_result(
+                    handle,
+                    ack_id.as_deref(),
+                    serde_json::json!({ "ok": true, "id": entry_id }),
+                );
+            }
+            Err(err) => {
+                write_ack_and_result(
+                    handle,
+                    ack_id.as_deref(),
+                    serde_json::json!({ "ok": false, "error": err }),
+                );
             }
         }
         return;
@@ -2556,6 +2689,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         let state = handle.state::<AppState>();
         state.pending_videos.lock().unwrap().push(payload.clone());
         let _ = handle.emit("incoming_video", payload);
+        write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
         return;
     }
     raise_main_window(handle);
@@ -2568,6 +2702,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
     let state = handle.state::<AppState>();
     state.pending_files.lock().unwrap().push(payload.clone());
     let _ = handle.emit("incoming_file", payload);
+    write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
 }
 
 /// The installed ndm-host binary, resolved from this app's own path:
@@ -2806,10 +2941,16 @@ fn main() {
             let handle2 = app.handle().clone();
             let queue_dir = dir.clone();
             std::thread::spawn(move || {
+                prune_acks(&queue_dir);
                 drain_incoming(&handle2, &queue_dir);
+                let mut ticks = 0u64;
                 loop {
                     std::thread::sleep(Duration::from_millis(200));
                     drain_incoming(&handle2, &queue_dir);
+                    ticks += 1;
+                    if ticks % 300 == 0 {
+                        prune_acks(&queue_dir);
+                    }
                 }
             });
             Ok(())
@@ -2846,3 +2987,124 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running NDM");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_preserve_user_connections_8_and_16_across_restarts() {
+        let dir = std::env::temp_dir().join(format!("ndm-settings-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.json");
+
+        let state = AppState {
+            entries: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
+            seq: AtomicU64::new(1),
+            data_file: Mutex::new(PathBuf::new()),
+            components_dir: Mutex::new(PathBuf::new()),
+            cookies_dir: Mutex::new(PathBuf::new()),
+            save_lock: Mutex::new(()),
+            settings: Mutex::new(Settings {
+                max_connections: 8,
+                ..Settings::default()
+            }),
+            settings_file: Mutex::new(settings_path.clone()),
+            sched_override: AtomicBool::new(false),
+            pending_videos: Mutex::new(Vec::new()),
+            pending_files: Mutex::new(Vec::new()),
+            components_busy: AtomicBool::new(false),
+            pending_update: Mutex::new(None),
+            update_required: AtomicBool::new(false),
+            update_busy: AtomicBool::new(false),
+        };
+        save_settings(&state);
+        state.settings.lock().unwrap().max_connections = 32;
+        load_settings(&state);
+        assert_eq!(state.settings.lock().unwrap().max_connections, 8);
+
+        state.settings.lock().unwrap().max_connections = 16;
+        save_settings(&state);
+        state.settings.lock().unwrap().max_connections = 32;
+        load_settings(&state);
+        assert_eq!(state.settings.lock().unwrap().max_connections, 16);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_ack_id_rejects_traversal_and_accepts_valid_ids() {
+        assert_eq!(sanitize_ack_id("12345-67890-0"), Some("12345-67890-0".to_string()));
+        assert_eq!(sanitize_ack_id("../etc/passwd"), None);
+        assert_eq!(sanitize_ack_id(""), None);
+    }
+
+    #[test]
+    fn persist_writes_live_downloading_status_not_fake_paused() {
+        let dir = std::env::temp_dir().join(format!("ndm-persist-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+
+        let state = AppState {
+            entries: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
+            seq: AtomicU64::new(1),
+            data_file: Mutex::new(data_file.clone()),
+            components_dir: Mutex::new(PathBuf::new()),
+            cookies_dir: Mutex::new(PathBuf::new()),
+            save_lock: Mutex::new(()),
+            settings: Mutex::new(Settings::default()),
+            settings_file: Mutex::new(PathBuf::new()),
+            sched_override: AtomicBool::new(false),
+            pending_videos: Mutex::new(Vec::new()),
+            pending_files: Mutex::new(Vec::new()),
+            components_busy: AtomicBool::new(false),
+            pending_update: Mutex::new(None),
+            update_required: AtomicBool::new(false),
+            update_busy: AtomicBool::new(false),
+        };
+
+        let entry = Arc::new(Entry {
+            id: "dl-1".to_string(),
+            name: "test.iso".to_string(),
+            url: "https://example.com/test.iso".to_string(),
+            out_path: dir.join("test.iso"),
+            category: "Programs".to_string(),
+            added: "2026-10-29 12:00".to_string(),
+            download: None,
+            video: None,
+            kind: "http".to_string(),
+            selector: String::new(),
+            cookies: String::new(),
+            referer: String::new(),
+            audio: false,
+            restored: Mutex::new(Some(Restored {
+                total: 1000,
+                done_bytes: 500,
+                blocks: vec![1, 0],
+                resumable: true,
+                status: "downloading".to_string(),
+            })),
+            queued: AtomicBool::new(false),
+            sample: Mutex::new((Instant::now(), 0, 0.0)),
+            emitting: AtomicBool::new(false),
+            starting: AtomicBool::new(false),
+            removed: AtomicBool::new(false),
+            pause_requested: AtomicBool::new(false),
+            completion: Mutex::new(String::new()),
+        });
+        state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
+        state.order.lock().unwrap().push("dl-1".to_string());
+
+        persist(&state);
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(text.contains("\"status\":\"downloading\""));
+        assert!(!text.contains("\"status\":\"paused\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

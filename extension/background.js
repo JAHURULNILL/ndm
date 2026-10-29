@@ -132,21 +132,34 @@ function sendToNdm(message) {
           const missing = /not found|No such native/i.test(text);
           setHostStatus(missing ? 'host-missing' : 'fail');
           console.warn('NDM host error:', text);
-          resolve(false);
+          resolve({
+            ok: false,
+            error: missing
+              ? 'NDM native host is not registered. Open the NDM desktop app once to register it.'
+              : text || 'Could not reach NDM native host.',
+          });
           return;
         }
         const ok = !!(response && response.ok);
         setHostStatus(ok ? 'ok' : 'fail');
         if (!ok) console.warn('NDM host rejected the download:', response);
-        resolve(ok);
+        resolve({
+          ok,
+          error: (response && response.error) || 'Download rejected by NDM.',
+        });
       });
     } catch (e) {
       setHostStatus('host-missing');
       console.warn('NDM send failed:', e);
-      resolve(false);
+      resolve({ ok: false, error: String(e) });
     }
   });
-  const timeout = new Promise(r => setTimeout(() => r(false), 25000));
+  const timeout = new Promise(r =>
+    setTimeout(() => {
+      setHostStatus('fail');
+      r({ ok: false, error: 'Timed out waiting for NDM app.' });
+    }, 25000)
+  );
   return Promise.race([attempt, timeout]);
 }
 
@@ -171,7 +184,7 @@ function probeWithNdm(url, cookies) {
           setHostStatus('ok');
           resolve({ ok: true, info: response.info });
         } else {
-          setHostStatus('ok');
+          setHostStatus(response ? 'fail' : 'host-missing');
           resolve({
             ok: false,
             error: (response && response.error) || 'Could not read video formats from this page.',
@@ -184,7 +197,10 @@ function probeWithNdm(url, cookies) {
     }
   });
   const timeout = new Promise(r =>
-    setTimeout(() => r({ ok: false, error: 'Timed out while reading video info.' }), 65000)
+    setTimeout(() => {
+      setHostStatus('fail');
+      r({ ok: false, error: 'Timed out while reading video info.' });
+    }, 50000)
   );
   return Promise.race([attempt, timeout]);
 }
@@ -387,8 +403,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         payload.later = !!message.later;
         payload.total = Number(message.total) || 0;
       }
-      const ok = await sendToNdm(payload);
-      sendResponse({ ok });
+      const res = await sendToNdm(payload);
+      sendResponse(res);
     })();
     return true;
   }

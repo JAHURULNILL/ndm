@@ -113,11 +113,26 @@ pub fn default_components_dir() -> Option<PathBuf> {
     }
 }
 
-fn cookie_file_has_real_session(file: &Path) -> bool {
+pub fn is_youtube_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    let after_scheme = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+        .unwrap_or(&lower);
+    let host = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    host == "youtube.com"
+        || host.ends_with(".youtube.com")
+        || host == "youtu.be"
+        || host.ends_with(".youtu.be")
+        || host == "youtube-nocookie.com"
+        || host.ends_with(".youtube-nocookie.com")
+}
+
+pub fn cookie_file_usable_for_url(url: &str, file: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(file) else {
         return false;
     };
-    let mut has_youtube = false;
+    let mut has_youtube_auth = false;
     let mut has_non_youtube = false;
     for line in text.lines() {
         let l = line.strip_prefix("#HttpOnly_").unwrap_or(line);
@@ -128,26 +143,40 @@ fn cookie_file_has_real_session(file: &Path) -> bool {
         if parts.len() < 7 {
             continue;
         }
-        let domain = parts[0];
+        let domain = parts[0].to_ascii_lowercase();
         let name = parts[5];
-        if domain.contains("youtube.com") || domain.contains("google.com") {
-            has_youtube = true;
+        if domain.contains("youtube.com")
+            || domain.contains("google.com")
+            || domain.contains("youtu.be")
+        {
             if matches!(
                 name,
-                "LOGIN_INFO" | "SID" | "HSID" | "SSID" | "SAPISID" | "__Secure-1PSID" | "__Secure-3PSID"
+                "LOGIN_INFO"
+                    | "SID"
+                    | "HSID"
+                    | "SSID"
+                    | "SAPISID"
+                    | "__Secure-1PSID"
+                    | "__Secure-3PSID"
             ) {
-                return true;
+                has_youtube_auth = true;
             }
         } else {
             has_non_youtube = true;
         }
     }
-    // If the cookie file is for a non-YouTube site (Facebook, Instagram, TikTok, etc.), keep it;
-    // if it only has anonymous YouTube tracking cookies, skip it so yt-dlp uses its full client pool.
-    has_non_youtube && !has_youtube
+    if !url.trim().is_empty() && is_youtube_url(url) {
+        has_youtube_auth
+    } else {
+        has_non_youtube || has_youtube_auth
+    }
 }
 
-pub fn base_args(components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
+pub fn cookie_file_has_real_session(file: &Path) -> bool {
+    cookie_file_usable_for_url("", file)
+}
+
+pub fn base_args_for_url(url: &str, components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--newline".into(),
         "--no-playlist".into(),
@@ -166,7 +195,7 @@ pub fn base_args(components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
         args.push(proxy);
     }
     if let Some(file) = cookies {
-        if file.is_file() && cookie_file_has_real_session(file) {
+        if file.is_file() && cookie_file_usable_for_url(url, file) {
             args.push("--cookies".into());
             args.push(file.to_string_lossy().into_owned());
         }
@@ -179,6 +208,10 @@ pub fn base_args(components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
         args.push(format!("node:{}", node.display()));
     }
     args
+}
+
+pub fn base_args(components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
+    base_args_for_url("", components_dir, cookies)
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
@@ -334,7 +367,7 @@ pub fn probe(
     let ytdlp = find_tool("yt-dlp", components_dir)
         .ok_or("yt-dlp not found — the video component is not installed yet")?;
     let mut cmd = Command::new(&ytdlp);
-    cmd.args(base_args(components_dir, cookies))
+    cmd.args(base_args_for_url(url, components_dir, cookies))
         .args(["-J", "--", url])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -367,7 +400,7 @@ pub fn probe(
         }
         tail
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let deadline = std::time::Instant::now() + Duration::from_secs(45);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
@@ -375,7 +408,7 @@ pub fn probe(
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err("yt-dlp took too long to read this page (90s limit)".to_string());
+                    return Err("yt-dlp took too long to read this page (45s limit)".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(80));
             }
@@ -590,3 +623,49 @@ pub fn probe(
         options,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_temp_cookies(name: &str, content: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ndm-test-cookies-{name}-{}.txt", std::process::id()));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn mixed_youtube_and_other_site_cookies_preserved_for_other_site() {
+        let body = "# Netscape HTTP Cookie File\n\
+            .youtube.com\tTRUE\t/\tTRUE\t1999999999\tVISITOR_INFO1_LIVE\tabcdef\n\
+            .facebook.com\tTRUE\t/\tTRUE\t1999999999\tc_user\t10000123456\n";
+        let f = write_temp_cookies("mixed", body);
+        assert!(cookie_file_has_real_session(&f));
+        assert!(cookie_file_usable_for_url("https://www.facebook.com/watch/?v=123", &f));
+        assert!(!cookie_file_usable_for_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &f));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn logged_in_youtube_cookies_accepted_for_youtube() {
+        let body = "# Netscape HTTP Cookie File\n\
+            .youtube.com\tTRUE\t/\tTRUE\t1999999999\tVISITOR_INFO1_LIVE\tabcdef\n\
+            .youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tsigned_token\n";
+        let f = write_temp_cookies("yt-auth", body);
+        assert!(cookie_file_has_real_session(&f));
+        assert!(cookie_file_usable_for_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &f));
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn anonymous_youtube_cookies_skipped() {
+        let body = "# Netscape HTTP Cookie File\n\
+            .youtube.com\tTRUE\t/\tTRUE\t1999999999\tVISITOR_INFO1_LIVE\tabcdef\n\
+            .youtube.com\tTRUE\t/\tTRUE\t1999999999\tYSC\txyz123\n";
+        let f = write_temp_cookies("yt-anon", body);
+        assert!(!cookie_file_has_real_session(&f));
+        assert!(!cookie_file_usable_for_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &f));
+        let _ = std::fs::remove_file(&f);
+    }
+}
+

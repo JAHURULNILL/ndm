@@ -23,7 +23,7 @@ cp "$APP" "$PKG/ndm/ndm-app"
 cp "$HOST" "$PKG/ndm/ndm-host"
 cp tools/yt-dlp tools/deno tools/ffmpeg "$PKG/ndm/components/"
 cp extension/manifest.json extension/background.js extension/content.js \
-   extension/popup.html extension/popup.js \
+   extension/page-hook.js extension/popup.html extension/popup.js \
    extension/icon16.png extension/icon48.png extension/icon128.png \
    "$PKG/ndm/extension/"
 cp extension/icon128.png "$PKG/ndm/ndm.png"

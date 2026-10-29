@@ -38,7 +38,7 @@ install -m 755 "$BIN" "$STAGE/usr/bin/ndm-app"
 # which find_tool locates on PATH.
 mkdir -p "$STAGE/usr/lib/ndm" "$STAGE/usr/share/ndm/extension"
 install -m 755 "$HOST_BIN" "$STAGE/usr/lib/ndm/ndm-host"
-for f in manifest.json background.js content.js popup.html popup.js icon16.png icon48.png icon128.png; do
+for f in manifest.json background.js content.js page-hook.js popup.html popup.js icon16.png icon48.png icon128.png; do
   install -m 644 "extension/$f" "$STAGE/usr/share/ndm/extension/$f"
 done
 install -m 755 scripts/ndm-setup-browser.sh "$STAGE/usr/bin/ndm-setup-browser"

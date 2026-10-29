@@ -1,7 +1,7 @@
 {
-  "version": "1.7.0",
-  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.7.0/NDM_1.7.0_amd64.deb",
-  "deb_sha256": "57c573e3fc6fa55c5e7c544c12842105359e9e7b8f87397872c8bae8748c5ebb",
+  "version": "1.8.0",
+  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.8.0/NDM_1.8.0_amd64.deb",
+  "deb_sha256": "8127533f94a1e3f5ee623d1dcb270e1f6dea21dca8d01ae4a9defdbc5ffb7e17",
   "min_supported": "1.0.0",
-  "notes": "NDM 1.7.0 — Full IDM-style in-browser video download dialog with thumbnail, resolution & MB size table, MP4/MP3/M4A format tabs, Start Queue & Download Later; guaranteed AAC audio+video merge via ffmpeg; adaptive dynamic work-stealing multi-connection download engine with HTTP/2 & TCP_NODELAY; security & performance overhaul."
+  "notes": "NDM 1.8.0 — IDM-parity release: Native host ACK and real-time start verification, duplicate title uniquification, Speed Limiter tab and complete connection grid visualization, preserved user connection settings, hardened origin and YouTube DOM security, real live download state persistence, and automated regression test suite."
 }

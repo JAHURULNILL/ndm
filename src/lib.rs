@@ -206,6 +206,7 @@ struct Shared {
     since_save: AtomicU64,
     last_save: Mutex<Instant>,
     active_limit: AtomicUsize,
+    active_workers: AtomicUsize,
     throttle_events: AtomicU64,
     failed: AtomicBool,
     error: Mutex<Option<String>>,
@@ -541,6 +542,19 @@ enum BlockError {
     Cancelled,
 }
 
+struct ActiveWorkerGuard<'a>(&'a AtomicUsize);
+impl<'a> ActiveWorkerGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+impl Drop for ActiveWorkerGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn download_block_run(
     agent: &ureq::Agent,
     url: &str,
@@ -557,6 +571,7 @@ fn download_block_run(
     if *pos > end {
         return Ok(());
     }
+    let _active_guard = ActiveWorkerGuard::new(&shared.active_workers);
     let req_start = *pos;
     let is_gvideo = url.contains("googlevideo.com/videoplayback")
         && !url.contains("&range=")
@@ -852,7 +867,9 @@ impl Download {
         let elapsed = self.started.elapsed().as_secs_f64();
         let fetched = self.shared.fetched_session.load(Ordering::Relaxed);
         let status = *self.shared.status.lock().unwrap();
-        let blocks: Vec<u8> = if self.resumable {
+        let blocks: Vec<u8> = if status == Status::Finished {
+            vec![1u8; self.shared.block_state.len().max(1)]
+        } else if self.resumable {
             self.shared
                 .block_state
                 .iter()
@@ -861,9 +878,18 @@ impl Download {
         } else {
             Vec::new()
         };
+        let conns = if status == Status::Downloading {
+            let live = self.shared.active_workers.load(Ordering::Relaxed);
+            let active_blocks = blocks.iter().filter(|&&b| b == 2).count();
+            live.max(active_blocks).max(1)
+        } else {
+            0
+        };
         Progress {
             total: self.total,
-            done_bytes: if self.resumable {
+            done_bytes: if status == Status::Finished && self.total > 0 {
+                self.total
+            } else if self.resumable {
                 // completed blocks + what each worker has already written
                 // toward its current block: smooth, and never ahead of the
                 // bytes actually on disk
@@ -879,8 +905,12 @@ impl Download {
                 fetched
             },
             fetched_session: fetched,
-            speed_bps: if elapsed > 0.0 { fetched as f64 / elapsed } else { 0.0 },
-            conns: self.shared.active_limit.load(Ordering::Relaxed),
+            speed_bps: if status == Status::Downloading && elapsed > 0.0 {
+                fetched as f64 / elapsed
+            } else {
+                0.0
+            },
+            conns,
             status,
             blocks,
             resumable: self.resumable,
@@ -1052,6 +1082,7 @@ fn start_impl(
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(max_conn.min(total_blocks).max(1)),
+        active_workers: AtomicUsize::new(0),
         throttle_events: AtomicU64::new(0),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
@@ -1096,6 +1127,9 @@ fn start_impl(
             } else if s.done_count.load(Ordering::Relaxed) >= total_blocks {
                 // byte-complete is Finished even if a cancel landed in
                 // the same instant — the file on disk IS the full file
+                for b in &s.block_state {
+                    b.store(1, Ordering::Relaxed);
+                }
                 set_status(&s, Status::Finished);
                 let _ = std::fs::remove_file(&s.state_path);
             } else if s.control.cancelled.load(Ordering::Relaxed) {
@@ -1153,6 +1187,7 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(1),
+        active_workers: AtomicUsize::new(0),
         throttle_events: AtomicU64::new(0),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
@@ -1196,6 +1231,7 @@ fn start_single_stream(
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(1),
+        active_workers: AtomicUsize::new(1),
         throttle_events: AtomicU64::new(0),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
@@ -1764,3 +1800,33 @@ pub fn grab_page(url: &str) -> Result<GrabPage, String> {
 
     Ok(GrabPage { title, items })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_name_of_decodes_and_sanitizes_safely() {
+        assert_eq!(
+            file_name_of("https://example.com/files/Ubuntu%2024.04%20LTS.iso?token=1"),
+            "Ubuntu 24.04 LTS.iso"
+        );
+        assert_eq!(file_name_of("https://example.com/.."), "index");
+        assert_eq!(file_name_of("https://example.com/"), "index");
+    }
+
+    #[test]
+    fn finished_download_reports_zero_active_conns_and_all_done_blocks() {
+        let control = Arc::new(Control {
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        });
+        let dl = finished_empty_download(control, PathBuf::from("/tmp/nonexistent.ndm.json"));
+        let p = dl.progress();
+        assert_eq!(p.status, Status::Finished);
+        assert_eq!(p.conns, 0);
+        assert!(!p.blocks.is_empty());
+        assert!(p.blocks.iter().all(|&b| b == 1));
+    }
+}
+

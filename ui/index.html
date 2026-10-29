@@ -140,7 +140,7 @@
 <div id="detail" class="modal hidden">
   <div class="modal-card detail-modal">
     <div class="modal-head"><span id="dTitle">Download Status</span> <span id="dModalClose">×</span></div>
-    <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabCompletion">Options on completion</span></div>
+    <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabCompletion">Options on completion</span><span class="tab" id="tabLimiter">Speed Limiter</span></div>
     <div class="detail-body" id="panelStatus">
       <dl class="kv">
         <dt>URL:</dt><dd id="dUrl">—</dd>
@@ -165,6 +165,21 @@
       <label class="comp-opt"><input type="radio" name="compAct" value="open_file"> Open the file</label>
       <label class="comp-opt"><input type="radio" name="compAct" value="open_folder"> Open the folder</label>
       <p class="comp-note dim">Applies to the selected download only, and is remembered across restarts.</p>
+    </div>
+    <div class="detail-body hidden" id="panelLimiter">
+      <p class="comp-note">Speed Limiter for active downloads:</p>
+      <label class="comp-opt">
+        <input type="checkbox" id="dLimitOn"> Use Speed Limiter
+      </label>
+      <div style="margin: 12px 0; display: flex; align-items: center; gap: 8px;">
+        <label for="dLimitVal">Maximum download speed:</label>
+        <input type="number" id="dLimitVal" min="0.1" step="0.5" max="1000" style="width: 80px; padding: 4px;" value="2">
+        <span>MB/s</span>
+      </div>
+      <div class="detail-btns" style="margin-top: 14px;">
+        <button id="dLimitApply" class="tool primary">Apply</button>
+      </div>
+      <p class="comp-note dim" style="margin-top: 12px;">Limits download bandwidth in real time across connections, matching IDM speed limiter.</p>
     </div>
   </div>
 </div>

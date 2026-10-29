@@ -138,6 +138,15 @@ function render() {
   const dl = all.filter(d => d.status === 'downloading');
   $('sideStatus').textContent = `${all.length} files (${dl.length} downloading)`;
   $('totalSpeed').textContent = 'Total speed: ' + fmtRate(dl.reduce((a, d) => a + d.speed_bps, 0)).replace('—', '0 B/s');
+
+  const cur = items.get(selectedId);
+  const curFinished = cur && cur.status === 'finished';
+  const curDownloading = cur && cur.status === 'downloading';
+  const curCanResume = cur && !curFinished && !curDownloading;
+  if ($('btnPause')) $('btnPause').disabled = !curDownloading;
+  if ($('btnResume')) $('btnResume').disabled = !curCanResume;
+  if ($('btnDelete')) $('btnDelete').disabled = !cur;
+
   if (!detailEl.classList.contains('hidden')) {
     renderDetail();
   }
@@ -150,8 +159,10 @@ function renderDetail() {
     $('dUrl').textContent = $('dStatus').textContent = $('dSize').textContent = '—';
     $('dDone').textContent = $('dRate').textContent = $('dLeft').textContent = $('dResume').textContent = '—';
     $('dBarFill').style.width = '0%'; $('dBarText').textContent = '0.0%';
+    if ($('dPause')) $('dPause').disabled = true;
+    if ($('dResumeBtn')) $('dResumeBtn').disabled = true;
     $('dOpen').disabled = $('dOpenFolder').disabled = $('dRefresh').disabled = true;
-    drawSegMap('');
+    drawSegMap('', '');
     return;
   }
   if ($('dTitle')) {
@@ -159,8 +170,12 @@ function renderDetail() {
       ? `${pctOf(d).toFixed(0)}% — ${d.name}`
       : 'Download Status';
   }
+  const isFinished = d.status === 'finished';
+  const isDownloading = d.status === 'downloading';
+  if ($('dPause')) $('dPause').disabled = !isDownloading;
+  if ($('dResumeBtn')) $('dResumeBtn').disabled = isFinished || isDownloading;
   $('dOpen').disabled = $('dOpenFolder').disabled = d.status === 'queued';
-  $('dRefresh').disabled = d.status === 'downloading';
+  $('dRefresh').disabled = isDownloading || isFinished;
   document.querySelectorAll('input[name="compAct"]').forEach(r => {
     r.checked = r.value === (d.completion || '');
   });
@@ -179,31 +194,38 @@ function renderDetail() {
   $('dBarFill').style.width = ind ? '' : pctOf(d).toFixed(1) + '%';
   $('dBarText').textContent = d.total > 0 ? pctOf(d).toFixed(1) + '%'
     : (d.status === 'downloading' ? fmtSize(d.done_bytes) : '—');
-  drawSegMap(d.blocks || '');
+  drawSegMap(d.blocks || '', d.status);
 }
 
 /* Segment map: one cell per block char — '1' done, '2' active (pulsing), else pending.
    Colors come from the active theme's CSS variables. */
-function drawSegMap(blocks) {
+function drawSegMap(blocks, status) {
   const cv = $('segMap'), ctx = cv.getContext('2d');
   const W = cv.width = cv.clientWidth || 760;
   const H = cv.height = 86;
   ctx.clearRect(0, 0, W, H);
-  if (!blocks) return;
+  if (!blocks && status !== 'finished') return;
   const css = getComputedStyle(document.documentElement);
   const cDone = css.getPropertyValue('--seg-done').trim() || '#3f9de0';
   const cActive = css.getPropertyValue('--seg-active').trim() || '#f5c542';
   const cActive2 = css.getPropertyValue('--seg-active2').trim() || '#c79a1d';
   const cPending = css.getPropertyValue('--seg-pending').trim() || '#c9d2da';
-  const n = Math.min(blocks.length, 1024);
-  const cols = Math.ceil(Math.sqrt(n * (W / H)));
-  const rows = Math.ceil(n / cols);
+  const n = Math.min(blocks ? blocks.length : 128, 1024);
+  const cols = Math.ceil(Math.sqrt(n * (W / H))) || 1;
+  const rows = Math.ceil(n / cols) || 1;
+  const totalCells = cols * rows;
   const cw = W / cols, ch = H / rows, gap = Math.min(2, cw * 0.18);
-  for (let i = 0; i < n; i++) {
-    const x = (i % cols) * cw, y = Math.floor(i / cols) * ch, c = blocks[i];
-    if (c === '1') ctx.fillStyle = cDone;
-    else if (c === '2') ctx.fillStyle = pulse % 2 ? cActive : cActive2;
-    else ctx.fillStyle = cPending;
+  for (let i = 0; i < totalCells; i++) {
+    const x = (i % cols) * cw, y = Math.floor(i / cols) * ch;
+    if (status === 'finished') {
+      ctx.fillStyle = cDone;
+    } else {
+      const blockIdx = Math.floor((i / totalCells) * n);
+      const c = blocks ? blocks[blockIdx] : '0';
+      if (c === '1') ctx.fillStyle = cDone;
+      else if (c === '2') ctx.fillStyle = pulse % 2 ? cActive : cActive2;
+      else ctx.fillStyle = cPending;
+    }
     ctx.fillRect(x + gap / 2, y + gap / 2, Math.max(1, cw - gap), Math.max(1, ch - gap));
   }
 }
@@ -982,15 +1004,40 @@ function demoGrab() {
   setGrabStatus(`Found ${grabItems.length} files on “Demo Page”`);
 }
 
-/* ---------- detail tabs + completion options + open/refresh ---------- */
+/* ---------- detail tabs + completion options + speed limiter + open/refresh ---------- */
+function syncLimiterPanel() {
+  const bps = settings.speed_limit_bps || 0;
+  if ($('dLimitOn')) $('dLimitOn').checked = bps > 0;
+  if ($('dLimitVal')) {
+    $('dLimitVal').value = bps > 0
+      ? (bps / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')
+      : '2';
+  }
+}
+
 function showDetailTab(which) {
   $('tabStatus').classList.toggle('active', which === 'status');
   $('tabCompletion').classList.toggle('active', which === 'completion');
+  if ($('tabLimiter')) $('tabLimiter').classList.toggle('active', which === 'limiter');
   $('panelStatus').classList.toggle('hidden', which !== 'status');
   $('panelCompletion').classList.toggle('hidden', which !== 'completion');
+  if ($('panelLimiter')) $('panelLimiter').classList.toggle('hidden', which !== 'limiter');
+  if (which === 'limiter') syncLimiterPanel();
 }
 $('tabStatus').onclick = () => showDetailTab('status');
 $('tabCompletion').onclick = () => showDetailTab('completion');
+if ($('tabLimiter')) $('tabLimiter').onclick = () => showDetailTab('limiter');
+
+if ($('dLimitApply')) {
+  $('dLimitApply').onclick = async () => {
+    const on = $('dLimitOn').checked;
+    const valMb = Math.max(0.1, Number($('dLimitVal').value) || 1);
+    const bps = on ? Math.round(valMb * 1024 * 1024) : 0;
+    settings.speed_limit_bps = bps;
+    await saveSettings();
+    toast(on ? `Speed limit set to ${valMb} MB/s` : 'Speed limiter turned off');
+  };
+}
 
 document.querySelectorAll('input[name="compAct"]').forEach(r => {
   r.addEventListener('change', async () => {
@@ -1174,7 +1221,7 @@ function demoRemove(id) { items.delete(id); if (selectedId === id) selectedId = 
 setInterval(() => {
   pulse++;
   const d = items.get(selectedId);
-  if (d && d.status === 'downloading') drawSegMap(d.blocks || '');
+  if (d && d.status === 'downloading') drawSegMap(d.blocks || '', d.status);
 }, 500);
 window.addEventListener('resize', () => { if (selectedId) renderDetail(); });
 /* =============== 1.5: menu bar, batch, import, about, updater =============== */
