@@ -41,11 +41,30 @@ const rowsEl = $('rows'), detailEl = $('detail');
 
 /* ---------- settings ---------- */
 const DEFAULT_SETTINGS = {
-  default_dir: '~/Downloads', max_connections: 32, speed_limit_bps: 0,
+  default_dir: '~/Downloads', max_connections: 8, speed_limit_bps: 0,
   max_simultaneous: 0, auto_resume: false, scheduler_enabled: false,
   sched_start: '22:00', sched_stop: '06:00', video_quality: 'best', proxy: '',
+  category_dirs: {}, conn_exceptions: [], exit_when_done: false,
+  sound_events: true, show_complete_dialog: true,
+  queues: [{ name: 'Main download queue', use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false }],
+  quota_mb: 0, quota_hours: 5, clipboard_monitor: true,
 };
 let settings = { ...DEFAULT_SETTINGS };
+
+/* Fill a <select> with the configured queue names. */
+function fillQueueSelect(sel, selectedName) {
+  if (!sel) return;
+  const names = (settings.queues || []).map(q => q.name);
+  const list = names.length ? names : ['Main download queue'];
+  sel.innerHTML = '';
+  for (const n of list) {
+    const o = document.createElement('option');
+    o.value = n;
+    o.textContent = n;
+    if (n === selectedName) o.selected = true;
+    sel.appendChild(o);
+  }
+}
 
 function syncLimiterLabel() {
   const bps = settings.speed_limit_bps || 0;
@@ -79,6 +98,7 @@ function visibleItems() {
   let out = all;
   if (currentCat === 'Finished') out = all.filter(d => d.status === 'finished');
   else if (currentCat === 'Unfinished') out = all.filter(d => d.status !== 'finished');
+  else if (currentCat.startsWith('queue:')) out = all.filter(d => d.queue === currentCat.slice(6));
   else if (currentCat !== 'All Downloads') out = all.filter(d => d.category === currentCat);
   const numId = id => parseInt(String(id).replace(/\D+/g, ''), 10) || 0;
   const by = {
@@ -90,7 +110,34 @@ function visibleItems() {
   return by ? [...out].sort(by) : out;
 }
 
+let queueListSig = '';
+function renderQueueFilters() {
+  const ul = $('queueList');
+  if (!ul) return;
+  const counts = {};
+  for (const d of items.values()) counts[d.queue || 'Main download queue'] = (counts[d.queue || 'Main download queue'] || 0) + 1;
+  const names = (settings.queues || []).map(q => q.name);
+  const sig = names.join('|') + '#' + names.map(n => counts[n] || 0).join(',') + '#' + currentCat;
+  if (sig === queueListSig) return;
+  queueListSig = sig;
+  ul.innerHTML = '';
+  for (const n of names) {
+    const li = document.createElement('li');
+    li.textContent = `▸ ${n} (${counts[n] || 0})`;
+    if (currentCat === 'queue:' + n) li.classList.add('active');
+    li.onclick = () => {
+      document.querySelectorAll('#catList li').forEach(x => x.classList.remove('active'));
+      document.querySelectorAll('#queueList li').forEach(x => x.classList.remove('active'));
+      li.classList.add('active');
+      currentCat = 'queue:' + n;
+      render();
+    };
+    ul.appendChild(li);
+  }
+}
+
 function render() {
+  renderQueueFilters();
   const list = visibleItems();
   rowsEl.innerHTML = '';
   for (const d of list) {
@@ -189,6 +236,21 @@ function renderDetail() {
   $('dLeft').textContent = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
     ? fmtLeft((d.total - d.done_bytes) / d.speed_bps) : '—';
   $('dResume').textContent = d.resume_capability || '—';
+  // per-connection table (IDM shows one row per connection)
+  const dc = $('dConns');
+  if (dc) {
+    const rows = (d.conns_detail || [])
+      .map((b, i) => ({ b, i }))
+      .filter(x => x.b > 0 || (d.status === 'downloading' && x.i < (d.conns || 0)));
+    dc.innerHTML = rows.length
+      ? rows.map(x => `<div class="d-conn-row"><span>Connection ${x.i + 1}</span><span>${fmtSize(x.b)} downloaded</span></div>`).join('')
+      : '';
+  }
+  // queue assignment (moving queues is IDM's "Add to queue")
+  const dq = $('dQueueSel');
+  if (dq && document.activeElement !== dq) {
+    fillQueueSelect(dq, d.queue || 'Main download queue');
+  }
   const ind = d.status === 'downloading' && d.total === 0;
   $('dBarFill').classList.toggle('ind', ind);
   $('dBarFill').style.width = ind ? '' : pctOf(d).toFixed(1) + '%';
@@ -303,6 +365,11 @@ if ($('btnStatus')) {
     select(selectedId, true);
   };
 }
+if ($('dQueueSel')) $('dQueueSel').addEventListener('change', async () => {
+  if (!selectedId || !TAURI) return;
+  try { await invoke('set_entry_queue', { id: selectedId, queue: $('dQueueSel').value }); }
+  catch (e) { toast('Could not move the download: ' + e); }
+});
 $('dPause').onclick = $('btnPause').onclick;
 $('dResumeBtn').onclick = $('btnResume').onclick;
 $('dHide').onclick = () => detailEl.classList.add('hidden');
@@ -320,6 +387,7 @@ $('btnStopAll').onclick = async () => {
 document.querySelectorAll('#catList li').forEach(li => {
   li.onclick = () => {
     document.querySelectorAll('#catList li').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('#queueList li').forEach(x => x.classList.remove('active'));
     li.classList.add('active');
     currentCat = li.dataset.cat;
     render();
@@ -378,7 +446,9 @@ async function runFileProbe() {
       ? (presentedFile.cookies || null) : null;
     const referer = (presentedFile && presentedFile.url === url)
       ? (presentedFile.referer || null) : null;
-    const info = await invoke('probe_file', { url, cookies, referer });
+    const login = $('inAuth').checked ? ($('inLogin').value.trim() || null) : null;
+    const password = $('inAuth').checked ? ($('inPassword').value || null) : null;
+    const info = await invoke('probe_file', { url, cookies, referer, login, password });
     if (mySeq !== fileProbeSeq || $('inUrl').value.trim() !== url) return;
     $('fCat').textContent = info.category || 'General';
     $('fSize').textContent = info.total > 0 ? fmtSize(info.total) : 'Unknown';
@@ -398,11 +468,21 @@ $('inUrl').addEventListener('input', () => {
   clearTimeout(fileProbeTimer);
   fileProbeTimer = setTimeout(runFileProbe, 350);
 });
+$('inAuth').addEventListener('change', () => {
+  $('inAuthBox').classList.toggle('hidden', !$('inAuth').checked);
+  clearTimeout(fileProbeTimer);
+  fileProbeTimer = setTimeout(runFileProbe, 350);
+});
 
 function openFileDialog(payload) {
   presentedFile = payload
     ? { url: payload.url, cookies: payload.cookies || '', referer: payload.pageUrl || '' }
     : null;
+  fillQueueSelect($('inQueue'));
+  $('inAuth').checked = false;
+  $('inAuthBox').classList.add('hidden');
+  $('inLogin').value = '';
+  $('inPassword').value = '';
   resetFileProbeUi();
   if (payload) {
     $('inUrl').value = payload.url;
@@ -434,11 +514,27 @@ async function submitAdd(later) {
   modal.classList.add('hidden');
   if (TAURI) {
     try {
-      await invoke('add_download', {
+      const args = {
         url, dir, later, category: null, name,
         cookies: session ? (session.cookies || null) : null,
         referer: session ? (session.referer || null) : null,
-      });
+        queue: $('inQueue').value || null,
+        login: $('inAuth').checked ? ($('inLogin').value.trim() || null) : null,
+        password: $('inAuth').checked ? ($('inPassword').value || null) : null,
+      };
+      try {
+        await invoke('add_download', args);
+      } catch (e) {
+        // IDM asks what to do about a duplicate link — so do we
+        if (String(e).startsWith('duplicate:') &&
+            confirm('This file is already in the download list.\nDownload it again as a new copy?')) {
+          await invoke('add_download', { ...args, force: true });
+        } else if (String(e).startsWith('duplicate:')) {
+          // user chose to keep the existing entry — done, not an error
+        } else {
+          throw e;
+        }
+      }
       $('inUrl').value = '';
       $('inName').value = '';
     } catch (e) {
@@ -503,6 +599,7 @@ function openVideoModal(url, cookies) {
   gateComponents();
   presentedVideoUrl = url || null;
   presentedVideoCookies = cookies || '';
+  fillQueueSelect($('vInQueue'));
   vmodal.classList.remove('hidden');
   if (url) { $('vInUrl').value = url; }
   $('vInUrl').focus();
@@ -697,6 +794,7 @@ async function fetchVideoInfo() {
     $('vInfo').classList.remove('hidden');
     $('vStart').disabled = false;
     if ($('vLater')) $('vLater').disabled = false;
+    if ($('vAll')) $('vAll').disabled = false;
     st.textContent = '';
   } catch (e) {
     st.textContent = String(e);
@@ -711,6 +809,7 @@ $('vInUrl').addEventListener('input', () => {
   $('vInfo').classList.add('hidden');
   $('vStart').disabled = true;
   if ($('vLater')) $('vLater').disabled = true;
+  if ($('vAll')) $('vAll').disabled = true;
   $('vStatus').textContent = '';
 });
 
@@ -729,7 +828,7 @@ async function submitVideo(later) {
   closeVideoModal();
   if (TAURI) {
     try {
-      await invoke('add_video', {
+      const args = {
         url,
         dir,
         selector: opt.selector,
@@ -738,7 +837,19 @@ async function submitVideo(later) {
         cookies,
         later: !!later,
         total: Number(opt.size_bytes) || 0,
-      });
+        queue: $('vInQueue').value || null,
+      };
+      try {
+        await invoke('add_video', args);
+      } catch (e) {
+        // IDM asks what to do about a duplicate link — so do we
+        if (String(e).startsWith('duplicate:') &&
+            confirm('This video quality is already in the download list.\nDownload it again as a new copy?')) {
+          await invoke('add_video', { ...args, force: true });
+        } else if (!String(e).startsWith('duplicate:')) {
+          throw e;
+        }
+      }
     } catch (e) {
       console.error('add_video failed', e);
       toast('Could not add the video: ' + e);
@@ -747,6 +858,37 @@ async function submitVideo(later) {
 }
 $('vStart').onclick = () => submitVideo(false);
 if ($('vLater')) $('vLater').onclick = () => submitVideo(true);
+if ($('vAll')) $('vAll').onclick = async () => {
+  // IDM's "Download all": every listed quality, each as its own
+  // download; ones already in the list are skipped, not duplicated
+  if (!vInfo) return;
+  const url = $('vInUrl').value.trim();
+  if (vInfo.url !== url) return;
+  const dir = $('vInDir').value.trim() || '~/Downloads';
+  const customTitle = ($('vTitleInput') && $('vTitleInput').value.trim()) || vInfo.title || '';
+  const cookies = (presentedVideoUrl && url === presentedVideoUrl)
+    ? (presentedVideoCookies || null) : null;
+  if (cookies) presentedTokenConsumed = true;
+  const queue = $('vInQueue').value || null;
+  const options = vInfo.options.slice();
+  closeVideoModal();
+  if (!TAURI) return;
+  let sent = 0;
+  let skipped = 0;
+  for (const opt of options) {
+    try {
+      await invoke('add_video', {
+        url, dir, selector: opt.selector, audio: !!opt.audio,
+        title: customTitle, cookies, later: false,
+        total: Number(opt.size_bytes) || 0, queue,
+      });
+      sent++;
+    } catch (e) {
+      skipped++;
+    }
+  }
+  toast(`Download all: ${sent} qualities added${skipped ? `, ${skipped} skipped` : ''}`);
+};
 
 /* ---------- Options modal ---------- */
 const omodal = $('omodal');
@@ -760,6 +902,17 @@ function openOptions() {
   $('oAutoResume').checked = settings.auto_resume;
   $('oVideoQ').value = settings.video_quality;
   $('oProxy').value = settings.proxy || '';
+  const cd = settings.category_dirs || {};
+  for (const c of ['Compressed', 'Documents', 'Music', 'Video', 'Programs', 'General']) {
+    $('oCat' + c).value = cd[c] || '';
+  }
+  $('oConnExc').value = (settings.conn_exceptions || []).join(', ');
+  $('oExitDone').checked = !!settings.exit_when_done;
+  $('oSounds').checked = settings.sound_events !== false;
+  $('oCompleteDlg').checked = settings.show_complete_dialog !== false;
+  $('oClipboard').checked = settings.clipboard_monitor !== false;
+  $('oQuotaMb').value = settings.quota_mb || 0;
+  $('oQuotaHours').value = settings.quota_hours || 5;
   $('oAutoUpdate').checked = settings.auto_update !== false;
   $('oEngine').textContent = '…';
   if (TAURI) invoke('components_status').then(st => {
@@ -776,7 +929,7 @@ $('oSave').onclick = async () => {
   settings = {
     ...settings,
     default_dir: $('oDir').value.trim() || '~/Downloads',
-    max_connections: Math.min(32, Math.max(1, Number($('oConns').value) || 16)),
+    max_connections: Math.min(32, Math.max(1, Number($('oConns').value) || 8)),
     speed_limit_bps: $('oLimitOn').checked
       ? Math.round(Math.max(0.1, Number($('oLimitVal').value) || 1) * 1024 * 1024) : 0,
     max_simultaneous: Math.min(10, Math.max(0, Number($('oSimul').value) || 0)),
@@ -784,6 +937,17 @@ $('oSave').onclick = async () => {
     auto_update: $('oAutoUpdate').checked,
     video_quality: $('oVideoQ').value,
     proxy: $('oProxy').value.trim(),
+    category_dirs: Object.fromEntries(
+      ['Compressed', 'Documents', 'Music', 'Video', 'Programs', 'General']
+        .map(c => [c, $('oCat' + c).value.trim()])
+        .filter(([, v]) => v)),
+    conn_exceptions: $('oConnExc').value.split(',').map(s => s.trim()).filter(Boolean),
+    exit_when_done: $('oExitDone').checked,
+    sound_events: $('oSounds').checked,
+    show_complete_dialog: $('oCompleteDlg').checked,
+    clipboard_monitor: $('oClipboard').checked,
+    quota_mb: Math.max(0, parseInt($('oQuotaMb').value, 10) || 0),
+    quota_hours: Math.min(168, Math.max(1, parseInt($('oQuotaHours').value, 10) || 5)),
   };
   await saveSettings();
   $('inDir').value = settings.default_dir;
@@ -793,39 +957,102 @@ $('oSave').onclick = async () => {
 
 /* ---------- Scheduler modal ---------- */
 const smodal = $('smodal');
+let schedSel = 'Main download queue';
+function schedCfgOf(name) {
+  return (settings.queues || []).find(q => q.name === name)
+    || { name, use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false };
+}
+function fillSchedulerFields() {
+  const cfg = schedCfgOf(schedSel);
+  $('sEnabled').checked = !!cfg.use_schedule;
+  $('sStart').value = cfg.start || '22:00';
+  $('sStop').value = cfg.stop || '06:00';
+  $('schedExitDone').checked = !!cfg.exit_when_done;
+  $('schedDelete').disabled = schedSel === 'Main download queue';
+}
 function openScheduler() {
-  $('sEnabled').checked = settings.scheduler_enabled;
-  $('sStart').value = settings.sched_start;
-  $('sStop').value = settings.sched_stop;
+  fillQueueSelect($('schedQueueSel'), schedSel);
+  schedSel = $('schedQueueSel').value || 'Main download queue';
+  fillSchedulerFields();
   $('sSimulVal').textContent = settings.max_simultaneous > 0
     ? String(settings.max_simultaneous) : 'Unlimited';
   $('sStatus').textContent = '';
   smodal.classList.remove('hidden');
 }
+$('schedQueueSel').addEventListener('change', () => {
+  schedSel = $('schedQueueSel').value;
+  fillSchedulerFields();
+});
+$('schedNew').onclick = async () => {
+  const name = $('schedNewName').value.trim();
+  if (!name) { $('sStatus').textContent = 'Type a name for the new queue first'; return; }
+  if ((settings.queues || []).some(q => q.name.toLowerCase() === name.toLowerCase())) {
+    $('sStatus').textContent = 'A queue with that name already exists';
+    return;
+  }
+  settings = {
+    ...settings,
+    queues: [...(settings.queues || []),
+      { name, use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false }],
+  };
+  await saveSettings();
+  schedSel = name;
+  $('schedNewName').value = '';
+  openScheduler();
+  $('sStatus').textContent = `Queue "${name}" created`;
+};
+$('schedDelete').onclick = async () => {
+  if (schedSel === 'Main download queue') return;
+  if (!confirm(`Delete the queue "${schedSel}"?\nIts downloads move to the Main download queue.`)) return;
+  settings = {
+    ...settings,
+    queues: (settings.queues || []).filter(q => q.name !== schedSel),
+  };
+  await saveSettings();
+  schedSel = 'Main download queue';
+  openScheduler();
+  renderList();
+};
 $('btnScheduler').onclick = openScheduler;
 $('sModalClose').onclick = $('sCancel').onclick = () => smodal.classList.add('hidden');
 smodal.addEventListener('click', e => { if (e.target === smodal) smodal.classList.add('hidden'); });
 $('sStartNow').onclick = async () => {
   if (TAURI) {
-    try { await invoke('scheduler_start_now'); }
+    try { await invoke('scheduler_start_now', { queue: schedSel }); }
     catch (e) { console.error(e); $('sStatus').textContent = 'Could not start the queue: ' + e; return; }
   }
-  $('sStatus').textContent = 'Queue started';
+  $('sStatus').textContent = `Queue "${schedSel}" started`;
 };
 $('sStopNow').onclick = async () => {
   if (TAURI) {
-    try { await invoke('scheduler_stop_now'); }
+    try { await invoke('scheduler_stop_now', { queue: schedSel }); }
     catch (e) { console.error(e); $('sStatus').textContent = 'Could not stop the queue: ' + e; return; }
   }
-  $('sStatus').textContent = 'All downloads paused';
+  $('sStatus').textContent = `Queue "${schedSel}" paused`;
 };
 $('sSave').onclick = async () => {
-  settings = {
-    ...settings,
-    scheduler_enabled: $('sEnabled').checked,
-    sched_start: $('sStart').value || '22:00',
-    sched_stop: $('sStop').value || '06:00',
-  };
+  // write the edited window back into the selected queue; the
+  // legacy global scheduler fields mirror the Main queue (backend
+  // sanitize keeps them in sync too)
+  const queues = (settings.queues || []).map(q => q.name === schedSel
+    ? {
+        ...q,
+        use_schedule: $('sEnabled').checked,
+        start: $('sStart').value || '22:00',
+        stop: $('sStop').value || '06:00',
+        exit_when_done: $('schedExitDone').checked,
+      }
+    : q);
+  settings = { ...settings, queues };
+  const main = queues.find(q => q.name === 'Main download queue');
+  if (main) {
+    settings = {
+      ...settings,
+      scheduler_enabled: !!main.use_schedule,
+      sched_start: main.start,
+      sched_stop: main.stop,
+    };
+  }
   await saveSettings();
   $('sStatus').textContent = 'Saved';
 };
@@ -1139,6 +1366,13 @@ async function initTauri() {
     const pending = await invoke('take_pending_videos');
     for (const p of pending || []) queueVideoLink(p.url || '', p.cookies || '');
   } catch (e) { console.error('take_pending_videos failed', e); }
+  await listen('quota_exceeded', () => {
+    toast(`Download limit reached (${settings.quota_mb} MB per ${settings.quota_hours} h). Downloads are paused until the next period.`);
+  });
+  await listen('download_complete', e => {
+    completeQueue.push(e.payload || {});
+    showNextComplete();
+  });
   await listen('components_progress', e => { onComponentsProgress(e.payload || {}); });
   await listen('update_available', e => { showUpdate(e.payload || {}); });
   await listen('update_progress', e => { onUpdateProgress(e.payload || {}); });
@@ -1156,6 +1390,42 @@ async function initTauri() {
 function normalize(d) {
   return { resume_capability: null, blocks: '', added: '', ...d };
 }
+
+/* ---------- Download Complete dialog (IDM shows one by default) -- */
+const completeQueue = [];
+let completeCurrent = null;
+function showNextComplete() {
+  const cm = $('cmodal');
+  if (!cm || completeCurrent || !completeQueue.length) return;
+  if (settings.show_complete_dialog === false) { completeQueue.length = 0; return; }
+  completeCurrent = completeQueue.shift();
+  $('cName').textContent = completeCurrent.name || 'Download';
+  $('cPath').textContent = 'Saved to: ' + (completeCurrent.path || '');
+  $('cSize').textContent = completeCurrent.total
+    ? 'Downloaded ' + fmtSize(completeCurrent.total) + ' (' + completeCurrent.total + ' bytes)'
+    : '';
+  $('cDontShow').checked = false;
+  cm.classList.remove('hidden');
+}
+async function closeComplete(openMode) {
+  const cm = $('cmodal');
+  const cur = completeCurrent;
+  completeCurrent = null;
+  cm.classList.add('hidden');
+  if ($('cDontShow').checked) {
+    settings = { ...settings, show_complete_dialog: false };
+    await saveSettings();
+  }
+  if (cur && openMode) {
+    try { await invoke('open_path', { id: cur.id, folder: openMode === 'folder' }); }
+    catch (e) { console.error('open_path failed', e); }
+  }
+  showNextComplete();
+}
+if ($('cOpen')) $('cOpen').onclick = () => closeComplete('file');
+if ($('cOpenFolder')) $('cOpenFolder').onclick = () => closeComplete('folder');
+if ($('cClose')) $('cClose').onclick = () => closeComplete(null);
+if ($('cModalClose')) $('cModalClose').onclick = () => closeComplete(null);
 
 /* ---------- demo mode (plain browser, no Tauri) ---------- */
 const DEMO_BLOCK_BYTES = 4 * 1024 * 1024;
