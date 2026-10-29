@@ -1898,7 +1898,7 @@ dependencies = [
 
 [[package]]
 name = "ndm"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "ndm-app"
-version = "1.8.0"
+version = "1.8.1"
 dependencies = [
  "chrono",
  "ndm",
