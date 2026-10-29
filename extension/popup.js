@@ -38,9 +38,17 @@ async function init() {
     stored = await chrome.storage.local.get(['ndmIntercept']);
   } catch (e) {}
   try {
-    await chrome.runtime.sendNativeMessage('com.ndm.host', { type: 'ping' });
-    statusBox.className = 'status ok';
-    statusBox.textContent = 'Connected to NDM ✓';
+    // Via the background worker, so the result also refreshes the
+    // shared host status that gates interception.
+    const r = await chrome.runtime.sendMessage({ action: 'ndm-host-ping' });
+    if (r && r.ok) {
+      statusBox.className = 'status ok';
+      statusBox.textContent = 'Connected to NDM ✓';
+    } else {
+      statusBox.className = 'status bad';
+      statusBox.innerHTML = 'NDM bridge not found.'
+        + '<div class="hint">Is NDM installed and the bridge set up?</div>';
+    }
   } catch (e) {
     statusBox.className = 'status bad';
     statusBox.innerHTML = 'NDM bridge not found.'

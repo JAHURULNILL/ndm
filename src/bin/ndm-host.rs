@@ -107,6 +107,8 @@ fn handle(message: &Value) -> Value {
         Some("probe_file") => handle_probe_file(message),
         Some("show_app") => handle_show_app(),
         Some("download") => handle_download(message),
+        Some("pause_entry") => handle_entry_control(message, "pause_entry"),
+        Some("cancel_entry") => handle_entry_control(message, "cancel_entry"),
         Some(other) => json!({ "ok": false, "error": format!("unknown type: {other}") }),
         None => json!({ "ok": false, "error": "missing type" }),
     }
@@ -177,6 +179,7 @@ fn handle_probe_file(message: &Value) -> Value {
     let auth = ndm::Auth {
         cookie: cookie_header_from_netscape(cookies_str),
         referer,
+        authorization: None,
     };
     match ndm::probe_with_auth(url, &auth) {
         Ok(probe) => {
@@ -330,17 +333,47 @@ fn handle_download(message: &Value) -> Value {
         let audio = message.get("audio").and_then(Value::as_bool).unwrap_or(false);
         let later = message.get("later").and_then(Value::as_bool).unwrap_or(false);
         let total = message.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let force = message.get("force").and_then(Value::as_bool).unwrap_or(false);
         obj["selector"] = json!(selector);
         obj["dir"] = json!(dir);
         obj["audio"] = json!(audio);
         obj["later"] = json!(later);
         obj["total"] = json!(total);
+        obj["force"] = json!(force);
     }
 
     let is_direct = kind == "video_direct" || kind == "file_direct";
     match append_to_queue(obj, cookies) {
         Ok(()) => {
             ensure_app_running(is_direct);
+            wait_for_ack_and_result(&id, 15)
+        }
+        Err(e) => {
+            eprintln!("ndm-host: cannot write queue: {e}");
+            json!({ "ok": false, "error": "cannot write queue file" })
+        }
+    }
+}
+
+/// Pause or cancel one existing entry by id — used by the browser
+/// dialog's Download Later / Cancel buttons now that the download
+/// starts while the dialog is open (IDM's File Info behavior): the
+/// entry already exists by the time the user decides.
+fn handle_entry_control(message: &Value, kind: &str) -> Value {
+    let entry = message.get("entry").and_then(Value::as_str).unwrap_or("");
+    if entry.is_empty()
+        || entry.len() > 64
+        || !entry
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return json!({ "ok": false, "error": "invalid entry id" });
+    }
+    let id = new_entry_id();
+    let obj = json!({ "id": id, "kind": kind, "entry": entry });
+    match append_to_queue(obj, "") {
+        Ok(()) => {
+            ensure_app_running(true);
             wait_for_ack_and_result(&id, 15)
         }
         Err(e) => {

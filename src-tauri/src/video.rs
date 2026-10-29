@@ -545,6 +545,7 @@ impl VideoJob {
             let auth = ndm::Auth {
                 cookie: st.cookie.clone(),
                 referer: st.referer.clone(),
+                authorization: None,
             };
             match ndm::start_with_auth(&st.url, &part, per_stream_conn, ndm::DEFAULT_BLOCK, auth) {
                 Ok(dl) => {
