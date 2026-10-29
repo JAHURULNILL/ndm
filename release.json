@@ -1,7 +1,7 @@
 {
-  "version": "1.8.1",
-  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.8.1/NDM_1.8.1_amd64.deb",
-  "deb_sha256": "5574e2ab9342f579008fbbbfdb6103bbde7666cf32a73c02aba79514361c9500",
+  "version": "1.8.2",
+  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.8.2/NDM_1.8.2_amd64.deb",
+  "deb_sha256": "1e5bcc577934d52ae29e803396f233bcd261d7983b91e0b171bebf2dca4326d0",
   "min_supported": "1.0.0",
-  "notes": "NDM 1.8.1 \u2014 IDM-parity fix release: separate audio/video streams are downloaded and muxed into one file with sound (the way IDM does it), and a silent video now ends as an error instead of a fake Finished; real download error reasons are stored, shown in the list and status dialog, and kept across restarts; videos sent while the engine is still setting up on first run wait in the queue and start automatically; interception never hands a download back to the browser, IDM-style; pause/cancel wins the finish race; AAC merge normalization restored; master playlist chosen by content; progress saved during flight."
+  "notes": "NDM 1.8.2 \u2014 the full IDM audit release. Every function of the app and extension was compared against IDM one by one and aligned: unified categories with IDM folder routing, per-server connection limits, duplicate downloads ask first (IDM-style), automatic retries (10x, 30s apart, permanent errors excluded), Download Complete dialog, completion sounds, exit-when-done. The dialogs now start the download while they are open, exactly like IDM's File Info: Start keeps it, Download Later pauses it in the app, Cancel discards it completely. Plus IDM's Scheduler queues (named queues, each with its own window, simultaneous cap and exit-when-done), Download limits (quota per period), clipboard link monitoring, the per-connection progress table, login/password authorization on Add URL, and Download all for videos. Default connection number is now 8, IDM's default."
 }
