@@ -1,7 +1,7 @@
 {
-  "version": "1.8.0",
-  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.8.0/NDM_1.8.0_amd64.deb",
-  "deb_sha256": "9a6641be34a06e08d6c9b7e112fd5eea835f6e08f459a8e34852d6b23535dadc",
+  "version": "1.8.1",
+  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.8.1/NDM_1.8.1_amd64.deb",
+  "deb_sha256": "5574e2ab9342f579008fbbbfdb6103bbde7666cf32a73c02aba79514361c9500",
   "min_supported": "1.0.0",
-  "notes": "NDM 1.8.0 — IDM-parity release: Instant 0ms browser download interception preventing native Save dialogs, silent background downloads without app window focus stealing, high-speed multi-connection TCP streaming (up to 256MB contiguous chunks), Native host ACK and real-time start verification, duplicate title uniquification, Speed Limiter tab and complete connection grid visualization, preserved user connection settings, hardened origin and YouTube DOM security, real live download state persistence, and automated regression test suite."
+  "notes": "NDM 1.8.1 \u2014 IDM-parity fix release: separate audio/video streams are downloaded and muxed into one file with sound (the way IDM does it), and a silent video now ends as an error instead of a fake Finished; real download error reasons are stored, shown in the list and status dialog, and kept across restarts; videos sent while the engine is still setting up on first run wait in the queue and start automatically; interception never hands a download back to the browser, IDM-style; pause/cancel wins the finish race; AAC merge normalization restored; master playlist chosen by content; progress saved during flight."
 }
