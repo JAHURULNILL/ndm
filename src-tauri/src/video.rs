@@ -34,7 +34,6 @@ pub fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
 
 /// Inspect a finished media file with `ffmpeg -hide_banner -i <path>` to
 /// verify which stream types (`(has_video, has_audio)`) are actually present.
-#[allow(dead_code)]
 pub fn probe_streams(path: &Path, components_dir: &Path) -> Option<(bool, bool)> {
     let ffmpeg = find_tool("ffmpeg", components_dir)?;
     let out = Command::new(ffmpeg)
@@ -272,12 +271,21 @@ pub struct VideoJob {
     stop_flag: Mutex<Option<String>>, // "paused" | "cancelled" when WE stopped it
     spawn_lock: Mutex<()>,
     gen: std::sync::atomic::AtomicU64,
+    /// the chosen formats carry a sound stream (learned from yt-dlp's own
+    /// resolution) — a "finished" video without sound is then a failure,
+    /// never a success
+    expect_audio: Mutex<bool>,
+    /// separate HLS audio rendition (master-playlist EXT-X-MEDIA) that the
+    /// app must fetch and mux itself; yt-dlp's generic extractor cannot
+    /// pair it with the chosen variant
+    pair_audio_url: Mutex<Option<String>>,
 }
 
 #[derive(Clone)]
 struct DirectStream {
     url: String,
     ext: String,
+    has_audio: bool,
     cookie: Option<String>,
     referer: Option<String>,
 }
@@ -322,6 +330,8 @@ impl VideoJob {
             stop_flag: Mutex::new(None),
             spawn_lock: Mutex::new(()),
             gen: std::sync::atomic::AtomicU64::new(0),
+            expect_audio: Mutex::new(false),
+            pair_audio_url: Mutex::new(None),
         });
         job.spawn(components_dir)?;
         Ok(job)
@@ -382,6 +392,49 @@ impl VideoJob {
             Some(arr) if !arr.is_empty() => arr.iter().collect(),
             _ => vec![&v],
         };
+        // Learn what this download SHOULD contain before any early
+        // return below can lose the information: whether the chosen
+        // formats carry sound, and — for HLS sources whose sound is a
+        // separate rendition in the master playlist — where it lives.
+        {
+            let any_audio = formats.iter().any(|f| {
+                let ac = f["acodec"].as_str().unwrap_or("none");
+                !ac.is_empty() && ac != "none"
+            });
+            *self.expect_audio.lock().unwrap() = any_audio;
+            if !any_audio && !self.audio {
+                let clean_url = self
+                    .url
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let is_hls = clean_url.ends_with(".m3u8")
+                    || formats
+                        .iter()
+                        .any(|f| f["protocol"].as_str().unwrap_or("").contains("m3u8"));
+                if is_hls {
+                    let hdr = &formats[0]["http_headers"];
+                    let cookie = hdr["Cookie"]
+                        .as_str()
+                        .or_else(|| hdr["cookie"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let referer = hdr["Referer"]
+                        .as_str()
+                        .or_else(|| hdr["referer"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if let Some(u) = ndm::video_probe::fetch_hls_default_audio(
+                        &self.url,
+                        &referer,
+                        &cookie,
+                    ) {
+                        *self.pair_audio_url.lock().unwrap() = Some(u);
+                    }
+                }
+            }
+        }
         if formats.is_empty() || formats.len() > 2 {
             return None;
         }
@@ -399,7 +452,24 @@ impl VideoJob {
             if lower.contains(".m3u8") || lower.contains(".mpd") {
                 return None;
             }
-            let ext = f["ext"].as_str().unwrap_or("mp4").to_string();
+            // The extension comes from the network: keep it a plain
+            // short token before it is ever used inside a file path.
+            let raw_ext = f["ext"].as_str().unwrap_or("mp4");
+            let cleaned: String = raw_ext
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(5)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let ext = if cleaned.len() < 2 {
+                "mp4".to_string()
+            } else {
+                cleaned
+            };
+            let has_audio = {
+                let ac = f["acodec"].as_str().unwrap_or("none");
+                !ac.is_empty() && ac != "none"
+            };
             let headers = &f["http_headers"];
             let cookie = headers["Cookie"]
                 .as_str()
@@ -412,6 +482,7 @@ impl VideoJob {
             streams.push(DirectStream {
                 url: u.to_string(),
                 ext,
+                has_audio,
                 cookie,
                 referer,
             });
@@ -432,6 +503,11 @@ impl VideoJob {
         else {
             return false;
         };
+        // The resolved streams are the ground truth for what the
+        // merged file must contain (the finish-line guard reads this).
+        if streams.iter().any(|s| s.has_audio) {
+            *self.expect_audio.lock().unwrap() = true;
+        }
         if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
             || self.stop_flag.lock().unwrap().is_some()
         {
@@ -622,6 +698,20 @@ impl VideoJob {
                 "-movflags".into(),
                 "+faststart".into(),
             ]);
+        } else if final_ext == "mp4" || final_ext == "m4a" || final_ext == "mov" {
+            // Normalize the audio to AAC like the two-stream branch:
+            // a verbatim copy can leave Opus-in-MP4 that many players
+            // refuse to play.
+            ff_args.extend([
+                "-c:v".into(),
+                "copy".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+                "-movflags".into(),
+                "+faststart".into(),
+            ]);
         } else {
             ff_args.extend([
                 "-c".into(),
@@ -648,19 +738,186 @@ impl VideoJob {
         }
 
         if merge_ok {
-            let mut p = self.progress.lock().unwrap();
-            if let Ok(m) = final_path.metadata() {
-                p.total = m.len();
-                p.done = m.len();
+            match self.ensure_audio(&final_path, components_dir) {
+                Ok(verified) => {
+                    let mut p = self.progress.lock().unwrap();
+                    if let Ok(m) = verified.metadata() {
+                        p.total = m.len();
+                        p.done = m.len();
+                    }
+                    p.status = "finished".to_string();
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                    p.final_path = Some(verified);
+                    true
+                }
+                Err(msg) => {
+                    // The bytes arrived but the file must not be
+                    // presented as a success (e.g. it has no sound).
+                    // Terminal: do NOT fall back to a second download.
+                    let mut p = self.progress.lock().unwrap();
+                    p.status = "error".to_string();
+                    p.error = Some(msg);
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                    p.final_path = Some(final_path);
+                    true
+                }
             }
-            p.status = "finished".to_string();
-            p.speed_bps = 0.0;
-            p.conns = 0;
-            p.final_path = Some(final_path);
-            true
         } else {
             false
         }
+    }
+
+    /// The silent-video guard. A video download is only "finished" when
+    /// the file on disk actually contains the sound the source offered:
+    /// verify the merged file's streams, and when the sound lives in a
+    /// separate HLS rendition, download it and mux it in. Returns the
+    /// final path (possibly the muxed replacement) or a user-readable
+    /// error — a silent file must never pass as a success.
+    fn ensure_audio(
+        &self,
+        final_path: &Path,
+        components_dir: &Path,
+    ) -> Result<PathBuf, String> {
+        if self.audio {
+            return Ok(final_path.to_path_buf());
+        }
+        let expect = *self.expect_audio.lock().unwrap();
+        let pair = self.pair_audio_url.lock().unwrap().clone();
+        let (has_video, has_audio) = match probe_streams(final_path, components_dir) {
+            Some(pair) => pair,
+            None => {
+                if expect || pair.is_some() {
+                    return Err("the download completed but its sound could not be verified (the stream check failed) — the file may be silent; please retry".to_string());
+                }
+                return Ok(final_path.to_path_buf());
+            }
+        };
+        if !has_video {
+            return Err("the downloaded file has no playable video stream — the source appears to be broken".to_string());
+        }
+        if has_audio {
+            return Ok(final_path.to_path_buf());
+        }
+        // Video is here, sound is missing.
+        if !expect && pair.is_none() {
+            return Ok(final_path.to_path_buf()); // the source itself is silent
+        }
+        let pair_url = pair.ok_or_else(|| {
+            "this video was expected to have sound, but no audio stream could be found for it — the file would be silent".to_string()
+        })?;
+        let ffmpeg = find_tool("ffmpeg", components_dir)
+            .ok_or("ffmpeg is not available, so the separate audio track cannot be joined")?;
+        let ytdlp = find_tool("yt-dlp", components_dir)
+            .ok_or("yt-dlp is not available, so the separate audio track cannot be fetched")?;
+
+        // 1. Fetch the audio rendition as its own small download.
+        let stem = final_path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "video".to_string());
+        let audio_tmpl = self.dir.join(format!(".{stem}.ndm_audio.%(ext)s"));
+        let before = dir_snapshot(&self.dir);
+        let mut args = base_args_for_url(&pair_url, components_dir, self.cookies.as_deref());
+        args.push("-f".into());
+        args.push("bestaudio/best".into());
+        args.push("--ffmpeg-location".into());
+        args.push(
+            ffmpeg
+                .parent()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+        args.push("--no-overwrites".into());
+        args.push("-o".into());
+        args.push(audio_tmpl.display().to_string());
+        args.push("--".into());
+        args.push(pair_url.clone());
+        let fetched = Command::new(&ytdlp)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let audio_file = if fetched {
+            // whatever new file the rendition download produced
+            let prefix = format!(".{stem}.ndm_audio.");
+            let mut found: Option<PathBuf> = None;
+            if let Ok(rd) = std::fs::read_dir(&self.dir) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with(&prefix) && !name.ends_with(".part") {
+                        if !before.contains_key(&name) {
+                            found = Some(e.path());
+                            break;
+                        }
+                    }
+                }
+            }
+            found
+        } else {
+            None
+        };
+        let audio_file = audio_file.ok_or_else(|| {
+            "the separate audio track could not be downloaded, so the video would be silent — please retry".to_string()
+        })?;
+
+        // 2. Mux video + audio into a temp file and verify it.
+        let mux_path = self.dir.join(format!(".{stem}.ndm_mux.mp4"));
+        let mux_ok = Command::new(&ffmpeg)
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+            ])
+            .arg(final_path)
+            .arg("-i")
+            .arg(&audio_file)
+            .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+            ])
+            .arg(&mux_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            && mux_path.is_file();
+        let _ = std::fs::remove_file(&audio_file);
+        if !mux_ok {
+            let _ = std::fs::remove_file(&mux_path);
+            return Err("joining the separate audio track into the video failed — the file would be silent; please retry".to_string());
+        }
+        match probe_streams(&mux_path, components_dir) {
+            Some((true, true)) => {}
+            _ => {
+                let _ = std::fs::remove_file(&mux_path);
+                return Err("the joined file still has no sound — refusing to call it finished".to_string());
+            }
+        }
+
+        // 3. Replace the silent file with the muxed one.
+        let _ = std::fs::remove_file(final_path);
+        std::fs::rename(&mux_path, final_path).map_err(|e| {
+            format!("the sound was joined but the file could not be saved in place: {e}")
+        })?;
+        Ok(final_path.to_path_buf())
     }
 
     fn spawn(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
@@ -785,9 +1042,9 @@ impl VideoJob {
             }
 
             let err_buf = Arc::new(Mutex::new(String::new()));
-            if let Some(mut se) = stderr {
+            let err_thread = if let Some(mut se) = stderr {
                 let eb = err_buf.clone();
-                std::thread::spawn(move || {
+                Some(std::thread::spawn(move || {
                     use std::io::Read as _;
                     let mut tail: Vec<u8> = Vec::new();
                     let mut chunk = [0u8; 8192];
@@ -804,8 +1061,10 @@ impl VideoJob {
                         }
                     }
                     *eb.lock().unwrap() = String::from_utf8_lossy(&tail).to_string();
-                });
-            }
+                }))
+            } else {
+                None
+            };
             let before = dir_snapshot(&job.dir);
             let mut base: u64 = 0;
             let mut cur_done: u64 = 0;
@@ -866,44 +1125,91 @@ impl VideoJob {
                 Some(mut c) => c.wait().ok(),
                 None => None,
             };
-            let mut p = job.progress.lock().unwrap();
-            p.conns = 0;
-            if status.map(|s| s.success()).unwrap_or(false) {
+            // The stderr reader publishes its tail only at EOF; wait
+            // for it, or the failure reason races us and is lost.
+            if let Some(h) = err_thread {
+                let _ = h.join();
+            }
+            let succeeded = status.map(|s| s.success()).unwrap_or(false);
+            // A pause/cancel that landed while yt-dlp was finishing
+            // wins over the success report: the user stopped this job,
+            // so its files stay partial and resumable.
+            let stop = job.stop_flag.lock().unwrap().clone();
+            // Resolve the outcome BEFORE taking the progress lock: the
+            // audio guard shells out to ffmpeg/yt-dlp and can take a
+            // few seconds on the pairing path.
+            enum Outcome {
+                Finished(PathBuf),
+                GuardError(PathBuf, String),
+                MergeMissing,
+                Stopped(String),
+                Failed,
+            }
+            let outcome = if let Some(flag) = stop {
+                Outcome::Stopped(flag)
+            } else if succeeded {
+                let prev_final = job.progress.lock().unwrap().final_path.clone();
                 let found = detected_final
                     .filter(|fp| fp.is_file())
-                    .or_else(|| p.final_path.clone().filter(|fp| fp.is_file()))
+                    .or_else(|| prev_final.filter(|fp| fp.is_file()))
                     .or_else(|| find_final_file(&job.dir, &before, job.audio));
                 match found {
-                    Some(fp) => {
-                        p.status = "finished".to_string();
-                        if let Ok(m) = fp.metadata() {
-                            p.total = m.len();
-                            p.done = m.len();
-                        }
-                        p.final_path = Some(fp);
-                    }
-                    None => {
-                        p.status = "error".to_string();
-                        p.error = Some(
-                            "the video and audio downloaded but could not be merged into one playable file — merging needs ffmpeg. Reinstall NDM with apt (ffmpeg is a package dependency), then try again"
-                                .to_string(),
-                        );
-                    }
+                    Some(fp) => match job.ensure_audio(&fp, &comp_dir) {
+                        Ok(verified) => Outcome::Finished(verified),
+                        Err(msg) => Outcome::GuardError(fp, msg),
+                    },
+                    None => Outcome::MergeMissing,
                 }
-                p.speed_bps = 0.0;
-            } else if let Some(flag) = job.stop_flag.lock().unwrap().clone() {
-                p.status = flag;
-                p.speed_bps = 0.0;
             } else {
-                p.status = "error".to_string();
-                p.speed_bps = 0.0;
-                let eb = err_buf.lock().unwrap();
-                p.error = eb
-                    .lines()
-                    .rev()
-                    .find(|l| l.contains("ERROR"))
-                    .map(|l| l.trim().to_string())
-                    .or_else(|| Some("yt-dlp failed".to_string()));
+                Outcome::Failed
+            };
+            let mut p = job.progress.lock().unwrap();
+            p.conns = 0;
+            match outcome {
+                Outcome::Finished(fp) => {
+                    p.status = "finished".to_string();
+                    if let Ok(m) = fp.metadata() {
+                        p.total = m.len();
+                        p.done = m.len();
+                    }
+                    p.final_path = Some(fp);
+                    p.speed_bps = 0.0;
+                }
+                Outcome::GuardError(fp, msg) => {
+                    p.status = "error".to_string();
+                    p.error = Some(msg);
+                    p.final_path = Some(fp);
+                    p.speed_bps = 0.0;
+                }
+                Outcome::MergeMissing => {
+                    p.status = "error".to_string();
+                    p.error = Some(
+                        "the video and audio downloaded but could not be merged into one playable file — merging needs ffmpeg. Reinstall NDM with apt (ffmpeg is a package dependency), then try again"
+                            .to_string(),
+                    );
+                    p.speed_bps = 0.0;
+                }
+                Outcome::Stopped(flag) => {
+                    p.status = flag;
+                    p.speed_bps = 0.0;
+                }
+                Outcome::Failed => {
+                    p.status = "error".to_string();
+                    p.speed_bps = 0.0;
+                    let eb = err_buf.lock().unwrap();
+                    p.error = eb
+                        .lines()
+                        .rev()
+                        .find(|l| l.contains("ERROR"))
+                        .map(|l| l.trim().to_string())
+                        .or_else(|| {
+                            eb.lines()
+                                .rev()
+                                .find(|l| !l.trim().is_empty())
+                                .map(|l| l.trim().to_string())
+                        })
+                        .or_else(|| Some("yt-dlp failed".to_string()));
+                }
             }
         });
         Ok(())
