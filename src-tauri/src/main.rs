@@ -33,6 +33,11 @@ struct ProgressPayload {
     resume_capability: String,
     completion: String,
     error: String,
+    /// the named queue this entry belongs to
+    queue: String,
+    /// cumulative bytes per connection this session (IDM's
+    /// per-connection progress table); empty for video jobs
+    conns_detail: Vec<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -73,6 +78,16 @@ struct SavedEntry {
     /// dialog, and kept across restarts so "Error" is never a dead end
     #[serde(default)]
     error: String,
+    /// the named queue this entry belongs to (older saves → Main)
+    #[serde(default = "main_queue_name")]
+    queue: String,
+    /// "Use authorization" login for this download (IDM parity);
+    /// the password is stored with the entry exactly like IDM
+    /// stores its per-site logins
+    #[serde(default)]
+    login: String,
+    #[serde(default)]
+    password: String,
 }
 
 fn default_kind() -> String {
@@ -80,7 +95,7 @@ fn default_kind() -> String {
 }
 
 fn default_category() -> String {
-    "All Downloads".to_string()
+    "General".to_string()
 }
 
 fn default_status() -> String {
@@ -119,6 +134,46 @@ struct Settings {
     /// "socks5://host:1080"; empty = direct connection
     #[serde(default)]
     proxy: String,
+    /// IDM-style category routing: category name → its own default
+    /// folder. Applies when a download is headed for the ordinary
+    /// default folder; an explicitly chosen folder always wins.
+    #[serde(default)]
+    category_dirs: std::collections::HashMap<String, String>,
+    /// IDM-style per-server connection exceptions, one per line as
+    /// "host-or-*.domain = max-connections" (see conns_for_url).
+    #[serde(default)]
+    conn_exceptions: Vec<String>,
+    /// exit the app when the queue drains (IDM's per-queue
+    /// "Exit when done", as a global switch)
+    #[serde(default)]
+    exit_when_done: bool,
+    /// play the system sound on download complete / failure
+    /// (IDM's Sounds options)
+    #[serde(default = "def_true")]
+    sound_events: bool,
+    /// show the "Download complete" dialog (IDM shows it by default)
+    #[serde(default = "def_true")]
+    show_complete_dialog: bool,
+    /// named download queues (IDM's Scheduler); sanitize() guarantees
+    /// at least the Main queue exists
+    #[serde(default)]
+    queues: Vec<QueueCfg>,
+    /// IDM's Download limits: stop starting (and pause) downloads
+    /// once this many MB were downloaded inside the window;
+    /// 0 = no limit
+    #[serde(default)]
+    quota_mb: u64,
+    /// the quota window length in hours (IDM's default is 5)
+    #[serde(default = "def_quota_hours")]
+    quota_hours: u64,
+    /// watch the clipboard for download links and offer them in the
+    /// Add URL dialog (IDM's clipboard monitoring)
+    #[serde(default = "def_true")]
+    clipboard_monitor: bool,
+}
+
+fn def_quota_hours() -> u64 {
+    5
 }
 
 fn def_true() -> bool {
@@ -129,7 +184,41 @@ fn def_dir() -> String {
     "~/Downloads".to_string()
 }
 fn def_conns() -> usize {
-    32
+    // IDM's default maximum connection number
+    8
+}
+
+fn main_queue_name() -> String {
+    // IDM's built-in queue name
+    "Main download queue".to_string()
+}
+
+/// One named download queue (IDM's Scheduler): entries belong to a
+/// queue, the simultaneous cap applies per queue, and a queue can
+/// carry its own daily window and exit-when-done action.
+#[derive(Clone, Serialize, Deserialize)]
+struct QueueCfg {
+    name: String,
+    #[serde(default)]
+    use_schedule: bool,
+    #[serde(default = "def_sched_start")]
+    start: String,
+    #[serde(default = "def_sched_stop")]
+    stop: String,
+    #[serde(default)]
+    exit_when_done: bool,
+}
+
+impl Default for QueueCfg {
+    fn default() -> Self {
+        QueueCfg {
+            name: main_queue_name(),
+            use_schedule: false,
+            start: def_sched_start(),
+            stop: def_sched_stop(),
+            exit_when_done: false,
+        }
+    }
 }
 fn def_sched_start() -> String {
     "22:00".to_string()
@@ -156,6 +245,15 @@ impl Default for Settings {
             auto_update: true,
             install_counted: false,
             proxy: String::new(),
+            category_dirs: std::collections::HashMap::new(),
+            conn_exceptions: Vec::new(),
+            exit_when_done: false,
+            sound_events: true,
+            show_complete_dialog: true,
+            queues: vec![QueueCfg::default()],
+            quota_mb: 0,
+            quota_hours: def_quota_hours(),
+            clipboard_monitor: true,
         }
     }
 }
@@ -176,6 +274,53 @@ impl Settings {
             self.video_quality = def_vq();
         }
         self.proxy = self.proxy.trim().to_string();
+        self.category_dirs = self
+            .category_dirs
+            .drain()
+            .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+            .collect();
+        self.conn_exceptions = self
+            .conn_exceptions
+            .iter()
+            .filter_map(|line| parse_conn_exception(line).map(|_| line.trim().to_string()))
+            .collect();
+        // queues: guarantee the Main queue exists, drop blank or
+        // duplicate names, normalize every queue's window; a settings
+        // file from before named queues existed seeds Main from the
+        // legacy global scheduler fields
+        if self.queues.is_empty() {
+            self.queues.push(QueueCfg {
+                name: main_queue_name(),
+                use_schedule: self.scheduler_enabled,
+                start: self.sched_start.clone(),
+                stop: self.sched_stop.clone(),
+                exit_when_done: false,
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.queues.retain(|q| {
+            let name = q.name.trim();
+            !name.is_empty() && seen.insert(name.to_lowercase())
+        });
+        if !self.queues.iter().any(|q| q.name == main_queue_name()) {
+            self.queues.insert(0, QueueCfg::default());
+        }
+        for q in &mut self.queues {
+            q.name = q.name.trim().to_string();
+            q.start = normalize_hhmm(&q.start, def_sched_start());
+            q.stop = normalize_hhmm(&q.stop, def_sched_stop());
+        }
+        // keep the legacy global fields mirroring Main, so any reader
+        // that still consults them stays consistent
+        if let Some(main) = self.queues.iter().find(|q| q.name == main_queue_name()) {
+            self.scheduler_enabled = main.use_schedule;
+            self.sched_start = main.start.clone();
+            self.sched_stop = main.stop.clone();
+        }
+        if self.quota_hours == 0 {
+            self.quota_hours = def_quota_hours();
+        }
     }
 }
 
@@ -194,22 +339,179 @@ fn normalize_hhmm(value: &str, fallback: String) -> String {
 }
 
 /// Is `now` ("HH:MM") inside the configured scheduler window?
-fn in_window(s: &Settings, now: &str) -> bool {
-    if s.sched_start == s.sched_stop {
+fn window_open(start: &str, stop: &str, now: &str) -> bool {
+    if start == stop {
         // equal times mean "all day", not "never": an always-empty
         // window would silently disable the scheduler
         return true;
     }
-    if s.sched_start <= s.sched_stop {
-        now >= s.sched_start.as_str() && now < s.sched_stop.as_str()
+    if start <= stop {
+        now >= start && now < stop
     } else {
         // overnight window, e.g. 22:00 -> 06:00
-        now >= s.sched_start.as_str() || now < s.sched_stop.as_str()
+        now >= start || now < stop
     }
+}
+
+fn in_window(s: &Settings, now: &str) -> bool {
+    window_open(&s.sched_start, &s.sched_stop, now)
+}
+
+/// The config of one queue by name (the Main queue's config when the
+/// name is unknown — an entry must never fall out of the system).
+fn queue_cfg(s: &Settings, name: &str) -> QueueCfg {
+    s.queues
+        .iter()
+        .find(|q| q.name == name)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The queue an entry currently belongs to.
+fn entry_queue(e: &Entry) -> String {
+    e.queue.lock().unwrap().clone()
+}
+
+/// Base64 (standard alphabet) for the Basic authorization header —
+/// small enough not to earn a dependency.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [
+            chunk[0] as u32,
+            *chunk.get(1).unwrap_or(&0) as u32,
+            *chunk.get(2).unwrap_or(&0) as u32,
+        ];
+        let n = (b[0] << 16) | (b[1] << 8) | b[2];
+        out.push(ALPHA[(n >> 18) as usize & 63] as char);
+        out.push(ALPHA[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHA[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHA[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Does this clipboard text look like a download IDM would offer to
+/// take? A single http(s) URL whose file type maps to a real
+/// category, or a known video-page URL.
+fn clipboard_url_qualifies(text: &str) -> bool {
+    if text.is_empty() || text.len() > 2048 || text.chars().any(|c| c.is_whitespace()) {
+        return false;
+    }
+    if !(text.starts_with("http://") || text.starts_with("https://")) {
+        return false;
+    }
+    if category_for(&file_name_for(text)) != "General" {
+        return true;
+    }
+    const VIDEO_HINTS: [&str; 8] = [
+        "youtube.com/watch",
+        "youtu.be/",
+        "vimeo.com/",
+        "dailymotion.com/video",
+        "tiktok.com/",
+        "instagram.com/reel",
+        "facebook.com/watch",
+        "twitch.tv/videos",
+    ];
+    VIDEO_HINTS.iter().any(|h| text.contains(h))
+}
+
+/// The Authorization header for an entry's saved login, if any
+/// (IDM's "Use authorization" on the Add URL dialog).
+fn basic_auth_header(login: &str, password: &str) -> Option<String> {
+    if login.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Basic {}",
+        base64_encode(format!("{login}:{password}").as_bytes())
+    ))
 }
 
 fn current_settings(state: &AppState) -> Settings {
     state.settings.lock().unwrap().clone()
+}
+
+/// Parse one per-server exception line: "host-or-*.domain = N".
+fn parse_conn_exception(line: &str) -> Option<(String, usize)> {
+    let (pat, n) = line.split_once('=')?;
+    let pat = pat.trim().trim_start_matches("http://").trim_start_matches("https://");
+    let pat = pat.split('/').next().unwrap_or("").trim().to_lowercase();
+    let n: usize = n.trim().parse().ok()?;
+    if pat.is_empty() || !(1..=64).contains(&n) {
+        return None;
+    }
+    Some((pat, n))
+}
+
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        host == suffix || host.ends_with(&format!(".{suffix}"))
+    } else {
+        host == pattern || host.ends_with(&format!(".{pattern}"))
+    }
+}
+
+/// The connection cap for one URL: the global setting, lowered by a
+/// matching per-server exception when one exists (IDM's Connection
+/// tab Exceptions table — some servers throttle or ban parallel
+/// connections, and one number never fit every host).
+fn conns_for_url(s: &Settings, url: &str) -> usize {
+    let mut cap = s.max_connections;
+    if s.conn_exceptions.is_empty() {
+        return cap;
+    }
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    if host.is_empty() {
+        return cap;
+    }
+    for line in &s.conn_exceptions {
+        if let Some((pat, n)) = parse_conn_exception(line) {
+            if host_pattern_matches(&pat, &host) {
+                cap = cap.min(n);
+            }
+        }
+    }
+    cap.max(1)
+}
+
+/// IDM categories are routing rules, not just labels: when a download
+/// is headed for the ordinary default folder (the global setting, or
+/// ~/Downloads as the extension sends it) and its category carries
+/// its own folder, the category folder wins. A folder the user picked
+/// explicitly for this download is never overridden.
+fn route_category_dir(state: &AppState, category: &str, dir: std::path::PathBuf) -> std::path::PathBuf {
+    let s = current_settings(state);
+    let Some(target) = s
+        .category_dirs
+        .get(category)
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    else {
+        return dir;
+    };
+    if dir == resolve_dir(&s.default_dir) || dir == resolve_dir("~/Downloads") {
+        resolve_dir(target)
+    } else {
+        dir
+    }
 }
 
 fn load_settings(state: &AppState) {
@@ -284,6 +586,12 @@ struct Entry {
     pause_requested: AtomicBool,
     /// "", "open_file" or "open_folder" — runs once when it finishes
     completion: Mutex<String>,
+    /// the named queue this entry belongs to (movable between
+    /// queues from the status dialog, like IDM)
+    queue: Mutex<String>,
+    /// "Use authorization" credentials for this download ("" = none)
+    login: String,
+    password: String,
 }
 
 struct AppState {
@@ -296,15 +604,27 @@ struct AppState {
     save_lock: Mutex<()>,
     settings: Mutex<Settings>,
     settings_file: Mutex<PathBuf>,
-    /// "Start Queue Now" override: lets the pump run outside the window
-    /// until the window starts/ends or "Stop Queue Now" clears it
-    sched_override: AtomicBool,
+    /// "Start Queue Now" overrides, per queue: lets the pump run that
+    /// queue outside its window until the window next starts/ends or
+    /// "Stop Queue Now" clears it
+    sched_override: Mutex<std::collections::HashSet<String>>,
+    /// download-quota bookkeeping: (done-bytes baseline at the window
+    /// start, window start epoch seconds, warning already shown)
+    quota_state: Mutex<(u64, i64, bool)>,
+    /// where quota.json lives (next to downloads.json)
+    quota_file: Mutex<PathBuf>,
     /// video links from the extension that arrived before the webview
     /// was listening; the frontend drains this once on load
     pending_videos: Mutex<Vec<serde_json::Value>>,
     pending_files: Mutex<Vec<serde_json::Value>>,
     /// a first-run video-component setup is currently downloading
     components_busy: AtomicBool,
+    /// IDM-queue-style automatic retries of failed downloads:
+    /// entry id → (attempts so far, when the next attempt is due)
+    retries: Mutex<HashMap<String, (u32, Instant)>>,
+    /// downloads have actually run in this session (gates the
+    /// exit-when-done action so an idle launch never self-closes)
+    had_active: AtomicBool,
     /// the newest release known from the update manifest, if newer
     pending_update: Mutex<Option<ndm::updater::ReleaseInfo>>,
     /// the running version fell below the manifest's min_supported:
@@ -345,16 +665,23 @@ impl AppState {
 }
 
 fn category_for(name: &str) -> &'static str {
+    // ONE canonical category table for the whole product — the host
+    // (ndm-host.rs) and the extension (content.js categoryForName)
+    // carry the identical sets, and the catch-all is "General",
+    // exactly like IDM's category of last resort. (Older saved lists
+    // may still carry the retired fallback name; restore maps it.)
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" => "Compressed",
-        "pdf" | "doc" | "docx" | "txt" | "md" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" => {
-            "Documents"
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "tgz" | "tbz2" | "txz" => {
+            "Compressed"
         }
-        "mp3" | "wav" | "flac" | "ogg" | "m4a" => "Music",
-        "mp4" | "mkv" | "avi" | "webm" | "mov" | "flv" => "Video",
-        "exe" | "msi" | "deb" | "rpm" | "appimage" | "dmg" | "iso" | "apk" => "Programs",
-        _ => "All Downloads",
+        "exe" | "msi" | "deb" | "rpm" | "dmg" | "pkg" | "appimage" | "apk" | "bin" | "iso"
+        | "img" | "flatpakref" => "Programs",
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "wmv" | "m4v" | "ts" => "Video",
+        "mp3" | "m4a" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" => "Music",
+        "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv"
+        | "epub" | "mobi" => "Documents",
+        _ => "General",
     }
 }
 
@@ -460,9 +787,12 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             resume_capability: "Yes (yt-dlp resume)".to_string(),
             completion: entry.completion.lock().unwrap().clone(),
             error: p.error.clone().unwrap_or_default(),
+            queue: entry_queue(entry),
+            conns_detail: Vec::new(),
         };
     }
-    let (total, done_bytes, rate, conns, status, blocks, resumable, error_text) = match &entry.download {
+    let (total, done_bytes, rate, conns, status, blocks, resumable, error_text, conns_detail) =
+        match &entry.download {
         Some(dl) => {
             let p = dl.progress();
             let rate = if p.status == ndm::Status::Downloading {
@@ -479,6 +809,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 downsample_blocks(&p.blocks),
                 p.resumable,
                 p.error.unwrap_or_default(),
+                p.conn_bytes,
             )
         }
         None => match &*entry.restored.lock().unwrap() {
@@ -491,6 +822,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 downsample_blocks(&r.blocks),
                 r.resumable,
                 r.error.clone(),
+                Vec::new(),
             ),
             None => (
                 0,
@@ -501,6 +833,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 String::new(),
                 false,
                 String::new(),
+                Vec::new(),
             ),
         },
     };
@@ -531,6 +864,8 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         },
         completion: entry.completion.lock().unwrap().clone(),
         error: error_text,
+        queue: entry_queue(entry),
+        conns_detail,
     }
 }
 
@@ -568,6 +903,9 @@ fn persist(state: &AppState) {
                 referer: e.referer.clone(),
                 completion: e.completion.lock().unwrap().clone(),
                 error: p.error.clone(),
+                queue: entry_queue(&e),
+                login: e.login.clone(),
+                password: e.password.clone(),
             }
         })
         .collect();
@@ -685,6 +1023,150 @@ fn resolve_video_file(entry: &Entry) -> PathBuf {
     entry.out_path.clone()
 }
 
+/// IDM's Sounds options, lite: play the desktop sound theme's event
+/// sound (via canberra or paplay) when a player exists; where none
+/// does, this is a silent no-op — never an error.
+fn play_event_sound(finished: bool) {
+    let (id, file) = if finished {
+        ("complete", "complete.oga")
+    } else {
+        ("dialog-error", "dialog-error.oga")
+    };
+    std::thread::spawn(move || {
+        let played = std::process::Command::new("canberra-gtk-play")
+            .args(["-i", id])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !played {
+            let path = format!("/usr/share/sounds/freedesktop/stereo/{file}");
+            if std::path::Path::new(&path).exists() {
+                let _ = std::process::Command::new("paplay")
+                    .arg(&path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    });
+}
+
+/// Errors that retrying cannot fix (IDM retries blindly; sparing the
+/// user five minutes of doomed retries on a dead link is the one
+/// deliberate deviation, and it only skips the hopeless cases).
+fn error_is_permanent(error: &str) -> bool {
+    error.contains("Unsupported URL")
+        || error.contains("HTTP Error 404")
+        || error.contains("HTTP Error 410")
+        || error.contains("no playable video stream")
+        || error.contains("required update")
+}
+
+/// Register a failed entry for an automatic retry — IDM's queue
+/// semantics: a failed file is retried (its Scheduler default is 10
+/// attempts) instead of sitting dead until the user notices.
+fn register_retry(state: &AppState, entry: &Entry) {
+    if error_is_permanent(&payload_of(entry).error) {
+        return;
+    }
+    let mut map = state.retries.lock().unwrap();
+    let (count, _) = map.get(&entry.id).cloned().unwrap_or((0, Instant::now()));
+    if count < 10 {
+        map.insert(
+            entry.id.clone(),
+            (count + 1, Instant::now() + Duration::from_secs(30)),
+        );
+    }
+}
+
+/// Total bytes recorded as downloaded across all entries right now.
+fn total_done_bytes(state: &AppState) -> u64 {
+    state
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .map(|e| payload_of(e).done_bytes)
+        .sum()
+}
+
+fn save_quota(state: &AppState) {
+    let path = state.quota_file.lock().unwrap().clone();
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    let q = state.quota_state.lock().unwrap();
+    let _ = std::fs::write(
+        &path,
+        serde_json::json!({ "baseline": q.0, "start": q.1 }).to_string(),
+    );
+}
+
+fn load_quota(state: &AppState) {
+    let path = state.quota_file.lock().unwrap().clone();
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    if let Ok(raw) = std::fs::read(&path) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&raw) {
+            let baseline = v["baseline"].as_u64().unwrap_or(0);
+            let start = v["start"].as_i64().unwrap_or(0);
+            if start > 0 {
+                *state.quota_state.lock().unwrap() = (baseline, start, false);
+            }
+        }
+    }
+}
+
+/// IDM's Download limits: has this window's byte budget run out?
+/// The window state (baseline + start) persists across restarts, so
+/// the budget is honest; an expired window resets itself.
+fn quota_blocks(state: &AppState) -> bool {
+    let s = current_settings(state);
+    if s.quota_mb == 0 {
+        return false;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let expired = {
+        let q = state.quota_state.lock().unwrap();
+        q.1 == 0 || now - q.1 >= (s.quota_hours as i64) * 3600
+    };
+    if expired {
+        *state.quota_state.lock().unwrap() = (total_done_bytes(state), now, false);
+        save_quota(state);
+        return false;
+    }
+    let baseline = state.quota_state.lock().unwrap().0;
+    total_done_bytes(state).saturating_sub(baseline) >= s.quota_mb * 1024 * 1024
+}
+
+/// IDM's "Exit when done": when it is on (globally, or on the queue
+/// the finished entry belonged to), downloads ran this session, and
+/// nothing is active or queued anymore, the app closes itself.
+fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str) {
+    let s = current_settings(state);
+    if !s.exit_when_done && !queue_cfg(&s, finished_queue).exit_when_done {
+        return;
+    }
+    if !state.had_active.load(Ordering::Relaxed) {
+        return;
+    }
+    if count_active(state) > 0 {
+        return;
+    }
+    let any_queued = state
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .any(|e| e.queued.load(Ordering::Relaxed));
+    if !any_queued {
+        app.exit(0);
+    }
+}
+
 /// The per-download "Options on completion" action, run once at finish.
 fn run_completion_action(entry: &Entry) {
     let action = entry.completion.lock().unwrap().clone();
@@ -729,19 +1211,55 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
             update_sample(&entry);
             let payload = payload_of(&entry);
             let status = payload.status.clone();
+            let total_now = payload.total;
             let _ = app.emit("progress", payload);
+            if status == "downloading" {
+                app.state::<AppState>()
+                    .had_active
+                    .store(true, Ordering::Relaxed);
+            }
             match status.as_str() {
                 "finished" => {
                     run_completion_action(&entry);
                     let state = app.state::<AppState>();
+                    state.retries.lock().unwrap().remove(&entry.id);
+                    if current_settings(&state).sound_events {
+                        play_event_sound(true);
+                    }
+                    if current_settings(&state).show_complete_dialog {
+                        let done_path = if entry.kind == "video" {
+                            resolve_video_file(&entry)
+                        } else {
+                            entry.out_path.clone()
+                        };
+                        let _ = app.emit(
+                            "download_complete",
+                            serde_json::json!({
+                                "id": entry.id,
+                                "name": entry.name,
+                                "path": done_path.to_string_lossy(),
+                                "total": total_now,
+                            }),
+                        );
+                    }
                     persist(&state);
                     pump_queue(&app);
+                    maybe_exit_when_done(&app, &state, &entry_queue(&entry));
                     break;
                 }
                 "error" | "cancelled" => {
                     let state = app.state::<AppState>();
+                    if status == "error" {
+                        if current_settings(&state).sound_events {
+                            play_event_sound(false);
+                        }
+                        register_retry(&state, &entry);
+                    } else {
+                        state.retries.lock().unwrap().remove(&entry.id);
+                    }
                     persist(&state);
                     pump_queue(&app);
+                    maybe_exit_when_done(&app, &state, &entry_queue(&entry));
                     break;
                 }
                 "paused" | "queued" => {
@@ -799,6 +1317,9 @@ fn swap_live(
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(stub.completion.lock().unwrap().clone()),
+        queue: Mutex::new(entry_queue(&stub)),
+        login: stub.login.clone(),
+        password: stub.password.clone(),
     });
     // re-verify under the SAME lock that inserts: a remove landing in
     // the gap after start_engine's own check must not leave a live
@@ -822,7 +1343,7 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
     let out_path = stub.out_path.clone();
     let max_conn = {
         let state = app.state::<AppState>();
-        current_settings(&state).max_connections
+        conns_for_url(&current_settings(&state), &url)
     };
     // a caught browser download carries the browser's own session for
     // this link (cookies token + referer): the engine repeats them on
@@ -839,7 +1360,12 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
         } else {
             Some(stub.referer.clone())
         };
-        ndm::Auth { cookie, referer }
+        let authorization = basic_auth_header(&stub.login, &stub.password);
+        ndm::Auth {
+            cookie,
+            referer,
+            authorization,
+        }
     };
     // the probe inside ndm::start can take seconds; the entry must count
     // against the simultaneous cap from this moment, not from first bytes.
@@ -1001,6 +1527,26 @@ fn cookie_header_from_netscape(text: &str) -> Option<String> {
     }
 }
 
+/// An entry for the same URL that is still alive (not finished,
+/// errored or cancelled). IDM asks what to do when a duplicate link
+/// is added ("download again" vs keeping the existing one); callers
+/// use this to ask — or, on the silent browser path, to point at the
+/// entry that is already there instead of starting a second copy.
+fn find_active_duplicate(state: &AppState, kind: &str, url: &str) -> Option<String> {
+    let entries = state.entries.lock().unwrap();
+    entries
+        .values()
+        .find(|e| {
+            e.kind == kind
+                && e.url == url
+                && !matches!(
+                    payload_of(e).status.as_str(),
+                    "error" | "finished" | "cancelled"
+                )
+        })
+        .map(|e| e.id.clone())
+}
+
 fn register_http_stub(
     state: &AppState,
     url: &str,
@@ -1009,15 +1555,23 @@ fn register_http_stub(
     name_hint: Option<&str>,
     cookies_token: &str,
     referer: &str,
+    queue: &str,
+    login: &str,
+    password: &str,
 ) -> Result<Arc<Entry>, String> {
-    let dir = resolve_dir(dir);
-    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
     // a name the browser suggested (Content-Disposition) wins over the
     // URL tail, stripped of any path parts a hostile page could smuggle
     let base_name = name_hint
         .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).trim().to_string())
         .filter(|n| !n.is_empty() && n != "." && n != "..")
         .unwrap_or_else(|| file_name_for(url));
+    let category = category
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| category_for(&base_name).to_string());
+    // category routing (IDM-style): the category's own folder applies
+    // when the caller asked for the ordinary default folder
+    let dir = route_category_dir(state, &category, resolve_dir(dir));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
     let (name, out_path) = unique_out_path(state, &dir, &base_name);
     let id = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
     let stub = Arc::new(Entry {
@@ -1025,9 +1579,7 @@ fn register_http_stub(
         name: name.clone(),
         url: url.to_string(),
         out_path,
-        category: category
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| category_for(&name).to_string()),
+        category,
         added: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
         download: None,
         video: None,
@@ -1044,6 +1596,9 @@ fn register_http_stub(
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
+        queue: Mutex::new(queue.to_string()),
+        login: login.to_string(),
+        password: password.to_string(),
     });
     state
         .entries
@@ -1166,6 +1721,9 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+                queue: Mutex::new(entry_queue(&entry)),
+                login: entry.login.clone(),
+                password: entry.password.clone(),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -1239,54 +1797,96 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
     });
 }
 
-/// The pump must not start downloads outside the scheduler window —
-/// unless the user pressed "Start Queue Now" (the override lasts until
-/// the window next starts or ends, or "Stop Queue Now" clears it).
-fn scheduler_blocks(state: &AppState) -> bool {
+/// The pump must not start a queue's downloads outside that queue's
+/// scheduler window — unless the user pressed "Start Queue Now" for
+/// it (the override lasts until the window next starts or ends, or
+/// "Stop Queue Now" clears it). Windows are per queue (IDM's
+/// Scheduler); a queue without a schedule never blocks.
+fn scheduler_blocks(state: &AppState, queue: &str) -> bool {
     let s = current_settings(state);
-    if !s.scheduler_enabled || state.sched_override.load(Ordering::Relaxed) {
+    let cfg = queue_cfg(&s, queue);
+    if !cfg.use_schedule {
+        return false;
+    }
+    if state.sched_override.lock().unwrap().contains(queue) {
         return false;
     }
     let now = chrono::Local::now().format("%H:%M").to_string();
-    !in_window(&s, &now)
+    !window_open(&cfg.start, &cfg.stop, &now)
 }
 
-/// Fill free simultaneous-download slots from the queue (Settings cap).
+/// Should a new/queued download in this queue wait right now?
+/// (Its queue's window or the download quota says so.)
+fn entry_blocks(state: &AppState, queue: &str) -> bool {
+    scheduler_blocks(state, queue) || quota_blocks(state)
+}
+
+/// How many downloads of one queue are running or starting.
+fn count_active_for(state: &AppState, queue: &str) -> usize {
+    let order = state.order.lock().unwrap().clone();
+    order
+        .iter()
+        .filter_map(|id| state.get(id))
+        .filter(|e| {
+            entry_queue(&e) == queue
+                && (e.starting.load(Ordering::Relaxed) || payload_of(e).status == "downloading")
+        })
+        .count()
+}
+
+/// Fill free simultaneous-download slots from the queues. The cap is
+/// per queue (IDM: each queue downloads N files at a time).
 fn pump_queue(app: &AppHandle) {
     let state = app.state::<AppState>();
-    if scheduler_blocks(&state) {
-        return;
-    }
-    let max = current_settings(&state).max_simultaneous;
-    if max == 0 {
-        start_all_queued(app);
-        return;
-    }
-    let mut active = count_active(&state);
-    if active >= max {
-        return;
-    }
+    let s = current_settings(&state);
+    let max = s.max_simultaneous;
     let order = state.order.lock().unwrap().clone();
-    for id in order {
-        if active >= max {
-            break;
+    for cfg in &s.queues {
+        if entry_blocks(&state, &cfg.name) {
+            continue;
         }
-        let Some(e) = state.get(&id) else { continue };
-        // atomic claim: two pumps running at once must never start the
-        // same entry twice (two engines, one output file)
-        if e.queued.swap(false, Ordering::SeqCst) {
-            start_entry(app, e);
-            active += 1;
+        if max == 0 {
+            for id in &order {
+                if let Some(e) = state.get(id) {
+                    if entry_queue(&e) == cfg.name && e.queued.swap(false, Ordering::SeqCst) {
+                        start_entry(app, e);
+                    }
+                }
+            }
+            continue;
+        }
+        let mut active = count_active_for(&state, &cfg.name);
+        if active >= max {
+            continue;
+        }
+        for id in &order {
+            if active >= max {
+                break;
+            }
+            let Some(e) = state.get(id) else { continue };
+            if entry_queue(&e) != cfg.name {
+                continue;
+            }
+            // atomic claim: two pumps running at once must never start
+            // the same entry twice (two engines, one output file)
+            if e.queued.swap(false, Ordering::SeqCst) {
+                start_entry(app, e);
+                active += 1;
+            }
         }
     }
 }
 
-/// Start every queued entry regardless of the simultaneous cap.
-fn start_all_queued(app: &AppHandle) {
+/// Start every queued entry of one queue (or of all queues when
+/// `queue` is None), regardless of the simultaneous cap.
+fn start_all_queued(app: &AppHandle, queue: Option<&str>) {
     let state = app.state::<AppState>();
     let order = state.order.lock().unwrap().clone();
     for id in order {
         if let Some(e) = state.get(&id) {
+            if queue.is_some_and(|q| entry_queue(&e) != q) {
+                continue;
+            }
             if e.queued.swap(false, Ordering::SeqCst) {
                 start_entry(app, e);
             }
@@ -1294,17 +1894,21 @@ fn start_all_queued(app: &AppHandle) {
     }
 }
 
-/// Pause everything that is currently downloading (engine + video jobs).
-/// With `requeue` (the scheduler's own window-end pause), entries that
-/// were actually downloading are handed back to the queue so the next
-/// window start claims them again — without it they sat paused forever
-/// while merely-queued entries around them started. A manual Stop
-/// Queue Now passes false: the user's stop is not the window's.
-fn pause_all(app: &AppHandle, requeue: bool) {
+/// Pause the currently-downloading entries of one queue (or of all
+/// queues when `queue` is None). With `requeue` (a queue's own
+/// window-end pause), entries that were actually downloading are
+/// handed back to the queue so the next window start claims them
+/// again — without it they sat paused forever while merely-queued
+/// entries around them started. A manual Stop Queue Now passes
+/// false: the user's stop is not the window's.
+fn pause_all(app: &AppHandle, requeue: bool, queue: Option<&str>) {
     let state = app.state::<AppState>();
     let order = state.order.lock().unwrap().clone();
     for id in order {
         if let Some(e) = state.get(&id) {
+            if queue.is_some_and(|q| entry_queue(&e) != q) {
+                continue;
+            }
             let was_downloading = payload_of(&e).status == "downloading";
             if let Some(dl) = &e.download {
                 dl.control.pause();
@@ -1333,36 +1937,66 @@ fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) 
     ndm::set_global_limit(s.speed_limit_bps);
     ndm::set_global_connections(s.max_connections);
     ndm::set_global_proxy(&s.proxy);
-    let unlimited = s.max_simultaneous == 0;
-    *state.settings.lock().unwrap() = s;
+    *state.settings.lock().unwrap() = s.clone();
     save_settings(&state);
-    if unlimited {
-        // pump_queue treats max == 0 as "no cap to enforce" and starts
-        // nobody; lifting the cap in Options must still drain the
-        // queue (Start Queue Now already branches this way)
-        if !scheduler_blocks(&state) {
-            start_all_queued(&app);
+    // an entry whose queue was deleted falls back to the Main queue
+    {
+        let names: Vec<String> = s.queues.iter().map(|q| q.name.clone()).collect();
+        let entries: Vec<Arc<Entry>> = state.entries.lock().unwrap().values().cloned().collect();
+        let mut moved = false;
+        for e in entries {
+            if !names.contains(&entry_queue(&e)) {
+                *e.queue.lock().unwrap() = main_queue_name();
+                moved = true;
+            }
         }
-    } else {
-        pump_queue(&app);
+        if moved {
+            persist(&state);
+        }
     }
+    // the pump itself respects every queue's window, quota and cap
+    // (including "no cap"), so saving settings just gives it a chance
+    // to fill whatever slots the new settings freed
+    pump_queue(&app);
+    Ok(())
+}
+
+/// Move an entry to another queue (IDM: right-click → Add to queue).
+#[tauri::command]
+fn set_entry_queue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    queue: String,
+) -> Result<(), String> {
+    let s = current_settings(&state);
+    if !s.queues.iter().any(|q| q.name == queue) {
+        return Err("unknown queue".to_string());
+    }
+    let entry = state.get(&id).ok_or("unknown download id")?;
+    *entry.queue.lock().unwrap() = queue;
+    persist(&state);
+    let _ = app.emit("progress", payload_of(&entry));
+    pump_queue(&app);
     Ok(())
 }
 
 #[tauri::command]
-fn scheduler_start_now(app: AppHandle, state: State<'_, AppState>) {
-    state.sched_override.store(true, Ordering::SeqCst);
+fn scheduler_start_now(app: AppHandle, state: State<'_, AppState>, queue: Option<String>) {
+    let q = queue.unwrap_or_else(main_queue_name);
+    state.sched_override.lock().unwrap().insert(q.clone());
     if current_settings(&state).max_simultaneous == 0 {
-        start_all_queued(&app);
+        start_all_queued(&app, Some(&q));
     } else {
         pump_queue(&app);
     }
 }
 
 #[tauri::command]
-fn scheduler_stop_now(app: AppHandle, state: State<'_, AppState>) {
-    state.sched_override.store(false, Ordering::SeqCst);
-    pause_all(&app, false);
+fn scheduler_stop_now(app: AppHandle, state: State<'_, AppState>, queue: Option<String>) {
+    let q = queue.unwrap_or_else(main_queue_name);
+    state.sched_override.lock().unwrap().remove(&q);
+    pause_all(&app, false, Some(&q));
 }
 
 #[tauri::command]
@@ -1376,9 +2010,18 @@ async fn add_download(
     name: Option<String>,
     cookies: Option<String>,
     referer: Option<String>,
+    force: Option<bool>,
+    queue: Option<String>,
+    login: Option<String>,
+    password: Option<String>,
 ) -> Result<String, String> {
     if state.update_required.load(Ordering::SeqCst) {
         return Err("NDM needs its latest update before it can download. Please install the update first.".to_string());
+    }
+    if !force.unwrap_or(false) {
+        if let Some(existing) = find_active_duplicate(&state, "http", &url) {
+            return Err(format!("duplicate:{existing}"));
+        }
     }
     let stub = register_http_stub(
         &state,
@@ -1388,12 +2031,16 @@ async fn add_download(
         name.as_deref(),
         cookies.as_deref().unwrap_or(""),
         referer.as_deref().unwrap_or(""),
+        queue.as_deref().unwrap_or(&main_queue_name()),
+        login.as_deref().unwrap_or(""),
+        password.as_deref().unwrap_or(""),
     )?;
     let id = stub.id.clone();
     let is_later = later.unwrap_or(false);
     let max = current_settings(&state).max_simultaneous;
-    let must_wait =
-        is_later || scheduler_blocks(&state) || (max > 0 && count_active(&state) >= max);
+    let must_wait = is_later
+        || entry_blocks(&state, &entry_queue(&stub))
+        || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
     if must_wait {
         if is_later {
             // "Download Later" stays paused until the user explicitly starts/resumes it
@@ -1559,6 +2206,9 @@ async fn resume_download(
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+                queue: Mutex::new(entry_queue(&entry)),
+                login: entry.login.clone(),
+                password: entry.password.clone(),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -1590,6 +2240,7 @@ async fn resume_download(
 
 #[tauri::command]
 fn remove_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.retries.lock().unwrap().remove(&id);
     if let Some(entry) = state.get(&id) {
         entry.removed.store(true, Ordering::SeqCst);
         if let Some(dl) = &entry.download {
@@ -1986,6 +2637,9 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+        queue: Mutex::new(entry_queue(&entry)),
+        login: entry.login.clone(),
+        password: entry.password.clone(),
     });
     state
         .entries
@@ -2013,6 +2667,8 @@ async fn probe_file(
     url: String,
     cookies: Option<String>,
     referer: Option<String>,
+    login: Option<String>,
+    password: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let url_trimmed = url.trim().to_string();
     if !(url_trimmed.starts_with("http://") || url_trimmed.starts_with("https://")) {
@@ -2024,7 +2680,15 @@ async fn probe_file(
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|text| cookie_header_from_netscape(&text));
     let referer = referer.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
-    let auth = ndm::Auth { cookie, referer };
+    let authorization = basic_auth_header(
+        login.as_deref().unwrap_or(""),
+        password.as_deref().unwrap_or(""),
+    );
+    let auth = ndm::Auth {
+        cookie,
+        referer,
+        authorization,
+    };
     let u2 = url_trimmed.clone();
     let probe = tauri::async_runtime::spawn_blocking(move || ndm::probe_with_auth(&u2, &auth))
         .await
@@ -2105,18 +2769,27 @@ fn do_add_video(
     cookies: Option<String>,
     later: bool,
     total_hint: u64,
+    force: bool,
+    queue: String,
 ) -> Result<String, String> {
     if state.update_required.load(Ordering::SeqCst) {
         return Err("please install the required update before starting new downloads".to_string());
     }
-    let dir = resolve_dir(&dir);
+    // category routing (IDM-style) happens BEFORE the duplicate
+    // check, so a re-add compares against the folder the first add
+    // was actually routed to
+    let dir = route_category_dir(
+        state,
+        if audio { "Music" } else { "Video" },
+        resolve_dir(&dir),
+    );
     let cookies_token = cookies
         .filter(|t| state.cookies_path(t).is_some())
         .unwrap_or_default();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
-    {
+    if !force {
         let entries = state.entries.lock().unwrap();
-        let dupe = entries.values().any(|e| {
+        let dupe = entries.values().find(|e| {
             e.kind == "video"
                 && e.url == url
                 && e.out_path == dir
@@ -2127,8 +2800,11 @@ fn do_add_video(
                     "error" | "finished" | "cancelled"
                 )
         });
-        if dupe {
-            return Err("this video quality is already in the download list".to_string());
+        if let Some(existing) = dupe {
+            // IDM asks instead of silently refusing or duplicating:
+            // the caller decides (dialog confirm / "Download again")
+            // and retries with force to get a second copy.
+            return Err(format!("duplicate:{}", existing.id));
         }
     }
     let raw_name = if title.trim().is_empty() {
@@ -2150,8 +2826,8 @@ fn do_add_video(
     let engine_missing = video::find_tool("yt-dlp", &state.components()).is_none();
     let should_wait = later
         || engine_missing
-        || scheduler_blocks(state)
-        || (max > 0 && count_active(state) >= max);
+        || entry_blocks(state, &queue)
+        || (max > 0 && count_active_for(state, &queue) >= max);
     if should_wait {
         let initial_status = if later { "paused" } else { "queued" };
         let entry = Arc::new(Entry {
@@ -2183,6 +2859,9 @@ fn do_add_video(
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(String::new()),
+            queue: Mutex::new(queue.clone()),
+            login: String::new(),
+            password: String::new(),
         });
         state
             .entries
@@ -2237,6 +2916,9 @@ fn do_add_video(
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
+        queue: Mutex::new(queue.clone()),
+        login: String::new(),
+        password: String::new(),
     });
     state
         .entries
@@ -2265,6 +2947,8 @@ async fn add_video(
     cookies: Option<String>,
     later: Option<bool>,
     total: Option<u64>,
+    force: Option<bool>,
+    queue: Option<String>,
 ) -> Result<String, String> {
     do_add_video(
         &app,
@@ -2277,6 +2961,8 @@ async fn add_video(
         cookies,
         later.unwrap_or(false),
         total.unwrap_or(0),
+        force.unwrap_or(false),
+        queue.unwrap_or_else(main_queue_name),
     )
 }
 
@@ -2338,6 +3024,15 @@ fn restore_saved(state: &AppState) {
         .collect();
     let mut max_seq = 0u64;
     for s in saved {
+        // the retired catch-all category name maps to "General"
+        let s = if s.category == "All Downloads" {
+            SavedEntry {
+                category: "General".to_string(),
+                ..s
+            }
+        } else {
+            s
+        };
         if let Some(n) = s.id.strip_prefix("dl-").and_then(|x| x.parse::<u64>().ok()) {
             max_seq = max_seq.max(n);
         }
@@ -2396,6 +3091,9 @@ fn restore_saved(state: &AppState) {
                 removed: AtomicBool::new(false),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(s.completion.clone()),
+                queue: Mutex::new(s.queue.clone()),
+                login: s.login.clone(),
+                password: s.password.clone(),
             });
             state.entries.lock().unwrap().insert(s.id.clone(), entry);
             state.order.lock().unwrap().push(s.id.clone());
@@ -2479,6 +3177,9 @@ fn restore_saved(state: &AppState) {
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(s.completion.clone()),
+            queue: Mutex::new(s.queue.clone()),
+            login: s.login.clone(),
+            password: s.password.clone(),
         });
         state.entries.lock().unwrap().insert(s.id.clone(), entry);
         state.order.lock().unwrap().push(s.id.clone());
@@ -2590,6 +3291,74 @@ fn prune_acks(queue_dir: &Path) {
 /// - `show_app`: user explicitly clicked "Show in NDM" -> raise NDM window.
 /// - `video`: open the in-app Video Download dialog.
 /// - `file`: open the in-app File Download Info dialog.
+/// Discard an entry completely — engine/job cancelled, list entry,
+/// resume state and the partial file all go. This is the browser
+/// dialog's Cancel for a download that already started while the
+/// dialog was open: IDM consumes the click, so nothing of the
+/// download may remain. (Deliberately different from removing a row
+/// in the app, which keeps the user's partial file.)
+fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
+    entry.removed.store(true, Ordering::SeqCst);
+    state.retries.lock().unwrap().remove(&entry.id);
+    if let Some(dl) = &entry.download {
+        dl.control.cancel();
+        // wait for the engine to actually stop: its shutdown writes
+        // the resume state one last time, and deleting the files
+        // before that would leave an orphan state file behind (a
+        // later download of the same name could trust stale blocks)
+        for _ in 0..40 {
+            if dl.is_terminal() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if let Some(job) = &entry.video {
+        job.cancel();
+    }
+    state.entries.lock().unwrap().remove(&entry.id);
+    state.order.lock().unwrap().retain(|x| x != &entry.id);
+    // the engine's final state write can land just after the cancel:
+    // keep removing the resume state until it stays gone, so no
+    // orphan survives to be trusted by a future same-name download
+    let sp = ndm::state_path_for(&entry.out_path);
+    for _ in 0..20 {
+        let _ = std::fs::remove_file(&sp);
+        std::thread::sleep(Duration::from_millis(100));
+        if !sp.exists() {
+            std::thread::sleep(Duration::from_millis(150));
+            if !sp.exists() {
+                break;
+            }
+        }
+    }
+    if entry.kind == "video" {
+        // sweep this video's part files from its folder
+        let stem = entry
+            .name
+            .rsplit_once('.')
+            .map(|(s, _)| s.to_string())
+            .unwrap_or_else(|| entry.name.clone());
+        if let Ok(rd) = std::fs::read_dir(&entry.out_path) {
+            for f in rd.flatten() {
+                let n = f.file_name().to_string_lossy().to_string();
+                if n.starts_with(&format!(".{stem}.ndm_stream"))
+                    || (n.starts_with(&stem) && (n.ends_with(".part") || n.contains(".f")))
+                {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+    } else if payload_of(entry).status != "finished" {
+        let _ = std::fs::remove_file(&entry.out_path);
+    }
+    if let Some(p) = state.cookies_path(&entry.cookies) {
+        let _ = std::fs::remove_file(p);
+    }
+    persist(state);
+    pump_queue(app);
+}
+
 fn handle_incoming_line(handle: &AppHandle, line: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
         return;
@@ -2599,6 +3368,25 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
     if kind == "show_app" {
         raise_main_window(handle);
         write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
+        return;
+    }
+    if kind == "pause_entry" || kind == "cancel_entry" {
+        // the browser dialog's Later / Cancel for a download that
+        // started while the dialog was open
+        let entry_id = v["entry"].as_str().unwrap_or("");
+        let state = handle.state::<AppState>();
+        let result = match state.get(entry_id) {
+            Some(entry) => {
+                if kind == "pause_entry" {
+                    let _ = pause_download(handle.clone(), state, entry_id.to_string());
+                } else {
+                    discard_entry(handle, &state, &entry);
+                }
+                serde_json::json!({ "ok": true })
+            }
+            None => serde_json::json!({ "ok": false, "error": "no such entry" }),
+        };
+        write_ack_and_result(handle, ack_id.as_deref(), result);
         return;
     }
     let url = v["url"].as_str().unwrap_or("");
@@ -2655,6 +3443,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         let total_hint = v["total"].as_u64().unwrap_or(0);
         let title = v["title"].as_str().unwrap_or("").to_string();
         let cookies_opt = if token.is_empty() { None } else { Some(token) };
+        let force = v["force"].as_bool().unwrap_or(false);
         match do_add_video(
             handle,
             &state,
@@ -2666,6 +3455,8 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             cookies_opt,
             later,
             total_hint,
+            force,
+            main_queue_name(),
         ) {
             Ok(entry_id) => write_ack_and_result(
                 handle,
@@ -2703,6 +3494,18 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         let title = v["title"].as_str().unwrap_or("").trim();
         let page_url = v["pageUrl"].as_str().unwrap_or("");
         let name_hint = if title.is_empty() { None } else { Some(title) };
+        // IDM asks about duplicate links; the silent path instead
+        // points at the entry that is already there (no second copy)
+        if !v["force"].as_bool().unwrap_or(false) {
+            if let Some(existing) = find_active_duplicate(&state, "http", url) {
+                write_ack_and_result(
+                    handle,
+                    ack_id.as_deref(),
+                    serde_json::json!({ "ok": true, "id": existing, "dupe": true }),
+                );
+                return;
+            }
+        }
         match register_http_stub(
             &state,
             url,
@@ -2711,12 +3514,16 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             name_hint,
             &token,
             page_url,
+            &main_queue_name(),
+            "",
+            "",
         ) {
             Ok(stub) => {
                 let entry_id = stub.id.clone();
                 let max = current_settings(&state).max_simultaneous;
-                let must_wait =
-                    later || scheduler_blocks(&state) || (max > 0 && count_active(&state) >= max);
+                let must_wait = later
+                    || entry_blocks(&state, &entry_queue(&stub))
+                    || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
                 if must_wait {
                     if later {
                         stub.queued.store(false, Ordering::Relaxed);
@@ -2869,10 +3676,14 @@ fn main() {
             save_lock: Mutex::new(()),
             settings: Mutex::new(Settings::default()),
             settings_file: Mutex::new(PathBuf::new()),
-            sched_override: AtomicBool::new(false),
+            sched_override: Mutex::new(std::collections::HashSet::new()),
+            quota_state: Mutex::new((0, 0, false)),
+            quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
+            retries: Mutex::new(HashMap::new()),
+            had_active: AtomicBool::new(false),
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
@@ -2900,7 +3711,9 @@ fn main() {
                 let _ = std::fs::create_dir_all(&cookies_dir);
                 *state.cookies_dir.lock().unwrap() = cookies_dir;
                 *state.settings_file.lock().unwrap() = settings_path;
+                *state.quota_file.lock().unwrap() = dir.join("quota.json");
                 load_settings(&state);
+                load_quota(&state);
                 restore_saved(&state);
             }
             // silent update check + the one-time anonymous install
@@ -2953,54 +3766,127 @@ fn main() {
                                 )
                         })
                         .collect();
-                    if scheduler_blocks(&state) {
-                        // the scheduler owns the queue right now: leave the
-                        // entries queued so the window start picks them up
-                        for e in &pending {
-                            e.queued.store(true, Ordering::Relaxed);
-                        }
-                        persist(&state);
-                    } else if s.max_simultaneous > 0 {
-                        for e in &pending {
-                            e.queued.store(true, Ordering::Relaxed);
-                        }
-                        pump_queue(app.handle());
-                    } else {
-                        let handle = app.handle().clone();
-                        for e in pending {
-                            start_entry(&handle, e);
-                        }
+                    // queue every pending entry and let the pump
+                    // decide per queue: a blocked queue's entries stay
+                    // queued for their window, the rest start now
+                    // (respecting each queue's cap)
+                    for e in &pending {
+                        e.queued.store(true, Ordering::Relaxed);
                     }
+                    persist(&state);
+                    pump_queue(app.handle());
                 }
             }
             // scheduler: every 30 s, start the queue inside the configured
             // window and pause everything when the window ends
             let handle4 = app.handle().clone();
             std::thread::spawn(move || {
-                let mut was_in_window = false;
+                let mut was_in_window: std::collections::HashMap<String, bool> =
+                    std::collections::HashMap::new();
                 loop {
                     std::thread::sleep(Duration::from_secs(30));
                     let state = handle4.state::<AppState>();
                     let s = current_settings(&state);
-                    if !s.scheduler_enabled {
-                        was_in_window = false;
+                    // automatic retries (IDM queue semantics): start
+                    // every failed entry whose retry is due and which
+                    // is still sitting in error
+                    {
+                        let due: Vec<String> = {
+                            let mut map = state.retries.lock().unwrap();
+                            let now = Instant::now();
+                            let mut due = Vec::new();
+                            map.retain(|id, (_, at)| {
+                                if *at <= now {
+                                    due.push(id.clone());
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            due
+                        };
+                        for id in due {
+                            let entry = state.entries.lock().unwrap().get(&id).cloned();
+                            if let Some(e) = entry {
+                                if payload_of(&e).status == "error" {
+                                    start_entry(&handle4, e);
+                                }
+                            }
+                        }
+                    }
+                    // per-queue scheduler windows (IDM's Scheduler):
+                    // each queue starts at its window opening and
+                    // pauses (re-queued) at its close
+                    let now = chrono::Local::now().format("%H:%M").to_string();
+                    for cfg in &s.queues {
+                        if !cfg.use_schedule {
+                            was_in_window.remove(&cfg.name);
+                            continue;
+                        }
+                        let in_win = window_open(&cfg.start, &cfg.stop, &now);
+                        let was = was_in_window.get(&cfg.name).copied().unwrap_or(false);
+                        if in_win && !was {
+                            // the window governs again; the manual
+                            // override for this queue ends
+                            state.sched_override.lock().unwrap().remove(&cfg.name);
+                            if s.max_simultaneous == 0 {
+                                start_all_queued(&handle4, Some(&cfg.name));
+                            } else {
+                                pump_queue(&handle4);
+                            }
+                        } else if !in_win && was {
+                            state.sched_override.lock().unwrap().remove(&cfg.name);
+                            pause_all(&handle4, true, Some(&cfg.name));
+                        }
+                        was_in_window.insert(cfg.name.clone(), in_win);
+                    }
+                }
+            });
+            // clipboard monitoring (IDM): copying a download link
+            // raises the Add URL dialog with the link filled in —
+            // the same incoming_file flow the browser extension uses.
+            // Each distinct link is offered once per session.
+            let handle5 = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut last_seen = String::new();
+                let mut prompted: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                let mut cb: Option<arboard::Clipboard> = None;
+                loop {
+                    std::thread::sleep(Duration::from_millis(900));
+                    let state = handle5.state::<AppState>();
+                    if !current_settings(&state).clipboard_monitor {
                         continue;
                     }
-                    let now = chrono::Local::now().format("%H:%M").to_string();
-                    let in_win = in_window(&s, &now);
-                    if in_win && !was_in_window {
-                        // the window governs again; any manual override ends
-                        state.sched_override.store(false, Ordering::SeqCst);
-                        if s.max_simultaneous == 0 {
-                            start_all_queued(&handle4);
-                        } else {
-                            pump_queue(&handle4);
-                        }
-                    } else if !in_win && was_in_window {
-                        state.sched_override.store(false, Ordering::SeqCst);
-                        pause_all(&handle4, true);
+                    if cb.is_none() {
+                        cb = arboard::Clipboard::new().ok();
                     }
-                    was_in_window = in_win;
+                    let Some(c) = cb.as_mut() else { continue };
+                    let Ok(text) = c.get_text() else { continue };
+                    let text = text.trim().to_string();
+                    if text == last_seen {
+                        continue;
+                    }
+                    last_seen = text.clone();
+                    if !clipboard_url_qualifies(&text) {
+                        continue;
+                    }
+                    if !prompted.insert(text.clone()) {
+                        continue;
+                    }
+                    if prompted.len() > 200 {
+                        prompted.clear();
+                        prompted.insert(text.clone());
+                    }
+                    let payload = serde_json::json!({
+                        "url": text,
+                        "title": "",
+                        "pageUrl": "",
+                        "cookies": "",
+                    });
+                    state.pending_files.lock().unwrap().push(payload.clone());
+                    raise_main_window(&handle5);
+                    let _ = handle5.emit("incoming_file", payload);
                 }
             });
             // periodic snapshot so even a hard power cut keeps a fresh list
@@ -3009,6 +3895,19 @@ fn main() {
                 std::thread::sleep(Duration::from_secs(5));
                 let state = handle.state::<AppState>();
                 persist(&state);
+                // download quota (IDM's Download limits): the moment
+                // the window's budget runs out, everything pauses —
+                // re-queued, so the next window resumes it — and the
+                // user is told once per window
+                if quota_blocks(&state) {
+                    let mut q = state.quota_state.lock().unwrap();
+                    if !q.2 {
+                        q.2 = true;
+                        drop(q);
+                        pause_all(&handle, true, None);
+                        let _ = handle.emit("quota_exceeded", serde_json::json!({}));
+                    }
+                }
             });
             // incoming queue from the browser extension (via ndm-host):
             // drain immediately on startup and poll every 200ms so browser
@@ -3042,6 +3941,7 @@ fn main() {
             grab_page,
             get_settings,
             set_settings,
+            set_entry_queue,
             scheduler_start_now,
             scheduler_stop_now,
             open_path,
@@ -3087,7 +3987,9 @@ mod tests {
                 ..Settings::default()
             }),
             settings_file: Mutex::new(settings_path.clone()),
-            sched_override: AtomicBool::new(false),
+            sched_override: Mutex::new(std::collections::HashSet::new()),
+            quota_state: Mutex::new((0, 0, false)),
+            quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
@@ -3133,7 +4035,9 @@ mod tests {
             save_lock: Mutex::new(()),
             settings: Mutex::new(Settings::default()),
             settings_file: Mutex::new(PathBuf::new()),
-            sched_override: AtomicBool::new(false),
+            sched_override: Mutex::new(std::collections::HashSet::new()),
+            quota_state: Mutex::new((0, 0, false)),
+            quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
@@ -3171,6 +4075,9 @@ mod tests {
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(String::new()),
+            queue: Mutex::new(String::new()),
+            login: String::new(),
+            password: String::new(),
         });
         state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
         state.order.lock().unwrap().push("dl-1".to_string());
