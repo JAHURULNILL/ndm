@@ -9,6 +9,10 @@
 // - `type: "download"` -> queues `"file"`, `"video"`, or `"video_direct"`
 //                         (pre-selected quality from the in-browser popup)
 //                         and ensures `ndm-app` is running.
+// - `type: "pause_entry" / "cancel_entry" / "resume_entry"`
+//                      -> controls one existing entry via the queue
+// - `type: "progress"` -> reads the app's per-entry progress file
+//                         (progress/<id>.json) for the panel's live card
 
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
@@ -88,7 +92,29 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
                 _guard = Some(f);
                 break;
             }
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => {
+                // a lock older than 30 s cannot belong to a live
+                // hand-off (the append it guards takes milliseconds):
+                // its owner died mid-handover, and without recovery
+                // EVERY later hand-off would first burn the full spin
+                // and then append unlocked, forever
+                if lock_is_stale(&lock_path) {
+                    let _ = std::fs::remove_file(&lock_path);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+    if _guard.is_none() && lock_is_stale(&lock_path) {
+        // one last recovery attempt after the spin before falling
+        // back to the unlocked append
+        let _ = std::fs::remove_file(&lock_path);
+        if let Ok(f) = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            _guard = Some(f);
         }
     }
     let result = (|| {
@@ -101,6 +127,36 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
     result
 }
 
+/// A queue lock older than 30 s is debris from a host process that
+/// was killed between creating it and removing it.
+fn lock_is_stale(lock_path: &std::path::Path) -> bool {
+    std::fs::metadata(lock_path)
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map(|d| d.as_secs() > 30).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Apply the app's configured proxy to this process before running
+/// probes. The settings live in settings.json in the same data dir
+/// as the queue; the proxy is a process-local static in the engine,
+/// set by the app for its own process only — without this, the host
+/// probed direct while the app's downloads used the proxy, so
+/// in-page dialogs failed for hosts that download perfectly fine.
+fn apply_saved_proxy_settings() {
+    let Ok(dir) = app_data_dir() else { return };
+    let Ok(raw) = std::fs::read_to_string(dir.join("settings.json")) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    if let Some(p) = v.get("proxy").and_then(Value::as_str) {
+        ndm::set_global_proxy(p);
+    }
+    let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(true);
+    ndm::set_proxy_protocols(flag("proxy_http"), flag("proxy_https"), flag("proxy_ftp"));
+}
+
 /// Handles one parsed message; returns the reply object to frame back.
 fn handle(message: &Value) -> Value {
     match message.get("type").and_then(Value::as_str) {
@@ -111,12 +167,30 @@ fn handle(message: &Value) -> Value {
         Some("download") => handle_download(message),
         Some("pause_entry") => handle_entry_control(message, "pause_entry"),
         Some("cancel_entry") => handle_entry_control(message, "cancel_entry"),
+        Some("resume_entry") => handle_entry_control(message, "resume_entry"),
+        Some("progress") => handle_progress(message),
         Some(other) => json!({ "ok": false, "error": format!("unknown type: {other}") }),
         None => json!({ "ok": false, "error": "missing type" }),
     }
 }
 
-fn cookie_header_from_netscape(text: &str) -> Option<String> {
+/// Convert the extension's Netscape cookie export into a Cookie
+/// header for ONE target URL. Only entries the browser would
+/// actually send to that URL are included — the whole jar
+/// unfiltered shipped unrelated cookies (including ones scoped to
+/// other sites) to whatever host was being probed.
+fn cookie_header_from_netscape(text: &str, url: &str) -> Option<String> {
+    let after = url.split("://").nth(1).unwrap_or("");
+    let (hostport, path) = match after.find('/') {
+        Some(i) => (&after[..i], &after[i..]),
+        None => (after, "/"),
+    };
+    let host = hostport
+        .split(':')
+        .next()
+        .unwrap_or(hostport)
+        .to_ascii_lowercase();
+    let path = path.split(['?', '#']).next().unwrap_or("/");
     let mut pairs = Vec::new();
     for line in text.lines() {
         let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
@@ -124,7 +198,14 @@ fn cookie_header_from_netscape(text: &str) -> Option<String> {
             continue;
         }
         let f: Vec<&str> = line.split('\t').collect();
+        // Netscape fields: domain, flag, path, secure, expiry, name, value
         if f.len() >= 7 {
+            let dom = f[0].trim_start_matches('.').to_ascii_lowercase();
+            let domain_match =
+                !dom.is_empty() && (host == dom || host.ends_with(&format!(".{dom}")));
+            if !domain_match || !path.starts_with(f[2]) {
+                continue;
+            }
             pairs.push(format!("{}={}", f[5], f[6]));
         }
     }
@@ -157,6 +238,14 @@ fn category_for_name(name: &str) -> &'static str {
 }
 
 fn default_file_name(url: &str) -> String {
+    // An endpoint like /dl?file=report.pdf carries its real name in
+    // the query string; the path tail ("dl") is a handler name, and
+    // using it saved the file extensionless in the wrong category
+    // (F-EXT-11). The engine's rule mirrors the extension's
+    // filenameFromUrl, so both sides agree on the name.
+    if let Some(q) = ndm::query_file_name(url) {
+        return q;
+    }
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let tail = path.rsplit('/').next().unwrap_or("download.bin").trim();
     if tail.is_empty() {
@@ -180,10 +269,11 @@ fn handle_probe_file(message: &Value) -> Value {
         .filter(|s| !s.is_empty())
         .map(String::from);
     let auth = ndm::Auth {
-        cookie: cookie_header_from_netscape(cookies_str),
+        cookie: cookie_header_from_netscape(cookies_str, url),
         referer,
         authorization: None,
     };
+    apply_saved_proxy_settings();
     match ndm::probe_with_auth(url, &auth) {
         Ok(probe) => {
             let suggested = probe
@@ -215,6 +305,7 @@ fn handle_probe(message: &Value) -> Value {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return json!({ "ok": false, "error": "url must be a non-empty http(s) URL" });
     }
+    apply_saved_proxy_settings();
     let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
     let cookies_str = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
 
@@ -262,7 +353,7 @@ fn new_entry_id() -> String {
     format!("{}-{nanos}-{n}", std::process::id())
 }
 
-fn wait_for_ack_and_result(id: &str, timeout_secs: u64) -> Value {
+fn wait_for_ack_and_result(id: &str, timeout_secs: u64, queued_on_timeout: bool) -> Value {
     let Ok(base) = app_data_dir() else {
         return json!({ "ok": false, "error": "cannot resolve app data directory" });
     };
@@ -294,6 +385,14 @@ fn wait_for_ack_and_result(id: &str, timeout_secs: u64) -> Value {
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
     }
+    if queued_on_timeout {
+        // the line IS in the app's queue file — the download was
+        // accepted; only the acknowledgement never surfaced in
+        // time. Reporting failure here made the extension claim the
+        // send failed while the download appeared moments later
+        // (and a user retry created a duplicate)
+        return json!({ "ok": true, "queued": true, "id": id });
+    }
     json!({
         "ok": false,
         "error": "NDM desktop app did not acknowledge the download in time"
@@ -302,8 +401,8 @@ fn wait_for_ack_and_result(id: &str, timeout_secs: u64) -> Value {
 
 fn handle_download(message: &Value) -> Value {
     let kind = message.get("kind").and_then(Value::as_str).unwrap_or("");
-    if kind != "video" && kind != "file" && kind != "video_direct" && kind != "file_direct" {
-        return json!({ "ok": false, "error": "kind must be \"video\", \"video_direct\", \"file\", or \"file_direct\"" });
+    if kind != "video" && kind != "file" && kind != "video_direct" && kind != "file_direct" && kind != "grab" {
+        return json!({ "ok": false, "error": "kind must be \"video\", \"video_direct\", \"file\", \"file_direct\", or \"grab\"" });
     }
     let url = message.get("url").and_then(Value::as_str).unwrap_or("");
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -361,7 +460,7 @@ fn handle_download(message: &Value) -> Value {
     match append_to_queue(obj, cookies) {
         Ok(()) => {
             ensure_app_running(is_direct);
-            wait_for_ack_and_result(&id, 15)
+            wait_for_ack_and_result(&id, 15, true)
         }
         Err(e) => {
             eprintln!("ndm-host: cannot write queue: {e}");
@@ -370,18 +469,54 @@ fn handle_download(message: &Value) -> Value {
     }
 }
 
-/// Pause or cancel one existing entry by id — used by the browser
-/// dialog's Download Later / Cancel buttons now that the download
-/// starts while the dialog is open (IDM's File Info behavior): the
-/// entry already exists by the time the user decides.
-fn handle_entry_control(message: &Value, kind: &str) -> Value {
-    let entry = message.get("entry").and_then(Value::as_str).unwrap_or("");
-    if entry.is_empty()
-        || entry.len() > 64
-        || !entry
+/// The entry-id rules shared by the control and progress paths:
+/// the id becomes a queue field and a file name, so it must stay a
+/// plain token (the same charset the app accepts for ack ids).
+fn valid_entry_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+}
+
+/// Live progress for one entry, read from the progress file the app
+/// maintains beside its acks/results (progress/<id>.json) and
+/// returned verbatim with ok:true merged in. No file (or an
+/// unparseable one) is a plain {ok:false} — the in-page card polls
+/// this once a second and degrades to a static state, so a missing
+/// file is an expected answer, not an error worth surfacing.
+fn handle_progress(message: &Value) -> Value {
+    let id = message.get("id").and_then(Value::as_str).unwrap_or("");
+    if !valid_entry_id(id) {
+        return json!({ "ok": false, "error": "invalid id" });
+    }
+    let Ok(base) = app_data_dir() else {
+        return json!({ "ok": false, "error": "no progress" });
+    };
+    let path = base.join("progress").join(format!("{id}.json"));
+    let parsed = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    match parsed {
+        Some(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("ok".to_string(), json!(true));
+            }
+            v
+        }
+        None => json!({ "ok": false, "error": "no progress" }),
+    }
+}
+
+/// Pause, cancel or resume one existing entry by id — used by the
+/// browser dialog's Download Later / Cancel buttons now that the
+/// download starts while the dialog is open (IDM's File Info
+/// behavior), and by the panel's progress card (Pause / Resume /
+/// Cancel): the entry already exists by the time the user decides.
+fn handle_entry_control(message: &Value, kind: &str) -> Value {
+    let entry = message.get("entry").and_then(Value::as_str).unwrap_or("");
+    if !valid_entry_id(entry) {
         return json!({ "ok": false, "error": "invalid entry id" });
     }
     let id = new_entry_id();
@@ -389,7 +524,7 @@ fn handle_entry_control(message: &Value, kind: &str) -> Value {
     match append_to_queue(obj, "") {
         Ok(()) => {
             ensure_app_running(true);
-            wait_for_ack_and_result(&id, 15)
+            wait_for_ack_and_result(&id, 15, false)
         }
         Err(e) => {
             eprintln!("ndm-host: cannot write queue: {e}");

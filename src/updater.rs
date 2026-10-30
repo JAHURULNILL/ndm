@@ -129,6 +129,15 @@ pub fn download_file(
             let _ = std::fs::remove_file(&tmp);
             return Err("the update failed its integrity check and was discarded".to_string());
         }
+    } else if total > 0 && downloaded != total {
+        // no hash to verify against: the server's own Content-Length
+        // is the only integrity signal — a connection that closed
+        // mid-body must not be renamed into place as a "successful"
+        // download and fail later, inside the installer
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "the update download was truncated ({downloaded} of {total} bytes) and was discarded"
+        ));
     }
     std::fs::rename(&tmp, dest).map_err(|e| format!("cannot install file: {e}"))?;
     on_progress(downloaded, total.max(downloaded));

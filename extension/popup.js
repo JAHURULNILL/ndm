@@ -28,9 +28,15 @@ async function init() {
       + '<div class="hint">Is NDM installed and the bridge set up?</div>';
   }
 
+  // Per-tab pause lives in SESSION storage: tab ids are recycled
+  // across restarts, so a persistent map would let an unrelated
+  // later tab inherit the pause (EX-m6).
+  const tabStore = chrome.storage.session || chrome.storage.local;
   let stored = {};
+  let tabOffStored = {};
   try {
-    stored = await chrome.storage.local.get(['ndmIntercept', 'ndmTabOff', 'ndmSiteExceptions']);
+    stored = await chrome.storage.local.get(['ndmIntercept', 'ndmSiteExceptions']);
+    tabOffStored = await tabStore.get({ ndmTabOff: {} });
   } catch (e) {}
   chk.checked = stored.ndmIntercept !== false;
   chk.addEventListener('change', () => {
@@ -47,16 +53,17 @@ async function init() {
     }
   })();
 
-  // Per-tab pause (link-click layer): stored per tab id.
-  const tabOff = stored.ndmTabOff || {};
+  // Per-tab pause (link-click layer): stored per tab id in the
+  // session store (see above).
+  const tabOff = tabOffStored.ndmTabOff || {};
   chkTabOff.checked = !!(tab.id != null && tabOff[tab.id]);
   chkTabOff.addEventListener('change', async () => {
-    const cur = (await chrome.storage.local.get({ ndmTabOff: {} })).ndmTabOff || {};
+    const cur = (await tabStore.get({ ndmTabOff: {} })).ndmTabOff || {};
     if (tab.id != null) {
       if (chkTabOff.checked) cur[tab.id] = true;
       else delete cur[tab.id];
     }
-    await chrome.storage.local.set({ ndmTabOff: cur });
+    await tabStore.set({ ndmTabOff: cur });
   });
 
   // Per-site exception list (both interception layers).
@@ -88,10 +95,37 @@ async function init() {
     return;
   }
   let isVideo = false;
+  let hasMedia = false;
   try {
-    const c = await chrome.runtime.sendMessage({ action: 'ndm-classify-url', url: tab.url });
+    const c = await chrome.runtime.sendMessage({
+      action: 'ndm-classify-url',
+      url: tab.url,
+      tabId: tab.id,
+    });
     isVideo = !!(c && c.video);
+    hasMedia = !!(c && c.hasMedia);
   } catch (e) {}
+  if (!hasMedia) {
+    // Ask the page itself — its answer is the freshest (the
+    // background's per-tab record can lag a just-loaded player).
+    try {
+      const q = await chrome.tabs.sendMessage(
+        tab.id,
+        { action: 'ndm-query-media' },
+        { frameId: 0 }
+      );
+      if (q && q.hasMedia) hasMedia = true;
+    } catch (e) {}
+  }
+  if (!hasMedia) {
+    // No detected media → no video offer at all (R2-EXT-08):
+    // offering one led to a flyout that probed the page itself
+    // and presented the HTML document as an MP4 row over a raw
+    // yt-dlp error.
+    btn.disabled = true;
+    btn.textContent = 'No video found on this page';
+    return;
+  }
   btn.disabled = false;
   btn.textContent = isVideo
     ? 'Choose Quality & Download Video'
@@ -100,7 +134,7 @@ async function init() {
     try {
       const opened = await chrome.tabs.sendMessage(tab.id, {
         action: 'ndm-open-video-modal',
-      });
+      }, { frameId: 0 });
       if (opened && opened.ok) {
         window.close();
         return;

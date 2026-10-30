@@ -34,14 +34,14 @@ fi
 
 # --- Firefox (extension ID is fixed: ndm@nill.download) ---
 write_manifest "$HOME/.mozilla/native-messaging-hosts" \
-  "{\"name\":\"com.ndm.host\",\"description\":\"NDM — Nill Download Manager native messaging host\",\"path\":\"$HOST\",\"type\":\"stdio\",\"allowed_extensions\":[\"ndm@nill.download\"]}"
+  "{\"name\":\"com.ndm.host\",\"description\":\"Nill Download Manager native messaging host\",\"path\":\"$HOST\",\"type\":\"stdio\",\"allowed_extensions\":[\"ndm@nill.download\"]}"
 echo "Firefox: done. In Firefox load the extension via about:debugging ->"
 echo "  This Firefox -> Load Temporary Add-on -> $EXT_DIR/manifest.json"
 echo "  (temporary add-ons last until Firefox restarts; a signed build is"
 echo "   on the roadmap for a permanent install.)"
 
 # --- Chrome family: the ID is fixed by the manifest key ---
-BODY="{\"name\":\"com.ndm.host\",\"description\":\"NDM — Nill Download Manager native messaging host\",\"path\":\"$HOST\",\"type\":\"stdio\",\"allowed_origins\":[\"chrome-extension://$EXT_ID/\"]}"
+BODY="{\"name\":\"com.ndm.host\",\"description\":\"Nill Download Manager native messaging host\",\"path\":\"$HOST\",\"type\":\"stdio\",\"allowed_origins\":[\"chrome-extension://$EXT_ID/\"]}"
 FOUND=0
 for cfg in "google-chrome" "google-chrome-beta" "chromium" "chromium-browser" "BraveSoftware/Brave-Browser" "microsoft-edge" "vivaldi" "opera"; do
   if [ -d "$HOME/.config/$cfg" ]; then

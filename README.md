@@ -1,6 +1,6 @@
 <div align="center">
 
-# NDM — Nill Download Manager
+# Nill Download Manager
 
 **A fast, resumable download manager for Linux and Windows — multi-connection downloads, browser integration, a video downloader and a site grabber in one small native app.**
 

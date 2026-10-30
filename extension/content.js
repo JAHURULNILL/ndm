@@ -1,5 +1,5 @@
 'use strict';
-/* NDM — Nill Download Manager: content script.
+/* Nill Download Manager: content script.
  *
  * Shows the IDM-style "⬇ Download with NDM" floating button at the top-right
  * corner of any downloadable video player. Clicking it opens an IDM-style
@@ -8,7 +8,7 @@
  *   - Video Thumbnail, Duration, and Channel/Uploader
  *   - Editable Title / File Name
  *   - Quality & Format Selection List with exact/estimated MB sizes
- *   - Save to Folder + Start Download / Download Later buttons
+ *   - Save to Folder + Download Now / Download Later buttons
  */
 
 (() => {
@@ -36,15 +36,19 @@
   let shadowRoot = null;  // closed shadow root
   let cardEl = null;      // the floating pill element
   let modalEl = null;     // the in-browser IDM quality modal backdrop
+  let flyCardEl = null;   // the video flyout card (inside modalEl while open)
+  let flyPollTimer = null; // 1s progress poll for the flyout's progress view
   let anchor = null;      // the <video> the pill is attached to
   let dismissed = false;  // user closed the pill on this page
   let modalOpen = false;  // whether the in-browser modal is currently open
   let activeProbeToken = 0;
-  // The open modal's own dismiss logic (Cancel semantics: discard or
-  // pause the entry that started while the dialog was open). Every
-  // close path — backdrop, pill ×, SPA navigation, modal replacement
-  // — must go through it; the raw teardown alone would leave a
-  // "dismissed" download running invisibly in the app.
+  // The open modal's own dismiss logic. Every close path —
+  // backdrop, pill ×, SPA navigation, modal replacement — must go
+  // through it, never the raw teardown alone, so the modal can
+  // settle its speculative state ( timers, polls, an in-flight
+  // start) as it closes. Dismiss semantics are IDM's: closing a
+  // dialog NEVER discards a download that has started — only the
+  // file dialog's labelled Cancel button does that (R3-EXT-02).
   let activeModalDismiss = null;
 
   function dismissActiveModal() {
@@ -73,17 +77,17 @@
         location.pathname.startsWith('/reel/');
     }
     if (
-      host.endsWith('instagram.com') ||
-      host.endsWith('tiktok.com') ||
-      host.endsWith('vimeo.com') ||
-      host.endsWith('dailymotion.com') ||
+      host === 'instagram.com' || host.endsWith('.instagram.com') ||
+      host === 'tiktok.com' || host.endsWith('.tiktok.com') ||
+      host === 'vimeo.com' || host.endsWith('.vimeo.com') ||
+      host === 'dailymotion.com' || host.endsWith('.dailymotion.com') ||
       host === 'x.com' ||
       host.endsWith('.x.com') ||
       host === 'twitter.com' ||
       host.endsWith('.twitter.com') ||
-      host.endsWith('twitch.tv') ||
-      host.endsWith('reddit.com') ||
-      host.endsWith('bilibili.com')
+      host === 'twitch.tv' || host.endsWith('.twitch.tv') ||
+      host === 'reddit.com' || host.endsWith('.reddit.com') ||
+      host === 'bilibili.com' || host.endsWith('.bilibili.com')
     ) {
       return document.querySelector('video') !== null;
     }
@@ -106,8 +110,24 @@
     return false;
   }
 
+  /* IDM's panel also appears on audio-only pages (with audio
+     formats): an <audio> player with a real source counts as media
+     worth offering the panel for. */
+  function hasPlayableAudioElement() {
+    for (const a of document.querySelectorAll('audio')) {
+      const r = a.getBoundingClientRect();
+      if (r.width < 180) continue;
+      const src = a.currentSrc || a.src || '';
+      if (src && !src.startsWith('blob:')) return true;
+      const srcEl = a.querySelector('source[src]');
+      if (srcEl && !(srcEl.getAttribute('src') || '').startsWith('blob:')) return true;
+      if (a.readyState >= 1 || !a.paused || a.duration > 3) return true;
+    }
+    return false;
+  }
+
   function videoDetected() {
-    return isKnownVideoSite() || hasPlayableVideoElement();
+    return isKnownVideoSite() || hasPlayableVideoElement() || hasPlayableAudioElement();
   }
 
   function pickAnchor() {
@@ -121,6 +141,19 @@
       const area = visW * visH;
       if (area > bestArea) {
         best = v;
+        bestArea = area;
+      }
+    }
+    if (best) return best;
+    // audio-only page: anchor the pill to the widest visible player
+    for (const a of document.querySelectorAll('audio')) {
+      const r = a.getBoundingClientRect();
+      if (r.width < 160) continue;
+      const visW = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+      const visH = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+      const area = visW * visH;
+      if (area > bestArea) {
+        best = a;
         bestArea = area;
       }
     }
@@ -143,8 +176,30 @@
       return href;
     }
 
-    // 2. Walk up from the <video> element to find a post/reel/video permalink
+    // 2. The element's OWN playable source outranks any neighbouring
+    //    link: the ancestor walk below used to run first and return
+    //    a "watch on YouTube" credit link out of the article subtree
+    //    for a plain embedded file (EX-m3).
     if (videoEl) {
+      const direct = videoEl.currentSrc || videoEl.src || '';
+      if (/^https?:\/\//i.test(direct)) return direct;
+      const sourceEl = videoEl.querySelector('source[src]');
+      const sUrl = sourceEl ? sourceEl.getAttribute('src') || '' : '';
+      if (/^https?:\/\//i.test(sUrl)) {
+        try {
+          return new URL(sUrl, href).href;
+        } catch (e) {}
+      }
+    }
+
+    // 3. Walk up from the element to find a post/reel/video
+    //    permalink — scoped to the element's own post container:
+    //    the old unbounded walk climbed into neighbouring posts'
+    //    subtrees and could return THEIR permalink.
+    if (videoEl) {
+      const container = videoEl.closest
+        ? videoEl.closest('article, [role="article"], [data-testid*="post" i]')
+        : null;
       let cur = videoEl;
       for (let depth = 0; depth < 16 && cur && cur !== document.body; depth++, cur = cur.parentElement) {
         const links = cur.querySelectorAll ? cur.querySelectorAll('a[href]') : [];
@@ -160,23 +215,22 @@
             return h.split('&__cft__')[0];
           }
         }
+        if (container ? cur === container : depth >= 3) break;
       }
     }
 
-    // 3. For generic sites: if the <video> has a direct http(s) media URL, or
-    //    if the background worker sniffed an .m3u8 / .mpd / .mp4 stream, use it
+    // 4. For generic sites: if the background worker sniffed an
+    //    .m3u8 / .mpd / .mp4 stream for this page, use it. The
+    //    request carries the page's canonical video key so the
+    //    background can prefer THIS page's streams over the tab's
+    //    older ones (EX-m2).
     if (!isKnownVideoSite() && videoEl) {
-      const direct = videoEl.currentSrc || videoEl.src || '';
-      if (/^https?:\/\//i.test(direct)) return direct;
-      const sourceEl = videoEl.querySelector('source[src]');
-      const sUrl = sourceEl ? sourceEl.getAttribute('src') || '' : '';
-      if (/^https?:\/\//i.test(sUrl)) {
-        try {
-          return new URL(sUrl, href).href;
-        } catch (e) {}
-      }
       try {
-        const mediaResp = await chrome.runtime.sendMessage({ action: 'ndm-tab-media' });
+        const mediaResp = await chrome.runtime.sendMessage({
+          action: 'ndm-tab-media',
+          pageUrl: href,
+          key: canonicalVideoKey(href),
+        });
         if (mediaResp && mediaResp.streamUrl) return mediaResp.streamUrl;
       } catch (e) {}
     }
@@ -265,11 +319,82 @@
     cardEl.style.display = 'flex';
     const w = cardEl.offsetWidth || 196;
     cardEl.style.left = Math.max(4, r.right - w - 12) + 'px';
-    cardEl.style.top = Math.max(4, r.top + 12) + 'px';
+    let pillTop = r.top + 12;
+    // Small native widgets (a standard <audio> player is ~40 px
+    // tall and nearly all controls): parking the pill ON the box
+    // buries the player's own controls under it (F-EXT-16) —
+    // float just above the widget, or just below it when there
+    // is no room above.
+    if ((anchor && anchor.tagName === 'AUDIO') || r.height <= 56) {
+      const ph = cardEl.offsetHeight || 34;
+      pillTop = r.top - ph - 6 >= 4 ? r.top - ph - 6 : r.bottom + 6;
+    }
+    cardEl.style.top = Math.max(4, pillTop) + 'px';
+    // The video flyout rides the same anchor — keep it glued just
+    // under the pill while the page scrolls / the player resizes.
+    if (flyCardEl && flyCardEl.isConnected) {
+      flyCardEl.style.top = Math.max(4, r.top + 52) + 'px';
+      flyCardEl.style.right =
+        Math.max(4, window.innerWidth - r.right + 12) + 'px';
+      clampFlyIntoView(flyCardEl);
+    }
+  }
+
+  /* Keep a flyout card fully inside the viewport (F-EXT-09):
+     anchoring to a left-edge player used to extend the card LEFT
+     past the screen edge (its `right` offset was positive, just
+     large), and a bottom-edge player could push it off the
+     bottom. Measures the card's ACTUAL rendered rect after
+     positioning and pulls it back with an 8 px margin on every
+     side (R3-EXT-09): the old style-parsing version engaged on
+     audio pages too, but landed the card at a 4 px inset where
+     its border and shadow still read as clipped against the
+     screen edge — a rect check with a real margin is the honest
+     guarantee, whatever width the card rendered at. */
+  function clampFlyIntoView(el) {
+    if (!el || !el.isConnected) return;
+    const M = 8;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0) return;
+    if (r.left < M) {
+      const right = parseFloat(el.style.right);
+      if (!isNaN(right)) {
+        el.style.right = Math.max(M, right + (r.left - M)) + 'px';
+      } else {
+        el.style.right = Math.max(M, window.innerWidth - r.width - M) + 'px';
+      }
+    } else if (r.right > window.innerWidth - M) {
+      const right = parseFloat(el.style.right);
+      if (!isNaN(right)) {
+        // too far right: a LARGER right offset moves the card left
+        el.style.right =
+          Math.max(M, right + (r.right - (window.innerWidth - M))) + 'px';
+      }
+    }
+    const r2 = el.getBoundingClientRect();
+    if (r2.height > 0 && r2.bottom > window.innerHeight - M) {
+      const top = parseFloat(el.style.top);
+      if (!isNaN(top)) {
+        el.style.top =
+          Math.max(M, top - (r2.bottom - (window.innerHeight - M))) + 'px';
+      }
+    }
+    if (r2.top < M) {
+      const top = parseFloat(el.style.top);
+      if (!isNaN(top)) el.style.top = Math.max(M, top + (M - r2.top)) + 'px';
+    }
   }
 
   const localProbeCache = new Map(); // canonicalUrl -> info
   const inFlightProbes = new Map();  // canonicalUrl -> Promise<res>
+  /* Entries this page started from the video flyout, keyed
+     `${canonicalUrl}|${selector}|${audio?'a':'v'}` ->
+     { id, name }. The flyout is rebuilt on every open, so without
+     this it reopens as a plain quality list with no sign that one
+     of its rows is already downloading (R3-EXT-08): renderList
+     consults the registry to badge the live row and route its
+     click back to that entry's progress view. */
+  const flyEntryRegistry = new Map();
   let lastPreProbedUrl = '';
   let onInstantInfoCallback = null;
 
@@ -392,7 +517,7 @@
     // never does — it resolves formats when its panel is clicked.
     // Warm only a page's main video, and warm probes carry no
     // session cookies (see fetchOrReuseProbe).
-    if (document.querySelectorAll('video').length > 3) return;
+    if (document.querySelectorAll('video, audio').length > 3) return;
     const targetUrl = await resolveVideoUrl(curAnchor);
     const key = canonicalVideoKey(targetUrl);
     if (!key || key === lastPreProbedUrl || localProbeCache.has(key)) return;
@@ -440,6 +565,13 @@
     onInstantInfoCallback = null;
     modalOpen = false;
     activeModalDismiss = null;
+    // The flyout's progress poll dies with the card — the download
+    // itself is never touched by closing the panel.
+    if (flyPollTimer) {
+      clearInterval(flyPollTimer);
+      flyPollTimer = null;
+    }
+    flyCardEl = null;
     if (modalEl) {
       modalEl.remove();
       modalEl = null;
@@ -447,18 +579,29 @@
     place();
   }
 
-  async function openBrowserModal(pillBtn, pillContainer) {
+  async function openBrowserModal(pillBtn, pillContainer, srcUrl, onShellOpen) {
     if (!shadowRoot) return;
     dismissActiveModal();
     modalOpen = true;
     const myToken = ++activeProbeToken;
 
+    // EX-m4: a caller that names the exact stream (right-click on a
+    // <video>) anchors the panel to THAT element, not the largest.
+    let srcAnchor = null;
+    if (srcUrl) {
+      for (const v of document.querySelectorAll('video')) {
+        if (v.currentSrc === srcUrl || v.src === srcUrl) { srcAnchor = v; break; }
+        const sEl = v.querySelector('source[src]');
+        if (sEl && sEl.src === srcUrl) { srcAnchor = v; break; }
+      }
+      if (srcAnchor) anchor = srcAnchor;
+    }
+
     requestMainWorldPlayerInfo();
-    const currentAnchor = anchor || pickAnchor();
+    const currentAnchor = srcAnchor || anchor || pickAnchor();
     const rawTargetUrl = await resolveVideoUrl(currentAnchor);
     const targetUrl = canonicalVideoKey(rawTargetUrl);
     const fallbackTitle = cleanPageTitle();
-    const fallbackThumb = guessFallbackThumbnail(targetUrl, currentAnchor);
 
     let savedDir = '~/Downloads';
     try {
@@ -466,611 +609,1176 @@
       if (st && st.ndmSaveDir) savedDir = st.ndmSaveDir;
     } catch (e) {}
 
+    // A close (SPA navigation, pill removal, a replacement modal)
+    // may have landed while the URL was being resolved: building
+    // the card now would leave a zombie panel nobody can dismiss.
+    if (myToken !== activeProbeToken || !shadowRoot || !panelHost) return;
+
+    /* ── IDM panel behaviour ────────────────────────────────────
+       A compact flyout anchored at the player — NOT a centered
+       dialog. Header row "Download all" + one plain-text row per
+       quality ("1. <title>, MP4 file, quality 1080p"). NOTHING is
+       sent to NDM until the user clicks a row (that format) or
+       "Download all" (every format). After a click, THIS card
+       becomes the progress view — IDM's progress dialog in
+       miniature: "<percent>% — <filename>", a bar, downloaded /
+       total · speed · time left, Pause / Cancel. Closing the
+       card (×, Esc, outside click) NEVER touches the download. */
     const backdrop = document.createElement('div');
-    backdrop.className = 'ndm-modal-backdrop';
+    backdrop.className = 'ndm-fly-backdrop';
     for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'dblclick']) {
       backdrop.addEventListener(evt, e => e.stopPropagation());
     }
     backdrop.addEventListener('click', e => {
       e.stopPropagation();
-      // clicking outside the dialog is a Cancel, with full Cancel
-      // semantics (the speculative entry is discarded) — the raw
-      // teardown used to leave it downloading invisibly
-      if (e.target === backdrop) dismissVideoCancel();
+      if (e.target === backdrop) closeFly();
     });
 
-    const dialog = document.createElement('div');
-    dialog.className = 'ndm-modal';
-    dialog.innerHTML = `
-      <div class="ndm-m-head">
-        <div class="ndm-m-brand">
-          <span class="ndm-m-logo">⬇</span>
-          <span>Download Video with NDM</span>
-        </div>
-        <button class="ndm-m-x" type="button" title="Close">×</button>
-      </div>
-      <div class="ndm-m-body">
-        <div class="ndm-m-preview">
-          <div class="ndm-m-thumb-wrap">
-            <img class="ndm-m-thumb" alt="" style="display:none" />
-            <div class="ndm-m-thumb-ph">🎬</div>
-            <span class="ndm-m-dur" style="display:none"></span>
-          </div>
-          <div class="ndm-m-meta">
-            <label class="ndm-m-lbl">Video Title / File Name</label>
-            <input class="ndm-m-input ndm-m-title" type="text" value="" placeholder="Video title" />
-            <div class="ndm-m-sub">
-              <span class="ndm-m-uploader"></span>
-              <span class="ndm-m-host">${location.hostname}</span>
-            </div>
-          </div>
-        </div>
+    // Audio-only pages get honest wording (F-EXT-15): the panel
+    // is reading an audio player, not a video.
+    const loadingText =
+      currentAnchor && currentAnchor.tagName === 'AUDIO'
+        ? 'Reading the audio…'
+        : 'Reading the video…';
 
-        <div class="ndm-m-qhead">
-          <span>Select Quality &amp; Format</span>
-          <span class="ndm-m-qhint">File Size</span>
-        </div>
-        <div class="ndm-m-qlist">
-          <div class="ndm-m-loading">
-            <div class="ndm-spinner"></div>
-            <div>
-              <div class="ndm-m-load-title">Reading video qualities &amp; calculating MB sizes…</div>
-              <div class="ndm-m-load-sub">Fetching stream manifest via NDM high-speed engine</div>
-            </div>
-          </div>
-        </div>
-
-        <div class="ndm-m-folder-row">
-          <label class="ndm-m-lbl">Save to folder</label>
-          <input class="ndm-m-input ndm-m-dir" type="text" value="" placeholder="~/Downloads" />
-        </div>
-        <div class="ndm-m-status" style="display:none"></div>
+    const card = document.createElement('div');
+    card.className = 'ndm-fly';
+    card.innerHTML = `
+      <div class="ndm-fly-head">
+        <button class="ndm-fly-all" type="button">Download all</button>
+        <span class="ndm-fly-title" style="display:none"></span>
+        <button class="ndm-fly-x" type="button" title="Close">×</button>
       </div>
-      <div class="ndm-m-foot">
-        <button class="ndm-btn ndm-btn-ghost ndm-btn-app" type="button" title="Open this video in the NDM desktop app window">Open in NDM App</button>
-        <div class="ndm-m-foot-right">
-          <button class="ndm-btn ndm-btn-secondary ndm-btn-cancel" type="button">Cancel</button>
-          <button class="ndm-btn ndm-btn-secondary ndm-btn-all" type="button" disabled title="Download every listed quality (IDM's Download all)">Download all</button>
-          <button class="ndm-btn ndm-btn-secondary ndm-btn-later" type="button" disabled>Download Later</button>
-          <button class="ndm-btn ndm-btn-primary ndm-btn-start" type="button" disabled>⬇ Start Download</button>
-        </div>
+      <div class="ndm-fly-body">
+        <div class="ndm-fly-loading"><div class="ndm-spinner"></div><div>${loadingText}</div></div>
+      </div>
+      <div class="ndm-fly-foot" style="display:none">
+        <button class="ndm-fly-app" type="button">Open in NDM App</button>
       </div>
     `;
 
-    backdrop.appendChild(dialog);
+    backdrop.appendChild(card);
     shadowRoot.appendChild(backdrop);
     modalEl = backdrop;
+    flyCardEl = card;
     syncHostParent();
     panelHost.style.display = 'block';
+    positionFly();
+    // EX-m5 (kept): focus the backdrop so Esc works without a
+    // first click inside the card.
+    backdrop.tabIndex = -1;
+    backdrop.focus();
+    // EX-m12 (kept): the shell is open — callers waiting on this
+    // open (popup) are answered NOW, not after the probe settles.
+    if (typeof onShellOpen === 'function') onShellOpen();
 
-    const titleIn = dialog.querySelector('.ndm-m-title');
-    const dirIn = dialog.querySelector('.ndm-m-dir');
-    const thumbImg = dialog.querySelector('.ndm-m-thumb');
-    const thumbPh = dialog.querySelector('.ndm-m-thumb-ph');
-    const durBadge = dialog.querySelector('.ndm-m-dur');
-    const uploaderEl = dialog.querySelector('.ndm-m-uploader');
-    const qListEl = dialog.querySelector('.ndm-m-qlist');
-    const statusEl = dialog.querySelector('.ndm-m-status');
-    const btnClose = dialog.querySelector('.ndm-m-x');
-    const btnCancel = dialog.querySelector('.ndm-btn-cancel');
-    const btnApp = dialog.querySelector('.ndm-btn-app');
-    const btnLater = dialog.querySelector('.ndm-btn-later');
-    const btnAll = dialog.querySelector('.ndm-btn-all');
-    const btnStart = dialog.querySelector('.ndm-btn-start');
+    const bodyEl = card.querySelector('.ndm-fly-body');
+    const footEl = card.querySelector('.ndm-fly-foot');
+    const btnAll = card.querySelector('.ndm-fly-all');
+    const btnX = card.querySelector('.ndm-fly-x');
+    const btnAppLink = card.querySelector('.ndm-fly-app');
+    const titleEl = card.querySelector('.ndm-fly-title');
 
-    titleIn.value = fallbackTitle;
-    dirIn.value = savedDir;
+    /* The card header is the "Download all" button in list view
+       and the entry's "<percent>% — <filename>" title in the
+       progress views, like IDM's progress-dialog title bar
+       (F-EXT-05). */
+    function showFlyTitle(text) {
+      btnAll.style.display = 'none';
+      titleEl.style.display = '';
+      titleEl.textContent = text;
+      titleEl.title = text;
+    }
+    function showFlyListHead() {
+      titleEl.style.display = 'none';
+      btnAll.style.display = '';
+    }
 
+    let probedTitle = fallbackTitle;
+    let qualities = [];
+    let rendered = false;
+    let closed = false;
+    let startBusy = false;
+    let probeSettled = false; // rows (or the failure fallback) are on screen
+    let wantAll = false;      // "Download all" clicked while still probing
+
+    // Used only when probing produced no format list at all (the
+    // same two automatic choices the old dialog fell back to).
+    const DEFAULT_QUALITIES = [
+      {
+        id: 'best',
+        label: 'Best available quality (Auto)',
+        selector: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
+        audio: false,
+        ext: 'MP4',
+        size_bytes: null,
+        height: 1080,
+      },
+      {
+        id: 'audio',
+        // No format claim: probing failed, so the container the
+        // audio job will land in is unknown from here (the app
+        // saves the chosen stream as-is — M4A, MP3, …). The label
+        // renders verbatim on the row, and '' is this file's "no
+        // honest ext word" marker (see audioRowExt).
+        label: 'Audio only',
+        selector: 'ba/b',
+        audio: true,
+        ext: '',
+        size_bytes: null,
+        height: 0,
+      },
+    ];
+
+    function positionFly() {
+      const el = currentAnchor && currentAnchor.isConnected
+        ? currentAnchor
+        : anchor;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      card.style.top = Math.max(4, r.top + 52) + 'px';
+      card.style.right = Math.max(4, window.innerWidth - r.right + 12) + 'px';
+      clampFlyIntoView(card);
+    }
+
+    function stopPoll() {
+      if (flyPollTimer) {
+        clearInterval(flyPollTimer);
+        flyPollTimer = null;
+      }
+    }
+
+    function closeFly() {
+      if (closed) return;
+      closed = true;
+      stopPoll();
+      closeBrowserModal();
+    }
+    activeModalDismiss = closeFly;
+
+    btnX.addEventListener('click', closeFly);
     backdrop.addEventListener('keydown', e => {
       e.stopPropagation();
       if (e.key === 'Escape') {
         e.preventDefault();
-        dismissVideoCancel();
-      } else if (e.key === 'Enter' && !btnStart.disabled) {
-        e.preventDefault();
-        btnStart.click();
+        closeFly();
       }
     });
 
-    function showThumbnail(src) {
-      if (!src) return;
-      thumbImg.onload = () => {
-        thumbImg.style.display = 'block';
-        thumbPh.style.display = 'none';
-      };
-      thumbImg.onerror = () => {
-        if (src !== fallbackThumb && fallbackThumb) {
-          thumbImg.src = fallbackThumb;
-        }
-      };
-      thumbImg.src = src;
-    }
-
-    if (fallbackThumb) showThumbnail(fallbackThumb);
-
-    btnClose.addEventListener('click', () => dismissVideoCancel());
-    btnCancel.addEventListener('click', () => dismissVideoCancel());
-    activeModalDismiss = dismissVideoCancel;
-
-    btnApp.addEventListener('click', async () => {
-      if (vspec.inflight) return;
-      if (vspec.id) {
-        // already downloading in the app (started while this dialog
-        // was open): just show the app
-        vspec.closed = true;
-        closeBrowserModal();
-        flashPill(pillBtn, pillContainer, true, 'Opened in NDM ✓');
-        try {
-          await chrome.runtime.sendMessage({ action: 'ndm-show-app' });
-        } catch (e) {}
-        return;
-      }
-      btnApp.disabled = true;
-      btnApp.textContent = 'Opening NDM…';
+    // "Open in NDM App" — the fallback link, shown only when
+    // probing failed: hand the page to the app's own video dialog
+    // (kind 'video'), exactly like the old dialog's app button but
+    // without the speculative entry it used to manage.
+    btnAppLink.addEventListener('click', async () => {
+      btnAppLink.disabled = true;
       try {
         const resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
           kind: 'video',
           url: targetUrl,
           pageUrl: location.href,
-          title: titleIn.value.trim() || fallbackTitle,
+          title: probedTitle || fallbackTitle,
         });
         if (resp && resp.ok) {
-          closeBrowserModal();
-          flashPill(pillBtn, pillContainer, true, 'Opened in NDM ✓');
+          closeFly();
         } else {
-          showError('Could not reach NDM desktop app. Please make sure NDM is installed.');
-          btnApp.disabled = false;
-          btnApp.textContent = 'Open in NDM App';
+          btnAppLink.disabled = false;
+          showNote('Could not reach NDM desktop app. Please make sure NDM is installed.');
         }
       } catch (e) {
-        showError('Could not reach NDM desktop app.');
-        btnApp.disabled = false;
-        btnApp.textContent = 'Open in NDM App';
+        btnAppLink.disabled = false;
+        showNote('Could not reach NDM desktop app.');
       }
     });
 
-    function showError(msg) {
-      statusEl.style.display = 'block';
-      statusEl.className = 'ndm-m-status err';
-      statusEl.textContent = msg;
+    function showNote(msg) {
+      let note = bodyEl.querySelector('.ndm-fly-note');
+      if (!note) {
+        note = document.createElement('div');
+        note.className = 'ndm-fly-note';
+        bodyEl.insertBefore(note, bodyEl.firstChild);
+      }
+      note.textContent = msg;
     }
 
-    let selectedOption = null;
-    let renderedAlready = false;
-
-    function applyVideoInfo(info) {
-      if (!info) return;
-      renderedAlready = true;
-      if (info.title && (!titleIn.value || titleIn.value === fallbackTitle)) {
-        titleIn.value = info.title;
-      }
-      if (info.thumbnail) {
-        showThumbnail(info.thumbnail);
-      }
-      if (info.duration) {
-        durBadge.textContent = fmtDuration(info.duration);
-        durBadge.style.display = 'inline-block';
-      }
-      if (info.uploader) {
-        uploaderEl.textContent = info.uploader + ' · ';
-      }
-      renderQualities(info.options || info.qualities || []);
+    function qualityText(q) {
+      if (q.id === 'best') return 'Best available';
+      if (q.audio) return q.label || 'Audio';
+      if (Number(q.height) > 0) return `${q.height}p`;
+      return q.label || 'Best';
     }
 
-    function renderQualities(qualities) {
-      qListEl.innerHTML = '';
-      if (!qualities || !qualities.length) {
-        qualities = [
-          {
-            id: 'best',
-            label: 'Best available quality (Auto)',
-            selector: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
-            audio: false,
-            ext: 'MP4',
-            size_bytes: null,
-            size_text: 'Auto',
-            height: 1080,
-            note: 'MP4 video + AAC audio',
-          },
-          {
-            id: 'audio',
-            label: 'Audio only (MP3)',
-            selector: 'ba/b',
-            audio: true,
-            ext: 'MP3',
-            size_bytes: null,
-            size_text: 'Audio',
-            height: 0,
-            note: 'High quality MP3 audio',
-          },
-        ];
-      }
-
-      selectedOption = qualities.find(q => q.height === 1080) ||
-        qualities.find(q => q.height === 720) ||
-        qualities[0];
-
-      for (const q of qualities) {
-        const row = document.createElement('div');
-        const isSel = q === selectedOption;
-        row.className = 'ndm-q-row' + (isSel ? ' sel' : '');
-        const extBadge = (q.ext || (q.audio ? 'MP3' : 'MP4')).toUpperCase();
-        const sizeLabel = q.size_text || (q.size_bytes ? fmtBytes(q.size_bytes) : (q.id === 'best' ? 'Auto' : 'Stream'));
-        const cleanNote = (q.note || '')
-          .split('•')
-          .map(p => p.trim())
-          .filter(p => p && p.toUpperCase() !== extBadge && !/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i.test(p))
-          .join(' · ');
-        const noteText = cleanNote ? `<span class="ndm-q-note">${escapeHtml(cleanNote)}</span>` : '';
-
-        row.innerHTML = `
-          <div class="ndm-q-left">
-            <span class="ndm-q-radio"></span>
-            <span class="ndm-q-badge ${q.audio ? 'audio' : 'video'}">${escapeHtml(extBadge)}</span>
-            <span class="ndm-q-label">${escapeHtml(q.label)}</span>
-            ${noteText}
-          </div>
-          <div class="ndm-q-right">
-            <span class="ndm-q-size ${q.size_bytes ? 'exact' : ''}">${escapeHtml(sizeLabel)}</span>
-          </div>
-        `;
-        row.addEventListener('click', () => {
-          selectedOption = q;
-          for (const el of qListEl.querySelectorAll('.ndm-q-row')) {
-            el.classList.remove('sel');
+    /* The extension the audio job will actually produce. An
+       audio download saves the chosen stream in its OWN container
+       — the app does not convert anything to MP3 — so the probe
+       option's "MP3" label must never become the displayed file
+       name (the card said big.mp3 while big.m4a landed on disk).
+       Truth available on this side, in order: a direct audio
+       file's own extension (the file is saved as-is); the format
+       the option's selector pins first ([ext=m4a] — the stream
+       the job prefers); otherwise no extension at all rather than
+       an invented one. The progress payload carries no file name,
+       so this derivation is all the card has. */
+    function audioOutputExt(q) {
+      try {
+        const u = new URL(targetUrl);
+        const tail = (u.pathname.split('/').pop() || '').toLowerCase();
+        const dot = tail.lastIndexOf('.');
+        if (dot > 0) {
+          const e = tail.slice(dot + 1);
+          if (['mp3', 'm4a', 'm4b', 'aac', 'flac', 'wav', 'ogg', 'opus', 'wma'].includes(e)) {
+            return e;
           }
-          row.classList.add('sel');
-          updateStartButtonLabel();
-          // picking a quality is what starts it (IDM's panel pick
-          // opens the already-downloading File Info dialog)
-          vspecSwitch(q);
-        });
-        row.addEventListener('dblclick', () => {
-          selectedOption = q;
-          btnStart.click();
-        });
-        qListEl.appendChild(row);
-      }
-
-      allQualities = qualities;
-      btnAll.disabled = false;
-      btnStart.disabled = false;
-      btnLater.disabled = false;
-      updateStartButtonLabel();
-      if (!vspec.started && !vspec.closed) vspecStart(selectedOption);
-    }
-
-    function updateStartButtonLabel() {
-      if (!selectedOption) return;
-      if (vspec.id) {
-        btnStart.textContent = '✓ Keep downloading';
-        return;
-      }
-      const sz = selectedOption.size_text || (selectedOption.size_bytes ? fmtBytes(selectedOption.size_bytes) : '');
-      btnStart.textContent = sz
-        ? `⬇ Start Download (${sz})`
-        : '⬇ Start Download';
-    }
-
-    let pendingForce = false; // set after a duplicate refusal: the
-    // next send is the user's explicit "download it again" (IDM asks
-    // about duplicate links instead of refusing silently)
-
-    /* ── IDM parity: the selected quality starts downloading while
-       this dialog is open (its File Info dialog behavior). Switching
-       quality restarts with the new one; Start = keep, Later =
-       pause in the app, Cancel = discard completely. A failed
-       speculative start falls back to the classic send-on-click. ── */
-    const vspec = {
-      started: false,
-      inflight: false,
-      id: null,
-      selector: null,
-      failed: false,
-      pending: null,
-      pendingSelector: null, // quality switch clicked mid-start
-      closed: false,
-    };
-    let allQualities = [];
-
-    async function vspecControl(action) {
-      if (!vspec.id) return;
-      try {
-        await chrome.runtime.sendMessage({ action, entry: vspec.id });
+        }
       } catch (e) {}
+      const pin = String((q && q.selector) || '').match(/\[ext=([a-z0-9]+)\]/i);
+      if (pin) return pin[1].toLowerCase();
+      return '';
     }
 
-    function dismissVideoKeep() {
-      vspec.closed = true;
-      closeBrowserModal();
-      flashPill(pillBtn, pillContainer, true, 'Downloading in NDM ✓');
-      showBrowserToast(
-        titleIn.value.trim() || fallbackTitle,
-        selectedOption ? selectedOption.label || '' : '',
-        '',
-        false
-      );
-    }
-
-    async function dismissVideoLater() {
-      vspec.closed = true;
-      closeBrowserModal();
-      if (vspec.id) await vspecControl('ndm-pause-entry');
-      flashPill(pillBtn, pillContainer, true, 'Paused in NDM ✓');
-      showBrowserToast(
-        titleIn.value.trim() || fallbackTitle,
-        selectedOption ? selectedOption.label || '' : '',
-        '',
-        true
-      );
-    }
-
-    function dismissVideoCancel() {
-      if (vspec.closed) return;
-      vspec.closed = true;
-      if (vspec.id) {
-        vspecControl('ndm-cancel-entry');
-      } else if (vspec.inflight) {
-        vspec.pending = 'cancel';
+    /* Container word for an audio row in the list: the same
+       derivation as the entry name, except the probe's explicit
+       HLS label stays — an HLS rendition is not a file container
+       (F-EXT-02). '' means "no honest word" and the caller falls
+       back to plain "Audio". */
+    function audioRowExt(q) {
+      if (String((q && q.ext) || '').toLowerCase() === 'audio (hls)') {
+        return q.ext;
       }
-      closeBrowserModal();
+      return audioOutputExt(q);
     }
 
-    async function vspecStart(q) {
-      if (!q || vspec.inflight) return;
-      vspec.inflight = true;
-      vspec.started = true;
-      vspec.selector = q.selector;
-      // lock the fields the entry is about to be created from (see
-      // the file dialog: edits during a cold-start round trip used
-      // to be silently discarded)
-      titleIn.disabled = true;
-      dirIn.disabled = true;
-      btnApp.disabled = true;
-      let resp = null;
+    function fileNameFor(q) {
+      const title = probedTitle || fallbackTitle;
+      if (q.audio) {
+        const ext = audioOutputExt(q);
+        return ext ? `${title}.${ext}` : title;
+      }
+      const ext = (q.ext || 'mp4').toLowerCase();
+      return `${title}.${ext}`;
+    }
+
+    /* Registry key for the entry a row starts (R3-EXT-08). */
+    function regKeyFor(q) {
+      return `${targetUrl}|${(q && q.selector) || ''}|${q && q.audio ? 'a' : 'v'}`;
+    }
+
+    /* Map a raw probe/engine error to plain language for the
+       flyout banner (R3-EXT-05). The raw text is yt-dlp / tool
+       stderr: PyInstaller extraction crashes, tracebacks and
+       library paths leaked verbatim into the banner. Only three
+       honest shapes survive: an HTTP status the user can act on,
+       a transport failure (where "check your connection" is the
+       truth), and a short single-line message with no internals
+       in it. Everything else collapses to '' and the caller uses
+       its plain fallback sentence. */
+    function plainErrorText(raw) {
+      const t = String(raw || '').trim();
+      if (!t) return '';
+      const http = t.match(/HTTP Error (\d{3})(?::?\s*([A-Za-z][A-Za-z ]*))?/i) ||
+        t.match(/\b(404 Not Found|403 Forbidden|410 Gone|429 Too Many Requests|5\d\d [A-Za-z ]+)\b/);
+      if (http) {
+        return http[2] ? `HTTP ${http[1]} ${http[2].trim()}` : `HTTP ${http[1]}`;
+      }
+      if (/unsupported url/i.test(t)) return 'This page is not a downloadable video.';
+      if (
+        /timed? ?out|name (resolution|or service)|failed to resolve|temporary failure in name|connection (refused|reset|aborted)|network is unreachable|no route to host|eof occurred|curl:\s*\(\d+\)/i.test(t)
+      ) {
+        return 'Could not reach the site — check your connection.';
+      }
+      const firstLine = t.split('\n')[0].replace(/^ERROR:\s*/i, '').trim();
+      if (
+        firstLine.length > 0 &&
+        firstLine.length <= 90 &&
+        !/traceback|pyinstaller|\.so\b|\.py\b|site-packages|\\|\/usr\/|\/tmp\/|appdata/i.test(firstLine)
+      ) {
+        return firstLine;
+      }
+      return '';
+    }
+
+    function fmtEta(secs) {
+      const s = Math.max(0, Math.round(Number(secs) || 0));
+      if (s < 60) return `${s}s left`;
+      if (s < 3600) return `${Math.round(s / 60)} min left`;
+      return `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min left`;
+    }
+
+    /* ── Sending ────────────────────────────────────────────────
+       The ONLY two send sites of this panel: a row click (one
+       format) and "Download all" (every format). No send happens
+       on open, on probe completion, or on selection changes. */
+    async function startQuality(q, force) {
       try {
-        resp = await chrome.runtime.sendMessage({
+        const resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
           kind: 'video_direct',
           url: targetUrl,
           pageUrl: location.href,
-          title: titleIn.value.trim() || fallbackTitle,
+          title: probedTitle || fallbackTitle,
           selector: q.selector,
           audio: !!q.audio,
-          dir: dirIn.value.trim() || '~/Downloads',
+          dir: savedDir,
           later: false,
           total: Number(q.size_bytes) || 0,
-          force: false,
+          force: !!force,
         });
-      } catch (e) {}
-      vspec.inflight = false;
-      btnApp.disabled = false;
-      const gone = vspec.closed || myToken !== activeProbeToken;
-      if (resp && resp.ok && resp.id) {
-        vspec.id = resp.id;
-        if (gone) {
-          if (vspec.pending === 'cancel') vspecControl('ndm-cancel-entry');
-          else if (vspec.pending === 'later') vspecControl('ndm-pause-entry');
-          return;
+        if (resp && resp.ok && resp.id && !resp.dupe) return { id: resp.id };
+        if (resp && resp.dupe) return { duplicate: true, id: resp.id || null };
+        if (
+          resp &&
+          typeof resp.error === 'string' &&
+          resp.error.startsWith('duplicate:')
+        ) {
+          // The app names the existing entry ("duplicate:<id>"):
+          // keep the id — the flyout polls that entry before
+          // choosing which state to show, so an ERRORED entry is
+          // presented as an error, not as a plain duplicate
+          // (R2-EXT-04).
+          const dupId = resp.error.slice('duplicate:'.length).trim();
+          return { duplicate: true, id: dupId || resp.id || null };
         }
-        if (vspec.pending === 'cancel') { dismissVideoCancel(); return; }
-        if (vspec.pending === 'later') { dismissVideoLater(); return; }
-        if (vspec.pending === 'keep') { dismissVideoKeep(); return; }
-        if (vspec.pendingSelector && vspec.pendingSelector.selector !== q.selector) {
-          // a quality switch clicked DURING the start was recorded,
-          // not dropped: apply it now (cancel this entry, start the
-          // chosen one) instead of silently downloading the quality
-          // the user already moved away from
-          const next = vspec.pendingSelector;
-          vspec.pendingSelector = null;
-          vspecSwitch(next);
-          return;
-        }
-        statusEl.style.display = 'block';
-        statusEl.className = 'ndm-m-status';
-        statusEl.textContent = '⬇ Downloading in NDM…';
-        btnStart.textContent = '✓ Keep downloading';
-        btnLater.textContent = '⏸ Pause in NDM';
-      } else if (
-        resp &&
-        typeof resp.error === 'string' &&
-        resp.error.startsWith('duplicate:')
-      ) {
-        // this quality is already downloading: not ours to control —
-        // Start becomes the explicit "Download again" (force path)
-        vspec.failed = true;
-        pendingForce = true;
-        titleIn.disabled = false;
-        dirIn.disabled = false;
-        if (!gone) {
-          showError('This quality is already in your download list. Press "Download again" to save a second copy.');
-          btnStart.textContent = '⬇ Download again';
-        }
-      } else if (!gone) {
-        vspec.failed = true;
-        titleIn.disabled = false;
-        dirIn.disabled = false;
-      }
-    }
-
-    async function vspecSwitch(q) {
-      if (vspec.failed || pendingForce || vspec.closed) return;
-      if (!vspec.started) {
-        vspecStart(q);
-        return;
-      }
-      if (vspec.inflight) {
-        // record it — vspecStart applies the switch when its ack
-        // lands (dropping it used to download the wrong quality
-        // while the dialog showed the new one selected)
-        vspec.pendingSelector = q;
-        return;
-      }
-      if (vspec.id && vspec.selector !== q.selector) {
-        const old = vspec.id;
-        vspec.id = null;
-        vspec.selector = null;
-        titleIn.disabled = false;
-        dirIn.disabled = false;
-        try {
-          await chrome.runtime.sendMessage({ action: 'ndm-cancel-entry', entry: old });
-        } catch (e) {}
-        if (!vspec.closed) vspecStart(q);
-      }
-    }
-    async function triggerDownload(later) {
-      if (!selectedOption) return;
-      const chosenDir = dirIn.value.trim() || '~/Downloads';
-      const chosenTitle = titleIn.value.trim() || fallbackTitle;
-      const qLabel = selectedOption.label || '';
-      const szLabel = selectedOption.size_text || (selectedOption.size_bytes ? fmtBytes(selectedOption.size_bytes) : '');
-      try {
-        chrome.storage.local.set({ ndmSaveDir: chosenDir }).catch(() => {});
-      } catch (e) {}
-
-      btnStart.disabled = true;
-      btnLater.disabled = true;
-      btnStart.textContent = later ? 'Queueing in NDM…' : 'Starting in NDM…';
-
-      let ok = false;
-      let resp = null;
-      try {
-        resp = await chrome.runtime.sendMessage({
-          action: 'ndm-download',
-          kind: 'video_direct',
-          url: targetUrl,
-          pageUrl: location.href,
-          title: chosenTitle,
-          selector: selectedOption.selector,
-          audio: !!selectedOption.audio,
-          dir: chosenDir,
-          later: !!later,
-          total: Number(selectedOption.size_bytes) || 0,
-          force: pendingForce,
-        });
-        ok = !!(resp && resp.ok);
+        // A send timeout is not a refusal: the request may still
+        // land in the app — but with no entry id there is nothing
+        // to poll, so the card degrades to the static state.
+        if (resp && resp.unknown) return { unknown: true };
+        return {
+          error:
+            (resp && resp.error) ||
+            'NDM could not be started. Make sure the NDM desktop app is installed.',
+        };
       } catch (e) {
-        ok = false;
-      }
-
-      if (ok) {
-        pendingForce = false;
-        closeBrowserModal();
-        flashPill(
-          pillBtn,
-          pillContainer,
-          true,
-          later ? 'Paused in NDM ✓' : 'Downloading in NDM ✓'
-        );
-        showBrowserToast(chosenTitle, qLabel, szLabel, later);
-      } else if (resp && typeof resp.error === 'string' && resp.error.startsWith('duplicate:')) {
-        pendingForce = true;
-        showError('This quality is already in your download list. Press "Download again" to save a second copy.');
-        btnStart.disabled = false;
-        btnLater.disabled = false;
-        btnStart.textContent = '⬇ Download again';
-      } else {
-        showError((resp && resp.error) || 'NDM could not be started. Make sure the NDM desktop app is installed.');
-        btnStart.disabled = false;
-        btnLater.disabled = false;
-        updateStartButtonLabel();
+        return { error: 'Could not reach NDM desktop app.' };
       }
     }
 
-    btnStart.addEventListener('click', () => {
-      if (vspec.id) {
-        dismissVideoKeep();
-      } else if (vspec.inflight) {
-        vspec.pending = 'keep';
-        btnStart.disabled = true;
-        btnLater.disabled = true;
-        btnStart.textContent = 'Starting in NDM…';
-      } else {
-        triggerDownload(false);
-      }
-    });
-    btnLater.addEventListener('click', () => {
-      if (vspec.id) {
-        dismissVideoLater();
-      } else if (vspec.inflight) {
-        vspec.pending = 'later';
-        btnStart.disabled = true;
-        btnLater.disabled = true;
-      } else {
-        triggerDownload(true);
-      }
-    });
-    btnAll.addEventListener('click', async () => {
-      if (!allQualities.length) return;
+    async function onRowClick(q) {
+      if (startBusy || closed) return;
+      startBusy = true;
+      card.classList.add('busy');
       btnAll.disabled = true;
-      btnAll.textContent = 'Sending all…';
-      let sent = 0;
+      const res = await startQuality(q, false);
+      if (closed) return;
+      card.classList.remove('busy');
+      if (res.id && !res.duplicate) {
+        flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
+        showProgress({ id: res.id, name: fileNameFor(q), regKey: regKeyFor(q) });
+      } else if (res.unknown) {
+        showProgress({ id: null, name: fileNameFor(q) });
+      } else if (res.duplicate) {
+        showDuplicate(q, res.id);
+      } else {
+        startBusy = false;
+        btnAll.disabled = false;
+        showNote(res.error);
+      }
+    }
+
+    async function onDownloadAll() {
+      if (startBusy || closed) return;
+      startBusy = true;
+      card.classList.add('busy');
+      btnAll.disabled = true;
+      const list = qualities.length ? qualities : DEFAULT_QUALITIES;
+      const started = [];
       let skipped = 0;
-      for (const q of allQualities) {
-        try {
-          const r = await chrome.runtime.sendMessage({
-            action: 'ndm-download',
-            kind: 'video_direct',
-            url: targetUrl,
-            pageUrl: location.href,
-            title: titleIn.value.trim() || fallbackTitle,
-            selector: q.selector,
-            audio: !!q.audio,
-            dir: dirIn.value.trim() || '~/Downloads',
-            later: false,
-            total: Number(q.size_bytes) || 0,
-            force: false,
+      for (const q of list) {
+        const res = await startQuality(q, false);
+        if (closed) return;
+        if (res.id) {
+          flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
+          started.push({
+            id: res.id,
+            regKey: regKeyFor(q),
+            name: `${probedTitle || fallbackTitle} — ${qualityText(q)}`,
           });
-          if (r && r.ok) sent++;
-          else skipped++;
-        } catch (e) {
+        } else {
           skipped++;
         }
       }
-      vspec.closed = true;
-      closeBrowserModal();
-      flashPill(pillBtn, pillContainer, true, `Download all: ${sent} sent ✓`);
-      showBrowserToast(
-        titleIn.value.trim() || fallbackTitle,
-        `Download all — ${sent} qualities sent to NDM${skipped ? `, ${skipped} skipped` : ''}`,
-        '',
-        false
-      );
+      card.classList.remove('busy');
+      if (started.length) {
+        showMultiProgress(
+          started,
+          skipped
+            ? `${skipped} format${skipped > 1 ? 's' : ''} skipped (already in the list or refused).`
+            : ''
+        );
+      } else {
+        startBusy = false;
+        btnAll.disabled = false;
+        showNote('Nothing could be started — the formats may already be in your download list.');
+      }
+    }
+    btnAll.addEventListener('click', () => {
+      if (!probeSettled) {
+        // Clicked while the probe is still running: REGISTER the
+        // intent instead of swallowing it (F-EXT-14) — it fires
+        // the moment the rows land, and the button says so.
+        if (!wantAll) {
+          wantAll = true;
+          btnAll.textContent = 'Download all — waiting…';
+        }
+        return;
+      }
+      onDownloadAll();
     });
 
-    // 1. Check instant cache (0ms on YouTube or pre-probed pages!)
-    const cached = localProbeCache.get(targetUrl) || localProbeCache.get(canonicalVideoKey(location.href));
+    /* The existing entry is in ERROR: the error state wins over
+       the duplicate state (R2-EXT-04). The user sees what actually
+       went wrong and gets a Retry that resumes THAT entry (the
+       card then follows it live), instead of an "already in your
+       list" note whose only exits were a forced second copy or
+       leaving for the app. */
+    function showErroredExisting(q, id, r) {
+      startBusy = false;
+      btnAll.disabled = false;
+      showFlyTitle(fileNameFor(q));
+      const msg =
+        (r && typeof r.error === 'string' && r.error) ||
+        'The download stopped with an error in NDM.';
+      bodyEl.innerHTML = `
+        <div class="ndm-fly-prog">
+          <div class="ndm-fly-prog-head">Download failed</div>
+          <div class="ndm-fly-stats">${escapeHtml(msg)}</div>
+          <div class="ndm-fly-btns">
+            <button class="ndm-btn ndm-btn-primary ndm-fly-retry" type="button">Retry</button>
+            <button class="ndm-btn ndm-btn-secondary ndm-fly-showe" type="button">Show in NDM</button>
+          </div>
+        </div>
+      `;
+      bodyEl.querySelector('.ndm-fly-showe').addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
+      });
+      bodyEl.querySelector('.ndm-fly-retry').addEventListener('click', async ev => {
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        try {
+          await chrome.runtime.sendMessage({
+            action: 'ndm-resume-entry',
+            entry: id,
+          });
+        } catch (e) {}
+        if (closed) return;
+        // Follow the entry live: the poll renders whatever the
+        // truth now is — downloading, paused, finished, or the
+        // error again if the retry did not take.
+        flyEntryRegistry.set(regKeyFor(q), { id, name: fileNameFor(q) });
+        showProgress({ id, name: fileNameFor(q), regKey: regKeyFor(q) });
+      });
+    }
+
+    async function showDuplicate(q, existingId) {
+      startBusy = false;
+      // State selection (R2-EXT-04): when the app named the
+      // existing entry, ask what state it is in BEFORE presenting
+      // the duplicate state — an errored entry must surface as an
+      // error with a retry, never as a plain "already in list".
+      // Any other state (finished, downloading, paused) — or no
+      // answer at all — keeps the duplicate state below.
+      if (existingId) {
+        const r = await pollOnce(existingId);
+        if (closed) return;
+        if (r && String(r.status || '') === 'error') {
+          showErroredExisting(q, existingId, r);
+          return;
+        }
+      }
+      showFlyListHead();
+      btnAll.disabled = false;
+      bodyEl.innerHTML = `
+        <div class="ndm-fly-note">This video is already in your download list.</div>
+        <div class="ndm-fly-dupe">
+          <button class="ndm-btn ndm-btn-secondary ndm-fly-again" type="button">Download again</button>
+          <button class="ndm-btn ndm-btn-secondary ndm-fly-showd" type="button">Show in NDM</button>
+        </div>
+      `;
+      bodyEl.querySelector('.ndm-fly-showd').addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
+      });
+      bodyEl.querySelector('.ndm-fly-again').addEventListener('click', async ev => {
+        const btn = ev.currentTarget;
+        btn.disabled = true;
+        const res = await startQuality(q, true);
+        if (closed) return;
+        if (res.id) {
+          flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
+          showProgress({ id: res.id, name: fileNameFor(q), regKey: regKeyFor(q) });
+        } else if (res.unknown) {
+          showProgress({ id: null, name: fileNameFor(q) });
+        } else {
+          btn.disabled = false;
+          showNote(res.error || 'NDM refused the second copy.');
+        }
+      });
+    }
+
+    /* ── Progress view ──────────────────────────────────────────
+       Polls the entry every 1 s through the background
+       ({action:'ndm-entry-progress', id} → the host's
+       {type:'progress', id}). Expected reply:
+       {ok:true, status, done_bytes, total, rate_bps, eta_secs}.
+       ANY non-ok answer (a background/host without the channel)
+       degrades the card to a static "Downloading in NDM…" state —
+       never invented numbers. */
+    async function pollOnce(id) {
+      try {
+        const r = await chrome.runtime.sendMessage({
+          action: 'ndm-entry-progress',
+          id,
+        });
+        return r && r.ok ? r : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function showProgress(entry) {
+      stopPoll();
+      btnAll.disabled = true;
+      showFlyTitle(entry.name);
+      bodyEl.innerHTML = `
+        <div class="ndm-fly-prog">
+          <div class="ndm-fly-prog-head">Downloading in NDM…</div>
+          <div class="ndm-fly-bar"><div class="ndm-fly-bar-fill"></div></div>
+          <div class="ndm-fly-stats">Progress is shown in the NDM app.</div>
+          <div class="ndm-fly-btns">
+            <button class="ndm-btn ndm-btn-secondary ndm-fly-pause" type="button">Pause</button>
+            <button class="ndm-btn ndm-btn-primary ndm-fly-resume" type="button" style="display:none">Resume</button>
+            <button class="ndm-btn ndm-btn-secondary ndm-fly-cancel" type="button">Cancel</button>
+            <button class="ndm-btn ndm-btn-secondary ndm-fly-show" type="button" style="display:none">Show in NDM</button>
+          </div>
+        </div>
+      `;
+      const headEl = bodyEl.querySelector('.ndm-fly-prog-head');
+      const fillEl = bodyEl.querySelector('.ndm-fly-bar-fill');
+      const statsEl = bodyEl.querySelector('.ndm-fly-stats');
+      const btnPause = bodyEl.querySelector('.ndm-fly-pause');
+      const btnResume = bodyEl.querySelector('.ndm-fly-resume');
+      const btnCancel = bodyEl.querySelector('.ndm-fly-cancel');
+      const btnShow = bodyEl.querySelector('.ndm-fly-show');
+
+      let last = null;       // last good progress reply
+      let uiPaused = false;  // Pause pressed here (poll may lag/never answer)
+      let terminal = false;
+
+      /* Keep the reopen-badge registry truthful (R3-EXT-08): a
+         cancelled or errored entry is no longer "live" for its
+         list row — the row goes back to being a plain starter. */
+      function syncRegistry(st) {
+        if (!entry.regKey) return;
+        if (st === 'cancelled' || st === 'error') {
+          flyEntryRegistry.delete(entry.regKey);
+        }
+      }
+
+      function render() {
+        if (!last && !uiPaused) {
+          headEl.textContent = 'Downloading in NDM…';
+          statsEl.textContent = 'Progress is shown in the NDM app.';
+          btnPause.style.display = '';
+          btnResume.style.display = 'none';
+          btnShow.style.display = 'none';
+          return;
+        }
+        if (!last && uiPaused) {
+          headEl.textContent = 'Paused';
+          statsEl.textContent = 'Paused in NDM.';
+          btnPause.style.display = 'none';
+          btnResume.style.display = '';
+          btnShow.style.display = '';
+          return;
+        }
+        const total = Number(last.total) || 0;
+        const done = Number(last.done_bytes) || 0;
+        const pct =
+          total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : null;
+        const st = String(last.status || '');
+        // Every byte is in but the entry has not settled to
+        // 'finished': the app is merging / finalising. There is
+        // nothing left to pause or cancel — those buttons must
+        // not stay live in this window.
+        const finalizing = st !== 'paused' && total > 0 && done >= total;
+        // The "% — filename" line belongs to the card's title bar
+        // only (IDM's progress-dialog title); the body head is a
+        // plain state word. Printing the same line in both places
+        // was pure duplication.
+        showFlyTitle(pct != null ? `${pct}% — ${entry.name}` : entry.name);
+        headEl.textContent =
+          st === 'paused' ? 'Paused' : finalizing ? 'Finishing…' : 'Downloading…';
+        fillEl.style.width = pct != null ? pct + '%' : '0%';
+        const parts = [];
+        if (total > 0) parts.push(`${fmtBytes(done)} / ${fmtBytes(total)}`);
+        else if (done > 0) parts.push(fmtBytes(done));
+        if (st === 'paused') {
+          parts.push('Paused');
+        } else if (finalizing) {
+          parts.push('Finishing…');
+        } else {
+          if (Number(last.rate_bps) > 0) {
+            parts.push(`${fmtBytes(last.rate_bps)}/s`);
+          }
+          if (Number(last.eta_secs) > 0) parts.push(fmtEta(last.eta_secs));
+        }
+        statsEl.textContent = parts.filter(Boolean).join(' · ');
+        if (finalizing) {
+          btnPause.style.display = 'none';
+          btnResume.style.display = 'none';
+          btnCancel.style.display = 'none';
+          btnShow.style.display = '';
+        } else {
+          btnPause.style.display = st === 'paused' ? 'none' : '';
+          btnResume.style.display = st === 'paused' ? '' : 'none';
+          btnCancel.style.display = '';
+          btnShow.style.display = st === 'paused' ? '' : 'none';
+        }
+      }
+
+      function renderFinished() {
+        terminal = true;
+        stopPoll();
+        showFlyTitle(`100% — ${entry.name}`);
+        bodyEl.innerHTML = `
+          <div class="ndm-fly-prog">
+            <div class="ndm-fly-prog-head">Download complete</div>
+            <div class="ndm-fly-stats">${escapeHtml(entry.name)}</div>
+            <div class="ndm-fly-btns">
+              <button class="ndm-btn ndm-btn-primary ndm-fly-show2" type="button">Show in NDM</button>
+            </div>
+          </div>
+        `;
+        bodyEl.querySelector('.ndm-fly-show2').addEventListener('click', () => {
+          chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
+        });
+      }
+
+      function renderFailed(st, r) {
+        terminal = true;
+        stopPoll();
+        syncRegistry(st);
+        showFlyTitle(entry.name);
+        const msg =
+          (r && typeof r.error === 'string' && r.error) ||
+          (st === 'cancelled'
+            ? 'The download was cancelled in NDM.'
+            : 'The download stopped with an error in NDM.');
+        bodyEl.innerHTML = `
+          <div class="ndm-fly-prog">
+            <div class="ndm-fly-prog-head">${st === 'cancelled' ? 'Cancelled' : 'Download failed'}</div>
+            <div class="ndm-fly-stats">${escapeHtml(msg)}</div>
+            <div class="ndm-fly-btns">
+              <button class="ndm-btn ndm-btn-secondary ndm-fly-show3" type="button">Show in NDM</button>
+            </div>
+          </div>
+        `;
+        bodyEl.querySelector('.ndm-fly-show3').addEventListener('click', () => {
+          chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
+        });
+        if (st === 'error' && entry.id) {
+          // An errored entry may leave the error state on its own
+          // (the app retries it): the error text shown here must
+          // not go stale. Keep a slow watch — while the entry is
+          // still errored, refresh the message if it changed; the
+          // moment it is downloading / paused / finished again,
+          // rebuild the live view so the error is gone from the
+          // card entirely. (The card only ever renders an error
+          // text that belongs to the entry's CURRENT error state.)
+          const statsEl2 = bodyEl.querySelector('.ndm-fly-stats');
+          flyPollTimer = setInterval(async () => {
+            if (closed) {
+              stopPoll();
+              return;
+            }
+            const r2 = await pollOnce(entry.id);
+            if (closed || !r2) return;
+            const st2 = String(r2.status || '');
+            if (st2 === 'error') {
+              const msg2 =
+                (typeof r2.error === 'string' && r2.error) ||
+                'The download stopped with an error in NDM.';
+              if (statsEl2 && statsEl2.textContent !== msg2) {
+                statsEl2.textContent = msg2;
+              }
+              return;
+            }
+            stopPoll();
+            if (st2 === 'cancelled') {
+              renderFailed('cancelled', r2);
+              return;
+            }
+            showProgress(entry);
+          }, 2000);
+        }
+      }
+
+      btnPause.addEventListener('click', async () => {
+        if (!entry.id || terminal) return;
+        btnPause.disabled = true;
+        uiPaused = true;
+        render();
+        try {
+          await chrome.runtime.sendMessage({
+            action: 'ndm-pause-entry',
+            entry: entry.id,
+          });
+        } catch (e) {}
+        btnPause.disabled = false;
+        tick();
+      });
+      btnResume.addEventListener('click', async () => {
+        if (!entry.id || terminal) return;
+        btnResume.disabled = true;
+        uiPaused = false;
+        render();
+        try {
+          await chrome.runtime.sendMessage({
+            action: 'ndm-resume-entry',
+            entry: entry.id,
+          });
+        } catch (e) {}
+        btnResume.disabled = false;
+        tick();
+      });
+      btnCancel.addEventListener('click', async () => {
+        if (!entry.id || terminal) return;
+        btnCancel.disabled = true;
+        btnPause.disabled = true;
+        try {
+          await chrome.runtime.sendMessage({
+            action: 'ndm-cancel-entry',
+            entry: entry.id,
+          });
+        } catch (e) {}
+        if (closed) return;
+        terminal = true;
+        stopPoll();
+        syncRegistry('cancelled');
+        headEl.textContent = 'Cancelled';
+        statsEl.textContent = '';
+        btnPause.style.display = 'none';
+        btnResume.style.display = 'none';
+        btnCancel.style.display = 'none';
+        btnShow.style.display = '';
+      });
+      btnShow.addEventListener('click', () => {
+        chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
+      });
+
+      if (!entry.id) {
+        // The send may have landed but returned no id (timeout):
+        // nothing exists to poll or control — static state only.
+        btnPause.style.display = 'none';
+        btnCancel.style.display = 'none';
+        btnShow.style.display = '';
+        render();
+        return;
+      }
+
+      const tick = async () => {
+        if (closed || terminal) return;
+        const r = await pollOnce(entry.id);
+        if (closed || terminal) return;
+        if (r) {
+          last = r;
+          const st = String(r.status || '');
+          if (st === 'finished') {
+            renderFinished();
+            return;
+          }
+          if (st === 'error' || st === 'cancelled') {
+            renderFailed(st, r);
+            return;
+          }
+          if (st !== 'paused') uiPaused = false;
+          render();
+        } else if (!last) {
+          render();
+        }
+      };
+      tick();
+      flyPollTimer = setInterval(tick, 1000);
+    }
+
+    function showMultiProgress(entries, note) {
+      stopPoll();
+      btnAll.disabled = true;
+      showFlyTitle(`${entries.length} downloads`);
+      bodyEl.innerHTML =
+        (note ? `<div class="ndm-fly-note">${escapeHtml(note)}</div>` : '') +
+        '<div class="ndm-fly-multi"></div>';
+      const wrap = bodyEl.querySelector('.ndm-fly-multi');
+      const rows = entries.map(en => {
+        const row = document.createElement('div');
+        row.className = 'ndm-fly-mrow';
+        const name = document.createElement('span');
+        name.className = 'ndm-fly-mname';
+        name.textContent = en.name;
+        name.title = en.name;
+        const pct = document.createElement('span');
+        pct.className = 'ndm-fly-mpct';
+        pct.textContent = '…';
+        // Per-entry controls (R3-EXT-03): the rows used to be
+        // display-only — pause/resume/cancel for one of the pair
+        // meant leaving for the app. Each row now drives ITS entry
+        // through the same message paths the single-progress card
+        // uses (ndm-pause-entry / ndm-resume-entry /
+        // ndm-cancel-entry).
+        const btns = document.createElement('span');
+        btns.className = 'ndm-fly-mbtns';
+        const btnPause = document.createElement('button');
+        btnPause.type = 'button';
+        btnPause.className = 'ndm-fly-mbtn';
+        btnPause.textContent = 'Pause';
+        const btnCancel = document.createElement('button');
+        btnCancel.type = 'button';
+        btnCancel.className = 'ndm-fly-mbtn';
+        btnCancel.textContent = 'Cancel';
+        btns.appendChild(btnPause);
+        btns.appendChild(btnCancel);
+        row.appendChild(name);
+        row.appendChild(pct);
+        row.appendChild(btns);
+        wrap.appendChild(row);
+        const rw = {
+          en, pctEl: pct, btnPause, btnCancel, btns,
+          done: false, touched: false,
+          lastTotal: 0, lastDone: 0, lastSt: '',
+          busy: false, // a control message is in flight
+        };
+        btnPause.addEventListener('click', async () => {
+          if (rw.done || rw.busy) return;
+          rw.busy = true;
+          const pausing = rw.lastSt !== 'paused';
+          // optimistic: the poll confirms within a second
+          rw.lastSt = pausing ? 'paused' : 'downloading';
+          applyRowState(rw);
+          try {
+            await chrome.runtime.sendMessage({
+              action: pausing ? 'ndm-pause-entry' : 'ndm-resume-entry',
+              entry: en.id,
+            });
+          } catch (e) {}
+          rw.busy = false;
+        });
+        btnCancel.addEventListener('click', async () => {
+          if (rw.done || rw.busy) return;
+          rw.busy = true;
+          btnPause.disabled = true;
+          btnCancel.disabled = true;
+          try {
+            await chrome.runtime.sendMessage({
+              action: 'ndm-cancel-entry',
+              entry: en.id,
+            });
+          } catch (e) {}
+          rw.busy = false;
+          if (closed) return;
+          rw.done = true;
+          rw.lastSt = 'cancelled';
+          if (en.regKey) flyEntryRegistry.delete(en.regKey);
+          applyRowState(rw);
+        });
+        return rw;
+      });
+
+      /* One place renders a row from its last known state, shared
+         by the poll and the control buttons. */
+      function applyRowState(rw) {
+        const st = rw.lastSt;
+        if (st === 'finished') {
+          rw.pctEl.textContent = 'Done';
+          rw.btns.style.display = 'none';
+        } else if (st === 'cancelled') {
+          rw.pctEl.textContent = 'Cancelled';
+          rw.btns.style.display = 'none';
+        } else if (st === 'error') {
+          // NOT terminal for the row: an errored entry can be
+          // restarted (by the app or the user), and the row must
+          // then show its live state again instead of a stale
+          // "Failed" forever. No pause/cancel applies to an
+          // errored entry, so the controls hide while it lasts.
+          rw.pctEl.textContent = 'Failed';
+          rw.btns.style.display = 'none';
+        } else if (st === 'paused') {
+          rw.pctEl.textContent = 'Paused';
+          rw.btns.style.display = '';
+          rw.btnPause.textContent = 'Resume';
+          rw.btnPause.disabled = rw.busy;
+          rw.btnCancel.disabled = rw.busy;
+        } else {
+          rw.btns.style.display = '';
+          rw.btnPause.textContent = 'Pause';
+          rw.btnPause.disabled = rw.busy;
+          rw.btnCancel.disabled = rw.busy;
+          if (rw.lastTotal > 0) {
+            rw.pctEl.textContent =
+              Math.min(100, Math.floor((rw.lastDone / rw.lastTotal) * 100)) + '%';
+          } else if (!rw.touched) {
+            rw.pctEl.textContent = '…';
+          }
+        }
+      }
+
+      const tick = async () => {
+        if (closed) return;
+        await Promise.all(
+          rows.map(async rw => {
+            if (rw.done) return;
+            const r = await pollOnce(rw.en.id);
+            // a control click may have settled the row (cancel)
+            // while this poll was in flight — its state wins
+            if (closed || rw.done) return;
+            if (!r) {
+              // no progress channel: say so once, never invent a %
+              if (!rw.touched) rw.pctEl.textContent = 'in NDM';
+              return;
+            }
+            rw.touched = true;
+            rw.lastTotal = Number(r.total) || 0;
+            rw.lastDone = Number(r.done_bytes) || 0;
+            rw.lastSt = String(r.status || '');
+            if (rw.lastSt === 'finished' || rw.lastSt === 'cancelled') {
+              rw.done = true;
+              if (rw.lastSt === 'cancelled' && rw.en.regKey) {
+                flyEntryRegistry.delete(rw.en.regKey);
+              }
+            }
+            applyRowState(rw);
+          })
+        );
+        if (!closed && rows.every(rw => rw.done)) {
+          titleEl.textContent = `Done — ${entries.length} downloads`;
+          stopPoll();
+        } else if (!closed) {
+          const tot = rows.reduce((s, rw) => s + (rw.lastTotal || 0), 0);
+          const don = rows.reduce((s, rw) => s + (rw.lastDone || 0), 0);
+          if (tot > 0) {
+            titleEl.textContent =
+              `${Math.min(100, Math.floor((don / tot) * 100))}% — ${entries.length} downloads`;
+          }
+        }
+      };
+      tick();
+      flyPollTimer = setInterval(tick, 1000);
+    }
+
+    /* ── List view ──────────────────────────────────────────── */
+    function renderList() {
+      const list = qualities.length ? qualities : DEFAULT_QUALITIES;
+      bodyEl.innerHTML = '';
+      list.forEach((q, i) => {
+        const row = document.createElement('div');
+        row.className = 'ndm-fly-row';
+        // Two lines (F-EXT-01): line 1 is the numbered title and
+        // may ellipsize; line 2 NEVER truncates — the quality is
+        // the very thing the user is choosing.
+        const t = document.createElement('div');
+        t.className = 'ndm-fly-row-t';
+        t.textContent = `${i + 1}. ${probedTitle}`;
+        const sub = document.createElement('div');
+        sub.className = 'ndm-fly-row-q';
+        if (q.audio && q.label) {
+          // An audio row shows the probe's full honest label
+          // verbatim — "Audio Only (M4A)" (N-09): composing
+          // "<EXT> file, quality Audio Only" around it dropped
+          // the format half of the label the probe supplied.
+          sub.textContent = q.label;
+        } else {
+          // Video rows: "<EXT> file, quality <label>". The
+          // container label is whatever the probe reported
+          // (F-EXT-02): when the probe gives no container, an
+          // audio row says "Audio", never an invented "MP3".
+          const ext = String(
+            q.container ||
+              (q.audio ? audioRowExt(q) : q.ext) ||
+              (q.audio ? 'Audio' : 'MP4')
+          ).toUpperCase();
+          sub.textContent = `${ext} file, quality ${qualityText(q)}`;
+        }
+        row.appendChild(t);
+        row.appendChild(sub);
+        row.title = `${t.textContent}, ${sub.textContent}`;
+        // markLiveRow may claim the click (the row's entry is
+        // already live): it installs row._ndmLiveClick, checked
+        // here so there is exactly one click path per row.
+        row.addEventListener('click', () => {
+          if (row._ndmLiveClick) row._ndmLiveClick();
+          else onRowClick(q);
+        });
+        bodyEl.appendChild(row);
+        markLiveRow(q, row, sub);
+      });
+      btnAll.disabled = false;
+    }
+
+    /* R3-EXT-08: if this page already started this exact format,
+       the reopened list must SAY so — a state badge on the row —
+       and the row's click must reopen that entry's progress view
+       instead of starting a second copy. The registry is written
+       by onRowClick / onDownloadAll; one poll settles the badge.
+       States that are over (error / cancelled) clear the registry
+       and leave the row a plain starter again — the backend
+       re-add semantics for those states live outside this card. */
+    function markLiveRow(q, row, sub) {
+      const key = regKeyFor(q);
+      const reg = flyEntryRegistry.get(key);
+      if (!reg || !reg.id) return;
+      const badge = document.createElement('span');
+      badge.className = 'ndm-fly-state';
+      badge.textContent = ' · …';
+      sub.appendChild(badge);
+      pollOnce(reg.id).then(r => {
+        if (closed) return;
+        if (!r) {
+          badge.remove();
+          return;
+        }
+        const st = String(r.status || '');
+        if (st === 'downloading' || st === 'queued') {
+          const total = Number(r.total) || 0;
+          const done = Number(r.done_bytes) || 0;
+          badge.textContent =
+            total > 0
+              ? ` · Downloading ${Math.min(100, Math.floor((done / total) * 100))}%`
+              : ' · Downloading…';
+          row._ndmLiveClick = () =>
+            showProgress({ id: reg.id, name: reg.name, regKey: key });
+        } else if (st === 'paused') {
+          badge.textContent = ' · Paused';
+          row._ndmLiveClick = () =>
+            showProgress({ id: reg.id, name: reg.name, regKey: key });
+        } else if (st === 'finished') {
+          badge.textContent = ' · Downloaded';
+          row._ndmLiveClick = () => showDuplicate(q, reg.id);
+        } else {
+          flyEntryRegistry.delete(key);
+          badge.remove();
+        }
+      });
+    }
+
+    function applyInfo(info) {
+      if (!info) return;
+      rendered = true;
+      if (info.title) probedTitle = info.title;
+      qualities = info.options || info.qualities || [];
+      renderList();
+      settleProbe();
+    }
+
+    /* The probe has produced a list (real formats or the failure
+       fallback): a "Download all" click that arrived while
+       probing was registered, not swallowed (F-EXT-14) — the
+       button returns to its plain label and the intent fires. */
+    function settleProbe() {
+      probeSettled = true;
+      btnAll.textContent = 'Download all';
+      if (wantAll && !closed) {
+        wantAll = false;
+        onDownloadAll();
+      }
+    }
+
+    /* No detected media: a plain statement, no rows, no probe
+       error, and no "Open in NDM App" hand-off — the page itself
+       is not a video and must never be offered as one
+       (R2-EXT-08). */
+    function showNoMedia() {
+      rendered = true;
+      probeSettled = true;
+      btnAll.style.display = 'none';
+      bodyEl.innerHTML = `
+        <div class="ndm-fly-note">No video found on this page.</div>
+      `;
+    }
+
+    function probeFailed(errText) {
+      rendered = true;
+      // Belt and braces (R2-EXT-08): if the probe target IS this
+      // page's own document and the page has no detected media,
+      // the document must not be offered as a video row and the
+      // raw probe error must not be shown — whatever path led
+      // here, the answer is the plain no-media state.
+      if (
+        !currentAnchor &&
+        !videoDetected() &&
+        canonicalVideoKey(targetUrl) === canonicalVideoKey(location.href)
+      ) {
+        showNoMedia();
+        return;
+      }
+      qualities = [];
+      // The automatic choices stay available (as before), the
+      // error is a note above them, and the app fallback link —
+      // shown ONLY on probe failure — appears in the footer.
+      // The note is PLAIN language only (R3-EXT-05): the raw
+      // probe error is tool stderr and must never reach the user
+      // verbatim.
+      renderList();
+      settleProbe();
+      const plain = plainErrorText(errText);
+      showNote(
+        plain
+          ? `${plain} — automatic quality is still available below.`
+          : 'Could not read exact formats — automatic quality is still available below.'
+      );
+      footEl.style.display = 'flex';
+    }
+
+    // 1. Instant cache (0ms on YouTube or pre-probed pages)
+    const cached =
+      localProbeCache.get(targetUrl) ||
+      localProbeCache.get(canonicalVideoKey(location.href));
     if (cached && (cached.options || cached.qualities || []).length) {
-      applyVideoInfo(cached);
+      applyInfo(cached);
       return;
     }
 
-    // 2. Listen for MAIN-world page-hook response if it arrives within milliseconds
+    /* R2-EXT-08 gate: with NO detected media there is nothing to
+       offer, and the page must not be probed as if it were a
+       video — that probe failed with a raw yt-dlp error and the
+       failure fallback then offered the HTML document itself as
+       an "MP4 Best available" row. Detected media here means: a
+       player element to anchor to, a known video page, or a
+       stream the background sniffed on this page. (Cached probe
+       info was already ruled out above.) */
+    let mediaKnown = !!currentAnchor || videoDetected();
+    if (!mediaKnown) {
+      try {
+        const mediaResp = await chrome.runtime.sendMessage({
+          action: 'ndm-tab-media',
+          pageUrl: location.href,
+          key: canonicalVideoKey(location.href),
+        });
+        if (mediaResp && mediaResp.streamUrl) mediaKnown = true;
+      } catch (e) {}
+      if (myToken !== activeProbeToken) return;
+      if (!mediaKnown) {
+        showNoMedia();
+        return;
+      }
+    }
+
+    // 2. MAIN-world page-hook info, if it lands within milliseconds
     onInstantInfoCallback = info => {
-      if (myToken !== activeProbeToken || renderedAlready) return;
-      applyVideoInfo(info);
+      if (myToken !== activeProbeToken || rendered) return;
+      applyInfo(info);
     };
 
-    // 3. Otherwise await in-flight or fresh native probe
+    // 3. Otherwise await the in-flight or a fresh native probe
     try {
       const res = await fetchOrReuseProbe(targetUrl);
-      if (myToken !== activeProbeToken || renderedAlready) return;
+      if (myToken !== activeProbeToken || rendered) return;
       if (res && res.ok && res.info) {
-        applyVideoInfo(res.info);
+        applyInfo(res.info);
       } else {
-        renderQualities([]);
-        if (res && res.error) {
-          showError(res.error + ' — You can still start with automatic best quality below.');
-        }
+        probeFailed((res && res.error) || '');
       }
     } catch (e) {
-      if (myToken !== activeProbeToken || renderedAlready) return;
-      renderQualities([]);
-      showError('Could not probe exact sizes — you can still start download below.');
+      if (myToken !== activeProbeToken || rendered) return;
+      probeFailed('');
     }
   }
-
   function defaultFileNameFromUrl(url) {
     try {
       const u = new URL(url);
@@ -1135,18 +1843,21 @@
           <label class="ndm-m-lbl">URL</label>
           <input class="ndm-m-input ndm-f-url" type="text" readonly />
         </div>
-        <div class="ndm-f-summary">
-          <span class="ndm-q-badge video ndm-f-cat">${escapeHtml(currentCat)}</span>
-          <span class="ndm-f-size">${currentBytes > 0 ? escapeHtml(fmtBytes(currentBytes)) : 'Checking size…'}</span>
-          <span class="ndm-f-resume">Checking…</span>
-        </div>
         <div class="ndm-m-folder-row">
-          <label class="ndm-m-lbl">Save file as</label>
-          <input class="ndm-m-input ndm-f-name" type="text" spellcheck="false" />
+          <label class="ndm-m-lbl">Category</label>
+          <div><span class="ndm-q-badge video ndm-f-cat">${escapeHtml(currentCat)}</span></div>
         </div>
         <div class="ndm-m-folder-row">
           <label class="ndm-m-lbl">Save to folder</label>
           <input class="ndm-m-input ndm-f-dir" type="text" placeholder="~/Downloads" />
+        </div>
+        <div class="ndm-m-folder-row">
+          <label class="ndm-m-lbl">File name</label>
+          <input class="ndm-m-input ndm-f-name" type="text" spellcheck="false" />
+        </div>
+        <div class="ndm-f-summary">
+          <span class="ndm-f-size">${currentBytes > 0 ? escapeHtml(fmtBytes(currentBytes)) : 'Checking size…'}</span>
+          <span class="ndm-f-resume">Checking…</span>
         </div>
         <div class="ndm-m-status" style="display:none"></div>
       </div>
@@ -1155,7 +1866,7 @@
         <div class="ndm-m-foot-right">
           <button class="ndm-btn ndm-btn-secondary ndm-btn-cancel" type="button">Cancel</button>
           <button class="ndm-btn ndm-btn-secondary ndm-btn-later" type="button">Download Later</button>
-          <button class="ndm-btn ndm-btn-primary ndm-btn-start" type="button">⬇ Start Download${currentBytes > 0 ? ' (' + escapeHtml(fmtBytes(currentBytes)) + ')' : ''}</button>
+          <button class="ndm-btn ndm-btn-primary ndm-btn-start" type="button">⬇ Download Now</button>
         </div>
       </div>
     `;
@@ -1165,6 +1876,10 @@
     modalEl = backdrop;
     syncHostParent();
     panelHost.style.display = 'block';
+    // EX-m5: focus the backdrop so Esc/Enter work without a first
+    // click inside the dialog (its keydown listener lives here).
+    backdrop.tabIndex = -1;
+    backdrop.focus();
 
     const urlIn = dialog.querySelector('.ndm-f-url');
     const catEl = dialog.querySelector('.ndm-f-cat');
@@ -1193,20 +1908,22 @@
       e.stopPropagation();
       if (e.key === 'Escape') {
         e.preventDefault();
-        dismissAsCancel();
+        dismissDialog();
       } else if (e.key === 'Enter' && !btnStart.disabled) {
         e.preventDefault();
         btnStart.click();
       }
     });
 
-    btnClose.addEventListener('click', () => dismissAsCancel());
+    // Dismiss gestures (×, Esc, backdrop click) are IDM dismissals:
+    // they close the dialog and KEEP a started download running
+    // (dismissDialog). Only the labelled Cancel button destroys —
+    // it alone calls dismissAsCancel (R3-EXT-02).
+    btnClose.addEventListener('click', () => dismissDialog());
     btnCancel.addEventListener('click', () => dismissAsCancel());
-    activeModalDismiss = dismissAsCancel;
-    // the file dialog's backdrop behaves like the video dialog's:
-    // an outside click is a Cancel, not a shrug
+    activeModalDismiss = dismissDialog;
     backdrop.addEventListener('click', e => {
-      if (e.target === backdrop) dismissAsCancel();
+      if (e.target === backdrop) dismissDialog();
     });
 
     btnApp.addEventListener('click', async () => {
@@ -1288,9 +2005,7 @@
         statusEl.textContent = (resp && resp.error) || 'NDM could not be started. Make sure the NDM desktop app is installed.';
         btnStart.disabled = false;
         btnLater.disabled = false;
-        btnStart.textContent = currentBytes > 0
-          ? `⬇ Start Download (${fmtBytes(currentBytes)})`
-          : '⬇ Start Download';
+        btnStart.textContent = '⬇ Download Now';
       }
     }
 
@@ -1310,6 +2025,10 @@
       pending: null, // 'keep' | 'later' | 'cancel' clicked mid-flight
       timer: null, // the 4 s probe-hang fallback start
       closed: false,
+      pollTimer: null, // 1 s entry-progress poll (F-EXT-12)
+      entryStatus: '', // last status the app reported for the entry
+      finished: false, // entry reached 'finished' — closing keeps it
+      lastPct: -1,
     };
 
     function specNote(text) {
@@ -1325,8 +2044,96 @@
       } catch (e) {}
     }
 
+    function stopSpecPoll() {
+      if (spec.pollTimer) {
+        clearInterval(spec.pollTimer);
+        spec.pollTimer = null;
+      }
+    }
+
+    /* The video flyout polls its entry — the file dialog must
+       reflect the same truth (F-EXT-12). A 29-byte file is
+       finished long before a human can read this dialog, and a
+       dialog still saying "Downloading…" invites an Esc that
+       used to discard the FINISHED entry from the list. */
+    function startSpecPoll() {
+      if (!spec.id || spec.pollTimer) return;
+      // Set while the note shows an error text: if the entry
+      // leaves the error state (the app retries it), the next
+      // live status must overwrite the note — a stale error left
+      // on screen after the entry recovered would be a lie.
+      let errorShown = false;
+      const tickSpec = async () => {
+        if (spec.closed || myToken !== activeProbeToken || !backdrop.isConnected) {
+          stopSpecPoll();
+          return;
+        }
+        let r = null;
+        try {
+          r = await chrome.runtime.sendMessage({
+            action: 'ndm-entry-progress',
+            id: spec.id,
+          });
+        } catch (e) {}
+        if (!r || !r.ok || spec.closed) return;
+        const st = String(r.status || '');
+        spec.entryStatus = st;
+        if (st === 'finished') {
+          spec.finished = true;
+          stopSpecPoll();
+          specNote('✓ Download complete');
+          btnStart.disabled = false;
+          btnStart.textContent = 'Close';
+          // Exactly ONE Close button once finished (R3-EXT-06):
+          // Cancel and Download Later have no meaning for a
+          // completed entry — hide them instead of relabelling
+          // Cancel into a second "Close".
+          btnLater.style.display = 'none';
+          btnCancel.style.display = 'none';
+        } else if (st === 'downloading' || st === 'queued') {
+          if (errorShown) {
+            // Back from an error: force the note to refresh even
+            // if the percentage has not moved.
+            errorShown = false;
+            spec.lastPct = -1;
+          }
+          const total = Number(r.total) || 0;
+          const done = Number(r.done_bytes) || 0;
+          if (total > 0) {
+            const pct = Math.min(100, Math.floor((done / total) * 100));
+            if (pct !== spec.lastPct) {
+              spec.lastPct = pct;
+              specNote(`⬇ Downloading in NDM… ${pct}%`);
+            }
+          } else if (spec.lastPct !== -2) {
+            spec.lastPct = -2;
+            specNote('⬇ Downloading in NDM…');
+          }
+        } else if (st === 'paused') {
+          errorShown = false;
+          specNote('⏸ Paused in NDM');
+        } else if (st === 'error') {
+          // Do NOT stop polling: if the entry is restarted and
+          // leaves the error state, the branches above replace
+          // this text with the live status.
+          errorShown = true;
+          specNote(
+            typeof r.error === 'string' && r.error
+              ? r.error
+              : 'The download stopped with an error in NDM.'
+          );
+        } else if (st === 'cancelled') {
+          stopSpecPoll();
+          specNote('The download was cancelled in NDM.');
+        }
+      };
+      tickSpec();
+      spec.pollTimer = setInterval(tickSpec, 1000);
+    }
+
     function dismissAsKeep() {
       spec.closed = true;
+      stopSpecPoll();
       closeBrowserModal();
       showBrowserToast(
         nameIn.value.trim() || initialName,
@@ -1338,6 +2145,7 @@
 
     async function dismissAsLater() {
       spec.closed = true;
+      stopSpecPoll();
       closeBrowserModal();
       if (spec.owned) await specControl('ndm-pause-entry');
       showBrowserToast(
@@ -1350,13 +2158,53 @@
 
     function dismissAsCancel() {
       if (spec.closed) return;
+      // A FINISHED entry is never discarded by closing this
+      // dialog (F-EXT-12): Esc/× after completion is a plain
+      // close that KEEPS the entry — the discard path applies
+      // only while the download is unfinished (and the backend
+      // now refuses to discard finished entries too).
+      if (spec.finished) {
+        spec.closed = true;
+        if (spec.timer) clearTimeout(spec.timer);
+        stopSpecPoll();
+        closeBrowserModal();
+        return;
+      }
       spec.closed = true;
       if (spec.timer) clearTimeout(spec.timer);
+      stopSpecPoll();
       if (spec.owned && spec.id) {
         specControl('ndm-cancel-entry');
       } else if (spec.inflight) {
         spec.pending = 'cancel';
       }
+      closeBrowserModal();
+    }
+
+    /* The dismiss gestures (Esc / × / backdrop click) and the
+       modal-teardown paths (activeModalDismiss), per R3-EXT-02:
+       IDM's progress dialog never kills the download when it is
+       merely closed. If this dialog's download has started, a
+       dismiss is exactly the "✓ Keep downloading" button — the
+       dialog closes, the entry keeps downloading in the app, and
+       the toast says so. If the start is still in flight, the
+       pending decision becomes 'keep' so the landing start is let
+       to download. Before anything has started (or when the entry
+       is not ours), a dismiss is a plain close — and the pending
+       start timer is cleared so nothing starts behind the user's
+       back. Destruction lives ONLY on the Cancel button above. */
+    function dismissDialog() {
+      if (spec.closed) return;
+      if (spec.owned && spec.id) {
+        dismissAsKeep();
+        return;
+      }
+      if (spec.inflight) {
+        spec.pending = 'keep';
+      }
+      spec.closed = true;
+      if (spec.timer) clearTimeout(spec.timer);
+      stopSpecPoll();
       closeBrowserModal();
     }
 
@@ -1414,6 +2262,7 @@
           dismissAsKeep();
           return;
         }
+        startSpecPoll();
         if (spec.dupe) {
           specNote('Already in your NDM download list — downloading there.');
           btnStart.textContent = 'OK';
@@ -1436,7 +2285,13 @@
     }
 
     btnStart.addEventListener('click', () => {
-      if (spec.dupe) {
+      if (spec.finished) {
+        // the button reads "Close" now: a plain close that
+        // keeps the finished entry (F-EXT-12)
+        spec.closed = true;
+        stopSpecPoll();
+        closeBrowserModal();
+      } else if (spec.dupe) {
         spec.closed = true;
         closeBrowserModal();
       } else if (spec.owned) {
@@ -1486,7 +2341,6 @@
         if (res.total && res.total > 0) {
           currentBytes = res.total;
           sizeEl.textContent = fmtBytes(res.total);
-          if (!spec.id) btnStart.textContent = `⬇ Start Download (${fmtBytes(res.total)})`;
         } else {
           sizeEl.textContent = 'Stream / Unknown size';
         }
@@ -1841,6 +2695,127 @@
         background: rgba(255,255,255,.65);
       }
 
+      /* ── IDM-style video flyout ─────────────────────────────
+         A compact card anchored at the player (the pill's corner),
+         NOT a centered dialog: a "Download all" header row, then
+         plain numbered text rows; after a click the same card is
+         the progress view. The backdrop is transparent — it only
+         catches outside clicks / Esc, the page stays visible. */
+      .ndm-fly-backdrop {
+        position: fixed; inset: 0; z-index: 2147483646;
+        background: transparent;
+        pointer-events: auto;
+        font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+        outline: none;
+      }
+      .ndm-fly {
+        position: fixed;
+        width: 348px; max-width: calc(100vw - 16px);
+        max-height: 70vh; overflow-y: auto;
+        background: #ffffff; color: #17293f;
+        border: 1px solid #b9c9da; border-radius: 8px;
+        box-shadow: 0 10px 32px rgba(10, 25, 45, .28);
+        font-size: 13px; line-height: 1.45;
+      }
+      .ndm-fly-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 7px 8px 7px 12px;
+        border-bottom: 1px solid #dbe5f0;
+        background: #f2f6fb;
+        border-radius: 8px 8px 0 0;
+      }
+      .ndm-fly-all {
+        background: none; border: none; padding: 2px 4px;
+        font: inherit; font-weight: 600; color: #14532d;
+        cursor: pointer; text-align: left;
+      }
+      .ndm-fly-all:hover:not(:disabled) { text-decoration: underline; }
+      .ndm-fly-all:disabled { color: #8aa0b8; cursor: default; }
+      .ndm-fly-title {
+        flex: 1; min-width: 0; margin-right: 8px;
+        font-weight: 600; color: #17293f;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ndm-fly-x {
+        background: none; border: none; cursor: pointer;
+        font-size: 17px; line-height: 1; color: #5b7189;
+        width: 24px; height: 24px; border-radius: 5px; padding: 0;
+      }
+      .ndm-fly-x:hover { background: #e3ecf6; color: #17293f; }
+      .ndm-fly-body { padding: 6px 0; }
+      .ndm-fly.busy .ndm-fly-body { opacity: .55; pointer-events: none; }
+      .ndm-fly-loading {
+        display: flex; align-items: center; gap: 9px;
+        padding: 8px 12px; color: #48637f;
+      }
+      .ndm-fly-row {
+        padding: 5px 12px; cursor: pointer;
+      }
+      .ndm-fly-row-t {
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ndm-fly-row-q {
+        white-space: nowrap; color: #48637f; font-size: 12px; margin-top: 1px;
+      }
+      .ndm-fly-row:hover { background: #eaf2fb; }
+      .ndm-fly-note {
+        padding: 6px 12px; color: #8a5a12;
+        background: #fdf6e3; border-bottom: 1px solid #f0e2b6;
+        font-size: 12px;
+      }
+      .ndm-fly-foot {
+        display: flex; justify-content: flex-end;
+        padding: 6px 12px 9px;
+        border-top: 1px solid #dbe5f0;
+      }
+      .ndm-fly-app {
+        background: none; border: none; padding: 2px 4px;
+        font: inherit; font-size: 12px; color: #14532d;
+        cursor: pointer;
+      }
+      .ndm-fly-app:hover:not(:disabled) { text-decoration: underline; }
+      .ndm-fly-app:disabled { color: #8aa0b8; cursor: default; }
+      .ndm-fly-dupe {
+        display: flex; gap: 8px; padding: 8px 12px 10px;
+      }
+      .ndm-fly-prog { padding: 9px 12px 11px; }
+      .ndm-fly-prog-head {
+        font-weight: 600; margin-bottom: 7px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ndm-fly-bar {
+        height: 8px; border-radius: 4px;
+        background: #dbe5f0; overflow: hidden; margin-bottom: 7px;
+      }
+      .ndm-fly-bar-fill {
+        height: 100%; width: 0%;
+        background: linear-gradient(90deg, #1d9e57, #35c172);
+        transition: width .3s ease;
+      }
+      .ndm-fly-stats { color: #48637f; font-size: 12px; min-height: 16px; }
+      .ndm-fly-btns { display: flex; gap: 8px; margin-top: 9px; }
+      .ndm-fly-btns .ndm-btn { height: 27px; padding: 0 12px; font-size: 12px; }
+      .ndm-fly-multi { padding: 2px 0; }
+      .ndm-fly-mrow {
+        display: flex; align-items: center; justify-content: space-between; gap: 10px;
+        padding: 4px 12px;
+      }
+      .ndm-fly-mname {
+        flex: 1; min-width: 0;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ndm-fly-mpct { color: #48637f; flex: none; }
+      .ndm-fly-mbtns { display: flex; gap: 6px; flex: none; }
+      .ndm-fly-mbtn {
+        background: linear-gradient(180deg, #ffffff 0%, #e6eef7 100%);
+        border: 1px solid #96aec9; color: #1c314a;
+        border-radius: 5px; height: 22px; padding: 0 8px;
+        font: inherit; font-size: 11px; cursor: pointer;
+      }
+      .ndm-fly-mbtn:hover:not(:disabled) { background: #f5f9ff; }
+      .ndm-fly-mbtn:disabled { opacity: .5; cursor: default; }
+      .ndm-fly-state { color: #1d7a3a; font-weight: 600; }
+
       /* Non-intrusive Bottom-Right Background Download Toast */
       .ndm-toast {
         position: fixed; right: 18px; bottom: 18px;
@@ -1945,7 +2920,23 @@
     }
   }
 
+  let lastMediaState = null;
+  function reportMediaState() {
+    // The background mirrors the page context menu's "Download
+    // this page's video" item to whether this page HAS media
+    // (F-EXT-15): report only when the answer changes.
+    const has = videoDetected();
+    if (has === lastMediaState) return;
+    lastMediaState = has;
+    try {
+      chrome.runtime
+        .sendMessage({ action: 'ndm-media-state', hasMedia: has })
+        .catch(() => {});
+    } catch (e) {}
+  }
+
   function refresh() {
+    reportMediaState();
     if (dismissed) return;
     const hasVid = videoDetected();
     if (hasVid || modalOpen) {
@@ -2003,18 +2994,45 @@
       } catch (e) {}
     }
   }
-  // IDM's escape hatches: hold Del (or Ins) while clicking to leave
-  // one link to the browser; per-site exception list; per-tab off.
-  let ndmPreventHeld = false;
+  // IDM's keys (Options → General → Keys): hold Alt+Shift while
+  // clicking to PREVENT taking over one link; hold Insert while
+  // clicking to FORCE the download. Per-site exception list and
+  // per-tab off remain the other escape hatches.
+  let ndmForceHeld = false;
   let ndmSiteExcepted = false;
   let ndmTabDisabled = false;
+  // Alt+Shift state is TRACKED from key events (like Insert) and
+  // also read off the click event itself — either source alone
+  // proved unreliable in the wild (F-EXT-13). The tracked state
+  // is also what the background's downloads layer asks about: a
+  // download the browser itself started (Shift+click opens a new
+  // window) never passes through the click handler below, yet
+  // the gesture still belongs to this page.
+  let ndmPreventHeld = false;
+  let lastPreventClickAt = 0;
+  function syncPreventHeld(e) {
+    ndmPreventHeld = !!(e.altKey && e.shiftKey);
+  }
+  function notePreventClick(url) {
+    lastPreventClickAt = Date.now();
+    try {
+      chrome.runtime
+        .sendMessage({ action: 'ndm-note-prevent', url: url || '' })
+        .catch(() => {});
+    } catch (e) {}
+  }
   addEventListener('keydown', e => {
-    if (e.key === 'Delete' || e.key === 'Insert') ndmPreventHeld = true;
+    if (e.key === 'Insert') ndmForceHeld = true;
+    syncPreventHeld(e);
   }, true);
   addEventListener('keyup', e => {
-    if (e.key === 'Delete' || e.key === 'Insert') ndmPreventHeld = false;
+    if (e.key === 'Insert') ndmForceHeld = false;
+    syncPreventHeld(e);
   }, true);
-  addEventListener('blur', () => { ndmPreventHeld = false; });
+  addEventListener('blur', () => {
+    ndmForceHeld = false;
+    ndmPreventHeld = false;
+  });
   try {
     chrome.storage.local.get({
       ndmIntercept: true,
@@ -2033,7 +3051,9 @@
       if (r) ndmTabDisabled = !!r.disabled;
     }).catch(() => {});
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area !== 'local') return;
+      // ndmTabOff lives in SESSION storage (EX-m6); everything else
+      // is local. Session changes only ever carry that one key.
+      if (area !== 'local' && area !== 'session') return;
       if (changes.ndmIntercept) {
         ndmInterceptActive = changes.ndmIntercept.newValue !== false;
       }
@@ -2068,6 +3088,17 @@
       const dot = cleanPath.lastIndexOf('.');
       const ext = dot >= 0 ? cleanPath.slice(dot + 1) : '';
       if (INTERCEPT_EXTS.has(ext)) return true;
+      // Query-string filenames (/download?file=setup.exe): the
+      // background layer catches these through filenameFromUrl —
+      // the click layer must recognise the same links, or the two
+      // layers disagree about the one canonical list (EX-m9).
+      for (const [k, v] of u.searchParams.entries()) {
+        if (/file|name|attachment|download/i.test(k) && v.includes('.')) {
+          const clean = v.split(/[?#]/)[0].toLowerCase();
+          const qDot = clean.lastIndexOf('.');
+          if (qDot >= 0 && INTERCEPT_EXTS.has(clean.slice(qDot + 1))) return true;
+        }
+      }
       if (a.hasAttribute('download')) {
         const dlAttr = (a.getAttribute('download') || '').toLowerCase();
         const dlDot = dlAttr.lastIndexOf('.');
@@ -2088,10 +3119,31 @@
       if (window.top !== window.self) return;
       if (!ndmInterceptActive) return;
       if (ndmHostKnownMissing) return;
-      if (ndmPreventHeld || ndmSiteExcepted || ndmTabDisabled) return;
-      if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+      if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey) return;
+      // IDM keys: Alt+Shift held PREVENTS the takeover of this
+      // one link. The gesture is RECORDED before bailing — the
+      // browser is about to start its own download, and the
+      // background's downloads layer must be able to learn that
+      // this click was a prevent (via the note above and its
+      // 'ndm-prevent-state' query), or it would simply grab the
+      // file itself and re-open this dialog (F-EXT-13). Any
+      // other Alt/Shift click keeps the browser's own semantics
+      // (new window/tab) as before.
+      if ((e.altKey && e.shiftKey) || ndmPreventHeld) {
+        const a =
+          e.target && e.target.closest ? e.target.closest('a[href]') : null;
+        notePreventClick(a ? a.href : '');
+        return;
+      }
+      if (e.altKey || e.shiftKey) return;
+      if (ndmTabDisabled) return;
       const target = e.target && e.target.closest ? e.target.closest('a[href]') : null;
-      if (!target || !isDirectDownloadLink(target)) return;
+      if (!target || !/^https?:\/\//i.test(target.href)) return;
+      // Insert held FORCES the download: it bypasses the per-site
+      // exception and the downloadable-type check.
+      const forced = ndmForceHeld;
+      if (!forced && ndmSiteExcepted) return;
+      if (!forced && !isDirectDownloadLink(target)) return;
       e.preventDefault();
       e.stopPropagation();
       const dlName = (target.getAttribute('download') || '').trim();
@@ -2108,16 +3160,53 @@
   // Listen for requests from extension popup or background script
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg) return;
+    if (msg.action === 'ndm-prevent-state') {
+      // The background's downloads layer asks before taking over
+      // a browser-started download (F-EXT-13): was Alt+Shift held
+      // for the click that produced it — held right now, or a
+      // prevent click within the last few seconds?
+      sendResponse({
+        held: ndmPreventHeld,
+        recent: Date.now() - lastPreventClickAt < 5000,
+        at: lastPreventClickAt,
+      });
+      return false;
+    }
+    if (msg.action === 'ndm-query-media') {
+      // The popup asks the page itself whether it has media
+      // before offering its video button (R2-EXT-08): the page is
+      // the freshest source — the background's per-tab record can
+      // lag a just-loaded player.
+      sendResponse({
+        hasMedia: videoDetected() || !!pickAnchor(),
+      });
+      return false;
+    }
     if (msg.action === 'ndm-open-video-modal') {
+      // Top frame only (EX-M1): a broadcast open used to build a
+      // panel + speculative download in EVERY frame, iframes
+      // included. (Callers also target frameId 0 now; this guard
+      // is the content side of the same contract.)
+      if (window.self !== window.top) {
+        return false;
+      }
       dismissed = false;
       if (!panelHost || !panelHost.isConnected) buildPanel();
       const btn = cardEl ? cardEl.querySelector('.label') : null;
-      // answer only once the open attempt has settled, and only
-      // claim success if a modal actually exists — the old instant
-      // ok:true left callers with no fallback when the open failed
-      openBrowserModal(btn, cardEl)
-        .then(() => sendResponse({ ok: !!(modalOpen && modalEl) }))
-        .catch(() => sendResponse({ ok: false }));
+      // Answer as soon as the dialog SHELL is open (EX-m12): the
+      // caller (popup) must not hang until the probe settles. If
+      // the shell never appears, the settled promise answers with
+      // the real outcome instead — the old instant ok:true left
+      // callers with no fallback when the open failed.
+      let answered = false;
+      const answer = ok => {
+        if (answered) return;
+        answered = true;
+        try { sendResponse({ ok }); } catch (e) {}
+      };
+      openBrowserModal(btn, cardEl, msg.srcUrl || '', () => answer(true))
+        .then(() => answer(!!(modalOpen && modalEl)))
+        .catch(() => answer(false));
       return true;
     }
     if (msg.action === 'ndm-open-file-modal') {
@@ -2143,6 +3232,12 @@
       lastUrl = location.href;
       dismissed = false;
       dismissActiveModal();
+      // SPA navigation: tell the background to drop this tab's
+      // sniffed streams — they belong to the video just left, and
+      // the next dialog must never be handed them (EX-m2).
+      try {
+        chrome.runtime.sendMessage({ action: 'ndm-spa-navigated', url: lastUrl }).catch(() => {});
+      } catch (e) {}
       refresh();
     } else {
       place();

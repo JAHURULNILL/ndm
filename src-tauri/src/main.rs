@@ -1,4 +1,4 @@
-// NDM — Nill Download Manager (app backend)
+// Nill Download Manager (app backend)
 // A thin Tauri shell over the proven `ndm` engine. The download list is
 // persisted to <app data>/downloads.json and restored on launch; unfinished
 // entries come back as Paused with their exact on-disk progress (read from
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 mod video;
 
@@ -489,7 +489,11 @@ impl Settings {
                     .collect();
                 (k.trim().to_string(), exts)
             })
-            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+            // an explicitly EMPTIED category keeps its (empty)
+            // entry: category_for_with reads a present-but-empty
+            // list as "matches nothing" instead of resurrecting
+            // the built-in list the user just cleared
+            .filter(|(k, _)| !k.is_empty())
             .collect();
         self.conn_exceptions = self
             .conn_exceptions
@@ -560,6 +564,37 @@ fn pct_encode_userinfo(s: &str) -> String {
     out
 }
 
+/// Percent-decode a proxy userinfo part (the inverse of
+/// pct_encode_userinfo): the parser must hand sanitize the RAW
+/// credentials, or sanitize's re-encoding would encode the escapes
+/// a second time ("%40" -> "%2540") and proxy authentication would
+/// silently break the first time a legacy proxy URL is migrated.
+fn pct_decode(s: &str) -> String {
+    fn hex(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Parse "scheme://[user[:pass]@]host[:port]" into the manual fields.
 fn parse_proxy_url(url: &str) -> Option<(String, String, u16, String, String)> {
     let (scheme, rest) = url.split_once("://")?;
@@ -577,8 +612,8 @@ fn parse_proxy_url(url: &str) -> Option<(String, String, u16, String, String)> {
     }
     let (user, pass) = match userinfo {
         Some(u) => match u.split_once(':') {
-            Some((a, b)) => (a.to_string(), b.to_string()),
-            None => (u.to_string(), String::new()),
+            Some((a, b)) => (pct_decode(a), pct_decode(b)),
+            None => (pct_decode(u), String::new()),
         },
         None => (String::new(), String::new()),
     };
@@ -598,6 +633,25 @@ fn system_proxy_url() -> String {
         }
     }
     String::new()
+}
+
+/// The proxy the engine should actually use under these settings.
+/// Every mode except PAC has its effective URL composed by sanitize
+/// into `proxy`; a PAC script is resolved here — at the points where
+/// the app applies the proxy to the engine — and the engine-global
+/// value then serves as the cache until the settings change again.
+fn effective_proxy(s: &Settings) -> String {
+    if s.proxy_mode == "pac" {
+        ndm::resolve_pac_proxy(&s.proxy_pac_url)
+    } else {
+        s.proxy.clone()
+    }
+}
+
+/// Push the settings' proxy configuration into the engine globals.
+fn apply_proxy_to_engine(s: &Settings) {
+    ndm::set_global_proxy(&effective_proxy(s));
+    ndm::set_proxy_protocols(s.proxy_http, s.proxy_https, s.proxy_ftp);
 }
 
 impl Settings {
@@ -630,7 +684,14 @@ impl Settings {
             }
             "pac" => {
                 self.proxy_pac_url = self.proxy_pac_url.trim().to_string();
-                self.proxy = ndm::resolve_pac_proxy(&self.proxy_pac_url);
+                // resolving the PAC script fetches it over the
+                // network and its answer is per-URL — neither belongs
+                // in sanitize, which runs on every load and save, and
+                // the result must not be frozen into the persisted
+                // `proxy` field. The effective proxy is resolved once
+                // per settings change where the settings are applied
+                // to the engine (effective_proxy below).
+                self.proxy = String::new();
                 self.proxy_mode = "pac".to_string();
             }
             "manual" => {
@@ -676,15 +737,35 @@ impl Settings {
 /// the site field is a host, optionally with a path prefix; the
 /// longest matching site wins, so a deeper path can override a
 /// host-wide login.
+/// Split an authority ("host" or "host:port") into its host and
+/// port parts: the last colon only introduces a port when what
+/// follows it is all digits, so a colon inside a host name is safe.
+fn split_host_port(authority: &str) -> (&str, Option<&str>) {
+    match authority.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => (h, Some(p)),
+        _ => (authority, None),
+    }
+}
+
 fn site_login_for(s: &Settings, url: &str) -> Option<(String, String)> {
     let after = url.split("://").nth(1).unwrap_or("");
-    let (host, path) = match after.find('/') {
+    let (authority, path) = match after.find('/') {
         Some(i) => (
-            after[..i].to_ascii_lowercase(),
+            &after[..i],
             after[i..].split(['?', '#']).next().unwrap_or("").to_string(),
         ),
-        None => (after.to_ascii_lowercase(), "/".to_string()),
+        None => (after, "/".to_string()),
     };
+    // an embedded "user:pass@" in the URL must not poison the host
+    // comparison, and the comparison itself is by HOST (IDM's rule):
+    // a saved site without a port matches the host on any port,
+    // while one that names a port must match that port too
+    let authority = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let (host, url_port) = split_host_port(&authority);
     let mut best: Option<(&SiteLogin, usize)> = None;
     for l in &s.site_logins {
         let site = l
@@ -697,8 +778,14 @@ fn site_login_for(s: &Settings, url: &str) -> Option<(String, String)> {
             Some(i) => (&site[..i], &site[i..]),
             None => (site.as_str(), ""),
         };
+        let (shost, site_port) = split_host_port(shost);
         if shost != host {
             continue;
+        }
+        if let Some(p) = site_port {
+            if url_port != Some(p) {
+                continue;
+            }
         }
         if !spath.is_empty() && spath != "/" && !path.starts_with(spath) {
             continue;
@@ -998,8 +1085,7 @@ fn load_settings(state: &AppState) {
             s.sanitize();
             ndm::set_global_limit(s.speed_limit_bps);
             ndm::set_global_connections(s.max_connections);
-            ndm::set_global_proxy(&s.proxy);
-            ndm::set_proxy_protocols(s.proxy_http, s.proxy_https, s.proxy_ftp);
+            apply_proxy_to_engine(&s);
             *state.settings.lock().unwrap() = s;
         }
     }
@@ -1113,6 +1199,10 @@ struct AppState {
     /// was listening; the frontend drains this once on load
     pending_videos: Mutex<Vec<serde_json::Value>>,
     pending_files: Mutex<Vec<serde_json::Value>>,
+    /// "Download all links" requests from the extension that arrived
+    /// before the webview was listening; drained once on load like
+    /// pending_videos
+    pending_grabs: Mutex<Vec<serde_json::Value>>,
     /// a first-run video-component setup is currently downloading
     components_busy: AtomicBool,
     /// IDM-queue-style automatic retries of failed downloads:
@@ -1185,17 +1275,27 @@ fn category_for(name: &str) -> &'static str {
 /// Settings-aware classification: an extension the user assigned to
 /// a category in Options wins over the built-in table.
 fn category_for_with(name: &str, s: &Settings) -> String {
-    if !s.category_exts.is_empty() {
-        let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-        if !ext.is_empty() {
-            for (cat, exts) in &s.category_exts {
-                if exts.iter().any(|e| e == &ext) {
-                    return cat.clone();
-                }
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    if !ext.is_empty() {
+        for (cat, exts) in &s.category_exts {
+            if exts.iter().any(|e| e == &ext) {
+                return cat.clone();
             }
         }
     }
-    category_for(name).to_string()
+    let builtin = category_for(name);
+    // a category the user explicitly emptied in Options (the key is
+    // present with an empty list) matches NOTHING: its built-in
+    // extensions fall through to General rather than the built-in
+    // list silently coming back. Only a MISSING key falls back.
+    if s.category_exts
+        .get(builtin)
+        .map(|v| v.is_empty())
+        .unwrap_or(false)
+    {
+        return "General".to_string();
+    }
+    builtin.to_string()
 }
 
 fn file_name_for(url: &str) -> String {
@@ -1273,13 +1373,24 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             .map(|n| n.to_string_lossy().to_string())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| entry.name.clone());
+        // state honesty (F-15): if the job's thread died mid-download
+        // its last sampled speed would otherwise be reported as a live
+        // rate forever — no byte progress for a few seconds means the
+        // rate is 0, whatever the stale sample says
+        let speed_bps = if p.status == "downloading"
+            && p.last_progress_at.elapsed() > Duration::from_secs(3)
+        {
+            0.0
+        } else {
+            p.speed_bps
+        };
         return ProgressPayload {
             id: entry.id.clone(),
             name: display_name,
             url: entry.url.clone(),
             total,
             done_bytes,
-            speed_bps: p.speed_bps,
+            speed_bps,
             conns: if p.status == "downloading" {
                 if p.conns > 0 {
                     p.conns
@@ -1313,7 +1424,18 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         Some(dl) => {
             let p = dl.progress();
             let rate = if p.status == ndm::Status::Downloading {
-                entry.sample.lock().unwrap().2
+                let s = entry.sample.lock().unwrap();
+                // state honesty (F-15): the smoothed sample is a LIVE
+                // rate only while bytes are actually moving. If no
+                // byte has arrived past the sample's mark for a few
+                // seconds — a stalled engine, a dead emit loop — the
+                // displayed rate decays to 0 instead of presenting a
+                // frozen number as a healthy live transfer forever.
+                if p.done_bytes <= s.1 && s.0.elapsed() > Duration::from_secs(3) {
+                    0.0
+                } else {
+                    s.2
+                }
             } else {
                 0.0
             };
@@ -1431,6 +1553,28 @@ fn persist(state: &AppState) {
     let saved: Vec<SavedEntry> = order
         .iter()
         .filter_map(|id| state.get(id))
+        .filter(|e| {
+            // a just-registered stub whose first start is still in
+            // flight — no engine, no job, no restored record yet —
+            // is a placeholder, not a download: snapshotting it
+            // would persist a total=0 row that a crash mid-probe
+            // restores as a phantom entry (R3). It joins the
+            // snapshot the moment its start resolves, one way or
+            // the other: a live handle, an error record, or the
+            // queued/paused record of a deliberate later start.
+            // QUEUED is one of those resolved states, not a
+            // placeholder trait: an entry the cap/scheduler
+            // deliberately parked (queued flag set, start already
+            // decided as "later") must reach downloads.json the
+            // moment it is queued — without this arm it matched
+            // the placeholder shape (no handle, no record when no
+            // size hint rode along) and silently vanished from
+            // the list file, restart included (battery19 t1/t3).
+            e.download.is_some()
+                || e.video.is_some()
+                || e.restored.lock().unwrap().is_some()
+                || e.queued.load(Ordering::Relaxed)
+        })
         .map(|e| {
             let p = payload_of(&e);
             SavedEntry {
@@ -1619,7 +1763,48 @@ fn error_is_permanent(error: &str) -> bool {
         || error.contains("status code 404")
         || error.contains("status code 410")
         || error.contains("no playable video stream")
+        // post-download verdicts that re-downloading the same bytes
+        // cannot change — the shrink guard's mismatch and a merge
+        // the tools could not perform. These used to burn the whole
+        // retry budget re-downloading the full file again and again
+        // (R2-EXT-03 / N-10); a manual retry stays available.
+        || error.contains("much smaller than what was downloaded")
+        || error.contains("could not be merged into one playable file")
         || error.contains("required update")
+}
+
+/// The user-facing form of a probe/start failure. A definitive
+/// HTTP answer from the server (404, 410, …) is NOT a reachability
+/// problem, and presenting it as one ("check your connection")
+/// sends the user debugging the wrong thing (N-07 — a batch of
+/// playlist links at wrong paths was reported as a network
+/// failure). Translate it into what the server actually said; the
+/// wording deliberately avoids the dialog's network-error trigger
+/// words, so the accurate text is what the user reads. Anything
+/// else — genuine transport failures — passes through unchanged.
+fn plain_server_error(err: &str) -> String {
+    let Some(pos) = err.find("status code ") else {
+        return err.to_string();
+    };
+    let code: String = err[pos + "status code ".len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    match code.as_str() {
+        "404" => {
+            "The server answered 404 (Not Found) — there is no file at that address."
+                .to_string()
+        }
+        "410" => {
+            "The server answered 410 (Gone) — that file has been removed.".to_string()
+        }
+        "403" => "The server answered 403 (Forbidden) — it will not serve that file; \
+                  it may need a login."
+            .to_string(),
+        "401" => "The server answered 401 — that file needs a login.".to_string(),
+        "" => err.to_string(),
+        _ => format!("The server answered {code} for that address."),
+    }
 }
 
 /// Register a failed entry for an automatic retry — IDM's queue
@@ -1765,6 +1950,17 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
     if !state.retries.lock().unwrap().is_empty() {
         return;
     }
+    // an entry the user PAUSED is unfinished work, not "done":
+    // powering down (or closing) over it would strand a download
+    // they fully intend to resume tomorrow
+    let any_paused = {
+        let entries: Vec<Arc<Entry>> =
+            state.entries.lock().unwrap().values().cloned().collect();
+        entries.iter().any(|e| payload_of(e).status == "paused")
+    };
+    if any_paused {
+        return;
+    }
     if count_active(state) > 0 {
         return;
     }
@@ -1776,6 +1972,11 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
         .any(|e| e.queued.load(Ordering::Relaxed));
     if !any_queued {
         if !power.is_empty() {
+            // audit trail (F-19): this is the queue/global
+            // power-when-done setting (the finished entry's queue
+            // wins over the global one) — distinct from the
+            // per-entry completion action above
+            eprintln!("[ndm] power-when-done firing: {power} (queue: {finished_queue})");
             // a dry-run (test/safety valve) writes its marker but
             // must not then exit as if the machine were going down
             let dry = std::env::var("NDM_POWER_DRY_RUN")
@@ -1793,6 +1994,18 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
 /// The per-download "Options on completion" action, run once at finish.
 fn run_completion_action(entry: &Entry) {
     let action = entry.completion.lock().unwrap().clone();
+    if !action.is_empty() {
+        // audit trail (F-19): the value acted on is THIS entry's own
+        // stored field — written per entry by set_completion and
+        // carried verbatim through every entry rebuild (swap_live,
+        // demote_terminal_live, the video relaunch) — never a shared
+        // or global slot, so one download's choice cannot fire for
+        // another. Log which action fires, for which entry.
+        eprintln!(
+            "[ndm] completion action for {} ({}): {action}",
+            entry.id, entry.name
+        );
+    }
     // IDM's "Options on completion" also offers turning the computer
     // off (or restarting it) when this download finishes
     match action.as_str() {
@@ -1840,14 +2053,34 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
     }
     std::thread::spawn(move || {
         let mut last_persist = Instant::now();
+        let mut last_progress_write: Option<Instant> = None;
         loop {
             if entry.removed.load(Ordering::Relaxed) {
                 break;
             }
             update_sample(&entry);
             let payload = payload_of(&entry);
+            // a discard that landed while this payload was being
+            // sampled ends the loop BEFORE anything is published:
+            // a late progress-file write (or a finish-arm persist)
+            // would resurrect the entry the discard just removed
+            // (R2-EXT-05)
+            if entry.removed.load(Ordering::Relaxed) {
+                break;
+            }
             let status = payload.status.clone();
             let total_now = payload.total;
+            // keep the browser panel's progress file in step with
+            // the event stream: ~2 writes/sec while bytes move,
+            // and ALWAYS on a status transition (every non-downloading
+            // status ends this loop, so the final state must land)
+            let progress_due = last_progress_write
+                .map(|t| t.elapsed() >= Duration::from_millis(500))
+                .unwrap_or(true);
+            if status != "downloading" || progress_due {
+                write_progress_file(&app, &payload);
+                last_progress_write = Some(Instant::now());
+            }
             let _ = app.emit("progress", payload);
             if status == "downloading" {
                 app.state::<AppState>()
@@ -1856,6 +2089,27 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
             }
             match status.as_str() {
                 "finished" => {
+                    // "finished" is a claim about a file on disk.
+                    // A video job whose output is not there (a
+                    // cancel won the finalize race and the file was
+                    // removed) must not fire completion actions or
+                    // persist as a finished download (R2-EXT-05).
+                    if entry.kind == "video" && !resolve_video_file(&entry).is_file() {
+                        if let Some(job) = &entry.video {
+                            let mut p = job.progress.lock().unwrap();
+                            p.status = "error".to_string();
+                            p.error = Some(
+                                "the download finished but its file is missing from the save folder"
+                                    .to_string(),
+                            );
+                            p.speed_bps = 0.0;
+                            p.conns = 0;
+                        }
+                        let state = app.state::<AppState>();
+                        persist(&state);
+                        pump_queue(&app);
+                        break;
+                    }
                     run_completion_action(&entry);
                     let state = app.state::<AppState>();
                     state.retries.lock().unwrap().remove(&entry.id);
@@ -1896,7 +2150,10 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                     }
                     persist(&state);
                     pump_queue(&app);
-                    maybe_exit_when_done(&app, &state, &entry_queue(&entry));
+                    // NOTE: no maybe_exit_when_done here — a user
+                    // CANCEL (or an error) is not a "done" transition;
+                    // only a genuine finish may close the app or fire
+                    // the power action
                     break;
                 }
                 "paused" | "queued" => {
@@ -2212,6 +2469,77 @@ fn find_active_duplicate(state: &AppState, kind: &str, url: &str) -> Option<Stri
         .map(|e| e.id.clone())
 }
 
+/// An entry for the same URL that is FINISHED — backend-verified,
+/// file on disk at the recorded size (entry_is_finished is the
+/// authority). The active-duplicate check above deliberately
+/// skips finished entries, which let the file paths silently
+/// re-download a completed file under a "(1)" name (R2-EXT-07;
+/// the video path's own check in do_add_video already counts
+/// finished copies). Callers surface this exactly like an active
+/// duplicate: the existing entry is the answer, not a second copy.
+fn find_finished_duplicate(state: &AppState, kind: &str, url: &str) -> Option<String> {
+    // snapshot first, payloads/files checked unlocked (see
+    // find_active_duplicate for why the lock must not be held)
+    let entries: Vec<Arc<Entry>> = state
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    entries
+        .iter()
+        .find(|e| e.kind == kind && e.url == url && entry_is_finished(e))
+        .map(|e| e.id.clone())
+}
+
+/// An entry for the same URL that sits in ERROR state. A re-add
+/// used to slip past both duplicate checks above — the active
+/// check excludes errored entries, the finished check only
+/// matches finished ones — and silently mint a "(2)" copy,
+/// orphaning the failed entry's partial progress (R2-EXT-04).
+/// Callers surface the errored entry exactly like the other
+/// duplicates: the browser flyout renders its error with a Retry
+/// button, the app dialog asks. This check never restarts or
+/// replaces the entry itself.
+fn find_errored_duplicate(state: &AppState, kind: &str, url: &str) -> Option<String> {
+    // snapshot first, payloads computed unlocked (see
+    // find_active_duplicate for why the lock must not be held)
+    let entries: Vec<Arc<Entry>> = state
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    entries
+        .iter()
+        .find(|e| e.kind == kind && e.url == url && payload_of(e).status == "error")
+        .map(|e| e.id.clone())
+}
+
+/// Give a just-minted entry id back to the shared sequence when an
+/// add fails before the entry ever became a download (R3: every
+/// failed add used to burn a number, leaving gaps like dl-1, dl-3,
+/// dl-7 missing from the profile). Minting is
+/// `fetch_add(1) + 1`, so right after minting `dl-<n>` the counter
+/// holds exactly n; the number is reclaimed only when the counter
+/// still holds it — a compare-exchange on the high-water mark. A
+/// concurrent mint (another entry, a captured-cookies token) makes
+/// the exchange fail and the gap simply stays: the scheme prefers
+/// a harmless gap over ever reissuing a live entry's id.
+fn release_entry_id(state: &AppState, id: &str) {
+    let Some(n) = id
+        .strip_prefix("dl-")
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let _ = state
+        .seq
+        .compare_exchange(n, n - 1, Ordering::Relaxed, Ordering::Relaxed);
+}
+
 fn register_http_stub(
     state: &AppState,
     url: &str,
@@ -2385,6 +2713,21 @@ fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<Entr
 /// entry gets the engine; a restored video entry gets a fresh yt-dlp job
 /// (which continues its .part files); a live-but-paused one just resumes.
 fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
+    // a finished entry must never be (re)started: resuming its dead
+    // handle would spawn a fresh emit loop whose first tick runs
+    // the completion action a second time
+    if payload_of(&entry).status == "finished" {
+        return;
+    }
+    // a (re)start supersedes the previous attempt's failure: the
+    // stored error clears NOW, so progress payloads (and the
+    // browser progress file mirrored from them) never carry a
+    // stale error alongside a live "downloading" state — the
+    // video jobs clear theirs in spawn()/resume(), this covers
+    // the restored record every stub start reads from
+    if let Some(r) = entry.restored.lock().unwrap().as_mut() {
+        r.error.clear();
+    }
     if entry.download.is_some() {
         let state = app.state::<AppState>();
         if let Some(stub) = demote_terminal_live(&state, &entry) {
@@ -2462,6 +2805,8 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             entry.audio,
             &entry.name,
             state.cookies_path(&entry.cookies),
+            &entry.login,
+            &entry.password,
             &state.components(),
         ) {
             Ok(job) => {
@@ -2562,23 +2907,40 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             let state = app.state::<AppState>();
             if let Some(e) = state.get(&entry.id) {
                 if Arc::ptr_eq(&e, &entry) {
-                    *e.restored.lock().unwrap() = Some(Restored {
-                        total: 0,
-                        done_bytes: 0,
-                        blocks: Vec::new(),
-                        resumable: false,
-                        status: "error".to_string(),
-                        error: start_err,
-                    });
-                    let _ = app.emit("progress", payload_of(&e));
-                    // probe/start failures (a server that is down or
-                    // refused the connection) never reach an emit
-                    // loop, so nothing ever registered them for the
-                    // automatic retry every other failure gets —
-                    // they sat dead until a manual Resume. Register
-                    // here; dead links (404/410) stay excluded by
-                    // error_is_permanent.
-                    register_retry(&state, &e);
+                    if e.pause_requested.load(Ordering::SeqCst) {
+                        // the user paused this entry while it was
+                        // still probing: the pause wins over the
+                        // start failure — the entry records "paused",
+                        // not an error, and no automatic retry is
+                        // queued behind the user's back
+                        *e.restored.lock().unwrap() = Some(Restored {
+                            total: 0,
+                            done_bytes: 0,
+                            blocks: Vec::new(),
+                            resumable: false,
+                            status: "paused".to_string(),
+                            error: String::new(),
+                        });
+                        let _ = app.emit("progress", payload_of(&e));
+                    } else {
+                        *e.restored.lock().unwrap() = Some(Restored {
+                            total: 0,
+                            done_bytes: 0,
+                            blocks: Vec::new(),
+                            resumable: false,
+                            status: "error".to_string(),
+                            error: start_err,
+                        });
+                        let _ = app.emit("progress", payload_of(&e));
+                        // probe/start failures (a server that is down or
+                        // refused the connection) never reach an emit
+                        // loop, so nothing ever registered them for the
+                        // automatic retry every other failure gets —
+                        // they sat dead until a manual Resume. Register
+                        // here; dead links (404/410) stay excluded by
+                        // error_is_permanent.
+                        register_retry(&state, &e);
+                    }
                 }
             }
             persist(&state);
@@ -2604,6 +2966,19 @@ fn scheduler_blocks(state: &AppState, queue: &str) -> bool {
     !window_open(&cfg.start, &cfg.stop, &now)
 }
 
+/// The simultaneous-download cap that applies to one queue: the
+/// queue's own cap when it sets one, else the global setting —
+/// the same rule pump_queue applies, so direct adds, the pump and
+/// the scheduler triggers never disagree about a queue's limit.
+fn effective_cap(s: &Settings, queue: &str) -> usize {
+    let cfg = queue_cfg(s, queue);
+    if cfg.max_simultaneous > 0 {
+        cfg.max_simultaneous
+    } else {
+        s.max_simultaneous
+    }
+}
+
 /// Should a new/queued download in this queue wait right now?
 /// (Its queue's window or the download quota says so.)
 fn entry_blocks(state: &AppState, queue: &str) -> bool {
@@ -2625,10 +3000,259 @@ fn count_active_for(state: &AppState, queue: &str) -> usize {
         .count()
 }
 
+/// The backend's own verdict on whether an entry is finished: the
+/// live engine/job state first, then the restored record checked
+/// against the file actually on disk (a download that completed
+/// just before a crash can sit in the list as "paused" with every
+/// byte present). Callers that act on "finished" — file deletion,
+/// dialog discards — must use THIS, never a status cached by the
+/// UI or the browser (F-21, F-EXT-12).
+fn entry_is_finished(entry: &Entry) -> bool {
+    let payload = payload_of(entry);
+    if payload.status == "finished" {
+        // "finished" is a claim about a file on disk, whoever made
+        // it — a live engine that just completed, or a record
+        // restored from downloads.json. The restored claim used to
+        // be trusted outright here, so the disk check below was
+        // never reached for exactly the records it exists for: a
+        // file deleted while the app was closed restored as
+        // "Finished", and demote_phantom_finished was a no-op
+        // (R3). The claim is honoured only when the output file
+        // verifiably exists at the recorded size.
+        return finished_file_on_disk(entry, payload.total);
+    }
+    if entry.download.is_some() || entry.video.is_some() {
+        return false;
+    }
+    let (total, done) = match &*entry.restored.lock().unwrap() {
+        Some(r) => (r.total, r.done_bytes),
+        None => (0, 0),
+    };
+    if total == 0 || done < total {
+        return false;
+    }
+    finished_file_on_disk(entry, total)
+}
+
+/// The disk half of the finished verdict: the entry's output file
+/// exists and matches the recorded total. A video's merged output
+/// may legitimately be smaller than the recorded total — the
+/// record can predate the finalize step that rewrites the total
+/// to the merged size (a crash in between, a record written by an
+/// older build) — so for video a present, non-empty file at or
+/// under the total counts. A missing or empty file never does,
+/// for any kind.
+fn finished_file_on_disk(entry: &Entry, total: u64) -> bool {
+    let path = if entry.kind == "video" {
+        resolve_video_file(entry)
+    } else {
+        entry.out_path.clone()
+    };
+    let Ok(m) = path.metadata() else { return false };
+    if !m.is_file() || m.len() == 0 {
+        return false;
+    }
+    if total == 0 || m.len() == total {
+        return true;
+    }
+    entry.kind == "video" && m.len() < total
+}
+
+/// The terminal snapshot of a live handle whose engine/job already
+/// reached a terminal state: (status, total, done_bytes, error).
+fn terminal_snapshot(entry: &Entry) -> Option<(String, u64, u64, String)> {
+    if let Some(dl) = &entry.download {
+        if !dl.is_terminal() {
+            return None;
+        }
+        let p = dl.progress();
+        let status = p.status.as_str().to_string();
+        if status == "downloading" || status == "paused" {
+            return None;
+        }
+        return Some((status, p.total, p.done_bytes, p.error.unwrap_or_default()));
+    }
+    if let Some(job) = &entry.video {
+        let p = job.progress.lock().unwrap().clone();
+        if matches!(p.status.as_str(), "finished" | "error" | "cancelled") {
+            return Some((
+                p.status.clone(),
+                p.total,
+                p.done,
+                p.error.clone().unwrap_or_default(),
+            ));
+        }
+    }
+    None
+}
+
+/// State-honesty sweep, run at the top of every pump (F-15/F-16):
+/// an entry whose recorded state claims something no live handle
+/// backs — or whose live handle reached a terminal state nobody
+/// processed because its emit loop died first — is reconciled with
+/// reality instead of sitting in a fake-live state forever.
+fn reconcile_wedged(app: &AppHandle, state: &AppState) {
+    let entries: Vec<Arc<Entry>> =
+        state.entries.lock().unwrap().values().cloned().collect();
+    let mut dirty = false;
+    for e in &entries {
+        if e.removed.load(Ordering::Relaxed) || e.starting.load(Ordering::Relaxed) {
+            continue;
+        }
+        if e.download.is_none() && e.video.is_none() {
+            // no live handle at all: a record claiming a live state
+            // ("downloading", or "queued" with the flag lost) can
+            // never move on its own — hand it back to the queue so
+            // the claim loop below starts it (a failed start then
+            // surfaces as a visible error, not a silent wedge). A
+            // pause the user asked for is never overridden.
+            if !e.queued.load(Ordering::Relaxed) && !e.pause_requested.load(Ordering::SeqCst) {
+                let st = e
+                    .restored
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|r| r.status.clone());
+                if matches!(st.as_deref(), Some("downloading") | Some("queued")) {
+                    e.queued.store(true, Ordering::Relaxed);
+                }
+            }
+            continue;
+        }
+        // live handle, terminal engine/job, but the terminal state
+        // was never recorded (the emit loop exited before its finish
+        // arm — e.g. around a pause/resume inside the detail
+        // dialog): persist the truth now, so the list, the payload
+        // stream and downloads.json stop disagreeing (F-16).
+        if let Some((status, total, done, error)) = terminal_snapshot(e) {
+            let mut r = e.restored.lock().unwrap();
+            let recorded = r
+                .as_ref()
+                .map(|x| x.status == status && x.done_bytes == done)
+                .unwrap_or(false);
+            if !recorded {
+                *r = Some(Restored {
+                    total,
+                    done_bytes: done,
+                    blocks: Vec::new(),
+                    resumable: true,
+                    status,
+                    error,
+                });
+                drop(r);
+                let _ = app.emit("progress", payload_of(e));
+                dirty = true;
+            }
+        }
+    }
+    if dirty {
+        persist(state);
+    }
+}
+
+/// Does this queue carry an enabled scheduler window? (A queue's
+/// window only exists when the user ticked "Use schedule" for it in
+/// the Scheduler dialog; start/stop always hold values, enabled or
+/// not, so the flag is the whole test.)
+fn queue_has_schedule(s: &Settings, queue: &str) -> bool {
+    queue_cfg(s, queue).use_schedule
+}
+
+/// "Download Later" answers "not NOW", not "never": when the target
+/// queue has an enabled schedule, a later-entry belongs to that
+/// schedule and is created QUEUED, so the pump claims it the moment
+/// the window opens — IDM's primary scheduler workflow (stock the
+/// queue now, the schedule starts it later). The pump refuses
+/// out-of-window claims via entry_blocks, so a queued later-entry
+/// can never start early. Only a queue with NO schedule keeps the
+/// parked behaviour: paused until the user starts it by hand (R5-5a:
+/// later-entries used to be created un-queued unconditionally, so a
+/// scheduled queue's own schedule could never see them at all).
+fn later_entry_queued(later: bool, queue_scheduled: bool) -> bool {
+    later && queue_scheduled
+}
+
+/// Was this entry parked before its first start and never run since?
+/// This is the state that separates "Download Later" from "the user
+/// paused it": a download the user paused mid-flight either still
+/// holds its live handle or has bytes on the record (done_bytes > 0);
+/// a parked later-entry has neither — no handle, a "paused" record,
+/// zero bytes. The pause latch is part of the test in-session: the
+/// one deliberate press that can land on a parked entry (Pause in
+/// the list) sets it, and a latched entry is the user's explicit
+/// stop, never the schedule's to adopt. (After an app restart the
+/// latch is gone — restores clear it — so a pre-restart pause of a
+/// zero-byte entry is indistinguishable from a fresh Download Later;
+/// that residue is accepted, the alternative would need a new
+/// persisted field for a corner the in-session state already covers.)
+fn never_started_parked(e: &Entry) -> bool {
+    if e.download.is_some() || e.video.is_some() || e.queued.load(Ordering::Relaxed) {
+        return false;
+    }
+    if e.pause_requested.load(Ordering::SeqCst) {
+        return false;
+    }
+    match &*e.restored.lock().unwrap() {
+        Some(r) => r.status == "paused" && r.done_bytes == 0,
+        None => false,
+    }
+}
+
+/// Bring a scheduled queue's parked Download-Later entries under its
+/// schedule: they become queued, and the existing window machinery
+/// (the pump outside the window refuses, the window-open edge starts)
+/// takes it from there. Covers the entries the add-path rule cannot
+/// reach: parked before the queue had a schedule, or moved into the
+/// queue while parked. Only never-started entries are adopted (see
+/// never_started_parked) — a file the user paused after it ran is
+/// never auto-started by this.
+fn adopt_parked_entries(app: &AppHandle, state: &AppState, s: &Settings, queue: &str) -> bool {
+    if !queue_has_schedule(s, queue) {
+        return false;
+    }
+    let order = state.order.lock().unwrap().clone();
+    let mut adopted = false;
+    for id in &order {
+        if let Some(e) = state.get(id) {
+            if entry_queue(&e) != queue || !never_started_parked(&e) {
+                continue;
+            }
+            e.queued.store(true, Ordering::Relaxed);
+            if let Some(r) = e.restored.lock().unwrap().as_mut() {
+                r.status = "queued".to_string();
+            }
+            let _ = app.emit("progress", payload_of(&e));
+            adopted = true;
+        }
+    }
+    if adopted {
+        persist(state);
+    }
+    adopted
+}
+
+/// Claim a queued entry for a pump/scheduler start. A successful
+/// claim also clears the pause latch: every legitimate pause of a
+/// handle-less entry either dequeues it (pause_download) or is
+/// consumed by the start path itself the moment the entry goes live,
+/// so a latch still set on an entry that stayed queued until claim
+/// time is stale by construction — exactly the R5-5b poison, where a
+/// schedule edit latched a merely-queued entry and its own window
+/// then paused it after a single block.
+fn claim_queued(e: &Entry) -> bool {
+    if e.queued.swap(false, Ordering::SeqCst) {
+        e.pause_requested.store(false, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
 /// Fill free simultaneous-download slots from the queues. The cap is
 /// per queue (IDM: each queue downloads N files at a time).
 fn pump_queue(app: &AppHandle) {
     let state = app.state::<AppState>();
+    reconcile_wedged(app, &state);
     let s = current_settings(&state);
     let order = state.order.lock().unwrap().clone();
     for cfg in &s.queues {
@@ -2645,7 +3269,7 @@ fn pump_queue(app: &AppHandle) {
         if max == 0 {
             for id in &order {
                 if let Some(e) = state.get(id) {
-                    if entry_queue(&e) == cfg.name && e.queued.swap(false, Ordering::SeqCst) {
+                    if entry_queue(&e) == cfg.name && claim_queued(&e) {
                         start_entry(app, e);
                     }
                 }
@@ -2666,7 +3290,7 @@ fn pump_queue(app: &AppHandle) {
             }
             // atomic claim: two pumps running at once must never start
             // the same entry twice (two engines, one output file)
-            if e.queued.swap(false, Ordering::SeqCst) {
+            if claim_queued(&e) {
                 start_entry(app, e);
                 active += 1;
             }
@@ -2684,7 +3308,7 @@ fn start_all_queued(app: &AppHandle, queue: Option<&str>) {
             if queue.is_some_and(|q| entry_queue(&e) != q) {
                 continue;
             }
-            if e.queued.swap(false, Ordering::SeqCst) {
+            if claim_queued(&e) {
                 start_entry(app, e);
             }
         }
@@ -2706,6 +3330,22 @@ fn pause_all(app: &AppHandle, requeue: bool, queue: Option<&str>) {
             if queue.is_some_and(|q| entry_queue(&e) != q) {
                 continue;
             }
+            // The pause latch exists for ONE case: a start genuinely
+            // in flight (probe running, live handle not installed
+            // yet) — it makes that start honour the pause the moment
+            // the entry goes live, instead of downloading outside
+            // the window this pause was meant to close. A MERELY
+            // QUEUED or parked entry must NOT be latched (R5-5b):
+            // its queued state already keeps it from starting
+            // outside the window (the pump refuses out-of-window
+            // claims), and the stale latch survived into its own
+            // window, pausing it immediately after the first block
+            // when the scheduler claimed it there.
+            let start_in_flight = e.starting.load(Ordering::Relaxed)
+                || e.slot_preclaimed.load(Ordering::Relaxed);
+            if e.download.is_none() && e.video.is_none() && start_in_flight {
+                e.pause_requested.store(true, Ordering::SeqCst);
+            }
             let was_downloading = payload_of(&e).status == "downloading";
             if let Some(dl) = &e.download {
                 dl.control.pause();
@@ -2715,6 +3355,32 @@ fn pause_all(app: &AppHandle, requeue: bool, queue: Option<&str>) {
             }
             if requeue && was_downloading {
                 e.queued.store(true, Ordering::Relaxed);
+            }
+            if !requeue
+                && e.download.is_none()
+                && e.video.is_none()
+                && !start_in_flight
+                && e.queued.swap(false, Ordering::Relaxed)
+            {
+                // a manual Stop Queue Now on a merely-queued entry:
+                // dequeue it and park it paused (the same shape
+                // pause_download uses for a not-running entry), so
+                // the stop holds — without the latch trick, the pump
+                // would simply claim it again on the next tick
+                let mut r = e.restored.lock().unwrap();
+                match r.as_mut() {
+                    Some(r) => r.status = "paused".to_string(),
+                    None => {
+                        *r = Some(Restored {
+                            total: 0,
+                            done_bytes: 0,
+                            blocks: Vec::new(),
+                            resumable: false,
+                            status: "paused".to_string(),
+                            error: String::new(),
+                        })
+                    }
+                }
             }
             let _ = app.emit("progress", payload_of(&e));
         }
@@ -2733,8 +3399,7 @@ fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) 
     s.sanitize();
     ndm::set_global_limit(s.speed_limit_bps);
     ndm::set_global_connections(s.max_connections);
-    ndm::set_global_proxy(&s.proxy);
-    ndm::set_proxy_protocols(s.proxy_http, s.proxy_https, s.proxy_ftp);
+    apply_proxy_to_engine(&s);
     *state.settings.lock().unwrap() = s.clone();
     save_settings(&state);
     // an entry whose queue was deleted falls back to the Main queue
@@ -2751,6 +3416,12 @@ fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) 
         if moved {
             persist(&state);
         }
+    }
+    // a schedule switched on (or pointed at a queue that already
+    // holds parked Download-Later entries) adopts those entries now
+    // (R5-5a): they join the queue and wait for their window
+    for cfg in &s.queues {
+        adopt_parked_entries(&app, &state, &s, &cfg.name);
     }
     // the pump itself respects every queue's window, quota and cap
     // (including "no cap"), so saving settings just gives it a chance
@@ -2772,9 +3443,13 @@ fn set_entry_queue(
         return Err("unknown queue".to_string());
     }
     let entry = state.get(&id).ok_or("unknown download id")?;
-    *entry.queue.lock().unwrap() = queue;
+    *entry.queue.lock().unwrap() = queue.clone();
     persist(&state);
     let _ = app.emit("progress", payload_of(&entry));
+    // an entry moved INTO a scheduled queue while parked as Download
+    // Later joins that queue's schedule (R5-5a) instead of sitting
+    // paused in it forever
+    adopt_parked_entries(&app, &state, &s, &queue);
     pump_queue(&app);
     Ok(())
 }
@@ -2894,7 +3569,14 @@ fn set_entry_description(
 fn scheduler_start_now(app: AppHandle, state: State<'_, AppState>, queue: Option<String>) {
     let q = queue.unwrap_or_else(main_queue_name);
     state.sched_override.lock().unwrap().insert(q.clone());
-    if current_settings(&state).max_simultaneous == 0 {
+    // "Start Queue Now" runs the queue — its parked Download-Later
+    // entries are part of the queue, so adopt them first (R5-5a);
+    // a no-op for queues without a schedule
+    adopt_parked_entries(&app, &state, &current_settings(&state), &q);
+    // the QUEUE's effective cap decides, not the global value: a
+    // queue with its own cap fills its slots through the pump
+    // instead of flooding past its simultaneous limit
+    if effective_cap(&current_settings(&state), &q) == 0 {
         start_all_queued(&app, Some(&q));
     } else {
         pump_queue(&app);
@@ -2907,6 +3589,11 @@ fn scheduler_stop_now(app: AppHandle, state: State<'_, AppState>, queue: Option<
     state.sched_override.lock().unwrap().remove(&q);
     pause_all(&app, false, Some(&q));
 }
+
+/// Serializes "cap check + slot reservation" across every direct
+/// start path: two starts landing together must not both pass the
+/// simultaneous-cap check before either has claimed its slot.
+static START_GATE: Mutex<()> = Mutex::new(());
 
 #[tauri::command]
 async fn add_download(
@@ -2924,12 +3611,25 @@ async fn add_download(
     login: Option<String>,
     password: Option<String>,
     description: Option<String>,
+    total: Option<u64>,
 ) -> Result<String, String> {
     if state.update_required.load(Ordering::SeqCst) {
         return Err("NDM needs its latest update before it can download. Please install the update first.".to_string());
     }
     if !force.unwrap_or(false) {
         if let Some(existing) = find_active_duplicate(&state, "http", &url) {
+            return Err(format!("duplicate:{existing}"));
+        }
+        // a FINISHED copy is a duplicate too (R2-EXT-07): the
+        // dialog asks about it exactly like an active one instead
+        // of silently minting a "(1)" file
+        if let Some(existing) = find_finished_duplicate(&state, "http", &url) {
+            return Err(format!("duplicate:{existing}"));
+        }
+        // and an ERRORED copy (R2-EXT-04): the dialog asks about
+        // the entry that already failed instead of minting a "(2)"
+        // copy that orphans its partial progress
+        if let Some(existing) = find_errored_duplicate(&state, "http", &url) {
             return Err(format!("duplicate:{existing}"));
         }
     }
@@ -2958,13 +3658,45 @@ async fn add_download(
     if let Some(d) = &description {
         *stub.description.lock().unwrap() = d.chars().take(500).collect();
     }
+    // the dialog already probed this link before asking: carry the
+    // probed size into the entry at creation, so the list shows it
+    // immediately — including for Download Later, whose entries used
+    // to sit at "Unknown" until their first start (F-03)
+    let probed_total = total.unwrap_or(0);
+    if probed_total > 0 {
+        let mut r = stub.restored.lock().unwrap();
+        match r.as_mut() {
+            Some(r) => {
+                if r.total == 0 {
+                    r.total = probed_total;
+                }
+            }
+            None => {
+                *r = Some(Restored {
+                    total: probed_total,
+                    done_bytes: 0,
+                    blocks: Vec::new(),
+                    resumable: true,
+                    status: "queued".to_string(),
+                    error: String::new(),
+                });
+            }
+        }
+    }
     let id = stub.id.clone();
     let is_later = later.unwrap_or(false);
-    let max = current_settings(&state).max_simultaneous;
+    // a Download Later aimed at a queue WITH an enabled schedule
+    // joins that schedule instead of parking (see later_entry_queued,
+    // R5-5a): created queued below, claimed by the pump when the
+    // window opens — never now, never early
+    let later_joins_schedule = later_entry_queued(
+        is_later,
+        queue_has_schedule(&current_settings(&state), &entry_queue(&stub)),
+    );
+    let max = effective_cap(&current_settings(&state), &entry_queue(&stub));
     // cap check + slot reservation under one gate: two adds landing
     // together used to both pass the check before either start
     // claimed its slot, overshooting the queue's cap
-    static START_GATE: Mutex<()> = Mutex::new(());
     let must_wait = {
         let _gate = START_GATE.lock().unwrap();
         let wait = is_later
@@ -2976,11 +3708,12 @@ async fn add_download(
         wait
     };
     if must_wait {
-        if is_later {
-            // "Download Later" stays paused until the user explicitly starts/resumes it
+        if is_later && !later_joins_schedule {
+            // "Download Later" into a queue with NO schedule stays
+            // paused until the user explicitly starts/resumes it
             stub.queued.store(false, Ordering::Relaxed);
             *stub.restored.lock().unwrap() = Some(Restored {
-                total: 0,
+                total: probed_total,
                 done_bytes: 0,
                 blocks: Vec::new(),
                 resumable: true,
@@ -2988,8 +3721,27 @@ async fn add_download(
                 error: String::new(),
             });
         } else {
-            // Scheduler or simultaneous cap: register as queued so the pump starts it when a slot frees up
+            // Scheduler or simultaneous cap: register as queued so the pump starts it when a slot frees up.
+            // A Download Later that joined its queue's schedule lands
+            // here too — queued, and the pump claims it at the window.
             stub.queued.store(true, Ordering::Relaxed);
+            // the queued state IS the entry's record (same shape
+            // the video path and Download Later use): without one,
+            // an unprobed queued entry existed only as the flag —
+            // persist now keeps it via that flag too, but the
+            // record keeps the in-memory state identical to what a
+            // restart restores
+            let mut r = stub.restored.lock().unwrap();
+            if r.is_none() {
+                *r = Some(Restored {
+                    total: probed_total,
+                    done_bytes: 0,
+                    blocks: Vec::new(),
+                    resumable: true,
+                    status: "queued".to_string(),
+                    error: String::new(),
+                });
+            }
         }
         let _ = app.emit("progress", payload_of(&stub));
         persist(&state);
@@ -3005,14 +3757,23 @@ async fn add_download(
             let sys = system_proxy_url();
             if s.proxy_from_browser_on_error
                 && !sys.is_empty()
-                && sys != s.proxy
+                && sys != effective_proxy(&s)
                 && (!stub.cookies.is_empty() || !stub.referer.is_empty())
             {
                 ndm::set_global_proxy(&sys);
                 match start_engine(app.clone(), &stub).await {
-                    Ok(v) => Ok(v),
+                    Ok(v) => {
+                        // the started engine captured the system-
+                        // proxy agent when it was built; the session
+                        // proxy goes back NOW, on success too — it
+                        // used to be restored only on failure, so one
+                        // fallback quietly rerouted every later
+                        // download through the browser's proxy
+                        ndm::set_global_proxy(&effective_proxy(&s));
+                        Ok(v)
+                    }
                     Err(_) => {
-                        ndm::set_global_proxy(&s.proxy);
+                        ndm::set_global_proxy(&effective_proxy(&s));
                         Err(e1)
                     }
                 }
@@ -3039,9 +3800,15 @@ async fn add_download(
                 if let Some(path) = state.cookies_path(&stub.cookies) {
                     let _ = std::fs::remove_file(path);
                 }
+                // the add never became a download: hand its id
+                // number back, so a failed add leaves neither a
+                // placeholder entry nor a gap in the numbering
+                release_entry_id(&state, &id);
             }
             persist(&state);
-            Err(e)
+            // a definitive server answer (404/410/…) is reported
+            // as what it is, not as a reachability failure (N-07)
+            Err(plain_server_error(&e))
         }
     }
 }
@@ -3153,6 +3920,8 @@ async fn resume_download(
                 entry.audio,
                 &entry.name,
                 state.cookies_path(&entry.cookies),
+                &entry.login,
+                &entry.password,
                 &state.components(),
             ) {
                 Ok(j) => j,
@@ -3214,8 +3983,27 @@ async fn resume_download(
         Ok(())
     } else {
         // restored entry: start the engine — it resumes from its state file
-        start_engine(app, &entry).await?;
-        Ok(())
+        match start_engine(app.clone(), &entry).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // mirror start_entry's failure handling: a failed
+                // start must surface on the entry as a visible error
+                // with its reason and an automatic retry — it used
+                // to vanish into the caller, leaving a stale status
+                *entry.restored.lock().unwrap() = Some(Restored {
+                    total: 0,
+                    done_bytes: 0,
+                    blocks: Vec::new(),
+                    resumable: false,
+                    status: "error".to_string(),
+                    error: e.clone(),
+                });
+                let _ = app.emit("progress", payload_of(&entry));
+                register_retry(&state, &entry);
+                persist(&state);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -3227,23 +4015,38 @@ fn remove_download(
     delete_file: Option<bool>,
 ) -> Result<(), String> {
     state.retries.lock().unwrap().remove(&id);
+    delete_progress_file(&app, &id);
     if let Some(entry) = state.get(&id) {
+        // judged BEFORE anything is cancelled: cancelling a video
+        // job rewrites its status to "cancelled", which would make
+        // a finished entry look unfinished to the check below
+        let was_finished = entry_is_finished(&entry);
         // its downloaded bytes stay on the quota meter even though
         // the entry leaves the list (deleting must not refund quota)
         quota_note_removed(&state, &entry);
         entry.removed.store(true, Ordering::SeqCst);
-        if let Some(dl) = &entry.download {
-            dl.control.cancel();
-        }
-        if let Some(job) = &entry.video {
-            job.cancel();
-        }
+        // settle BEFORE any file is touched: the engines write
+        // their resume state one last time on the way out, and the
+        // old cancel-then-immediately-delete raced that write —
+        // the journal survived the delete and unique_out_path then
+        // treated the name as taken forever (R3). discard_entry
+        // (the browser dialog's path) already settled this way;
+        // the app's own removal now gets the same treatment.
+        settle_entry_engines(&entry);
         // the engine's state file is our own bookkeeping: leaving it
         // behind would make unique_out_path treat the path as taken
         // forever (phantom "name (1)" on every future re-add). The
         // partial data file itself is the user's — it stays.
-        if entry.kind != "video" {
-            let _ = std::fs::remove_file(ndm::state_path_for(&entry.out_path));
+        sweep_engine_state_file(&entry);
+        // a video entry's intermediates are NDM's own working
+        // files, not user data: deleting a mid-download video used
+        // to orphan a full-size .ndm_stream part + its journal in
+        // the save folder (R3). The sweep covers exactly the
+        // discard set (stream parts, mux/audio temps, yt-dlp
+        // parts — journals ride along by prefix); the entry's
+        // final file follows the ordinary rule below.
+        if entry.kind == "video" && !was_finished {
+            sweep_video_temps(&entry);
         }
         // a captured-cookies file belongs to this entry alone and holds
         // the user's browser session: it must not outlive the entry
@@ -3252,8 +4055,14 @@ fn remove_download(
         }
         // IDM's delete confirmation offers "also delete the file":
         // only then does the downloaded data itself go (the plain
-        // list removal above always keeps it)
-        if delete_file.unwrap_or(false) {
+        // list removal above always keeps it). The finished half of
+        // that decision is the BACKEND's, taken from the entry's
+        // live truth — never from a status the caller cached: a
+        // batch delete keyed on the UI's stale "Paused" silently
+        // kept a finished 800 MB file the user had explicitly asked
+        // to delete (F-21). An unfinished entry's partial stays,
+        // exactly like a plain removal.
+        if delete_file.unwrap_or(false) && was_finished {
             if entry.kind == "video" {
                 let f = resolve_video_file(&entry);
                 let _ = std::fs::remove_file(&f);
@@ -3261,9 +4070,20 @@ fn remove_download(
                 let _ = std::fs::remove_file(&entry.out_path);
             }
         }
+        // the emit loop is stopped and the entry is leaving: its
+        // progress mirror must not survive it (the delete at the
+        // top of this command ran before the settle, when a last
+        // emit could still rewrite it — discard_entry does the
+        // same at its end)
+        delete_progress_file(&app, &id);
     }
     state.entries.lock().unwrap().remove(&id);
     state.order.lock().unwrap().retain(|x| x != &id);
+    // same removal signal discard_entry emits: this command is
+    // normally invoked BY the window (which drops the row itself),
+    // but the list must never depend on which path removed the
+    // entry (R3 X-REF)
+    let _ = app.emit("entry_removed", serde_json::json!({ "id": id }));
     persist(&state);
     pump_queue(&app);
     Ok(())
@@ -3420,8 +4240,7 @@ fn restart_app(app: AppHandle) {
 #[tauri::command]
 fn export_downloads(state: State<'_, AppState>) -> Result<String, String> {
     let items = list_downloads(state.clone());
-    let home = std::env::var("HOME").map_err(|_| "no home folder".to_string())?;
-    let dir = PathBuf::from(home).join("Downloads");
+    let dir = home_dir().join("Downloads");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join("ndm-downloads-export.json");
     let body = serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?;
@@ -3583,6 +4402,11 @@ fn take_pending_videos(state: State<'_, AppState>) -> Vec<serde_json::Value> {
     std::mem::take(&mut state.pending_videos.lock().unwrap())
 }
 
+#[tauri::command]
+fn take_pending_grabs(state: State<'_, AppState>) -> Vec<serde_json::Value> {
+    std::mem::take(&mut state.pending_grabs.lock().unwrap())
+}
+
 /// The user closed the video dialog without starting the download:
 /// the captured browser session for that link must not linger on disk.
 #[tauri::command]
@@ -3631,6 +4455,10 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         job.cancel();
     }
     entry.removed.store(true, Ordering::SeqCst); // stop a stray emit loop
+    // the refreshed entry restarts from byte 0: the bytes it already
+    // downloaded stay on the quota meter (the same accounting the
+    // remove paths use), or refreshing would refund spent budget
+    quota_note_removed(&state, &entry);
     let total = payload_of(&entry).total;
     let _ = std::fs::remove_file(ndm::state_path_for(&entry.out_path));
     let fresh = Arc::new(Entry {
@@ -3720,7 +4548,10 @@ async fn probe_file(
     let u2 = url_trimmed.clone();
     let probe = tauri::async_runtime::spawn_blocking(move || ndm::probe_with_auth(&u2, &auth))
         .await
-        .map_err(|e| format!("internal join error: {e}"))??;
+        .map_err(|e| format!("internal join error: {e}"))?
+        // a definitive server answer is reported as what it is,
+        // not as a reachability failure (N-07)
+        .map_err(|e| plain_server_error(&e))?;
     let suggested = probe
         .suggested_name
         .unwrap_or_else(|| file_name_for(&url_trimmed));
@@ -3749,29 +4580,24 @@ async fn probe_video(
         .map_err(|e| format!("internal join error: {e}"))?
 }
 
-fn unique_video_name(state: &AppState, dir: &Path, raw_title: &str) -> String {
+fn unique_video_name(state: &AppState, dir: &Path, raw_title: &str, audio: bool) -> String {
     let base_stem = video::safe_filename_stem(raw_title);
     if base_stem.is_empty() {
         return raw_title.trim().to_string();
     }
+    // A stem is taken only by this entry's OWN final filename: a
+    // same-stem file or live entry of the other kind (the video half
+    // of a download-all pair vs its audio half) writes a different
+    // filename and must not force a spurious "(1)" (R3-EXT-04).
     let taken = |cand: &str| -> bool {
-        for ext in ["mp4", "mp3", "m4a", "mkv", "webm"] {
-            if dir.join(format!("{cand}.{ext}")).exists() {
-                return true;
-            }
-            if dir
-                .join(format!(".{cand}.ndm_stream0.{ext}.part"))
-                .exists()
-            {
-                return true;
-            }
-        }
-        state.entries.lock().unwrap().values().any(|e| {
-            e.kind == "video"
-                && e.out_path == dir
-                && !e.removed.load(Ordering::Relaxed)
-                && (e.name == cand || video::safe_filename_stem(&e.name) == cand)
-        })
+        video::stem_taken_on_disk(dir, cand, audio)
+            || state.entries.lock().unwrap().values().any(|e| {
+                e.kind == "video"
+                    && e.audio == audio
+                    && e.out_path == dir
+                    && !e.removed.load(Ordering::Relaxed)
+                    && (e.name == cand || video::safe_filename_stem(&e.name) == cand)
+            })
     };
     if !taken(&base_stem) {
         return base_stem;
@@ -3831,10 +4657,22 @@ fn do_add_video(
                 && e.out_path == dir
                 && e.selector == selector
                 && e.audio == audio
-                && !matches!(
-                    payload_of(e).status.as_str(),
-                    "error" | "finished" | "cancelled"
-                )
+                // a FINISHED copy counts as a duplicate too
+                // (F-EXT-07): re-adding it used to slip past this
+                // check and silently re-download everything under a
+                // "(1)" name, so the browser card's "already in your
+                // download list" state could never appear. An
+                // ERRORED copy counts as well (R2-EXT-04): the
+                // caller surfaces the existing entry — the browser
+                // flyout shows its error with a Retry button —
+                // instead of silently minting a "(2)" copy that
+                // orphans the failed entry's partial progress. Only
+                // cancelled entries fall through: a cancel was a
+                // deliberate discard, so a fresh add is a fresh
+                // start. (Plain file downloads keep their
+                // rename-on-re-add behaviour in
+                // find_active_duplicate's callers.)
+                && !matches!(payload_of(e).status.as_str(), "cancelled")
         });
         if let Some(existing) = dupe {
             // IDM asks instead of silently refusing or duplicating:
@@ -3848,24 +4686,34 @@ fn do_add_video(
     } else {
         title.trim().to_string()
     };
-    let name = unique_video_name(state, &dir, &raw_name);
+    let name = unique_video_name(state, &dir, &raw_name, audio);
     let category = if audio {
         "Music".to_string()
     } else {
         "Video".to_string()
     };
     let id = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
-    let max = current_settings(state).max_simultaneous;
+    // a saved Site Login for this address applies to video
+    // downloads too: it is stored on the entry and travels into
+    // the job, which passes it to yt-dlp (--username/--password),
+    // so a login-gated page resolves the way a browser tab would
+    let (login, password) =
+        site_login_for(&current_settings(state), &url).unwrap_or_default();
+    let max = effective_cap(&current_settings(state), &queue);
     // A video that arrives while the engine itself is still
     // downloading waits in the queue like any other not-now download —
     // it must not be rejected for a condition the user cannot fix.
     let engine_missing = video::find_tool("yt-dlp", &state.components()).is_none();
+    // a Download Later aimed at a queue WITH an enabled schedule
+    // joins that schedule instead of parking (see later_entry_queued,
+    // R5-5a): created queued below, claimed by the pump at the window
+    let joins_schedule = later_entry_queued(later, queue_has_schedule(&current_settings(state), &queue));
     let should_wait = later
         || engine_missing
         || entry_blocks(state, &queue)
         || (max > 0 && count_active_for(state, &queue) >= max);
     if should_wait {
-        let initial_status = if later { "paused" } else { "queued" };
+        let initial_status = if later && !joins_schedule { "paused" } else { "queued" };
         let entry = Arc::new(Entry {
             id: id.clone(),
             name,
@@ -3888,7 +4736,7 @@ fn do_add_video(
                 status: initial_status.to_string(),
                 error: String::new(),
             })),
-            queued: AtomicBool::new(!later),
+            queued: AtomicBool::new(!later || joins_schedule),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
             emitting: AtomicBool::new(false),
             starting: AtomicBool::new(false),
@@ -3897,8 +4745,8 @@ fn do_add_video(
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(String::new()),
             queue: Mutex::new(queue.clone()),
-            login: String::new(),
-            password: String::new(),
+            login: login.clone(),
+            password: password.clone(),
             description: Mutex::new(String::new()),
             speed_limit: Mutex::new(0),
         });
@@ -3912,15 +4760,25 @@ fn do_add_video(
         persist(state);
         return Ok(id);
     }
-    let job = video::VideoJob::start(
+    let job = match video::VideoJob::start(
         &url,
         &dir,
         &selector,
         audio,
         &name,
         state.cookies_path(&cookies_token),
+        &login,
+        &password,
         &state.components(),
-    )?;
+    ) {
+        Ok(job) => job,
+        Err(e) => {
+            // the entry was never inserted: the add failed before
+            // it became a download, so its id number goes back too
+            release_entry_id(state, &id);
+            return Err(e);
+        }
+    };
     let initial_restored = if total_hint > 0 {
         Some(Restored {
             total: total_hint,
@@ -3957,8 +4815,8 @@ fn do_add_video(
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
         queue: Mutex::new(queue.clone()),
-        login: String::new(),
-        password: String::new(),
+        login,
+        password,
             description: Mutex::new(String::new()),
             speed_limit: Mutex::new(0),
     });
@@ -4132,6 +4990,27 @@ async fn grab_explore(
 }
 
 /// Rebuild the in-memory list from downloads.json + engine state files.
+/// A restored record that claims "finished" is only believed when
+/// the file it names is actually on disk at the recorded size
+/// (entry_is_finished is the authority). A claim that fails the
+/// check — the file was deleted, moved, or never really written —
+/// comes back as an honest error instead of a list row pointing
+/// at nothing (R2-EXT-05).
+fn demote_phantom_finished(entry: &Entry) {
+    if entry_is_finished(entry) {
+        return;
+    }
+    let mut r = entry.restored.lock().unwrap();
+    if let Some(rec) = r.as_mut() {
+        if rec.status == "finished" {
+            rec.status = "error".to_string();
+            rec.error =
+                "NDM recorded this download as finished, but its file is missing from the save folder."
+                    .to_string();
+        }
+    }
+}
+
 fn restore_saved(state: &AppState) {
     let path = state.data_file.lock().unwrap().clone();
     let raw = match std::fs::read(&path) {
@@ -4264,6 +5143,7 @@ fn restore_saved(state: &AppState) {
                 description: Mutex::new(s.description.clone()),
                 speed_limit: Mutex::new(s.speed_limit),
             });
+            demote_phantom_finished(&entry);
             state.entries.lock().unwrap().insert(s.id.clone(), entry);
             state.order.lock().unwrap().push(s.id.clone());
             continue;
@@ -4353,6 +5233,7 @@ fn restore_saved(state: &AppState) {
                 description: Mutex::new(s.description.clone()),
                 speed_limit: Mutex::new(s.speed_limit),
         });
+        demote_phantom_finished(&entry);
         state.entries.lock().unwrap().insert(s.id.clone(), entry);
         state.order.lock().unwrap().push(s.id.clone());
     }
@@ -4436,23 +5317,88 @@ fn write_ack_and_result(handle: &AppHandle, ack_id: Option<&str>, result: serde_
     let _ = std::fs::write(ack_dir.join(format!("{id}.ack")), b"ok");
 }
 
-fn prune_acks(queue_dir: &Path) {
+/// Mirror one entry's payload into <app data>/progress/<id>.json —
+/// the file the native host reads back for the browser panel's live
+/// progress card (the app's own "progress" event stream is not
+/// visible outside the app). Only the fields the card renders are
+/// written; eta_secs is derived here because the payload itself
+/// carries no ETA (0 = unknown, which the card renders as absent).
+fn write_progress_file(handle: &AppHandle, payload: &ProgressPayload) {
+    let Some(id) = sanitize_ack_id(&payload.id) else {
+        return;
+    };
+    let Ok(base) = handle.path().app_data_dir() else {
+        return;
+    };
+    let dir = base.join("progress");
+    let _ = std::fs::create_dir_all(&dir);
+    let eta_secs = if payload.speed_bps > 0.0 && payload.total > payload.done_bytes {
+        ((payload.total - payload.done_bytes) as f64 / payload.speed_bps).ceil() as u64
+    } else {
+        0
+    };
+    let body = serde_json::json!({
+        "status": payload.status,
+        "done_bytes": payload.done_bytes,
+        "total": payload.total,
+        "rate_bps": payload.speed_bps,
+        "eta_secs": eta_secs,
+        "error": payload.error,
+    });
+    let _ = std::fs::write(dir.join(format!("{id}.json")), body.to_string());
+}
+
+/// Remove one entry's browser-panel progress mirror: once the entry
+/// is gone, a leftover file keeps answering the host's progress
+/// queries with a phantom live download for minutes (F-EXT-08).
+fn delete_progress_file(app: &AppHandle, id: &str) {
+    let Some(id) = sanitize_ack_id(id) else {
+        return;
+    };
+    if let Ok(base) = app.path().app_data_dir() {
+        let _ = std::fs::remove_file(base.join("progress").join(format!("{id}.json")));
+    }
+}
+
+fn prune_stale_files(dir: &Path, max_age_secs: u64) {
     let now = std::time::SystemTime::now();
-    for sub in ["acks", "results"] {
-        if let Ok(rd) = std::fs::read_dir(queue_dir.join(sub)) {
-            for e in rd.flatten() {
-                let stale = e
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| now.duration_since(t).ok())
-                    .map(|d| d.as_secs() > 120)
-                    .unwrap_or(false);
-                if stale {
-                    let _ = std::fs::remove_file(e.path());
-                }
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let stale = e
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|d| d.as_secs() > max_age_secs)
+                .unwrap_or(false);
+            if stale {
+                let _ = std::fs::remove_file(e.path());
             }
         }
+    }
+}
+
+fn prune_acks(queue_dir: &Path) {
+    for sub in ["acks", "results"] {
+        prune_stale_files(&queue_dir.join(sub), 120);
+    }
+    // browser-panel progress mirrors: a live entry's file is
+    // rewritten ~twice a second while it downloads, so a file
+    // untouched for 120 s belongs to an entry nobody polls anymore
+    prune_stale_files(&queue_dir.join("progress"), 120);
+    // captured browser sessions whose dialog was never acted on:
+    // a day is far longer than any dialog sits open, and a live
+    // session file must not linger on disk indefinitely
+    prune_stale_files(&queue_dir.join("cookies"), 24 * 3600);
+}
+
+/// Delete a captured browser-session file whose incoming path is
+/// returning WITHOUT handing the token to an entry or a dialog:
+/// left behind, live session files would accumulate in the cookies
+/// folder forever (the periodic 24 h prune is only the backstop).
+fn drop_cookies_token(state: &AppState, token: &str) {
+    if let Some(p) = state.cookies_path(token) {
+        let _ = std::fs::remove_file(p);
     }
 }
 
@@ -4469,18 +5415,28 @@ fn prune_acks(queue_dir: &Path) {
 /// dialog was open: IDM consumes the click, so nothing of the
 /// download may remain. (Deliberately different from removing a row
 /// in the app, which keeps the user's partial file.)
-fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
-    entry.removed.store(true, Ordering::SeqCst);
-    state.retries.lock().unwrap().remove(&entry.id);
-    quota_note_removed(state, entry);
+/// Cancel an entry's engine/job and wait until they have fully
+/// stopped — every shutdown write (the engine's final resume-state
+/// save, the job's last progress update) has landed, so a file
+/// sweep that follows cannot be raced by a last-moment rewrite.
+/// Shared by every removal path: sweeping while the engine is
+/// still winding down is exactly how orphan journals and stream
+/// parts survived deletes (R3). A paused engine's workers are
+/// already gone — nothing is left to write, so there is nothing
+/// to wait for on that side.
+fn settle_entry_engines(entry: &Entry) {
     if let Some(dl) = &entry.download {
         dl.control.cancel();
-        // wait for the engine to actually stop: its shutdown writes
-        // the resume state one last time, and deleting the files
-        // before that would leave an orphan state file behind (a
-        // later download of the same name could trust stale blocks)
-        for _ in 0..40 {
-            if dl.is_terminal() {
+        // Wait for SETTLED, not merely terminal: the engine's
+        // supervisor publishes the terminal status FIRST and only
+        // then syncs the file and writes the final resume state,
+        // so a terminal-only wait let the sweeps race that last
+        // write — the journal reappeared after the delete, on the
+        // app path and the extension Cancel path alike (R4 item
+        // 2). The cap only guards a pathological engine; on expiry
+        // the sweeps below still run, exactly as before.
+        for _ in 0..100 {
+            if dl.is_settled() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -4488,12 +5444,24 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
     }
     if let Some(job) = &entry.video {
         job.cancel();
+        for _ in 0..100 {
+            let st = job.progress.lock().unwrap().status.clone();
+            if matches!(st.as_str(), "cancelled" | "error" | "finished") && job.is_settled() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
-    state.entries.lock().unwrap().remove(&entry.id);
-    state.order.lock().unwrap().retain(|x| x != &entry.id);
-    // the engine's final state write can land just after the cancel:
-    // keep removing the resume state until it stays gone, so no
-    // orphan survives to be trusted by a future same-name download
+}
+
+/// Remove an entry's engine resume-state file, and keep removing
+/// it until it stays gone: an engine that was mid-flight when the
+/// removal began writes its state one last time on the way out,
+/// and a single-pass removal loses that race — the surviving
+/// journal then makes unique_out_path treat the name as taken
+/// forever (phantom "(1)" names on re-add). Callers settle the
+/// engines first; this loop is the post-settle final sweep.
+fn sweep_engine_state_file(entry: &Entry) {
     let sp = ndm::state_path_for(&entry.out_path);
     for _ in 0..20 {
         let _ = std::fs::remove_file(&sp);
@@ -4505,40 +5473,160 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
             }
         }
     }
-    if entry.kind == "video" && payload_of(entry).status != "finished" {
-        // sweep this video's part files from its folder — STRICTLY
-        // its own intermediates. The old pattern (stem prefix + any
-        // ".f" anywhere) could delete FINISHED, unrelated user files:
-        // a video titled "my.film" has stem "my", and the completed
-        // "my.film.mp4" itself matched. Only the engine's hidden
-        // parts and yt-dlp's "{stem}.f<digits>.*.part" files go.
-        let stem = entry
-            .name
-            .rsplit_once('.')
-            .map(|(s, _)| s.to_string())
-            .unwrap_or_else(|| entry.name.clone());
+}
+
+/// Sweep a video entry's intermediate files from its save folder —
+/// STRICTLY its own intermediates. The old pattern (stem prefix +
+/// any ".f" anywhere) could delete FINISHED, unrelated user files:
+/// a video titled "my.film" has stem "my", and the completed
+/// "my.film.mp4" itself matched. Only the engine's hidden parts
+/// and yt-dlp's "{stem}.f<digits>.*.part" files go. The engine
+/// parts' resume-state files (".…ndm_stream0.mp4.part.ndm.json")
+/// match the same prefix and go too — a single immediate pass
+/// used to miss them because the job's engines write their final
+/// state on the way out, AFTER the sweep had already run
+/// (F-EXT-08), so the sweep repeats until a full pass finds
+/// nothing left to remove.
+fn sweep_video_temps(entry: &Entry) {
+    let raw_stem = entry
+        .name
+        .rsplit_once('.')
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| entry.name.clone());
+    let job_stem = video::safe_filename_stem(&entry.name);
+    let stems: Vec<&str> = if job_stem.is_empty() || job_stem == raw_stem {
+        vec![raw_stem.as_str()]
+    } else {
+        vec![raw_stem.as_str(), job_stem.as_str()]
+    };
+    for pass in 0..10 {
+        let mut removed_any = false;
         if let Ok(rd) = std::fs::read_dir(&entry.out_path) {
             for f in rd.flatten() {
                 let n = f.file_name().to_string_lossy().to_string();
-                let engine_part = n.starts_with(&format!(".{stem}.ndm_stream"));
-                let ytdlp_part = n.ends_with(".part")
-                    && n
-                        .strip_prefix(&format!("{stem}.f"))
-                        .map(|rest| {
-                            rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                if engine_part || ytdlp_part {
-                    let _ = std::fs::remove_file(f.path());
+                let engine_part = stems
+                    .iter()
+                    .any(|s| n.starts_with(&format!(".{s}.ndm_stream")));
+                // the audio-pairing temps (the fetched rendition
+                // and the mux output), if the removal landed
+                // mid-pairing
+                let mux_temp = stems
+                    .iter()
+                    .any(|s| n.starts_with(&format!(".{s}.ndm_mux")));
+                let pair_temp = stems
+                    .iter()
+                    .any(|s| n.starts_with(&format!(".{s}.ndm_audio")));
+                // yt-dlp working files: "{stem}.f<digits>…" for
+                // split formats AND "{stem}.<ext>…" for the
+                // single-format template, as .part OR .ytdl — the
+                // old pattern knew only the first shape and only
+                // .part, so .ytdl files and single-format parts
+                // survived the sweep (F-EXT-08)
+                let ytdlp_part = (n.ends_with(".part") || n.ends_with(".ytdl"))
+                    && stems.iter().any(|s| {
+                        let split = n
+                            .strip_prefix(&format!("{s}.f"))
+                            .map(|rest| {
+                                rest.chars()
+                                    .next()
+                                    .map(|c| c.is_ascii_digit())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        let single = n
+                            .strip_prefix(&format!("{s}."))
+                            .map(|rest| {
+                                ["mp4", "m4a", "mp3", "webm", "mkv", "ts"].iter().any(|e| {
+                                    rest == *e || rest.starts_with(&format!("{e}."))
+                                })
+                            })
+                            .unwrap_or(false);
+                        split || single
+                    });
+                if engine_part || mux_temp || pair_temp || ytdlp_part {
+                    removed_any = std::fs::remove_file(f.path()).is_ok() || removed_any;
                 }
             }
         }
-    } else if payload_of(entry).status != "finished" {
+        if !removed_any && pass >= 2 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
+    // a finished download is the user's completed file, not a
+    // dialog session: the browser dialog's Cancel/Esc arriving
+    // after the download already finished must never delete its
+    // list entry while the file stays on disk (F-EXT-12). No-op —
+    // the caller still answers ok, and the entry (and file) stay.
+    if entry_is_finished(entry) {
+        return;
+    }
+    // A video job SETTLES before anything is removed. Its engine
+    // streams write their resume state on the way out; sweeping
+    // immediately raced those final writes and an orphan sidecar
+    // survived on disk (F-EXT-08) — the HTTP branch below already
+    // waits for its engine the same way. And if the job finishes
+    // during the wait, the finish has WON against the cancel: the
+    // discard aborts with nothing touched, under the same rule as
+    // the finished guard above (R2-EXT-05).
+    if entry.video.is_some() {
+        settle_entry_engines(entry);
+        if entry_is_finished(entry) {
+            return;
+        }
+    }
+    entry.removed.store(true, Ordering::SeqCst);
+    state.retries.lock().unwrap().remove(&entry.id);
+    quota_note_removed(state, entry);
+    if entry.download.is_some() {
+        // wait for the engine to actually stop: its shutdown writes
+        // the resume state one last time, and deleting the files
+        // before that would leave an orphan state file behind (a
+        // later download of the same name could trust stale blocks)
+        settle_entry_engines(entry);
+    }
+    state.entries.lock().unwrap().remove(&entry.id);
+    state.order.lock().unwrap().retain(|x| x != &entry.id);
+    // the engine's final state write can land just after the
+    // cancel: the sweep keeps removing the resume state until it
+    // stays gone, so no orphan survives to be trusted by a future
+    // same-name download
+    sweep_engine_state_file(entry);
+    if entry.kind == "video" && !entry_is_finished(entry) {
+        // the file the job itself produced and recorded — e.g. a
+        // merge kept for a resume that will now never come — is
+        // this download's own output, and a discard leaves nothing
+        // of the download behind. (A FINISHED download never
+        // reaches this sweep: the guards above return first.)
+        if let Some(job) = &entry.video {
+            if let Some(fp) = job.progress.lock().unwrap().final_path.clone() {
+                let _ = std::fs::remove_file(&fp);
+            }
+        }
+        sweep_video_temps(entry);
+    } else if !entry_is_finished(entry) {
         let _ = std::fs::remove_file(&entry.out_path);
     }
     if let Some(p) = state.cookies_path(&entry.cookies) {
         let _ = std::fs::remove_file(p);
     }
+    // the entry is gone: its progress mirror must go too, or the
+    // browser panel keeps reporting a phantom live download (F-EXT-08)
+    delete_progress_file(app, &entry.id);
+    // the window's list is add-only — it merges progress events
+    // and list_downloads pulls, and rows leave it only through
+    // this event. A discard arrives from the browser (host path),
+    // behind the window's back: without the signal the row stayed
+    // behind as a ghost, counted in the list while downloads.json
+    // no longer held the entry (R3 X-REF). The listener contract:
+    // payload { "id": <entry id> } — drop that row.
+    let _ = app.emit(
+        "entry_removed",
+        serde_json::json!({ "id": entry.id }),
+    );
     persist(state);
     pump_queue(app);
 }
@@ -4554,19 +5642,34 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
         return;
     }
-    if kind == "pause_entry" || kind == "cancel_entry" {
+    if kind == "pause_entry" || kind == "cancel_entry" || kind == "resume_entry" {
         // the browser dialog's Later / Cancel for a download that
-        // started while the dialog was open
+        // started while the dialog was open, and the panel progress
+        // card's Pause / Resume / Cancel
         let entry_id = v["entry"].as_str().unwrap_or("");
         let state = handle.state::<AppState>();
         let result = match state.get(entry_id) {
             Some(entry) => {
                 if kind == "pause_entry" {
                     let _ = pause_download(handle.clone(), state, entry_id.to_string());
-                } else {
+                    serde_json::json!({ "ok": true })
+                } else if kind == "cancel_entry" {
                     discard_entry(handle, &state, &entry);
+                    serde_json::json!({ "ok": true })
+                } else {
+                    // the SAME resume the app's own Resume button
+                    // runs — no second implementation to drift. This
+                    // handler runs on the queue-drain thread (never
+                    // inside a runtime task), so block_on is safe.
+                    match tauri::async_runtime::block_on(resume_download(
+                        handle.clone(),
+                        state,
+                        entry_id.to_string(),
+                    )) {
+                        Ok(()) => serde_json::json!({ "ok": true }),
+                        Err(e) => serde_json::json!({ "ok": false, "error": e }),
+                    }
                 }
-                serde_json::json!({ "ok": true })
             }
             None => serde_json::json!({ "ok": false, "error": "no such entry" }),
         };
@@ -4626,7 +5729,11 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         let later = v["later"].as_bool().unwrap_or(false);
         let total_hint = v["total"].as_u64().unwrap_or(0);
         let title = v["title"].as_str().unwrap_or("").to_string();
-        let cookies_opt = if token.is_empty() { None } else { Some(token) };
+        let cookies_opt = if token.is_empty() {
+            None
+        } else {
+            Some(token.clone())
+        };
         let force = v["force"].as_bool().unwrap_or(false);
         match do_add_video(
             handle,
@@ -4647,11 +5754,14 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
                 ack_id.as_deref(),
                 serde_json::json!({ "ok": true, "id": entry_id }),
             ),
-            Err(err) => write_ack_and_result(
-                handle,
-                ack_id.as_deref(),
-                serde_json::json!({ "ok": false, "error": err }),
-            ),
+            Err(err) => {
+                drop_cookies_token(&state, &token);
+                write_ack_and_result(
+                    handle,
+                    ack_id.as_deref(),
+                    serde_json::json!({ "ok": false, "error": err }),
+                );
+            }
         }
         return;
     }
@@ -4659,6 +5769,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         // Run silently in the background — NEVER steal focus from the browser!
         let state = handle.state::<AppState>();
         if state.update_required.load(Ordering::SeqCst) {
+            drop_cookies_token(&state, &token);
             write_ack_and_result(
                 handle,
                 ack_id.as_deref(),
@@ -4682,6 +5793,32 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         // points at the entry that is already there (no second copy)
         if !v["force"].as_bool().unwrap_or(false) {
             if let Some(existing) = find_active_duplicate(&state, "http", url) {
+                drop_cookies_token(&state, &token);
+                write_ack_and_result(
+                    handle,
+                    ack_id.as_deref(),
+                    serde_json::json!({ "ok": true, "id": existing, "dupe": true }),
+                );
+                return;
+            }
+            // a FINISHED copy counts too (R2-EXT-07): the context
+            // menu path used to re-download it as "(1)" with no
+            // word — the existing entry is the answer here as well
+            if let Some(existing) = find_finished_duplicate(&state, "http", url) {
+                drop_cookies_token(&state, &token);
+                write_ack_and_result(
+                    handle,
+                    ack_id.as_deref(),
+                    serde_json::json!({ "ok": true, "id": existing, "dupe": true }),
+                );
+                return;
+            }
+            // an ERRORED copy counts too (R2-EXT-04): the flyout
+            // renders the existing entry's error with a Retry
+            // button — a silent "(2)" re-add would orphan the
+            // failed entry's partial progress instead
+            if let Some(existing) = find_errored_duplicate(&state, "http", url) {
+                drop_cookies_token(&state, &token);
                 write_ack_and_result(
                     handle,
                     ack_id.as_deref(),
@@ -4704,10 +5841,21 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         ) {
             Ok(stub) => {
                 let entry_id = stub.id.clone();
-                let max = current_settings(&state).max_simultaneous;
-                let must_wait = later
-                    || entry_blocks(&state, &entry_queue(&stub))
-                    || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
+                let max = effective_cap(&current_settings(&state), &entry_queue(&stub));
+                // the same gate + slot pre-claim discipline as the
+                // dialog path: several catches landing in one drain
+                // batch used to all pass the cap check before any of
+                // them became visible to the counter
+                let must_wait = {
+                    let _gate = START_GATE.lock().unwrap();
+                    let wait = later
+                        || entry_blocks(&state, &entry_queue(&stub))
+                        || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
+                    if !wait {
+                        stub.slot_preclaimed.store(true, Ordering::SeqCst);
+                    }
+                    wait
+                };
                 if must_wait {
                     if later {
                         stub.queued.store(false, Ordering::Relaxed);
@@ -4721,6 +5869,27 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
                         });
                     } else {
                         stub.queued.store(true, Ordering::Relaxed);
+                        // the browser's size hint rides along so a
+                        // queued catch shows its size, not "Unknown"
+                        // (F-03, same rule as the dialog path). The
+                        // record is written even with NO hint: a
+                        // queued catch whose only trace was the flag
+                        // never reached downloads.json and was lost
+                        // on restart (battery19 t1/t3) — persist
+                        // also keeps flag-only queued entries now,
+                        // and the record keeps memory and disk in
+                        // the same shape.
+                        let mut r = stub.restored.lock().unwrap();
+                        if r.is_none() {
+                            *r = Some(Restored {
+                                total: total_hint,
+                                done_bytes: 0,
+                                blocks: Vec::new(),
+                                resumable: true,
+                                status: "queued".to_string(),
+                                error: String::new(),
+                            });
+                        }
                     }
                     let _ = handle.emit("progress", payload_of(&stub));
                     persist(&state);
@@ -4734,6 +5903,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
                 );
             }
             Err(err) => {
+                drop_cookies_token(&state, &token);
                 write_ack_and_result(
                     handle,
                     ack_id.as_deref(),
@@ -4741,6 +5911,25 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
                 );
             }
         }
+        return;
+    }
+    if kind == "grab" {
+        // "Download all links" from the browser: open the in-app
+        // Site Grabber preloaded with this page (the grab
+        // counterpart of the video/file dialog kinds below)
+        raise_main_window(handle);
+        let state = handle.state::<AppState>();
+        // a grab starts no download itself, so a captured session
+        // file has no consumer on this path and must not linger
+        drop_cookies_token(&state, &token);
+        let payload = serde_json::json!({
+            "url": url,
+            "pageUrl": v["pageUrl"].as_str().unwrap_or(""),
+            "title": v["title"].as_str().unwrap_or(""),
+        });
+        state.pending_grabs.lock().unwrap().push(payload.clone());
+        let _ = handle.emit("incoming_grab", payload);
+        write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
         return;
     }
     if kind == "video" {
@@ -4797,8 +5986,9 @@ fn write_if_changed(path: &Path, body: &str) {
 }
 
 /// Connect the browser extension with zero terminal steps: on every
-/// start, (re)write the native-messaging host manifests for each
-/// browser config present, using the extension's fixed ID (pinned by
+/// start, (re)write the native-messaging host manifests for every
+/// known browser (creating the config dirs when needed), using the
+/// extension's fixed ID (pinned by
 /// the public key in its manifest). Idempotent; all errors ignored —
 /// the ndm-setup-browser command remains as a manual fallback.
 fn register_native_hosts() {
@@ -4813,39 +6003,41 @@ fn register_native_hosts() {
     // containing a quote or backslash must not corrupt the manifest
     let chrome = serde_json::json!({
         "name": "com.ndm.host",
-        "description": "NDM — Nill Download Manager native messaging host",
+        "description": "Nill Download Manager native messaging host",
         "path": host,
         "type": "stdio",
         "allowed_origins": ["chrome-extension://njjmngpfmblaghapeenfdfkahhdocbic/"],
     })
     .to_string();
+    // create the NativeMessagingHosts directories unconditionally
+    // (F-EXT-06): writing only into config dirs that already exist
+    // silently skipped every browser the user had not launched yet —
+    // on a fresh machine the app ran, "registered", and the extension
+    // still reported the host missing, sending the user in a circle.
+    // write_if_changed creates the parent dirs itself.
     for cfg in [
         "google-chrome", "google-chrome-beta", "chromium", "chromium-browser",
         "BraveSoftware/Brave-Browser", "microsoft-edge", "vivaldi", "opera",
     ] {
         let base = config.join(cfg);
-        if base.is_dir() {
-            write_if_changed(
-                &base.join("NativeMessagingHosts").join("com.ndm.host.json"),
-                &chrome,
-            );
-        }
-    }
-    let moz = home.join(".mozilla");
-    if moz.is_dir() {
-        let firefox = serde_json::json!({
-            "name": "com.ndm.host",
-            "description": "NDM — Nill Download Manager native messaging host",
-            "path": host,
-            "type": "stdio",
-            "allowed_extensions": ["ndm@nill.download"],
-        })
-        .to_string();
         write_if_changed(
-            &moz.join("native-messaging-hosts").join("com.ndm.host.json"),
-            &firefox,
+            &base.join("NativeMessagingHosts").join("com.ndm.host.json"),
+            &chrome,
         );
     }
+    let moz = home.join(".mozilla");
+    let firefox = serde_json::json!({
+        "name": "com.ndm.host",
+        "description": "Nill Download Manager native messaging host",
+        "path": host,
+        "type": "stdio",
+        "allowed_extensions": ["ndm@nill.download"],
+    })
+    .to_string();
+    write_if_changed(
+        &moz.join("native-messaging-hosts").join("com.ndm.host.json"),
+        &firefox,
+    );
 }
 
 fn main() {
@@ -4866,12 +6058,30 @@ fn main() {
             quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
+            pending_grabs: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+        })
+        .on_window_event(|window, event| {
+            // N-12: closing the main window IS the user leaving —
+            // there is no tray and no close-to-tray mode anywhere
+            // in the app. Tauri only requests an exit when its
+            // window map becomes EMPTY, and the hidden drop-basket
+            // window keeps that map non-empty forever, so closing
+            // main used to leave a windowless zombie process (its
+            // WebKit children, bridge sockets and "downloading"
+            // claims all alive) with no visible way back. An
+            // explicit close of the main window now exits fully,
+            // exactly like File → Exit / Ctrl+Q (quit_app).
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { .. } = event {
+                    window.app_handle().exit(0);
+                }
+            }
         })
         .setup(|app| {
             if let Some(w) = app.get_webview_window("main") {
@@ -5020,6 +6230,18 @@ fn main() {
                             pump_queue(&handle4);
                         }
                     }
+                    // the periodic promoter (F-18): queued entries
+                    // are re-offered to the pump on every tick, not
+                    // only when some unrelated event happens to pump —
+                    // a queue whose moment was missed (a transient
+                    // block, a wedged neighbour holding a cap slot)
+                    // still drains on its own. The pump honours each
+                    // queue's window, the quota and the caps, and it
+                    // claims queued entries regardless of whether
+                    // their size is known yet — the start path probes
+                    // anyway, so an unknown total is never a reason
+                    // to leave an entry sitting in "Queued".
+                    pump_queue(&handle4);
                     // per-queue scheduler windows (IDM's Scheduler):
                     // each queue starts at its window opening and
                     // pauses (re-queued) at its close
@@ -5035,7 +6257,13 @@ fn main() {
                             // the window governs again; the manual
                             // override for this queue ends
                             state.sched_override.lock().unwrap().remove(&cfg.name);
-                            if s.max_simultaneous == 0 && !quota_blocks(&state) {
+                            // parked Download-Later entries join the
+                            // queue before it starts (R5-5a) — also
+                            // the catch-all for entries restored from
+                            // disk parked, which no add/move/settings
+                            // path has touched this session
+                            adopt_parked_entries(&handle4, &state, &s, &cfg.name);
+                            if effective_cap(&s, &cfg.name) == 0 && !quota_blocks(&state) {
                                 // start-all respects Download limits:
                                 // an exhausted quota is not overridden
                                 // by a queue window opening
@@ -5209,6 +6437,7 @@ fn main() {
             refresh_url,
             take_pending_videos,
             take_pending_files,
+            take_pending_grabs,
             components_status,
             ensure_components,
             app_version,
@@ -5226,6 +6455,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_download_verdicts_are_permanent_for_auto_retry() {
+        // R2-EXT-03 / N-10: these errors re-downloading the same
+        // bytes cannot change — they must never enter the retry map
+        assert!(error_is_permanent(
+            "the merged file is much smaller than what was downloaded (79165 of 100663296 bytes) — the source streams may be incomplete"
+        ));
+        assert!(error_is_permanent(
+            "the video and audio downloaded but could not be merged into one playable file — merging needs ffmpeg. Reinstall NDM with apt (ffmpeg is a package dependency), then try again"
+        ));
+        // transient failures still retry
+        assert!(!error_is_permanent("probe failed: connection timed out"));
+        assert!(!error_is_permanent("the server closed the connection early"));
+    }
+
+    #[test]
+    fn server_answers_are_translated_not_blamed_on_the_connection() {
+        // N-07: the probe's raw wording for a definitive HTTP answer
+        let raw = "probe failed: http://127.0.0.1:8951/master.m3u8: status code 404";
+        let plain = plain_server_error(raw);
+        assert!(plain.contains("404"), "{plain}");
+        // the dialog maps these trigger words to "could not reach
+        // that address" — the translation must contain none of them
+        let lower = plain.to_lowercase();
+        for trigger in ["probe", "connect", "network", "timeout", "timed out", "dns", "refused"] {
+            assert!(!lower.contains(trigger), "{plain} contains {trigger}");
+        }
+        // transport failures pass through untouched
+        let transport = "probe failed: http://x.test/f.bin: Connection Failed";
+        assert_eq!(plain_server_error(transport), transport);
+    }
 
     #[test]
     fn settings_preserve_user_connections_8_and_16_across_restarts() {
@@ -5253,6 +6514,7 @@ mod tests {
             quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
+            pending_grabs: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
@@ -5380,6 +6642,7 @@ mod tests {
             quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
+            pending_grabs: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
@@ -5433,6 +6696,319 @@ mod tests {
         assert!(!text.contains("\"status\":\"paused\""));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn restored_entry(name: &str, kind: &str, total: u64, out_path: PathBuf) -> Entry {
+        Entry {
+            id: "dl-1".to_string(),
+            name: name.to_string(),
+            url: "https://example.com/f".to_string(),
+            out_path,
+            category: "General".to_string(),
+            added: "2026-10-30 12:00".to_string(),
+            download: None,
+            video: None,
+            kind: kind.to_string(),
+            selector: String::new(),
+            cookies: String::new(),
+            referer: String::new(),
+            audio: false,
+            restored: Mutex::new(Some(Restored {
+                total,
+                done_bytes: total,
+                blocks: Vec::new(),
+                resumable: true,
+                status: "finished".to_string(),
+                error: String::new(),
+            })),
+            queued: AtomicBool::new(false),
+            sample: Mutex::new((Instant::now(), 0, 0.0)),
+            emitting: AtomicBool::new(false),
+            starting: AtomicBool::new(false),
+            slot_preclaimed: AtomicBool::new(false),
+            removed: AtomicBool::new(false),
+            pause_requested: AtomicBool::new(false),
+            completion: Mutex::new(String::new()),
+            queue: Mutex::new(String::new()),
+            login: String::new(),
+            password: String::new(),
+            description: Mutex::new(String::new()),
+            speed_limit: Mutex::new(0),
+        }
+    }
+
+    #[test]
+    fn restored_finished_claim_needs_the_file_on_disk() {
+        // R3 (restart phantom-finished): a restored record that
+        // claims "finished" is only believed when the file is
+        // really on disk at the recorded size — the stored status
+        // alone used to be trusted, so a file deleted while the
+        // app was closed restored as "Finished" and the demote
+        // below could never fire.
+        let dir = std::env::temp_dir().join(format!("ndm-phantom-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("movie.mp4");
+
+        // file deleted while the app was closed → NOT finished,
+        // and the demote turns the record into an honest error
+        let entry = restored_entry("movie.mp4", "http", 5, file.clone());
+        assert!(!entry_is_finished(&entry));
+        demote_phantom_finished(&entry);
+        let guard = entry.restored.lock().unwrap();
+        let rec = guard.as_ref().unwrap();
+        assert_eq!(rec.status, "error");
+        assert!(rec.error.contains("missing"));
+        drop(guard);
+
+        // file present at the recorded size → finished, demote
+        // leaves the record alone
+        std::fs::write(&file, b"12345").unwrap();
+        let entry = restored_entry("movie.mp4", "http", 5, file.clone());
+        assert!(entry_is_finished(&entry));
+        demote_phantom_finished(&entry);
+        assert_eq!(
+            entry.restored.lock().unwrap().as_ref().unwrap().status,
+            "finished"
+        );
+
+        // file present but truncated (HTTP is exact) → not finished
+        std::fs::write(&file, b"123").unwrap();
+        let entry = restored_entry("movie.mp4", "http", 5, file.clone());
+        assert!(!entry_is_finished(&entry));
+
+        // video tolerance: a merged file smaller than the recorded
+        // total still counts (the record can predate the finalize
+        // step that rewrites the total to the merged size)
+        let vfile = dir.join("clip.mp4");
+        std::fs::write(&vfile, b"123").unwrap();
+        let entry = restored_entry("clip.mp4", "video", 5, dir.clone());
+        assert!(entry_is_finished(&entry));
+        // …but a missing video file never does
+        let _ = std::fs::remove_file(&vfile);
+        let entry = restored_entry("clip.mp4", "video", 5, dir.clone());
+        assert!(!entry_is_finished(&entry));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn release_entry_id_only_reclaims_the_high_water_mark() {
+        // R3 (failed adds burn ids): a failed add hands its number
+        // back only while it is still the counter's latest — a
+        // later mint (another entry, a cookies token) keeps it.
+        let state = AppState {
+            entries: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
+            seq: AtomicU64::new(1),
+            data_file: Mutex::new(PathBuf::new()),
+            components_dir: Mutex::new(PathBuf::new()),
+            cookies_dir: Mutex::new(PathBuf::new()),
+            save_lock: Mutex::new(()),
+            settings: Mutex::new(Settings::default()),
+            settings_file: Mutex::new(PathBuf::new()),
+            sched_override: Mutex::new(std::collections::HashSet::new()),
+            quota_state: Mutex::new((0, 0, false)),
+            quota_removed: Mutex::new(0),
+            quota_file: Mutex::new(PathBuf::new()),
+            pending_videos: Mutex::new(Vec::new()),
+            pending_files: Mutex::new(Vec::new()),
+            pending_grabs: Mutex::new(Vec::new()),
+            components_busy: AtomicBool::new(false),
+            pending_update: Mutex::new(None),
+            update_required: AtomicBool::new(false),
+            update_busy: AtomicBool::new(false),
+            retries: Mutex::new(HashMap::new()),
+            had_active: AtomicBool::new(false),
+        };
+        let mint = |st: &AppState| st.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        // mint dl-2, release it → the next mint reuses 2
+        assert_eq!(mint(&state), 2);
+        release_entry_id(&state, "dl-2");
+        assert_eq!(mint(&state), 2);
+        // mint dl-3 on top: dl-2 is no longer the high-water mark
+        assert_eq!(mint(&state), 3);
+        release_entry_id(&state, "dl-2");
+        assert_eq!(state.seq.load(Ordering::Relaxed), 3);
+        // releasing the actual high-water mark still works
+        release_entry_id(&state, "dl-3");
+        assert_eq!(state.seq.load(Ordering::Relaxed), 2);
+        // foreign id shapes are ignored
+        release_entry_id(&state, "ck9");
+        assert_eq!(state.seq.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn persist_skips_unborn_placeholder_stubs() {
+        // R3 (failed adds): a registered stub whose first start is
+        // still in flight must never reach downloads.json — a
+        // crash mid-probe would restore it as a total=0 phantom.
+        // The moment it has a restored record it persists normally.
+        let dir = std::env::temp_dir().join(format!("ndm-unborn-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+
+        let state = AppState {
+            entries: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
+            seq: AtomicU64::new(1),
+            data_file: Mutex::new(data_file.clone()),
+            components_dir: Mutex::new(PathBuf::new()),
+            cookies_dir: Mutex::new(PathBuf::new()),
+            save_lock: Mutex::new(()),
+            settings: Mutex::new(Settings::default()),
+            settings_file: Mutex::new(PathBuf::new()),
+            sched_override: Mutex::new(std::collections::HashSet::new()),
+            quota_state: Mutex::new((0, 0, false)),
+            quota_removed: Mutex::new(0),
+            quota_file: Mutex::new(PathBuf::new()),
+            pending_videos: Mutex::new(Vec::new()),
+            pending_files: Mutex::new(Vec::new()),
+            pending_grabs: Mutex::new(Vec::new()),
+            components_busy: AtomicBool::new(false),
+            pending_update: Mutex::new(None),
+            update_required: AtomicBool::new(false),
+            update_busy: AtomicBool::new(false),
+            retries: Mutex::new(HashMap::new()),
+            had_active: AtomicBool::new(false),
+        };
+
+        let stub = restored_entry("f.bin", "http", 0, dir.join("f.bin"));
+        *stub.restored.lock().unwrap() = None;
+        let stub = Arc::new(stub);
+        state
+            .entries
+            .lock()
+            .unwrap()
+            .insert("dl-1".to_string(), stub.clone());
+        state.order.lock().unwrap().push("dl-1".to_string());
+
+        persist(&state);
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(!text.contains("dl-1"), "placeholder persisted: {text}");
+
+        *stub.restored.lock().unwrap() = Some(Restored {
+            total: 0,
+            done_bytes: 0,
+            blocks: Vec::new(),
+            resumable: true,
+            status: "paused".to_string(),
+            error: String::new(),
+        });
+        persist(&state);
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(text.contains("dl-1"), "real entry missing: {text}");
+
+        // battery19 t1/t3: a deliberately QUEUED entry is a resolved
+        // state, not an unborn placeholder — with no handle and no
+        // restored record (a catch that carried no size hint) it
+        // must still be persisted, as "queued", the moment it is
+        // queued, so it survives a restart and the startup pump
+        // can start it.
+        let mut q = restored_entry("g.bin", "http", 0, dir.join("g.bin"));
+        q.id = "dl-2".to_string();
+        *q.restored.lock().unwrap() = None;
+        q.queued.store(true, Ordering::Relaxed);
+        let q = Arc::new(q);
+        state
+            .entries
+            .lock()
+            .unwrap()
+            .insert("dl-2".to_string(), q);
+        state.order.lock().unwrap().push("dl-2".to_string());
+        persist(&state);
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(text.contains("dl-2"), "queued entry missing: {text}");
+        assert!(
+            text.contains("\"status\":\"queued\""),
+            "queued entry not saved as queued: {text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn later_entry_queued_only_into_a_scheduled_queue() {
+        // R5-5a: "Download Later" joins the queue only when that
+        // queue has an enabled schedule; every other combination
+        // keeps today's behaviour
+        assert!(later_entry_queued(true, true));
+        assert!(!later_entry_queued(true, false));
+        assert!(!later_entry_queued(false, true));
+        assert!(!later_entry_queued(false, false));
+    }
+
+    #[test]
+    fn queue_has_schedule_reads_the_use_schedule_flag() {
+        let mut s = Settings::default();
+        s.queues = vec![
+            QueueCfg {
+                name: "Night".to_string(),
+                use_schedule: true,
+                ..QueueCfg::default()
+            },
+            QueueCfg {
+                name: "Plain".to_string(),
+                use_schedule: false,
+                ..QueueCfg::default()
+            },
+        ];
+        assert!(queue_has_schedule(&s, "Night"));
+        assert!(!queue_has_schedule(&s, "Plain"));
+        // an unknown name falls back to the Main queue's config,
+        // which carries no schedule here
+        assert!(!queue_has_schedule(&s, "Nope"));
+    }
+
+    fn parked_entry(done: u64, status: &str) -> Entry {
+        let mut e = restored_entry("f.bin", "http", 1000, PathBuf::from("/tmp/f.bin"));
+        *e.restored.lock().unwrap() = Some(Restored {
+            total: 1000,
+            done_bytes: done,
+            blocks: Vec::new(),
+            resumable: true,
+            status: status.to_string(),
+            error: String::new(),
+        });
+        e
+    }
+
+    #[test]
+    fn never_started_parked_matches_only_the_download_later_shape() {
+        // the Download Later shape: parked paused, zero bytes
+        assert!(never_started_parked(&parked_entry(0, "paused")));
+        // paused AFTER bytes moved = a user pause, never adopted
+        assert!(!never_started_parked(&parked_entry(500, "paused")));
+        // an explicit Pause press on a parked entry latches it, and
+        // the latch is the user's stop — not adoptable either
+        let latched = parked_entry(0, "paused");
+        latched.pause_requested.store(true, Ordering::SeqCst);
+        assert!(!never_started_parked(&latched));
+        // already queued entries are claimable as they are
+        let queued = parked_entry(0, "paused");
+        queued.queued.store(true, Ordering::Relaxed);
+        assert!(!never_started_parked(&queued));
+        // other parked states are not Download Later
+        assert!(!never_started_parked(&parked_entry(0, "error")));
+        let bare = parked_entry(0, "paused");
+        *bare.restored.lock().unwrap() = None;
+        assert!(!never_started_parked(&bare));
+    }
+
+    #[test]
+    fn claim_queued_clears_a_stale_pause_latch() {
+        // R5-5b belt: an entry claimed by the pump/scheduler starts
+        // clean — a latch left over from a schedule edit must not
+        // pause it after its first block
+        let e = parked_entry(0, "queued");
+        e.queued.store(true, Ordering::Relaxed);
+        e.pause_requested.store(true, Ordering::SeqCst);
+        assert!(claim_queued(&e));
+        assert!(!e.queued.load(Ordering::Relaxed));
+        assert!(!e.pause_requested.load(Ordering::SeqCst));
+        // a second claim finds nothing to claim
+        assert!(!claim_queued(&e));
     }
 }
 

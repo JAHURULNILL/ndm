@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>NDM — Nill Download Manager</title>
+<title>Nill Download Manager</title>
 <script>
   // apply the saved theme before first paint (default: light)
   try {
@@ -24,13 +24,8 @@
 <body>
 
 <header class="titlebar">
-  <div class="app-title"><span class="logo">⬇</span> NDM — Nill Download Manager</div>
+  <div class="app-title"><span class="logo">⬇</span> Nill Download Manager</div>
   <div class="title-right">
-    <div class="title-stats">
-      <span id="totalSpeed">Total speed: 0 B/s</span>
-      <span class="sep">|</span>
-      <span id="limiterLabel">Speed Limiter: <b>OFF</b></span>
-    </div>
     <button id="themeToggle" class="theme-toggle" title="Switch theme">🌙 Dark</button>
   </div>
 </header>
@@ -125,7 +120,6 @@
     </ul>
     <div class="side-head">QUEUES</div>
     <ul id="queueList"></ul>
-    <div id="sideStatus" class="side-status">0 files (0 downloading)</div>
   </aside>
 
   <section class="content">
@@ -142,10 +136,22 @@
   </section>
 </main>
 
+<!-- IDM-style bottom status bar: file counts left, live totals
+     right (the same elements the header used to carry — ids and
+     the JS that fills them are unchanged) -->
+<footer class="statusbar">
+  <div id="sideStatus" class="side-status">0 files (0 downloading)</div>
+  <div class="title-stats">
+    <span id="totalSpeed">Total speed: 0 B/s</span>
+    <span class="sep">|</span>
+    <span id="limiterLabel">Speed Limiter: <b>OFF</b></span>
+  </div>
+</footer>
+
 <div id="detail" class="modal hidden">
   <div class="modal-card detail-modal">
     <div class="modal-head"><span id="dTitle">Download Status</span> <span id="dModalClose">×</span></div>
-    <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabCompletion">Options on completion</span><span class="tab" id="tabLimiter">Speed Limiter</span></div>
+    <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabLimiter">Speed Limiter</span><span class="tab" id="tabCompletion">Options on completion</span></div>
     <div class="detail-body" id="panelStatus">
       <dl class="kv">
         <dt>URL:</dt><dd id="dUrl">—</dd>
@@ -164,10 +170,6 @@
       <canvas id="segMap" width="760" height="86"></canvas>
       <div id="dConns" class="d-conns"></div>
       <div class="opt-row"><span>Queue</span><select id="dQueueSel"></select></div>
-      <div class="detail-btns">
-        <button id="dPause">Pause</button><button id="dResumeBtn">Resume</button>
-        <button id="dHide">Hide</button><button id="dOpen">Open</button><button id="dOpenFolder">Open Folder</button><button id="dRefresh">↻ Refresh URL</button>
-      </div>
     </div>
     <div class="detail-body hidden" id="panelCompletion">
       <p class="comp-note">When the selected download finishes:</p>
@@ -193,6 +195,13 @@
       </div>
       <p class="comp-note dim" style="margin-top: 12px;">Applies immediately to the running download and is remembered across restarts.</p>
     </div>
+    <!-- the action row belongs to the DIALOG, not to the Status
+         tab: it used to live inside that panel, so switching to
+         the Speed Limiter tab made Pause/Hide/Open vanish (N-04) -->
+    <div class="detail-btns">
+      <button id="dPause">Pause</button><button id="dResumeBtn">Resume</button>
+      <button id="dHide">Hide</button><button id="dOpen">Open</button><button id="dOpenFolder">Open Folder</button><button id="dRefresh">↻ Refresh URL</button>
+    </div>
   </div>
 </div>
 
@@ -213,9 +222,16 @@
     <label>File name
       <input id="inName" type="text" placeholder="(taken from the address)" spellcheck="false">
     </label>
+    <label>Category
+      <span class="cat-row">
+        <select id="inCat"></select>
+        <button id="inCatAdd" class="tool" type="button" title="New category…">+</button>
+      </span>
+    </label>
     <label>Save to folder
       <input id="inDir" type="text" value="~/Downloads" spellcheck="false">
     </label>
+    <label class="opt-check"><input id="inRememberCat" type="checkbox"> Remember this path for this category</label>
     <label>Queue
       <select id="inQueue"></select>
     </label>
@@ -228,6 +244,7 @@
         <input id="inPassword" type="password" autocomplete="off">
       </label>
     </div>
+    <div id="fError" class="v-status error hidden" style="margin-bottom:10px"></div>
     <div class="modal-btns">
       <button id="btnStart" class="tool primary">⬇ Start Download</button>
       <button id="btnLater" class="tool">Download Later</button>
@@ -292,14 +309,19 @@
 <div id="omodal" class="modal hidden">
   <div class="modal-card">
     <div class="modal-head">Options <span id="oModalClose">×</span></div>
+    <div class="detail-tabs opt-tabs" id="optTabs">
+      <span class="tab active" data-opanel="opGeneral">General</span>
+      <span class="tab" data-opanel="opConnection">Connection</span>
+      <span class="tab" data-opanel="opDownloads">Downloads</span>
+      <span class="tab" data-opanel="opProxy">Proxy &amp; Site Logins</span>
+      <span class="tab" data-opanel="opCategories">Categories</span>
+    </div>
+    <div class="opt-panel" id="opGeneral">
     <div class="opt-row"><span>Default download folder</span><input id="oDir" type="text" spellcheck="false"></div>
-    <div class="opt-row"><span>Max connections per download</span><input id="oConns" type="number" min="1" max="32"></div>
-    <label class="opt-check"><input id="oLimitOn" type="checkbox"> Limit download speed</label>
-    <div class="opt-row"><span>Speed limit</span><input id="oLimitVal" type="number" min="0.5" step="0.5"><span class="opt-unit">MB/s</span></div>
-    <div class="opt-row"><span>Max simultaneous downloads</span><input id="oSimul" type="number" min="0" max="10"></div>
-    <div class="opt-note">0 = unlimited simultaneous downloads.</div>
     <label class="opt-check"><input id="oAutoResume" type="checkbox"> Auto-resume unfinished downloads on start</label>
     <label class="opt-check"><input id="oAutoUpdate" type="checkbox"> Automatically check for updates</label>
+    <label class="opt-check"><input id="oClipboard" type="checkbox"> Watch the clipboard for download links</label>
+    <label class="opt-check"><input id="oExitDone" type="checkbox"> Exit NDM when all downloads finish</label>
     <div class="opt-row"><span>Video engine</span><span id="oEngine" class="opt-unit">—</span></div>
     <div class="opt-row"><span>Default video quality</span>
       <select id="oVideoQ">
@@ -311,9 +333,38 @@
         <option value="480">480p</option>
         <option value="360">360p</option>
         <option value="240">240p</option>
-        <option value="audio">Audio only (MP3)</option>
+        <option value="audio">Audio only</option>
       </select>
     </div>
+    </div>
+    <div class="opt-panel hidden" id="opConnection">
+    <div class="opt-row"><span>Max connections per download</span><input id="oConns" type="number" min="1" max="32"></div>
+    <div class="opt-row"><span>Per-server connections</span><input id="oConnExc" type="text" placeholder="Example: slow-server.com = 1, *.example.org = 2" spellcheck="false"></div>
+    <div class="opt-note">Servers listed here get fewer parallel connections than the global setting (IDM's connection exceptions). Separate entries with commas.</div>
+    <label class="opt-check"><input id="oLimitOn" type="checkbox"> Limit download speed</label>
+    <div class="opt-row"><span>Speed limit</span><input id="oLimitVal" type="number" min="0.5" step="0.5"><span class="opt-unit">MB/s</span></div>
+    <div class="opt-row"><span>Download limit (MB per period, 0 = off)</span><input id="oQuotaMb" type="number" min="0" step="50"></div>
+    <div class="opt-row"><span>Limit period (hours)</span><input id="oQuotaHours" type="number" min="1" max="168"></div>
+    </div>
+    <div class="opt-panel hidden" id="opDownloads">
+    <div class="opt-row"><span>Max simultaneous downloads</span><input id="oSimul" type="number" min="0" max="10"></div>
+    <div class="opt-note">0 = unlimited simultaneous downloads.</div>
+    <label class="opt-check"><input id="oCompleteDlg" type="checkbox"> Show the "Download complete" dialog</label>
+    <label class="opt-check"><input id="oSounds" type="checkbox"> Play a sound when a download completes or fails</label>
+    <div class="opt-note" style="font-weight:600;color:inherit">When all downloads finish</div>
+    <div class="opt-row"><span>Computer power action</span>
+      <select id="oPowerWhenDone">
+        <option value="">Do nothing</option>
+        <option value="shutdown">Shut down</option>
+        <option value="restart">Restart</option>
+        <option value="sleep">Sleep</option>
+        <option value="hibernate">Hibernate</option>
+        <option value="logoff">Log off</option>
+      </select>
+    </div>
+    <label class="opt-check"><input id="oPowerForce" type="checkbox"> Force running programs to close with the power action</label>
+    </div>
+    <div class="opt-panel hidden" id="opProxy">
     <div class="opt-note" style="font-weight:600;color:inherit">Proxy / Socks — how downloads reach the internet</div>
     <div class="opt-radios">
       <label class="comp-opt"><input type="radio" name="proxyMode" value="none"> No proxy — direct connection</label>
@@ -348,38 +399,21 @@
     <div class="opt-row"><span>User name</span><input id="oLoginUser" type="text" spellcheck="false" autocomplete="off"></div>
     <div class="opt-row"><span>Password</span><input id="oLoginPass" type="password" autocomplete="off"></div>
     <div class="modal-btns left"><button id="oLoginAdd" class="tool">Add login</button></div>
-    <div class="opt-note" style="font-weight:600;color:inherit">When all downloads finish</div>
-    <div class="opt-row"><span>Computer power action</span>
-      <select id="oPowerWhenDone">
-        <option value="">Do nothing</option>
-        <option value="shutdown">Shut down</option>
-        <option value="restart">Restart</option>
-        <option value="sleep">Sleep</option>
-        <option value="hibernate">Hibernate</option>
-        <option value="logoff">Log off</option>
-      </select>
     </div>
-    <label class="opt-check"><input id="oPowerForce" type="checkbox"> Force running programs to close with the power action</label>
+    <div class="opt-panel hidden" id="opCategories">
     <div class="opt-note" style="font-weight:600;color:inherit">Categories — each category has its own folder (used when a download would otherwise go to the default folder) and its own file types, like IDM's category editor. Editing the types changes how the app classifies new downloads; the browser extension keeps the built-in list.</div>
     <div class="opt-row"><span>Compressed folder</span><input id="oCatCompressed" type="text" placeholder="~/Downloads" spellcheck="false"></div>
-    <div class="opt-row"><span>Compressed types</span><input id="oCatExtCompressed" type="text" spellcheck="false"></div>
+    <div class="opt-row"><span>Compressed types</span><textarea id="oCatExtCompressed" class="cat-types" rows="2" spellcheck="false"></textarea></div>
     <div class="opt-row"><span>Documents folder</span><input id="oCatDocuments" type="text" placeholder="~/Downloads" spellcheck="false"></div>
-    <div class="opt-row"><span>Documents types</span><input id="oCatExtDocuments" type="text" spellcheck="false"></div>
+    <div class="opt-row"><span>Documents types</span><textarea id="oCatExtDocuments" class="cat-types" rows="2" spellcheck="false"></textarea></div>
     <div class="opt-row"><span>Music folder</span><input id="oCatMusic" type="text" placeholder="~/Downloads" spellcheck="false"></div>
-    <div class="opt-row"><span>Music types</span><input id="oCatExtMusic" type="text" spellcheck="false"></div>
+    <div class="opt-row"><span>Music types</span><textarea id="oCatExtMusic" class="cat-types" rows="2" spellcheck="false"></textarea></div>
     <div class="opt-row"><span>Video folder</span><input id="oCatVideo" type="text" placeholder="~/Downloads" spellcheck="false"></div>
-    <div class="opt-row"><span>Video types</span><input id="oCatExtVideo" type="text" spellcheck="false"></div>
+    <div class="opt-row"><span>Video types</span><textarea id="oCatExtVideo" class="cat-types" rows="2" spellcheck="false"></textarea></div>
     <div class="opt-row"><span>Programs folder</span><input id="oCatPrograms" type="text" placeholder="~/Downloads" spellcheck="false"></div>
-    <div class="opt-row"><span>Programs types</span><input id="oCatExtPrograms" type="text" spellcheck="false"></div>
+    <div class="opt-row"><span>Programs types</span><textarea id="oCatExtPrograms" class="cat-types" rows="2" spellcheck="false"></textarea></div>
     <div class="opt-row"><span>General folder</span><input id="oCatGeneral" type="text" placeholder="~/Downloads" spellcheck="false"></div>
-    <div class="opt-row"><span>Per-server connections</span><input id="oConnExc" type="text" placeholder="Example: slow-server.com = 1, *.example.org = 2" spellcheck="false"></div>
-    <div class="opt-note">Servers listed here get fewer parallel connections than the global setting (IDM's connection exceptions). Separate entries with commas.</div>
-    <label class="opt-check"><input id="oExitDone" type="checkbox"> Exit NDM when all downloads finish</label>
-    <label class="opt-check"><input id="oSounds" type="checkbox"> Play a sound when a download completes or fails</label>
-    <label class="opt-check"><input id="oCompleteDlg" type="checkbox"> Show the "Download complete" dialog</label>
-    <label class="opt-check"><input id="oClipboard" type="checkbox"> Watch the clipboard for download links</label>
-    <div class="opt-row"><span>Download limit (MB per period, 0 = off)</span><input id="oQuotaMb" type="number" min="0" step="50"></div>
-    <div class="opt-row"><span>Limit period (hours)</span><input id="oQuotaHours" type="number" min="1" max="168"></div>
+    </div>
     <div class="modal-btns">
       <button id="oSave" class="tool primary">Save</button>
       <button id="oCancel" class="tool">Cancel</button>
@@ -391,7 +425,7 @@
   <div class="modal-card">
     <div class="modal-head">Download complete <span id="cModalClose">×</span></div>
     <div class="opt-row"><span id="cName" style="font-weight:600"></span></div>
-    <div class="opt-note" id="cAddr" style="word-break:break-all"></div>
+    <div class="opt-note" id="cAddr" style="word-break:break-all;white-space:pre-line"></div>
     <div class="opt-note" id="cPath" style="word-break:break-all"></div>
     <div class="opt-note" id="cSize"></div>
     <label class="opt-check"><input id="cDontShow" type="checkbox"> Don't show this dialog again</label>
@@ -411,7 +445,7 @@
     <div class="opt-row"><span>Start downloads at</span><input id="sStart" type="time"></div>
     <div class="opt-row"><span>Stop downloads at</span><input id="sStop" type="time"></div>
     <label class="opt-check"><input id="schedExitDone" type="checkbox"> Exit NDM when this queue finishes</label>
-    <div class="opt-row"><span>When this queue finishes, turn off computer</span>
+    <div class="opt-row stack"><span>When this queue finishes, turn off computer</span>
       <select id="sPowerWhenDone">
         <option value="">Use the Options power setting</option>
         <option value="shutdown">Shut down</option>
@@ -602,6 +636,7 @@
       <div><b>F5</b><span>Refresh List</span></div>
       <div><b>Esc</b><span>Close Dialog / Menu</span></div>
       <div><b>Ctrl+Q</b><span>Exit NDM</span></div>
+      <div><b>Ctrl+A</b><span>Select All Downloads</span></div>
     </div>
     <div class="modal-btns"><button id="sOk" class="tool primary">OK</button></div>
   </div>
@@ -612,7 +647,7 @@
     <div class="modal-head">About NDM <span id="aModalClose">×</span></div>
     <div class="about">
       <div class="about-logo">⬇</div>
-      <div class="about-name">NDM — Nill Download Manager</div>
+      <div class="about-name">Nill Download Manager</div>
       <div id="aVersion" class="v-meta">Version —</div>
       <div id="aEngine" class="v-meta">Video engine: —</div>
       <p class="about-note">Fast, resumable downloads with browser integration for files and videos from 1,700+ sites. Video engine components (yt-dlp, deno) are downloaded automatically on first use and verified by SHA-256.</p>
@@ -674,10 +709,21 @@
   <div class="modal-card">
     <div class="modal-head">Delete download <span id="delModalClose">×</span></div>
     <div class="opt-note" id="delName" style="word-break:break-all"></div>
-    <label class="opt-check"><input id="delFileChk" type="checkbox"> Also delete the downloaded file from the disk</label>
+    <label class="opt-check"><input id="delFileChk" type="checkbox"> <span id="delFileLbl">Also delete the downloaded file from the disk</span></label>
     <div class="modal-btns">
       <button id="delConfirm" class="tool primary">Delete</button>
       <button id="delCancel" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="cfmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Confirm <span id="cfModalClose">×</span></div>
+    <div class="opt-note" id="cfMsg" style="white-space:pre-line"></div>
+    <div class="modal-btns">
+      <button id="cfYes" class="tool primary">Confirm</button>
+      <button id="cfNo" class="tool">Cancel</button>
     </div>
   </div>
 </div>

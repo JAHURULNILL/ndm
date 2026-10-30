@@ -13,7 +13,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 /// Parse `ffmpeg -hide_banner -i <file>` stderr to check `(has_video, has_audio)`.
 pub fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
@@ -48,6 +48,142 @@ pub fn probe_streams(path: &Path, components_dir: &Path) -> Option<(bool, bool)>
     Some(streams_in_ffmpeg_info(&stderr))
 }
 
+/// Completion size reconciliation for MERGE/REMUX jobs (F-EXT-04,
+/// R3-EXT-01). The question at the finish line is whether the merged
+/// output holds the media this job selected — so the baseline is
+/// `expected_media`, the expected size of the SELECTED media streams
+/// (the chosen video + audio payloads), and never the raw downloaded
+/// byte count: a container may legitimately carry a large non-media
+/// payload (padding, embedded data, extra renditions) that a remux
+/// drops, so a correct merge can be a small fraction of what was
+/// downloaded. The earlier form of this guard compared against the
+/// download total and declared byte-perfect merges broken (the R3
+/// fixture: 100 MB container, 2.3 MB of media, errored 3×). A merged
+/// file under half of the expected media is still the drastic case
+/// it exists for — a stub where the real movie should be.
+///
+/// `expected_media == None` (or 0) means the selected streams'
+/// sizes are genuinely unknown — the source reported no bitrates to
+/// estimate from — and the guard then SKIPS the job rather than
+/// fabricating a verdict. `downloaded` is accepted so callers and
+/// tests can state the full scenario; it is deliberately never
+/// compared against.
+///
+/// SCOPE (R2-EXT-02): callers apply this ONLY to merge/remux jobs.
+/// Audio extraction/transcode jobs (`self.audio`) are never judged
+/// by it: their correct output is routinely a small fraction of the
+/// source container, and the guard used to fail every one of them
+/// after a perfect download.
+fn drastic_shrink(
+    expected_media: Option<u64>,
+    downloaded: u64,
+    final_len: u64,
+) -> Option<String> {
+    let _ = downloaded; // context only — see the note above
+    let expected = expected_media?;
+    if expected > 0 && final_len.saturating_mul(2) < expected {
+        Some(format!(
+            "the merged file is much smaller than what was downloaded ({final_len} of {expected} bytes of media in the selected streams) — the source streams may be incomplete"
+        ))
+    } else {
+        None
+    }
+}
+
+/// Estimate a media file's true media payload in bytes from its
+/// `ffmpeg -i` text: the container duration × the sum of its
+/// streams' OWN bitrates. Per-stream bitrates describe the media
+/// itself, so container padding and other non-media payload do not
+/// inflate the estimate the way the file's byte count would (the
+/// Duration line's bitrate is derived from that byte count and is
+/// useless for this — 134217 kb/s for the padded R3 fixture, whose
+/// streams report their true 3010 + 69 kb/s). Returns None when
+/// the duration or any stream's bitrate is unreported: an estimate
+/// is never fabricated from partial data.
+pub fn media_payload_estimate(text: &str) -> Option<u64> {
+    let mut duration_secs: Option<f64> = None;
+    let mut total_kbps: u64 = 0;
+    let mut streams = 0usize;
+    for line in text.lines() {
+        let t = line.trim_start();
+        if duration_secs.is_none() {
+            if let Some(rest) = t.strip_prefix("Duration: ") {
+                let token = rest.split(',').next()?.trim();
+                if token != "N/A" {
+                    let mut parts = token.split(':');
+                    let h: f64 = parts.next()?.parse().ok()?;
+                    let m: f64 = parts.next()?.parse().ok()?;
+                    let s: f64 = parts.next()?.parse().ok()?;
+                    duration_secs = Some(h * 3600.0 + m * 60.0 + s);
+                }
+            }
+        }
+        if t.starts_with("Stream #") {
+            streams += 1;
+            // the stream's own bitrate is the first "kb/s" figure
+            // on its line; a stream that reports none leaves the
+            // file's payload unknowable, so the estimate fails
+            let (before, _) = t.split_once(" kb/s")?;
+            let kbps: u64 = before
+                .rsplit(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()?;
+            if kbps == 0 {
+                return None;
+            }
+            total_kbps = total_kbps.saturating_add(kbps);
+        }
+    }
+    let duration = duration_secs?;
+    if streams == 0 || duration <= 0.0 || total_kbps == 0 {
+        return None;
+    }
+    let bytes = (duration * total_kbps as f64 * 1000.0 / 8.0) as u64;
+    (bytes > 0).then_some(bytes)
+}
+
+/// Run `ffmpeg -i` over a downloaded file and estimate its media
+/// payload (see `media_payload_estimate`).
+fn estimate_media_payload(path: &Path, components_dir: &Path) -> Option<u64> {
+    let ffmpeg = find_tool("ffmpeg", components_dir)?;
+    let out = Command::new(ffmpeg)
+        .args(["-hide_banner", "-i"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    media_payload_estimate(&stderr)
+}
+
+/// Estimate the selected formats' combined media payload from
+/// yt-dlp's resolution: each format's bitrate (tbr, else vbr+abr)
+/// × the media duration. yt-dlp's `filesize` fields are
+/// deliberately NOT used — for direct containers they report the
+/// container's byte count, which can far exceed the media inside
+/// (R3-EXT-01; for the padded fixture they are absent entirely).
+/// None when any selected format reports no bitrate or the
+/// duration is unknown.
+fn formats_media_bytes(duration_secs: f64, formats: &[&serde_json::Value]) -> Option<u64> {
+    if duration_secs <= 0.0 || formats.is_empty() {
+        return None;
+    }
+    let mut total_kbps = 0.0f64;
+    for f in formats {
+        let br = f["tbr"].as_f64().filter(|b| *b > 0.0).or_else(|| {
+            let v = f["vbr"].as_f64().unwrap_or(0.0);
+            let a = f["abr"].as_f64().unwrap_or(0.0);
+            (v + a > 0.0).then_some(v + a)
+        })?;
+        total_kbps += br;
+    }
+    let bytes = (total_kbps * 1000.0 / 8.0 * duration_secs) as u64;
+    (bytes > 0).then_some(bytes)
+}
+
 /// (name -> (len, mtime)) for every file in `dir`, taken just before a
 /// download starts so the finished file can be recognised afterwards.
 fn dir_snapshot(dir: &Path) -> HashMap<String, (u64, SystemTime)> {
@@ -65,6 +201,60 @@ fn dir_snapshot(dir: &Path) -> HashMap<String, (u64, SystemTime)> {
         }
     }
     out
+}
+
+/// Remove THIS job's intermediate files from its save folder —
+/// BOTH engines' working files for `stem`: the parallel engine's
+/// hidden parts and their resume-state journals (".{stem}.
+/// ndm_stream*" — the journal rides the same prefix), its mux /
+/// audio-pairing temps, and yt-dlp's "{stem}.f<digits>…" split
+/// parts and "{stem}.<ext>…" single-format parts (.part / .ytdl).
+/// Called when a run publishes "finished": an earlier attempt of
+/// the SAME job may have run on the OTHER engine (pause kills the
+/// yt-dlp child; the resume tries the parallel engine first), and
+/// each engine's own finish cleanup only ever knew its own temps
+/// — the abandoned attempt's partial survived next to the
+/// finished file (R4 side observation: an orphaned 13.9 MB
+/// big2.mp4.part after a pause/resume → finish cycle). The
+/// finished file itself never matches: it carries no .part/.ytdl
+/// suffix and no leading dot. Strictly this stem — the same rule
+/// the discard sweep in main.rs applies.
+fn sweep_job_temps(dir: &Path, stem: &str) {
+    if stem.is_empty() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for f in rd.flatten() {
+        let n = f.file_name().to_string_lossy().to_string();
+        let engine_temp = n.starts_with(&format!(".{stem}.ndm_stream"))
+            || n.starts_with(&format!(".{stem}.ndm_mux"))
+            || n.starts_with(&format!(".{stem}.ndm_audio"));
+        let ytdlp_part = (n.ends_with(".part") || n.ends_with(".ytdl")) && {
+            let split = n
+                .strip_prefix(&format!("{stem}.f"))
+                .map(|rest| {
+                    rest.chars()
+                        .next()
+                        .map(|c| c.is_ascii_digit())
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let single = n
+                .strip_prefix(&format!("{stem}."))
+                .map(|rest| {
+                    ["mp4", "m4a", "mp3", "webm", "mkv", "ts"]
+                        .iter()
+                        .any(|e| rest == *e || rest.starts_with(&format!("{e}.")))
+                })
+                .unwrap_or(false);
+            split || single
+        };
+        if engine_temp || ytdlp_part {
+            let _ = std::fs::remove_file(f.path());
+        }
+    }
 }
 
 /// "<title>.f<format-id>.<ext>" stream files wait for the merge step and
@@ -193,6 +383,11 @@ pub struct VideoProgress {
     pub conns: usize,
     pub final_path: Option<PathBuf>,
     pub error: Option<String>,
+    /// when `done` last changed: a "downloading" job whose bytes
+    /// have not moved for a few seconds is stalled, whatever its
+    /// last sampled speed says — payload_of decays the reported
+    /// rate to 0 from this (F-15 state honesty)
+    pub last_progress_at: Instant,
 }
 
 impl Default for VideoProgress {
@@ -205,6 +400,7 @@ impl Default for VideoProgress {
             conns: 0,
             final_path: None,
             error: None,
+            last_progress_at: Instant::now(),
         }
     }
 }
@@ -245,34 +441,47 @@ pub fn safe_filename_stem(title: &str) -> String {
     trimmed[..end].trim().trim_matches('.').to_string()
 }
 
-/// Choose a non-colliding filename stem inside `dir` so two videos with the
-/// same title (or two qualities of the same video) never overwrite each other
-/// or collide on `.part` files.
-pub fn unique_stem_on_disk(dir: &Path, base_stem: &str) -> String {
+/// The filename extensions a job of one kind can actually land on
+/// disk with: video jobs mux to MP4 (MKV/WebM are the other video
+/// containers a same-title file may already occupy); audio jobs save
+/// MP3 (yt-dlp extraction) or M4A (the chosen stream's own
+/// container). A stem only collides within its OWN kind — a finished
+/// `big2.mp4` must not push the audio half of a download-all pair to
+/// "big2 (1).m4a" when no `big2.m4a` exists (R3-EXT-04).
+pub fn own_media_exts(audio: bool) -> &'static [&'static str] {
+    if audio {
+        &["mp3", "m4a"]
+    } else {
+        &["mp4", "mkv", "webm"]
+    }
+}
+
+/// True when `cand` is already used inside `dir` by a finished file
+/// (or an in-flight `.part`) whose extension belongs to this kind —
+/// i.e. the new job's own final filename would collide.
+pub fn stem_taken_on_disk(dir: &Path, cand: &str, audio: bool) -> bool {
+    own_media_exts(audio).iter().any(|ext| {
+        dir.join(format!("{cand}.{ext}")).exists()
+            || dir
+                .join(format!(".{cand}.ndm_stream0.{ext}.part"))
+                .exists()
+    })
+}
+
+/// Choose a non-colliding filename stem inside `dir` so two downloads
+/// of the same kind with the same title (or two qualities of the same
+/// video) never overwrite each other or collide on `.part` files.
+pub fn unique_stem_on_disk(dir: &Path, base_stem: &str, audio: bool) -> String {
     let stem = safe_filename_stem(base_stem);
     if stem.is_empty() {
         return String::new();
     }
-    let stem_taken = |cand: &str| -> bool {
-        for ext in ["mp4", "mp3", "m4a", "mkv", "webm"] {
-            if dir.join(format!("{cand}.{ext}")).exists() {
-                return true;
-            }
-            if dir
-                .join(format!(".{cand}.ndm_stream0.{ext}.part"))
-                .exists()
-            {
-                return true;
-            }
-        }
-        false
-    };
-    if !stem_taken(&stem) {
+    if !stem_taken_on_disk(dir, &stem, audio) {
         return stem;
     }
     for n in 1..10_000 {
         let cand = format!("{stem} ({n})");
-        if !stem_taken(&cand) {
+        if !stem_taken_on_disk(dir, &cand, audio) {
             return cand;
         }
     }
@@ -297,6 +506,13 @@ pub struct VideoJob {
     /// resolution) — a "finished" video without sound is then a failure,
     /// never a success
     expect_audio: Mutex<bool>,
+    /// the selected formats' combined media payload in bytes,
+    /// learned from yt-dlp's resolution (bitrates × duration) —
+    /// the finish-line size guard's baseline for the yt-dlp
+    /// finalize path. None when the resolution reported no usable
+    /// bitrates: the guard then skips the job instead of guessing
+    /// (R3-EXT-01)
+    expected_media: Mutex<Option<u64>>,
     /// separate HLS audio rendition (master-playlist EXT-X-MEDIA) that the
     /// app must fetch and mux itself; yt-dlp's generic extractor cannot
     /// pair it with the chosen variant
@@ -304,6 +520,15 @@ pub struct VideoJob {
     /// this entry's own speed limit in bytes/sec (0 = none) — applied
     /// to every engine stream and to the yt-dlp fallback
     limit_bps: std::sync::atomic::AtomicU64,
+    /// saved Site Login for this page: passed to yt-dlp as
+    /// --username/--password whenever non-empty, the way the HTTP
+    /// engine applies the same login as Basic credentials
+    login: String,
+    password: String,
+    /// set when a pause landed DURING the ffmpeg merge: the merged
+    /// output file, kept on disk and recorded here, which the next
+    /// resume finalizes instead of re-downloading everything
+    merged_final: Mutex<Option<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -323,6 +548,8 @@ impl VideoJob {
         audio: bool,
         title: &str,
         cookies: Option<PathBuf>,
+        login: &str,
+        password: &str,
         components_dir: &Path,
     ) -> Result<Arc<VideoJob>, String> {
         let initial_stem = {
@@ -330,11 +557,11 @@ impl VideoJob {
             if s.is_empty() {
                 None
             } else {
-                let final_exists = ["mp4", "mp3", "m4a", "mkv", "webm"]
+                let final_exists = own_media_exts(audio)
                     .iter()
                     .any(|ext| dir.join(format!("{s}.{ext}")).exists());
                 if final_exists {
-                    Some(unique_stem_on_disk(dir, &s))
+                    Some(unique_stem_on_disk(dir, &s, audio))
                 } else {
                     Some(s)
                 }
@@ -356,8 +583,12 @@ impl VideoJob {
             spawn_lock: Mutex::new(()),
             gen: std::sync::atomic::AtomicU64::new(0),
             expect_audio: Mutex::new(false),
+            expected_media: Mutex::new(None),
             pair_audio_url: Mutex::new(None),
             limit_bps: std::sync::atomic::AtomicU64::new(0),
+            login: login.to_string(),
+            password: password.to_string(),
+            merged_final: Mutex::new(None),
         });
         job.spawn(components_dir)?;
         Ok(job)
@@ -375,7 +606,7 @@ impl VideoJob {
         } else {
             fallback_title
         };
-        let unique = unique_stem_on_disk(&self.dir, raw);
+        let unique = unique_stem_on_disk(&self.dir, raw, self.audio);
         if !unique.is_empty() {
             *guard = Some(unique.clone());
         }
@@ -392,6 +623,12 @@ impl VideoJob {
         sel: &str,
     ) -> Option<(String, Vec<DirectStream>)> {
         let mut args = base_args_for_url(&self.url, components_dir, self.cookies.as_deref());
+        if !self.login.is_empty() {
+            args.push("--username".into());
+            args.push(self.login.clone());
+            args.push("--password".into());
+            args.push(self.password.clone());
+        }
         args.push("-j".into());
         args.push("-f".into());
         args.push(sel.to_string());
@@ -464,7 +701,20 @@ impl VideoJob {
         if formats.is_empty() || formats.len() > 2 {
             return None;
         }
+        // Learn the selected streams' combined media payload for
+        // the finish-line guard (see the field's note): recorded
+        // only when every selected format reported a bitrate.
+        // (Recorded before the stream checks below on purpose: if
+        // this resolution is rejected, the yt-dlp fallback still
+        // downloads this same selection, so the estimate stands.)
+        if let Some(bytes) =
+            formats_media_bytes(v["duration"].as_f64().unwrap_or(0.0), &formats)
+        {
+            *self.expected_media.lock().unwrap() = Some(bytes);
+        }
         let mut streams = Vec::new();
+        let mut saw_vcodec = false;
+        let mut any_video = false;
         for f in formats {
             let proto = f["protocol"].as_str().unwrap_or("");
             if proto != "https" && proto != "http" {
@@ -496,6 +746,15 @@ impl VideoJob {
                 let ac = f["acodec"].as_str().unwrap_or("none");
                 !ac.is_empty() && ac != "none"
             };
+            {
+                let vc = f["vcodec"].as_str().unwrap_or("");
+                if !vc.is_empty() {
+                    saw_vcodec = true;
+                    if vc != "none" {
+                        any_video = true;
+                    }
+                }
+            }
             let headers = &f["http_headers"];
             let cookie = headers["Cookie"]
                 .as_str()
@@ -512,6 +771,17 @@ impl VideoJob {
                 cookie,
                 referer,
             });
+        }
+        if !self.audio && saw_vcodec && !any_video {
+            // Defensive guard: the selector resolved to an
+            // audio-only set for a VIDEO job (every format declares
+            // vcodec "none"). The parallel engine would download
+            // the whole set and only fail at the finish line
+            // ("no playable video stream") — refuse here instead,
+            // so the caller falls back to yt-dlp, which re-resolves
+            // independently. Formats that declare no codec info at
+            // all (saw_vcodec == false) keep the old behaviour.
+            return None;
         }
         Some((resolved_title, streams))
     }
@@ -542,7 +812,7 @@ impl VideoJob {
 
         let mut stem = self.resolve_or_lock_stem(&resolved_title);
         if stem.is_empty() {
-            stem = unique_stem_on_disk(&self.dir, "video");
+            stem = unique_stem_on_disk(&self.dir, "video", self.audio);
         }
         let final_ext = if self.audio {
             if sel.contains("m4a") && !sel.contains("mp3") {
@@ -611,10 +881,12 @@ impl VideoJob {
                     for d in &dls {
                         d.control.cancel();
                     }
-                    for p in &part_paths {
-                        let _ = std::fs::remove_file(p);
-                        let _ = std::fs::remove_file(ndm::state_path_for(p));
-                    }
+                    // the part files and their resume state are
+                    // KEPT: plain list removal preserves partials
+                    // on BOTH engines (parity with the yt-dlp path),
+                    // and deleting them is exclusive to the discard
+                    // flow in main.rs, which sweeps .ndm_stream*
+                    // when the user explicitly discards
                     let mut p = self.progress.lock().unwrap();
                     p.status = "cancelled".to_string();
                     p.speed_bps = 0.0;
@@ -660,6 +932,9 @@ impl VideoJob {
                 if total_sum > 0 {
                     p.total = total_sum;
                 }
+                if done_sum != p.done {
+                    p.last_progress_at = Instant::now();
+                }
                 p.done = done_sum;
                 p.speed_bps = if any_paused { 0.0 } else { speed_sum };
                 p.conns = if any_paused || all_finished {
@@ -701,6 +976,35 @@ impl VideoJob {
             p.speed_bps = 0.0;
             p.conns = 0;
         }
+
+        // The finish-line guard's baseline for this merge: the
+        // media payload of the parts about to be merged, estimated
+        // from the parts themselves (duration × their streams' own
+        // bitrates). The parts' byte counts are NOT the baseline —
+        // a part's container can carry arbitrary non-media payload
+        // that the remux legitimately drops (R3-EXT-01). Unknown
+        // when any part reports no bitrate/duration; the guard then
+        // skips this job rather than guessing.
+        let expected_media = if self.audio {
+            None
+        } else {
+            let mut sum = 0u64;
+            let mut known = !part_paths.is_empty();
+            for part in &part_paths {
+                match estimate_media_payload(part, components_dir) {
+                    Some(n) => sum = sum.saturating_add(n),
+                    None => {
+                        known = false;
+                        break;
+                    }
+                }
+            }
+            if known && sum > 0 {
+                Some(sum)
+            } else {
+                None
+            }
+        };
 
         // Merge / remux into final output file with ffmpeg
         let mut ff_args: Vec<String> = vec!["-y".into(), "-loglevel".into(), "error".into()];
@@ -787,20 +1091,121 @@ impl VideoJob {
                 p.conns = 0;
                 return true;
             }
-        }
-
-        if merge_ok {
-            match self.ensure_audio(&final_path, components_dir) {
-                Ok(verified) => {
+            if flag == "paused" {
+                // the user paused while ffmpeg was merging: the
+                // entry must end PAUSED — publishing "finished"
+                // would fire the completion actions (sound, power)
+                // over a download the user deliberately stopped.
+                // A good merge is KEPT and recorded, so the resume
+                // finalizes it (see the spawn thread) instead of
+                // re-downloading; a failed merge leaves nothing
+                // usable, but the pause still wins over a fallback.
+                if merge_ok {
+                    *self.merged_final.lock().unwrap() = Some(final_path.clone());
                     let mut p = self.progress.lock().unwrap();
-                    if let Ok(m) = verified.metadata() {
+                    if let Ok(m) = final_path.metadata() {
                         p.total = m.len();
                         p.done = m.len();
                     }
-                    p.status = "finished".to_string();
+                    p.status = "paused".to_string();
                     p.speed_bps = 0.0;
                     p.conns = 0;
-                    p.final_path = Some(verified);
+                    p.final_path = Some(final_path);
+                } else {
+                    let mut p = self.progress.lock().unwrap();
+                    p.status = "paused".to_string();
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                }
+                return true;
+            }
+        }
+
+        if merge_ok {
+            // the bytes this job actually downloaded, captured BEFORE
+            // the finalize below can overwrite the total with the
+            // merged file's size (F-EXT-04)
+            let downloaded = self.progress.lock().unwrap().total;
+            let audio_result = self.ensure_audio(&final_path, components_dir);
+            // A stop that landed DURING the audio check (which can
+            // take seconds when it fetches a separate rendition)
+            // wins over the merge result — the stop check above ran
+            // BEFORE the check and cannot see it. A cancelled job
+            // must never publish "finished" (R2-EXT-05).
+            if let Some(flag) = self.stop_flag.lock().unwrap().clone() {
+                if flag == "cancelled" {
+                    if let Ok(verified) = &audio_result {
+                        let _ = std::fs::remove_file(verified);
+                    }
+                    let _ = std::fs::remove_file(&final_path);
+                    let mut p = self.progress.lock().unwrap();
+                    p.status = "cancelled".to_string();
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                    return true;
+                }
+                if flag == "paused" {
+                    // same contract as a pause during the merge
+                    // itself: the merge is KEPT and recorded, so the
+                    // resume finalizes it instead of re-downloading
+                    let kept = match &audio_result {
+                        Ok(verified) => verified.clone(),
+                        Err(_) => final_path.clone(),
+                    };
+                    *self.merged_final.lock().unwrap() = Some(kept.clone());
+                    let mut p = self.progress.lock().unwrap();
+                    if let Ok(m) = kept.metadata() {
+                        p.total = m.len();
+                        p.done = m.len();
+                    }
+                    p.status = "paused".to_string();
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                    p.final_path = Some(kept);
+                    return true;
+                }
+            }
+            match audio_result {
+                Ok(verified) => {
+                    let flen = verified.metadata().map(|m| m.len()).unwrap_or(0);
+                    // judged against the selected streams' media
+                    // payload (expected_media), never the downloaded
+                    // total (R3-EXT-01); audio jobs are exempt: an
+                    // extracted audio track is legitimately a small
+                    // fraction of the downloaded container (R2-EXT-02)
+                    let shrink = if flen > 0 && !self.audio {
+                        drastic_shrink(expected_media, downloaded, flen)
+                    } else {
+                        None
+                    };
+                    let finished_now = shrink.is_none();
+                    let mut p = self.progress.lock().unwrap();
+                    if let Some(msg) = shrink {
+                        // keep the true downloaded total; a
+                        // drastically smaller deliverable is a
+                        // visible error, not a silent success
+                        p.status = "error".to_string();
+                        p.error = Some(msg);
+                        p.speed_bps = 0.0;
+                        p.conns = 0;
+                        p.final_path = Some(verified);
+                    } else {
+                        if flen > 0 {
+                            p.total = flen;
+                            p.done = flen;
+                        }
+                        p.status = "finished".to_string();
+                        p.speed_bps = 0.0;
+                        p.conns = 0;
+                        p.final_path = Some(verified);
+                    }
+                    drop(p);
+                    if finished_now {
+                        // a finished job leaves no working files
+                        // behind — including a previous attempt's
+                        // yt-dlp partials (R4 side observation)
+                        sweep_job_temps(&self.dir, &stem);
+                    }
                     true
                 }
                 Err(msg) => {
@@ -885,6 +1290,12 @@ impl VideoJob {
         }
         let before = dir_snapshot(&self.dir);
         let mut args = base_args_for_url(&pair_url, components_dir, self.cookies.as_deref());
+        if !self.login.is_empty() {
+            args.push("--username".into());
+            args.push(self.login.clone());
+            args.push("--password".into());
+            args.push(self.password.clone());
+        }
         args.push("-f".into());
         args.push("bestaudio/best".into());
         args.push("--ffmpeg-location".into());
@@ -1019,12 +1430,112 @@ impl VideoJob {
         {
             let mut p = self.progress.lock().unwrap();
             p.status = "downloading".to_string();
+            // a (re)start supersedes the previous attempt's
+            // failure: the stored error clears NOW, so progress
+            // payloads never carry a stale error alongside a live
+            // "downloading" state (the browser panel showed the old
+            // error text through whole retry cycles)
+            p.error = None;
             p.conns = ndm::global_connections().clamp(1, 32);
+            p.last_progress_at = Instant::now();
         }
 
         let job = self.clone();
         let comp_dir = components_dir.to_path_buf();
         std::thread::spawn(move || {
+            // 0. A previous run merged the file but was paused before
+            // it could be finalized: verify and publish that merge
+            // instead of downloading everything again.
+            let kept_merge = job.merged_final.lock().unwrap().take();
+            if let Some(merged) = kept_merge {
+                if merged.is_file() {
+                    // the recorded total here IS the kept merge's
+                    // own size (set when the pause landed), so it is
+                    // no baseline at all; the guard judges the file
+                    // against the selected streams' media payload
+                    // learned when the producing run resolved them —
+                    // unknown (e.g. the merge came from a run whose
+                    // resolution reported no bitrates) means the
+                    // guard skips this finalize (R3-EXT-01)
+                    let downloaded = job.progress.lock().unwrap().total;
+                    let expected_media = *job.expected_media.lock().unwrap();
+                    let audio_result = job.ensure_audio(&merged, &comp_dir);
+                    // a stop that landed DURING the audio check wins
+                    // over the kept merge's verdict, exactly as in
+                    // the fresh-merge finalize (R2-EXT-05)
+                    if let Some(flag) = job.stop_flag.lock().unwrap().clone() {
+                        if flag == "cancelled" {
+                            // the kept file stays on disk (it
+                            // predates this run); only the status is
+                            // the job's to publish
+                            let mut p = job.progress.lock().unwrap();
+                            p.status = "cancelled".to_string();
+                            p.speed_bps = 0.0;
+                            p.conns = 0;
+                            return;
+                        }
+                        if flag == "paused" {
+                            *job.merged_final.lock().unwrap() = Some(merged.clone());
+                            let mut p = job.progress.lock().unwrap();
+                            p.status = "paused".to_string();
+                            p.speed_bps = 0.0;
+                            p.conns = 0;
+                            p.final_path = Some(merged);
+                            return;
+                        }
+                    }
+                    let mut published_finish = false;
+                    match audio_result {
+                        Ok(verified) => {
+                            let flen = verified.metadata().map(|m| m.len()).unwrap_or(0);
+                            // audio jobs exempt (R2-EXT-02), as in
+                            // the fresh-merge finalize
+                            let shrink = if flen > 0 && !job.audio {
+                                drastic_shrink(expected_media, downloaded, flen)
+                            } else {
+                                None
+                            };
+                            let mut p = job.progress.lock().unwrap();
+                            if let Some(msg) = shrink {
+                                p.status = "error".to_string();
+                                p.error = Some(msg);
+                                p.speed_bps = 0.0;
+                                p.conns = 0;
+                                p.final_path = Some(verified);
+                            } else {
+                                if flen > 0 {
+                                    p.total = flen;
+                                    p.done = flen;
+                                }
+                                p.status = "finished".to_string();
+                                p.speed_bps = 0.0;
+                                p.conns = 0;
+                                p.final_path = Some(verified);
+                                published_finish = true;
+                            }
+                        }
+                        Err(msg) => {
+                            let mut p = job.progress.lock().unwrap();
+                            p.status = "error".to_string();
+                            p.error = Some(msg);
+                            p.speed_bps = 0.0;
+                            p.conns = 0;
+                            p.final_path = Some(merged);
+                        }
+                    }
+                    if published_finish {
+                        // a finished job leaves no working files
+                        // behind, whichever engine produced them
+                        // (R4 side observation)
+                        if let Some(stem) = job.chosen_stem.lock().unwrap().clone() {
+                            sweep_job_temps(&job.dir, &stem);
+                        }
+                    }
+                    return;
+                }
+                // the kept file vanished meanwhile: fall through and
+                // download normally
+            }
             // 1. Try parallel multi-connection Rust engine download first
             if job.run_parallel_engine(&ytdlp, &ffmpeg, &comp_dir, &sel, my_gen) {
                 return;
@@ -1037,6 +1548,12 @@ impl VideoJob {
 
             // 2. Fallback to yt-dlp with concurrent fragments for HLS/DASH streams
             let mut args = base_args_for_url(&job.url, &comp_dir, job.cookies.as_deref());
+            if !job.login.is_empty() {
+                args.push("--username".into());
+                args.push(job.login.clone());
+                args.push("--password".into());
+                args.push(job.password.clone());
+            }
             args.push("-f".into());
             args.push(sel.clone());
             if job.audio {
@@ -1067,7 +1584,11 @@ impl VideoJob {
             args.push("--no-overwrites".into());
 
             let limit = ndm::global_limit();
-            if limit > 0 {
+            if lim == 0 && limit > 0 {
+                // the per-download limit above takes precedence:
+                // yt-dlp honours the LAST --limit-rate it is given,
+                // so pushing the global one too would silently
+                // override this download's own limiter
                 args.push("--limit-rate".into());
                 args.push(format!("{}K", (limit / 1024).max(1)));
             }
@@ -1091,6 +1612,12 @@ impl VideoJob {
             args.push("--".into());
             args.push(job.url.clone());
 
+            // snapshot BEFORE the child starts: taken after the
+            // spawn, a fast site could finish and write its final
+            // file inside the snapshot window, and find_final_file
+            // would then skip that file as "pre-existing" and report
+            // a finished download as an error
+            let before = dir_snapshot(&job.dir);
             let Ok(mut child) = Command::new(&ytdlp)
                 .args(&args)
                 .stdout(Stdio::piped())
@@ -1140,7 +1667,6 @@ impl VideoJob {
             } else {
                 None
             };
-            let before = dir_snapshot(&job.dir);
             let mut base: u64 = 0;
             let mut cur_done: u64 = 0;
             let mut cur_total: u64 = 0;
@@ -1162,7 +1688,11 @@ impl VideoJob {
                             cur_total = 0;
                         }
                         cur_done = d;
-                        p.done = base + cur_done;
+                        let new_done = base + cur_done;
+                        if new_done != p.done {
+                            p.last_progress_at = Instant::now();
+                        }
+                        p.done = new_done;
                     }
                     if let Some(t) = parse(1).or_else(|| parse(2)) {
                         if t > 0.0 {
@@ -1244,14 +1774,62 @@ impl VideoJob {
             } else {
                 Outcome::Failed
             };
+            // A stop that landed while the outcome was being
+            // resolved (the audio check above can take seconds)
+            // wins over a "finished" verdict: the stop flag sampled
+            // before the resolution is stale by now, and a
+            // cancelled job must never publish "finished"
+            // (R2-EXT-05). A pause keeps the produced file as a
+            // kept merge, so the resume finalizes it instead of
+            // re-downloading.
+            let outcome = match (job.stop_flag.lock().unwrap().clone(), outcome) {
+                (Some(flag), Outcome::Finished(fp)) if flag == "cancelled" => {
+                    let _ = std::fs::remove_file(&fp);
+                    Outcome::Stopped(flag)
+                }
+                (Some(flag), Outcome::Finished(fp)) if flag == "paused" => {
+                    *job.merged_final.lock().unwrap() = Some(fp);
+                    Outcome::Stopped(flag)
+                }
+                (Some(flag), Outcome::GuardError(_, _)) if flag == "cancelled" => {
+                    Outcome::Stopped(flag)
+                }
+                (_, o) => o,
+            };
+            let expected_media = *job.expected_media.lock().unwrap();
             let mut p = job.progress.lock().unwrap();
             p.conns = 0;
+            let mut published_finish = false;
             match outcome {
                 Outcome::Finished(fp) => {
-                    p.status = "finished".to_string();
-                    if let Ok(m) = fp.metadata() {
-                        p.total = m.len();
-                        p.done = m.len();
+                    let flen = fp.metadata().map(|m| m.len()).unwrap_or(0);
+                    // F-EXT-04 / R3-EXT-01: the merged file is
+                    // judged against the selected streams' media
+                    // payload (learned at resolution time), NOT
+                    // against p.total — what yt-dlp downloaded can
+                    // far exceed the media inside a padded
+                    // container, and a good merge must not be
+                    // declared broken. Unknown payload → the guard
+                    // skips. On a verdict the true total stays; it
+                    // is not rewritten to the output size. Audio
+                    // jobs are exempt: an extracted audio track is
+                    // legitimately a small fraction of the
+                    // downloaded source (R2-EXT-02).
+                    let shrink = if flen > 0 && !job.audio {
+                        drastic_shrink(expected_media, p.total, flen)
+                    } else {
+                        None
+                    };
+                    if let Some(msg) = shrink {
+                        p.status = "error".to_string();
+                        p.error = Some(msg);
+                    } else {
+                        p.status = "finished".to_string();
+                        if flen > 0 {
+                            p.total = flen;
+                            p.done = flen;
+                        }
+                        published_finish = true;
                     }
                     p.final_path = Some(fp);
                     p.speed_bps = 0.0;
@@ -1290,6 +1868,15 @@ impl VideoJob {
                                 .map(|l| l.trim().to_string())
                         })
                         .or_else(|| Some("yt-dlp failed".to_string()));
+                }
+            }
+            drop(p);
+            if published_finish {
+                // a finished job leaves no working files behind —
+                // including a previous attempt's parallel-engine
+                // parts (R4 side observation)
+                if let Some(stem) = job.chosen_stem.lock().unwrap().clone() {
+                    sweep_job_temps(&job.dir, &stem);
                 }
             }
         });
@@ -1338,6 +1925,14 @@ impl VideoJob {
 
     pub fn cancel(&self) {
         let _spawn_guard = self.spawn_lock.lock().unwrap();
+        // A finished job has nothing to cancel — and overwriting
+        // its status here would let a stop that lost the finish
+        // race flip a completed download to "cancelled", after
+        // which a discard could sweep it as if it had never
+        // finished (R2-EXT-05, the F-EXT-12 rule).
+        if self.progress.lock().unwrap().status == "finished" {
+            return;
+        }
         *self.stop_flag.lock().unwrap() = Some("cancelled".to_string());
         for d in self.active_downloads.lock().unwrap().iter() {
             d.control.cancel();
@@ -1350,6 +1945,33 @@ impl VideoJob {
         p.conns = 0;
     }
 
+    /// True once nothing of this job is still running: the yt-dlp
+    /// child has exited and every engine stream is SETTLED —
+    /// terminal with its final resume-state save on disk (a merely
+    /// terminal stream can still be between the supervisor's
+    /// status settle and its last save, and sweeping in that
+    /// window is how the stream journal survived deletes, R4
+    /// item 2). The discard flow waits for this before sweeping
+    /// the job's files, the way the HTTP path waits for its
+    /// engine (F-EXT-08).
+    pub fn is_settled(&self) -> bool {
+        let child_done = self
+            .child
+            .lock()
+            .unwrap()
+            .as_mut()
+            .map(|c| matches!(c.try_wait(), Ok(Some(_)) | Err(_)))
+            .unwrap_or(true);
+        if !child_done {
+            return false;
+        }
+        self.active_downloads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|d| d.is_settled())
+    }
+
     pub fn resume(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
         {
             let active = self.active_downloads.lock().unwrap().clone();
@@ -1358,7 +1980,12 @@ impl VideoJob {
                 for d in &active {
                     d.control.resume();
                 }
-                self.progress.lock().unwrap().status = "downloading".to_string();
+                // same stale-error rule as spawn(): a resumed job
+                // is a new attempt, its old error does not ride
+                // along in the progress payloads
+                let mut p = self.progress.lock().unwrap();
+                p.status = "downloading".to_string();
+                p.error = None;
                 return Ok(());
             }
         }
@@ -1379,6 +2006,45 @@ impl VideoJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finish_sweep_removes_both_engines_temps_only() {
+        // R4 side observation: a job paused on yt-dlp and finished
+        // on the parallel engine left its yt-dlp partial behind —
+        // the finish sweep must take BOTH engines' temps for the
+        // job's stem, plus the stream journals, and nothing else.
+        let dir =
+            std::env::temp_dir().join(format!("ndm-sweep-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let gone = [
+            ".big2.ndm_stream0.mp4.part",
+            ".big2.ndm_stream0.mp4.part.ndm.json",
+            ".big2.ndm_mux.mp4",
+            ".big2.ndm_audio.m4a",
+            "big2.mp4.part",
+            "big2.mp4.ytdl",
+            "big2.f140.m4a.part",
+        ];
+        let kept = [
+            "big2.mp4",
+            "big2.txt.part",
+            "big22.mp4.part",
+            "other.mp4.part",
+            ".big2.ndm_backup",
+        ];
+        for n in gone.iter().chain(kept.iter()) {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        sweep_job_temps(&dir, "big2");
+        for n in gone {
+            assert!(!dir.join(n).exists(), "{n} must be swept");
+        }
+        for n in kept {
+            assert!(dir.join(n).exists(), "{n} must survive");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn merged_mp4_reports_both_streams() {
@@ -1423,18 +2089,135 @@ Input #0, mp3, from 'song.mp3':
     }
 
     #[test]
+    fn merge_guard_judges_output_against_selected_media_not_download_total() {
+        // (a) R3-EXT-01, the padded container: 100,663,296 bytes
+        // were downloaded, but the selected streams hold only
+        // ≈2.31 MB of media and the merge produced the byte-perfect
+        // 2,342,828-byte movie — PASS. (The old baseline, the
+        // download total, errored exactly this case three times.)
+        assert!(drastic_shrink(Some(2_309_250), 100_663_296, 2_342_828).is_none());
+        // (b) the F-EXT-04 class the guard exists for: the selected
+        // media really is ~96 MB and the merge produced a 2.34 MB
+        // stub instead of the movie — ERROR, honestly reported
+        let err = drastic_shrink(Some(96_000_000), 100_663_296, 2_342_828)
+            .expect("a stub merge must still error");
+        assert!(err.contains("much smaller than what was downloaded"), "{err}");
+        // (c) the expected media size is genuinely unknown — the
+        // guard skips the job rather than fabricating a verdict,
+        // however lopsided the download total looks
+        assert!(drastic_shrink(None, 100_663_296, 2_342_828).is_none());
+        assert!(drastic_shrink(None, 0, 0).is_none());
+        // a zero estimate is no estimate
+        assert!(drastic_shrink(Some(0), 100_663_296, 10).is_none());
+        // exactly half of the expected media is within tolerance
+        assert!(drastic_shrink(Some(1000), 5000, 500).is_none());
+        // a normal remux (audio re-encode) shrinks a few percent
+        assert!(drastic_shrink(Some(1000), 1000, 970).is_none());
+    }
+
+    #[test]
+    fn media_payload_estimate_uses_stream_bitrates_not_file_size() {
+        // the R3 fixture's real `ffmpeg -i` header: the Duration
+        // line's 134217 kb/s is derived from the padded file size,
+        // while the streams report their true bitrates — 3010 + 69
+        // kb/s over 6.00 s is the ≈2.31 MB payload of the
+        // 2,342,828-byte movie inside the 100 MB container
+        let info = "\
+Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'big.mp4':
+  Duration: 00:00:06.00, start: 0.000000, bitrate: 134217 kb/s
+  Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 1280x720 [SAR 1:1 DAR 16:9], 3010 kb/s, 30 fps, 30 tbr, 15360 tbn (default)
+  Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 44100 Hz, mono, fltp, 69 kb/s (default)
+At least one output file must be specified";
+        assert_eq!(media_payload_estimate(info), Some(2_309_250));
+    }
+
+    #[test]
+    fn media_payload_estimate_refuses_partial_data() {
+        // a stream with no reported bitrate → unknown, not a guess
+        let no_bitrate = "\
+  Duration: 00:00:06.00, start: 0.000000, bitrate: 134217 kb/s
+  Stream #0:0: Video: h264, yuv420p, 1280x720, 30 fps";
+        assert_eq!(media_payload_estimate(no_bitrate), None);
+        // unknown duration → unknown
+        let no_duration = "\
+  Duration: N/A, bitrate: N/A
+  Stream #0:0: Audio: aac, 44100 Hz, mono, 69 kb/s";
+        assert_eq!(media_payload_estimate(no_duration), None);
+        // no streams at all → unknown
+        assert_eq!(
+            media_payload_estimate("  Duration: 00:00:06.00, bitrate: 100 kb/s"),
+            None
+        );
+    }
+
+    #[test]
+    fn formats_media_bytes_estimates_from_bitrates_only() {
+        let v = serde_json::json!({"formats": [
+            {"tbr": 800.0},
+            {"vbr": null, "abr": 128.0}
+        ]});
+        let formats: Vec<&serde_json::Value> =
+            v["formats"].as_array().unwrap().iter().collect();
+        // (800 + 128) kb/s × 100 s = 11,600,000 bytes of media
+        assert_eq!(formats_media_bytes(100.0, &formats), Some(11_600_000));
+        // a selected format with no bitrate at all → unknown
+        let v2 = serde_json::json!({"formats": [{"tbr": 800.0}, {"ext": "mp4"}]});
+        let formats2: Vec<&serde_json::Value> =
+            v2["formats"].as_array().unwrap().iter().collect();
+        assert_eq!(formats_media_bytes(100.0, &formats2), None);
+        // unknown duration → unknown
+        assert_eq!(formats_media_bytes(0.0, &formats), None);
+    }
+
+    #[test]
     fn unique_stem_on_disk_disambiguates_duplicate_titles() {
         let dir = std::env::temp_dir().join(format!("ndm-uniq-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let s0 = unique_stem_on_disk(&dir, "Fixture Player — Test Video");
+        let s0 = unique_stem_on_disk(&dir, "Fixture Player — Test Video", false);
         assert_eq!(s0, "Fixture Player — Test Video");
         std::fs::write(dir.join(format!("{s0}.mp4")), b"1").unwrap();
-        let s1 = unique_stem_on_disk(&dir, "Fixture Player — Test Video");
+        let s1 = unique_stem_on_disk(&dir, "Fixture Player — Test Video", false);
         assert_eq!(s1, "Fixture Player — Test Video (1)");
         std::fs::write(dir.join(format!("{s1}.mp4")), b"2").unwrap();
-        let s2 = unique_stem_on_disk(&dir, "Fixture Player — Test Video");
+        let s2 = unique_stem_on_disk(&dir, "Fixture Player — Test Video", false);
         assert_eq!(s2, "Fixture Player — Test Video (2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_stem_on_disk_ignores_the_other_kinds_files() {
+        // R3-EXT-04: the video half of a download-all pair landing
+        // first (big2.mp4 — and likewise any other video container)
+        // must not rename the audio half: no big2.m4a / big2.mp3
+        // exists, so the audio stem stays "big2".
+        let dir = std::env::temp_dir().join(format!("ndm-uniq-cross-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big2.mp4"), b"v").unwrap();
+        std::fs::write(dir.join("big2.mkv"), b"v").unwrap();
+        assert_eq!(unique_stem_on_disk(&dir, "big2", true), "big2");
+        // Symmetrically, audio files never rename a video stem.
+        std::fs::write(dir.join("song.m4a"), b"a").unwrap();
+        std::fs::write(dir.join("song.mp3"), b"a").unwrap();
+        assert_eq!(unique_stem_on_disk(&dir, "song", false), "song");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_stem_on_disk_renames_on_same_kind_collision() {
+        // Genuine collision: the entry's OWN final filename already
+        // exists, so "(1)" is correct — for either audio container.
+        let dir = std::env::temp_dir().join(format!("ndm-uniq-same-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("big2.m4a"), b"a").unwrap();
+        assert_eq!(unique_stem_on_disk(&dir, "big2", true), "big2 (1)");
+        std::fs::write(dir.join("song.mp3"), b"a").unwrap();
+        assert_eq!(unique_stem_on_disk(&dir, "song", true), "song (1)");
+        // …and the video kind against its own container.
+        std::fs::write(dir.join("clip.mkv"), b"v").unwrap();
+        assert_eq!(unique_stem_on_disk(&dir, "clip", false), "clip (1)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

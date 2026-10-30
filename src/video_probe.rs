@@ -245,7 +245,7 @@ fn fetch_thumbnail_data_uri(url: &str) -> Option<String> {
     if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
         return None;
     }
-    let agent = crate::apply_proxy(ureq::AgentBuilder::new())
+    let agent = crate::apply_proxy_for(ureq::AgentBuilder::new(), url)
         .timeout_connect(Duration::from_secs(4))
         .timeout_read(Duration::from_secs(4))
         .user_agent(crate::BROWSER_UA)
@@ -424,8 +424,14 @@ pub fn hls_default_audio_rendition(manifest: &str, base_url: &str) -> Option<Str
 /// rendition search: when `url` itself is a master, its renditions
 /// are resolved against it.
 pub fn fetch_hls_default_audio(url: &str, referer: &str, cookie: &str) -> Option<String> {
-    let mut req = ureq::get(url)
+    // through the configured proxy like every other fetch (and
+    // protocol-gated): on a proxy-only network a bare request here
+    // silently found "no separate audio" while downloads worked
+    let agent = crate::apply_proxy_for(ureq::AgentBuilder::new(), url)
         .timeout(Duration::from_secs(15))
+        .build();
+    let mut req = agent
+        .get(url)
         .set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
     if !referer.is_empty() {
         req = req.set("Referer", referer);
@@ -438,6 +444,308 @@ pub fn fetch_hls_default_audio(url: &str, referer: &str, cookie: &str) -> Option
         return None;
     }
     hls_default_audio_rendition(&text, url)
+}
+
+/// The vcodec yt-dlp actually reported, if any. `null` (the
+/// generic extractor does this for direct media files) and a
+/// missing key both mean "unknown" — NOT "no video stream".
+/// Only the explicit string `"none"` is an audio-only signal
+/// (R2-EXT-01: collapsing null into "none" made every direct
+/// .mp4 probe as audio-only and the video row vanished).
+fn reported_vcodec(f: &serde_json::Value) -> Option<&str> {
+    f["vcodec"].as_str().filter(|s| !s.is_empty())
+}
+
+/// The acodec yt-dlp actually reported, if any (same null rule
+/// as `reported_vcodec`).
+fn reported_acodec(f: &serde_json::Value) -> Option<&str> {
+    f["acodec"].as_str().filter(|s| !s.is_empty())
+}
+
+/// Container extensions that are audio-only by nature. Used as
+/// the positive audio evidence when yt-dlp left the codecs
+/// unknown: a direct .mp3 with null codecs is audio, while a
+/// direct .mp4 with null codecs is a video file.
+fn is_audio_container(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp3" | "m4a" | "aac" | "opus" | "ogg" | "oga" | "wav" | "flac" | "mka" | "wma" | "aif"
+            | "aiff"
+    )
+}
+
+/// Does this format carry a video stream? A reported vcodec
+/// other than "none" does. Unknown codecs count as video
+/// unless the container itself is an audio-only format.
+fn format_has_video(f: &serde_json::Value) -> bool {
+    match reported_vcodec(f) {
+        Some(vc) => vc != "none",
+        None => !is_audio_container(f["ext"].as_str().unwrap_or("")),
+    }
+}
+
+/// Is this format an audio-only stream? Explicit signal:
+/// vcodec "none" together with a real acodec. vcodec "none"
+/// with the acodec unreported: audio when the container is an
+/// audio-only format — yt-dlp's generic extractor describes a
+/// direct .m4a exactly that way ({vcodec: "none", acodec: null}),
+/// and a stream that declares no video inside an audio container
+/// has no other honest reading. (An explicit acodec "none" still
+/// rejects: that format declares it carries no audio either.)
+/// Unknown vcodec: only when the container is an audio-only
+/// format (a direct .mp3/.m4a file IS its audio stream).
+fn format_is_audio_only(f: &serde_json::Value) -> bool {
+    match reported_vcodec(f) {
+        Some(vc) => {
+            if vc != "none" {
+                return false;
+            }
+            match reported_acodec(f) {
+                Some(ac) => ac != "none",
+                None => is_audio_container(f["ext"].as_str().unwrap_or("")),
+            }
+        }
+        None => is_audio_container(f["ext"].as_str().unwrap_or("")),
+    }
+}
+
+/// Build the quality options from yt-dlp's format list. Pure
+/// (no I/O) so the classification rules — above all "no video
+/// streams means no video options" — are unit-testable.
+fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<QualityOption> {
+    // Best audio-only stream size (preferring m4a/aac to match our selector).
+    // Also track HOW the audio is delivered: an audio option built
+    // from HLS renditions must not be labelled "MP3" (F-EXT-02).
+    let mut best_m4a_size: u64 = 0;
+    let mut best_m4a_ext = String::new();
+    let mut best_any_audio_size: u64 = 0;
+    let mut best_any_audio_ext = String::new();
+    // Preference-ordered candidates for the size-less case below:
+    // the ext of an m4a/aac-preferred audio format, and of any
+    // audio format, in the selector's own preference order.
+    let mut pref_m4a_ext = String::new();
+    let mut pref_any_audio_ext = String::new();
+    let mut has_direct_audio = false;
+    let mut has_hls_audio = false;
+    for f in formats {
+        if format_is_audio_only(f) {
+            let acodec = reported_acodec(f).unwrap_or("");
+            let proto = f["protocol"].as_str().unwrap_or("");
+            if proto.contains("m3u8") {
+                has_hls_audio = true;
+            } else {
+                has_direct_audio = true;
+            }
+            let sz = format_size_bytes(f, duration_f64);
+            let ext = f["ext"].as_str().unwrap_or("");
+            if ext == "m4a" || acodec.starts_with("mp4a") || acodec.starts_with("aac") {
+                // yt-dlp lists formats worst→best, so the LAST
+                // match recorded here is the one the selector's
+                // first branch would pick
+                pref_m4a_ext = ext.to_string();
+                if sz > best_m4a_size {
+                    best_m4a_size = sz;
+                    best_m4a_ext = ext.to_string();
+                }
+            }
+            pref_any_audio_ext = ext.to_string();
+            if sz > best_any_audio_size {
+                best_any_audio_size = sz;
+                best_any_audio_ext = ext.to_string();
+            }
+        }
+    }
+    // The ext the audio selector (ba[ext=m4a]/ba/b) will actually
+    // fetch, in the selector's own preference order. The audio
+    // option's label must name THIS format — a hardcoded "MP3"
+    // labelled a download that landed on disk as .m4a (N-09).
+    // When sizes are known the size winner is the fetch (it tracks
+    // the selector's "best"); when NO format reports a usable size
+    // — a direct media file reports filesize: null — the size race
+    // never starts, so fall back to the preference candidates:
+    // an m4a/aac format is what ba[ext=m4a] fetches, and without
+    // one, ba takes the best remaining audio format (R4 item 12).
+    let audio_ext = if best_m4a_size > 0 {
+        best_m4a_ext
+    } else if best_any_audio_size > 0 {
+        best_any_audio_ext
+    } else if !pref_m4a_ext.is_empty() {
+        pref_m4a_ext
+    } else {
+        pref_any_audio_ext
+    };
+    let audio_bytes = if best_m4a_size > 0 {
+        best_m4a_size
+    } else if best_any_audio_size > 0 {
+        best_any_audio_size
+    } else if duration_f64 > 0.0 {
+        ((128_000.0 / 8.0) * duration_f64) as u64
+    } else {
+        0
+    };
+
+    // Any real video stream at all? Storyboards (mhtml) don't count.
+    let has_video = formats.iter().any(|f| {
+        let ext = f["ext"].as_str().unwrap_or("");
+        format_has_video(f) && ext != "mhtml"
+    });
+
+    // Collect distinct video heights (excluding storyboards/mhtml).
+    let mut heights: Vec<u64> = formats
+        .iter()
+        .filter(|f| {
+            let ext = f["ext"].as_str().unwrap_or("");
+            format_has_video(f) && ext != "mhtml"
+        })
+        .filter_map(|f| f["height"].as_u64())
+        .filter(|&h| h >= 120)
+        .collect();
+    heights.sort_unstable();
+    heights.dedup();
+
+    // Estimate size for a given height `h` by finding the format our selector prefers.
+    let size_for_height = |h: u64| -> u64 {
+        let mut best_rank = (0u8, 0u8, 0u64);
+        let mut chosen: Option<&serde_json::Value> = None;
+        for f in formats {
+            let vc = reported_vcodec(f).unwrap_or("");
+            if !format_has_video(f) || f["height"].as_u64() != Some(h) {
+                continue;
+            }
+            let ext = f["ext"].as_str().unwrap_or("");
+            let proto = f["protocol"].as_str().unwrap_or("");
+            let is_direct = !proto.contains("m3u8");
+            let codec_tier: u8 = if vc.starts_with("avc") && ext == "mp4" && is_direct {
+                5
+            } else if vc.starts_with("avc") && ext == "mp4" {
+                4
+            } else if ext == "mp4" && is_direct {
+                3
+            } else if ext == "mp4" {
+                2
+            } else {
+                1
+            };
+            let sz = format_size_bytes(f, duration_f64);
+            let has_size: u8 = if sz > 0 { 1 } else { 0 };
+            let rank = (codec_tier, has_size, sz);
+            if chosen.is_none() || rank > best_rank {
+                best_rank = rank;
+                chosen = Some(f);
+            }
+        }
+        if let Some(f) = chosen {
+            let v_sz = format_size_bytes(f, duration_f64);
+            if v_sz == 0 {
+                return 0;
+            }
+            // Only an EXPLICIT acodec "none" marks a video-only
+            // stream whose size needs the audio added. A real
+            // acodec — or an unknown one (null: a direct file is
+            // muxed, so its size already covers the audio) — does not.
+            if reported_acodec(f) == Some("none") {
+                v_sz + audio_bytes
+            } else {
+                v_sz
+            }
+        } else {
+            0
+        }
+    };
+
+    let mut options: Vec<QualityOption> = Vec::new();
+
+    if !has_video {
+        // Pure audio — a direct .mp3, an audio-only extractor
+        // result: NO video option may be offered. The old code fell
+        // into the heights-empty fallback below and invented a
+        // "Best Quality" MP4 row for it; the panel then created a
+        // VIDEO job for audio content, which downloaded to 100%
+        // and failed the playable-stream check (F-EXT-10). Only
+        // the audio option (pushed below) is returned.
+    } else if heights.is_empty() {
+        // Fallback when extractor reports no pixel heights (e.g. direct stream)
+        let top_size = formats
+            .iter()
+            .map(|f| format_size_bytes(f, duration_f64))
+            .max()
+            .unwrap_or(0);
+        let st = fmt_size(top_size);
+        let note = if st.is_empty() {
+            "MP4 • Video + Audio".to_string()
+        } else {
+            format!("MP4 • Video + Audio • {st}")
+        };
+        options.push(QualityOption {
+            selector: best_selector(),
+            label: "Best Quality".into(),
+            ext: "MP4".into(),
+            note,
+            size_bytes: top_size,
+            size_text: st,
+            audio: false,
+            height: 0,
+        });
+    } else {
+        for &h in heights.iter().rev() {
+            let sz = size_for_height(h);
+            let st = fmt_size(sz);
+            let tag = quality_tag(h);
+            let label = if tag.is_empty() {
+                format!("{h}p")
+            } else {
+                format!("{h}p ({tag})")
+            };
+            let note = if st.is_empty() {
+                "MP4 • Video + Audio".to_string()
+            } else {
+                format!("MP4 • Video + Audio • {st}")
+            };
+            options.push(QualityOption {
+                selector: selector_for_height(h),
+                label,
+                ext: "MP4".into(),
+                note,
+                size_bytes: sz,
+                size_text: st,
+                audio: false,
+                height: h,
+            });
+        }
+    }
+
+    // The audio option's label must describe what will actually be
+    // fetched: when the only audio streams are HLS renditions, the
+    // result is an HLS audio stream, not an MP3 file (F-EXT-02).
+    let hls_only_audio = !has_direct_audio && has_hls_audio;
+    let (a_ext, a_label, a_kind): (String, String, String) = if hls_only_audio {
+        ("Audio (HLS)".into(), "Audio Only (HLS)".into(), "HLS".into())
+    } else if !audio_ext.is_empty() {
+        let up = audio_ext.to_uppercase();
+        (up.clone(), format!("Audio Only ({up})"), up)
+    } else {
+        // No audio format was reported at all (size was estimated):
+        // stay neutral rather than inventing a format name.
+        ("Audio".into(), "Audio Only".into(), "Audio".into())
+    };
+    let audio_st = fmt_size(audio_bytes);
+    let audio_note = if audio_st.is_empty() {
+        format!("{a_kind} • High Quality Audio")
+    } else {
+        format!("{a_kind} • Audio Only • {audio_st}")
+    };
+    options.push(QualityOption {
+        selector: "ba[ext=m4a]/ba/b".into(),
+        label: a_label.into(),
+        ext: a_ext.into(),
+        note: audio_note,
+        size_bytes: audio_bytes,
+        size_text: audio_st,
+        audio: true,
+        height: 0,
+    });
+
+    options
 }
 
 pub fn probe(
@@ -536,165 +844,7 @@ pub fn probe(
 
     let formats = v["formats"].as_array().cloned().unwrap_or_default();
 
-    // Best audio-only stream size (preferring m4a/aac to match our selector).
-    let mut best_m4a_size: u64 = 0;
-    let mut best_any_audio_size: u64 = 0;
-    for f in &formats {
-        let vcodec = f["vcodec"].as_str().unwrap_or("none");
-        let acodec = f["acodec"].as_str().unwrap_or("none");
-        if vcodec == "none" && acodec != "none" {
-            let sz = format_size_bytes(f, duration_f64);
-            let ext = f["ext"].as_str().unwrap_or("");
-            if ext == "m4a" || acodec.starts_with("mp4a") || acodec.starts_with("aac") {
-                if sz > best_m4a_size {
-                    best_m4a_size = sz;
-                }
-            }
-            if sz > best_any_audio_size {
-                best_any_audio_size = sz;
-            }
-        }
-    }
-    let audio_bytes = if best_m4a_size > 0 {
-        best_m4a_size
-    } else if best_any_audio_size > 0 {
-        best_any_audio_size
-    } else if duration_f64 > 0.0 {
-        ((128_000.0 / 8.0) * duration_f64) as u64
-    } else {
-        0
-    };
-
-    // Collect distinct video heights (excluding storyboards/mhtml).
-    let mut heights: Vec<u64> = formats
-        .iter()
-        .filter(|f| {
-            let vc = f["vcodec"].as_str().unwrap_or("none");
-            let ext = f["ext"].as_str().unwrap_or("");
-            vc != "none" && ext != "mhtml"
-        })
-        .filter_map(|f| f["height"].as_u64())
-        .filter(|&h| h >= 120)
-        .collect();
-    heights.sort_unstable();
-    heights.dedup();
-
-    // Estimate size for a given height `h` by finding the format our selector prefers.
-    let size_for_height = |h: u64| -> u64 {
-        let mut best_rank = (0u8, 0u8, 0u64);
-        let mut chosen: Option<&serde_json::Value> = None;
-        for f in &formats {
-            let vc = f["vcodec"].as_str().unwrap_or("none");
-            if vc == "none" || f["height"].as_u64() != Some(h) {
-                continue;
-            }
-            let ext = f["ext"].as_str().unwrap_or("");
-            let proto = f["protocol"].as_str().unwrap_or("");
-            let is_direct = !proto.contains("m3u8");
-            let codec_tier: u8 = if vc.starts_with("avc") && ext == "mp4" && is_direct {
-                5
-            } else if vc.starts_with("avc") && ext == "mp4" {
-                4
-            } else if ext == "mp4" && is_direct {
-                3
-            } else if ext == "mp4" {
-                2
-            } else {
-                1
-            };
-            let sz = format_size_bytes(f, duration_f64);
-            let has_size: u8 = if sz > 0 { 1 } else { 0 };
-            let rank = (codec_tier, has_size, sz);
-            if chosen.is_none() || rank > best_rank {
-                best_rank = rank;
-                chosen = Some(f);
-            }
-        }
-        if let Some(f) = chosen {
-            let v_sz = format_size_bytes(f, duration_f64);
-            if v_sz == 0 {
-                return 0;
-            }
-            let ac = f["acodec"].as_str().unwrap_or("none");
-            if ac != "none" && !ac.is_empty() {
-                v_sz
-            } else {
-                v_sz + audio_bytes
-            }
-        } else {
-            0
-        }
-    };
-
-    let mut options: Vec<QualityOption> = Vec::new();
-
-    if heights.is_empty() {
-        // Fallback when extractor reports no pixel heights (e.g. direct stream)
-        let top_size = formats
-            .iter()
-            .map(|f| format_size_bytes(f, duration_f64))
-            .max()
-            .unwrap_or(0);
-        let st = fmt_size(top_size);
-        let note = if st.is_empty() {
-            "MP4 • Video + Audio".to_string()
-        } else {
-            format!("MP4 • Video + Audio • {st}")
-        };
-        options.push(QualityOption {
-            selector: best_selector(),
-            label: "Best Quality".into(),
-            ext: "MP4".into(),
-            note,
-            size_bytes: top_size,
-            size_text: st,
-            audio: false,
-            height: 0,
-        });
-    } else {
-        for &h in heights.iter().rev() {
-            let sz = size_for_height(h);
-            let st = fmt_size(sz);
-            let tag = quality_tag(h);
-            let label = if tag.is_empty() {
-                format!("{h}p")
-            } else {
-                format!("{h}p ({tag})")
-            };
-            let note = if st.is_empty() {
-                "MP4 • Video + Audio".to_string()
-            } else {
-                format!("MP4 • Video + Audio • {st}")
-            };
-            options.push(QualityOption {
-                selector: selector_for_height(h),
-                label,
-                ext: "MP4".into(),
-                note,
-                size_bytes: sz,
-                size_text: st,
-                audio: false,
-                height: h,
-            });
-        }
-    }
-
-    let audio_st = fmt_size(audio_bytes);
-    let audio_note = if audio_st.is_empty() {
-        "MP3 • High Quality Audio".to_string()
-    } else {
-        format!("MP3 • Audio Only • {audio_st}")
-    };
-    options.push(QualityOption {
-        selector: "ba[ext=m4a]/ba/b".into(),
-        label: "Audio Only (MP3)".into(),
-        ext: "MP3".into(),
-        note: audio_note,
-        size_bytes: audio_bytes,
-        size_text: audio_st,
-        audio: true,
-        height: 0,
-    });
+    let options = build_options(&formats, duration_f64);
 
     Ok(VideoInfo {
         title,
@@ -769,6 +919,279 @@ mod tests {
             hls_default_audio_rendition(master, "https://cdn.test:8443/h/master.m3u8"),
             Some("https://cdn.test:8443/abs/a.m3u8".to_string())
         );
+    }
+
+    #[test]
+    fn pure_audio_formats_yield_audio_only_options() {
+        // a direct .mp3 as yt-dlp reports it: one format, no video
+        // stream at all — the F-EXT-10 case. No video/"Best Quality"
+        // option may be invented for it.
+        let formats = vec![serde_json::json!({
+            "vcodec": "none", "acodec": "mp3", "ext": "mp3",
+            "filesize": 100_000, "protocol": "https"
+        })];
+        let options = build_options(&formats, 30.0);
+        assert_eq!(
+            options.len(),
+            1,
+            "labels: {:?}",
+            options.iter().map(|o| &o.label).collect::<Vec<_>>()
+        );
+        assert!(options[0].audio);
+    }
+
+    #[test]
+    fn null_vcodec_direct_mp4_offers_video() {
+        // R2-EXT-01: yt-dlp's generic extractor reports a direct
+        // media file with vcodec/acodec as JSON null (verified
+        // against the bundled yt-dlp `-j`), NOT the string "none".
+        // Null means "unknown", so the video row must survive.
+        let formats = vec![serde_json::json!({
+            "format_id": "0", "url": "http://cdn.test/big.mp4",
+            "ext": "mp4", "vcodec": null, "acodec": null,
+            "filesize": 100_663_296, "protocol": "https"
+        })];
+        let options = build_options(&formats, 30.0);
+        assert!(
+            options.iter().any(|o| !o.audio),
+            "a direct .mp4 must offer a video option, got: {:?}",
+            options.iter().map(|o| &o.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn missing_vcodec_key_direct_mp4_offers_video() {
+        // Same unknown-codec rule when the key is absent entirely.
+        let formats = vec![serde_json::json!({
+            "format_id": "0", "url": "http://cdn.test/clip.mp4",
+            "ext": "mp4", "acodec": null,
+            "filesize": 5_000_000, "protocol": "https"
+        })];
+        let options = build_options(&formats, 30.0);
+        assert!(options.iter().any(|o| !o.audio));
+    }
+
+    #[test]
+    fn null_vcodec_direct_mp3_stays_audio_only() {
+        // The other side of R2-EXT-01: unknown codecs must not
+        // resurrect the F-EXT-10 bug — a direct .mp3 is an audio
+        // container, so no video row may be invented for it.
+        let formats = vec![serde_json::json!({
+            "format_id": "0", "url": "http://cdn.test/song.mp3",
+            "ext": "mp3", "vcodec": null, "acodec": null,
+            "filesize": 100_000, "protocol": "https"
+        })];
+        let options = build_options(&formats, 30.0);
+        assert_eq!(
+            options.len(),
+            1,
+            "labels: {:?}",
+            options.iter().map(|o| &o.label).collect::<Vec<_>>()
+        );
+        assert!(options[0].audio);
+    }
+
+    #[test]
+    fn null_vcodec_with_height_yields_that_height_row() {
+        // Unknown codec but a reported height: the per-height row
+        // (and its size estimate) must be built from the format,
+        // not dropped by the size ranking.
+        let formats = vec![serde_json::json!({
+            "format_id": "0", "url": "http://cdn.test/movie.mp4",
+            "ext": "mp4", "vcodec": null, "acodec": null, "height": 720,
+            "filesize": 5_000_000, "protocol": "https"
+        })];
+        let options = build_options(&formats, 60.0);
+        let video = options
+            .iter()
+            .find(|o| !o.audio)
+            .expect("a video option must exist");
+        assert_eq!(video.height, 720);
+        assert_eq!(video.size_bytes, 5_000_000);
+    }
+
+    #[test]
+    fn hls_only_audio_is_not_labelled_mp3() {
+        // F-EXT-02: the only audio streams are HLS renditions.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 5_000_000, "protocol": "m3u8_native"
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": 900_000, "protocol": "m3u8_native"
+            }),
+        ];
+        let options = build_options(&formats, 60.0);
+        assert!(options.iter().any(|o| !o.audio), "video rows must exist");
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert!(!audio.ext.contains("MP3"), "ext: {}", audio.ext);
+        assert!(audio.ext.contains("HLS"), "ext: {}", audio.ext);
+        assert!(!audio.label.contains("MP3"), "label: {}", audio.label);
+    }
+
+    #[test]
+    fn direct_audio_label_follows_the_real_format() {
+        // N-09: the best audio here is an .m4a — the option must say
+        // M4A, because that is the file the download produces. (The
+        // old hardcoded "MP3" label is what this test used to assert.)
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 5_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": 900_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 60.0);
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert_eq!(audio.label, "Audio Only (M4A)");
+        assert_eq!(audio.ext, "M4A");
+        assert!(options.iter().any(|o| !o.audio && o.height == 720));
+    }
+
+    #[test]
+    fn mp3_audio_keeps_its_mp3_label() {
+        // When the best (only) audio really is an MP3, MP3 it is.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 5_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp3", "ext": "mp3",
+                "filesize": 900_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 60.0);
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert_eq!(audio.label, "Audio Only (MP3)");
+        assert_eq!(audio.ext, "MP3");
+    }
+
+    #[test]
+    fn sizeless_direct_m4a_keeps_its_format_label() {
+        // R4 item 12: a direct media file's format reports
+        // filesize: null and no bitrate (real yt-dlp JSON for a
+        // direct .m4a link), so no size ever exceeds 0 — the label
+        // must still name the container, from the selector's
+        // preference order, not fall back to neutral "Audio Only".
+        let formats = vec![serde_json::json!({
+            "format_id": "direct",
+            "url": "https://example.invalid/tune.m4a",
+            "ext": "m4a",
+            "vcodec": null,
+            "acodec": null,
+            "filesize": null,
+            "protocol": "https"
+        })];
+        let options = build_options(&formats, 0.0);
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert_eq!(audio.label, "Audio Only (M4A)");
+        assert_eq!(audio.ext, "M4A");
+        assert!(
+            options.iter().all(|o| o.audio),
+            "an audio file gets no video row"
+        );
+    }
+
+    #[test]
+    fn sizeless_direct_mp3_keeps_its_format_label() {
+        // Same size-less direct-file shape, MP3 container: no
+        // m4a/aac candidate exists, so ba falls through to the
+        // best (only) audio format — an MP3.
+        let formats = vec![serde_json::json!({
+            "format_id": "direct",
+            "url": "https://example.invalid/song.mp3",
+            "ext": "mp3",
+            "vcodec": null,
+            "acodec": null,
+            "filesize": null,
+            "protocol": "https"
+        })];
+        let options = build_options(&formats, 0.0);
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert_eq!(audio.label, "Audio Only (MP3)");
+        assert_eq!(audio.ext, "MP3");
+        assert!(
+            options.iter().all(|o| o.audio),
+            "an audio file gets no video row"
+        );
+    }
+
+    #[test]
+    fn none_vcodec_null_acodec_m4a_is_audio_only() {
+        // R5 item 2: the EXACT shape yt-dlp's generic extractor
+        // returns for a direct .m4a — vcodec is the string "none"
+        // (not null, so the unknown-vcodec branch never runs) and
+        // acodec is null. The old rule demanded a present acodec,
+        // rejected the format, and the label fell back to neutral
+        // "Audio Only". A no-video stream in an audio container
+        // is audio.
+        let formats = vec![serde_json::json!({
+            "format_id": "fmp4",
+            "ext": "m4a",
+            "vcodec": "none",
+            "acodec": null,
+            "filesize": null
+        })];
+        let options = build_options(&formats, 0.0);
+        assert_eq!(options.len(), 1, "exactly one option: {options:?}");
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert_eq!(audio.label, "Audio Only (M4A)");
+        assert_eq!(audio.ext, "M4A");
+        assert!(
+            options.iter().all(|o| o.audio),
+            "no video option may be invented for an audio file"
+        );
+    }
+
+    #[test]
+    fn none_vcodec_null_acodec_mp3_is_audio_only() {
+        // Same generic-extractor shape in an MP3 container whose
+        // acodec is null (the MP3 case used to pass only when the
+        // format happened to carry acodec: "mp3").
+        let formats = vec![serde_json::json!({
+            "format_id": "fmp3",
+            "ext": "mp3",
+            "vcodec": "none",
+            "acodec": null,
+            "filesize": null
+        })];
+        let options = build_options(&formats, 0.0);
+        assert_eq!(options.len(), 1, "exactly one option: {options:?}");
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert_eq!(audio.label, "Audio Only (MP3)");
+        assert_eq!(audio.ext, "MP3");
+        assert!(
+            options.iter().all(|o| o.audio),
+            "no video option may be invented for an audio file"
+        );
+    }
+
+    #[test]
+    fn sizeless_m4a_beside_a_sized_video_still_labels_m4a() {
+        // The audio format reports no size while the video format
+        // does: the size race for AUDIO still never starts, so the
+        // preference fallback names the m4a the selector fetches.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 5_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": null, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 60.0);
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert_eq!(audio.label, "Audio Only (M4A)");
+        assert_eq!(audio.ext, "M4A");
+        assert!(options.iter().any(|o| !o.audio && o.height == 720));
     }
 
     #[test]

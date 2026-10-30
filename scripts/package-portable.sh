@@ -33,7 +33,7 @@ chmod +x "$PKG/ndm/ndm-app" "$PKG/ndm/ndm-host" "$PKG/ndm/components/"*
 cat > "$PKG/ndm/NDM.desktop" << 'EOF'
 [Desktop Entry]
 Type=Application
-Name=NDM — Nill Download Manager
+Name=Nill Download Manager
 Comment=Fast download manager with browser integration
 Exec=NDM_DIR/ndm-app
 Icon=NDM_DIR/ndm.png
@@ -75,7 +75,7 @@ fi
 mkdir -p "$HOME/.local/share/applications"
 sed "s|NDM_DIR|$DIR|g" "$DIR/NDM.desktop" > "$HOME/.local/share/applications/ndm.desktop"
 chmod +x "$HOME/.local/share/applications/ndm.desktop"
-echo "menu entry added: NDM — Nill Download Manager"
+echo "menu entry added: Nill Download Manager"
 if ! ldconfig -p 2>/dev/null | grep -q 'libwebkit2gtk-4.1\.so'; then
   echo ""
   echo "NOTE: the GUI library WebKitGTK 4.1 was not found. Install it once:"
@@ -89,7 +89,7 @@ EOF
 chmod +x "$PKG/ndm/install.sh"
 
 cat > "$PKG/ndm/README.txt" << 'EOF'
-NDM — Nill Download Manager (portable Linux build)
+Nill Download Manager (portable Linux build)
 
 Run ./install.sh once (no root needed), then start ./ndm-app.
 Everything is inside this folder: the app, the browser bridge and

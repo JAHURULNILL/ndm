@@ -1,16 +1,20 @@
 /* NDM — light theme by default, dark theme via [data-theme="dark"].
    All colors flow through variables so the toggle is a single attribute flip. */
 * { box-sizing: border-box; margin: 0; padding: 0; }
+/* IDM hubuhu reskin: the light theme is IDM's classic desktop
+   look — plain white/grey surfaces, flat standard controls, the
+   Windows highlight blue for selection, Tahoma-class font, tight
+   spacing. No gradients, no glass, no heavy rounding/shadows. */
 :root {
-  --bg: #eceff2; --panel: #ffffff; --panel2: #f3f5f7; --line: #d3dae1;
-  --text: #1f262d; --dim: #68737e; --blue: #1f6fd0; --blue2: #2f7fd1;
-  --green: #2e9e63; --yellow: #b8860b;
-  --title-bg: #ffffff; --hover: #e7edf2; --th-bg: #e8edf1;
-  --row-line: #e2e8ed; --row-hover: #eff4f9; --sel: #cfe4fa; --sel-hover: #c1dcf8;
-  --track: #dde4ea; --seg-bg: #eef1f4; --input-bg: #ffffff;
-  --bar-text: #ffffff; --bar-shadow: 0 1px 2px rgba(0,0,0,.45);
-  --seg-done: #3f9de0; --seg-active: #f5c542; --seg-active2: #c79a1d; --seg-pending: #c9d2da;
-  --modal-shadow: 0 14px 44px rgba(30, 45, 60, .25);
+  --bg: #f0f0f0; --panel: #ffffff; --panel2: #f0f0f0; --line: #c6c6c6;
+  --text: #111111; --dim: #5a5a5a; --blue: #316ac5; --blue2: #316ac5;
+  --green: #2e7d4f; --yellow: #9c7200;
+  --title-bg: #f0f0f0; --hover: #e5f1fb; --th-bg: #f7f7f7;
+  --row-line: #e4e4e4; --row-hover: #eef5fc; --sel: #316ac5; --sel-hover: #2a5dab;
+  --track: #e0e0e0; --seg-bg: #f4f4f4; --input-bg: #ffffff;
+  --bar-text: #ffffff; --bar-shadow: none;
+  --seg-done: #316ac5; --seg-active: #f5c542; --seg-active2: #c79a1d; --seg-pending: #d4d4d4;
+  --modal-shadow: 0 2px 10px rgba(0,0,0,.28);
 }
 [data-theme="dark"] {
   --bg: #232629; --panel: #2b2f33; --panel2: #31363b; --line: #3d4247;
@@ -21,12 +25,12 @@
   --track: #1c1e20; --seg-bg: #1a1c1e; --input-bg: #1c1e20;
   --bar-text: #ffffff; --bar-shadow: 0 1px 2px rgba(0,0,0,.6);
   --seg-done: #3f9de0; --seg-active: #f5c542; --seg-active2: #a97e14; --seg-pending: #3a3f44;
-  --modal-shadow: 0 14px 44px rgba(0,0,0,.5);
+  --modal-shadow: 0 2px 10px rgba(0,0,0,.5);
 }
 html, body { height: 100%; }
 body {
-  font-family: -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, sans-serif;
-  background: var(--bg); color: var(--text); font-size: 13px;
+  font-family: Tahoma, "Segoe UI", -apple-system, Roboto, "Noto Sans", Ubuntu, sans-serif;
+  background: var(--bg); color: var(--text); font-size: 12.5px;
   display: flex; flex-direction: column; overflow: hidden;
 }
 
@@ -43,7 +47,7 @@ body {
 .title-stats b { color: var(--text); }
 .theme-toggle {
   background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-  border-radius: 20px; padding: 4px 11px; font-size: 12px; cursor: pointer;
+  border-radius: 2px; padding: 4px 11px; font-size: 12px; cursor: pointer;
   transition: background .15s;
 }
 .theme-toggle:hover { background: var(--hover); }
@@ -55,15 +59,23 @@ body {
 }
 .tool {
   background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-  border-radius: 6px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+  border-radius: 2px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
   transition: background .15s, transform .05s;
 }
 .tool:hover:not(:disabled) { background: var(--hover); }
 .tool:active:not(:disabled) { transform: translateY(1px); }
 .tool:disabled { opacity: .45; cursor: default; }
-.tool.primary { background: var(--blue); border-color: var(--blue); color: #fff; font-weight: 600; }
-.tool.primary:hover { background: var(--blue2); }
+/* the primary button is IDM's DEFAULT button: standard grey,
+   emphasised by its border and weight — not a coloured fill */
+.tool.primary { background: #e7e7e7; border-color: #7a7a7a; color: var(--text); font-weight: 600; }
+[data-theme="dark"] .tool.primary { background: #3c4249; border-color: #7d848c; }
+.tool.primary:hover { background: var(--hover); }
 .tool-sep { width: 1px; height: 22px; background: var(--line); margin: 0 4px; }
+/* IDM's toolbar buttons sit flat on the bar until hovered */
+.toolbar .tool { background: transparent; border-color: transparent; }
+.toolbar .tool.primary { background: transparent; border-color: transparent; color: var(--text); }
+.toolbar .tool:hover:not(:disabled) { background: var(--hover); border-color: #b9d7f2; }
+[data-theme="dark"] .toolbar .tool:hover:not(:disabled) { border-color: var(--line); }
 
 /* layout */
 .layout { flex: 1; display: flex; min-height: 0; }
@@ -77,33 +89,46 @@ body {
 }
 .sidebar ul { list-style: none; padding: 6px; flex: 1; overflow-y: auto; }
 .sidebar li {
-  padding: 6px 9px; border-radius: 6px; cursor: pointer; color: var(--dim);
+  padding: 5px 9px; border-radius: 2px; cursor: pointer; color: var(--dim);
   transition: background .15s, color .15s; white-space: nowrap;
 }
 .sidebar li:hover { background: var(--panel2); color: var(--text); }
 .sidebar li.active { background: var(--blue); color: #fff; }
 .side-status { padding: 7px 10px; border-top: 1px solid var(--line); color: var(--dim); font-size: 11.5px; }
+/* the bottom status bar (IDM's main window ends in one): file
+   counts on the left, live totals on the right */
+.statusbar {
+  display: flex; justify-content: space-between; align-items: center; gap: 16px;
+  padding: 4px 10px; background: var(--panel2); border-top: 1px solid var(--line);
+  color: var(--dim); font-size: 12px;
+}
+.statusbar .side-status { padding: 0; border-top: none; font-size: 12px; }
+.statusbar .title-stats { color: var(--dim); }
 
 .content { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); }
 .grid-wrap { flex: 1; min-height: 0; overflow-y: auto; overflow-x: auto; }
 .grid thead th { position: sticky; top: 0; z-index: 1; }
 .grid { width: 100%; border-collapse: collapse; }
 .grid th {
-  text-align: left; font-weight: 600; color: var(--dim); font-size: 11.5px;
-  padding: 7px 10px; border-bottom: 1px solid var(--line); background: var(--th-bg);
-  text-transform: uppercase; letter-spacing: .4px;
+  text-align: left; font-weight: 600; color: var(--text); font-size: 12px;
+  padding: 5px 8px; border-bottom: 1px solid var(--line); background: var(--th-bg);
 }
-.grid td { padding: 7px 10px; border-bottom: 1px solid var(--row-line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.grid .c-name, .grid td.name { max-width: 340px; }
+.grid td { padding: 5px 8px; border-bottom: 1px solid var(--row-line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* no max-width cap on the name column: the Columns dialog owns its
+   width (a 340px CSS cap made the picker disagree with the list) */
 .grid tbody tr { cursor: pointer; transition: background .12s; }
 .grid tbody tr:hover { background: var(--row-hover); }
 .grid tbody tr.selected { background: var(--sel); }
 .grid tbody tr.selected:hover { background: var(--sel-hover); }
+/* IDM's selection is the solid highlight blue with WHITE text —
+   including the status cell, whose state colour would otherwise
+   fight the background */
+.grid tbody tr.selected td { color: #fff; }
 /* row progress bar: the fill child's width is set via the DOM after
    render (see app.js) — inline-style percentages do not survive
    this WebKit's parsing inside the list's innerHTML */
-.pbar { height: 5px; border-radius: 3px; margin-top: 4px; width: 150px; background: var(--track); overflow: hidden; }
-.pbar i { display: block; height: 100%; background: var(--blue2); border-radius: 3px; }
+.pbar { height: 5px; border-radius: 2px; margin-top: 4px; width: 150px; background: var(--track); overflow: hidden; }
+.pbar i { display: block; height: 100%; background: var(--blue2); border-radius: 2px; }
 .pbar.ind { background: linear-gradient(90deg, var(--track) 0%, var(--blue2) 50%, var(--track) 100%);
   background-size: 200% 100%; animation: indslide3 1.1s linear infinite; }
 @keyframes indslide3 { from { background-position: 100% 0; } to { background-position: -100% 0; } }
@@ -115,69 +140,130 @@ body {
 .empty { padding: 26px; text-align: center; color: var(--dim); }
 
 /* detail modal (IDM Download Status floating window) */
-.modal-card.detail-modal { width: 580px; max-width: 95vw; }
+/* one FIXED dialog geometry (N-04): the card's height used to
+   follow the active tab, so it re-centred on every tab switch
+   and the tab strip jumped ~125 px — a returning click landed
+   on the backdrop and closed the dialog. Now the card is a
+   fixed-height frame: head, tab strip and the action row never
+   move; only the active panel's content scrolls when the
+   window is too short for it. */
+.modal-card.detail-modal {
+  width: 580px; max-width: 95vw; height: 600px;
+  display: flex; flex-direction: column;
+}
+.detail-modal .detail-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+.detail-modal .detail-btns { flex: none; }
 .detail-tabs { display: flex; gap: 2px; padding: 0 2px; border-bottom: 1px solid var(--line); }
-.detail-tabs .tab { padding: 6px 12px; color: var(--dim); border-radius: 6px 6px 0 0; cursor: pointer; font-weight: 600; font-size: 12.5px; }
+.detail-tabs .tab { padding: 6px 12px; color: var(--dim); border-radius: 3px 3px 0 0; cursor: pointer; font-weight: 600; font-size: 12.5px; }
 .detail-tabs .tab.active { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-bottom-color: var(--panel2); margin-bottom: -1px; }
-.detail-body { padding: 12px 14px; background: var(--panel2); border: 1px solid var(--line); border-top: none; border-radius: 0 0 8px 8px; }
+.detail-body { padding: 12px 14px; background: var(--panel2); border: 1px solid var(--line); border-top: none; border-radius: 0 0 3px 3px; }
 .d-conns { margin: 6px 0 2px; font-size: 12px; color: var(--dim); }
 .d-conn-row { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px dashed var(--line, #ddd); }
 .d-conn-row:last-child { border-bottom: none; }
 .kv { display: grid; grid-template-columns: 130px 1fr; row-gap: 4px; margin-bottom: 10px; }
 .kv dt { color: var(--dim); } .kv dd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .bar {
-  position: relative; height: 16px; background: var(--track); border-radius: 4px;
+  position: relative; height: 16px; background: var(--track); border-radius: 2px;
   overflow: hidden; margin-bottom: 8px; text-align: center;
 }
-.bar #dBarFill { position: absolute; inset: 0; width: 0%; background: linear-gradient(90deg, var(--blue), var(--blue2)); transition: width .3s; }
+.bar #dBarFill { position: absolute; inset: 0; width: 0%; background: var(--blue2); transition: width .3s; }
 .bar span { position: relative; font-size: 11px; line-height: 16px; color: var(--bar-text); text-shadow: var(--bar-shadow); }
 .seg-label { color: var(--dim); margin-bottom: 4px; }
-#segMap { width: 100%; height: 86px; background: var(--seg-bg); border: 1px solid var(--line); border-radius: 4px; }
+#segMap { width: 100%; height: 86px; background: var(--seg-bg); border: 1px solid var(--line); border-radius: 2px; }
 .detail-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .detail-btns button {
   background: var(--panel); color: var(--text); border: 1px solid var(--line);
-  border-radius: 6px; padding: 5px 14px; cursor: pointer; transition: background .15s;
+  border-radius: 2px; padding: 5px 14px; cursor: pointer; transition: background .15s;
 }
 .detail-btns button:hover:not(:disabled) { background: var(--hover); }
 .detail-btns button:disabled { opacity: .45; cursor: default; }
 
 /* modal */
 .modal {
-  position: fixed; inset: 0; background: rgba(15, 23, 32, .45);
-  display: flex; align-items: center; justify-content: center; z-index: 10;
-  overflow-y: auto;
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .35);
+  display: flex; z-index: 50;
+  overflow-y: auto; padding: 12px 8px;
 }
 .modal.hidden { display: none; }
 .modal-card {
-  width: 430px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 10px; padding: 16px; box-shadow: var(--modal-shadow);
+  /* margin:auto is the SAFE centring for a flex item in a scrolling
+     container: align-items:center pushed a taller-than-viewport
+     card's top (its header — title + close ×) above the scroll
+     origin, clipped and unreachable (Options/Scheduler headers).
+     With auto margins the card centres when it fits and aligns to
+     the top — fully scrollable — when it does not. */
+  margin: auto;
+  width: 430px; background: var(--panel); border: 1px solid #8a8a8a;
+  border-radius: 3px; padding: 16px; box-shadow: var(--modal-shadow);
   /* at the minimum window height a tall card (grabber, options) must
-     scroll internally — centred overflow off both ends is a trap */
-  max-height: calc(100vh - 24px); overflow-y: auto;
+     scroll internally — centred overflow off both ends is a trap.
+     The 60px pairs with the overlay's 48px top padding below. */
+  max-height: calc(100vh - 60px); overflow-y: auto;
 }
-.modal-head { font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; margin-bottom: 12px; }
-.modal-head span { cursor: pointer; color: var(--dim); font-size: 17px; }
+/* F-11 (root cause found in R3, pixel-measured): the menubar
+   (position:relative, z-index 40) paints ABOVE the modal layer
+   (z-index 10), and in this WebKit's software renderer the rows
+   the menubar occupies — viewport rows ~42–73 — lose whatever
+   the modal paints there. A tall card's title bar parks exactly
+   in that band (overlay top padding 48 puts its top at ~row 53),
+   so the header renders blank: laid out, clickable, never
+   drawn. Short dialogs centre lower, below the band, and kept
+   their headers — the "tall dialogs only" pattern. Neither a
+   transform toggle (R2) nor a forced display-toggle repaint
+   (R3) restored the strip; the cure is stacking: .modal now
+   sits at z-index 50, above the menubar, which is also the
+   correct behaviour — menus must not float over a modal. The
+   48px top padding stays (it keeps a tall card's top clear of
+   the app chrome it now covers). The detail window positions
+   itself by pixel and is excluded from the padding. */
+.modal:not(.detail-win) { padding: 48px 8px 12px; }
+/* a dialog's title bar, IDM-style: a flat grey strip bleeding to
+   the card's edges, the close × at its right end. Only the LAST
+   span is the close button — the first span (detail/grabber
+   titles) is title text and keeps the title look. */
+.modal-head {
+  font-weight: 600; font-size: 13px; display: flex; justify-content: space-between;
+  align-items: center; background: var(--panel2); border-bottom: 1px solid var(--line);
+  margin: -16px -16px 12px; padding: 8px 12px;
+}
+.modal-head > span:last-child { cursor: pointer; color: var(--dim); font-size: 15px; line-height: 1; padding: 0 2px; }
 .modal-card label { display: block; color: var(--dim); margin-bottom: 11px; font-size: 12px; }
 .modal-card input {
-  width: 100%; margin-top: 4px; padding: 8px 9px; border-radius: 6px;
+  width: 100%; margin-top: 4px; padding: 6px 8px; border-radius: 2px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
 }
 .modal-card input:focus { border-color: var(--blue2); }
+/* radios and checkboxes are NOT text fields: the generic rule above
+   gave them width:100%, padding and a top margin, so the circle
+   rendered stretched/offset from its label and the click target no
+   longer matched the visible circle (in the completion tab a click
+   beside "Open the folder" armed the neighbouring power option) */
+.modal-card input[type="radio"], .modal-card input[type="checkbox"] {
+  width: auto; margin: 0; padding: 0; flex: none;
+}
+.modal-card input.invalid { border-color: #d84a3a; }
+.cat-row { display: flex; gap: 6px; margin-top: 4px; }
+.cat-row select {
+  flex: 1; min-width: 0; padding: 6px 8px; border-radius: 2px;
+  border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
+}
+.cat-row select:focus { border-color: var(--blue2); }
+.cat-row button { flex: 0 0 auto; }
 .modal-btns { display: flex; gap: 6px; justify-content: flex-end; margin-top: 4px; }
 .modal-btns.left { justify-content: flex-start; align-items: center; margin-bottom: 10px; }
 .modal-card.wide { width: 520px; }
 /* ---------- menu bar ---------- */
 .menubar { display: flex; gap: 2px; padding: 3px 8px; background: var(--panel, #f4f6f8); border-bottom: 1px solid var(--line, #dde3e8); position: relative; z-index: 40; }
 .menu { position: relative; }
-.menu-btn { background: none; border: none; font: inherit; font-size: 13.5px; padding: 4px 10px; border-radius: 6px; cursor: pointer; color: inherit; }
+.menu-btn { background: none; border: none; font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 2px; cursor: pointer; color: inherit; }
 .menu-btn:hover, .menu-btn.open { background: var(--hover, rgba(90, 140, 200, .16)); }
-.menu-drop { position: absolute; top: calc(100% + 2px); left: 0; min-width: 264px; background: var(--card, #fff); border: 1px solid var(--line, #dde3e8); border-radius: 10px; box-shadow: 0 12px 32px rgba(20, 40, 70, .18); padding: 5px; display: flex; flex-direction: column; }
-.menu-drop > button { display: flex; justify-content: space-between; align-items: center; gap: 18px; background: none; border: none; font: inherit; font-size: 13.5px; text-align: left; padding: 7px 10px; border-radius: 6px; cursor: pointer; color: inherit; white-space: nowrap; }
+.menu-drop { position: absolute; top: calc(100% + 2px); left: 0; min-width: 264px; background: var(--panel, #fff); border: 1px solid var(--line, #dde3e8); border-radius: 3px; box-shadow: 0 4px 14px rgba(0, 0, 0, .18); padding: 4px; display: flex; flex-direction: column; }
+.menu-drop > button { display: flex; justify-content: space-between; align-items: center; gap: 18px; background: none; border: none; font: inherit; font-size: 13px; text-align: left; padding: 6px 10px; border-radius: 2px; cursor: pointer; color: inherit; white-space: nowrap; }
 .menu-drop > button:hover { background: var(--hover, rgba(90, 140, 200, .16)); }
 .menu-drop .mkey { opacity: .55; font-size: 12px; }
 .menu-sep { height: 1px; background: var(--line, #dde3e8); margin: 5px 4px; }
 body.no-side .sidebar { display: none; }
-.ta { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px; border: 1px solid var(--line, #ccd4dc); border-radius: 8px; background: var(--card, #fff); color: inherit; resize: vertical; }
+.ta { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px; border: 1px solid var(--line, #ccd4dc); border-radius: 2px; background: var(--input-bg, #fff); color: inherit; resize: vertical; }
 .shortcuts div { display: flex; gap: 14px; padding: 5px 2px; font-size: 13.5px; }
 .shortcuts b { min-width: 110px; font-weight: 600; }
 .about { text-align: center; padding: 6px 4px 2px; }
@@ -189,9 +275,12 @@ body.no-side .sidebar { display: none; }
 .v-setup .error { color: #c0392b; }
 .v-status { color: var(--dim); font-size: 12px; }
 .v-status.error { color: #d84a3a; }
+/* the batch dialog's status line carries the per-URL failure
+   list (N-07) — one failed link + reason per line */
+#bStatus { white-space: pre-line; }
 .f-probe-box {
   display: flex; gap: 10px; justify-content: space-between;
-  padding: 8px 11px; margin-bottom: 11px; border-radius: 7px;
+  padding: 8px 11px; margin-bottom: 11px; border-radius: 2px;
   background: var(--panel2, #eef3f8); border: 1px solid var(--line);
   font-size: 12px;
 }
@@ -205,13 +294,13 @@ body.no-side .sidebar { display: none; }
 .v-info.hidden { display: none; }
 .v-preview {
   display: flex; gap: 12px; align-items: center;
-  padding: 9px; margin-bottom: 10px; border-radius: 8px;
+  padding: 9px; margin-bottom: 10px; border-radius: 2px;
   background: var(--panel2, #f2f6fa); border: 1px solid var(--line);
 }
 .v-thumb-wrap {
   position: relative; width: 132px; height: 76px; flex: none;
-  border-radius: 6px; overflow: hidden;
-  background: linear-gradient(135deg, #1b2b42, #0f1826);
+  border-radius: 2px; overflow: hidden;
+  background: #3a3a3a;
   border: 1px solid var(--line);
   display: flex; align-items: center; justify-content: center;
 }
@@ -221,7 +310,7 @@ body.no-side .sidebar { display: none; }
   position: absolute; right: 5px; bottom: 5px;
   background: rgba(0, 0, 0, .82); color: #fff;
   font-size: 11px; font-weight: 700; padding: 1px 5px;
-  border-radius: 4px; font-variant-numeric: tabular-nums;
+  border-radius: 2px; font-variant-numeric: tabular-nums;
 }
 .v-preview-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
 .modal-card .v-title-lbl { margin-bottom: 2px; font-weight: 600; }
@@ -236,19 +325,19 @@ body.no-side .sidebar { display: none; }
 .v-options { display: flex; flex-direction: column; gap: 5px; max-height: 215px; overflow-y: auto; }
 .v-options label {
   display: flex; gap: 8px; align-items: center; margin: 0; padding: 7px 10px;
-  border: 1px solid var(--line); border-radius: 6px; cursor: pointer; color: var(--text);
+  border: 1px solid var(--line); border-radius: 2px; cursor: pointer; color: var(--text);
   transition: background .1s ease, border-color .1s ease;
 }
 .v-options label:hover { background: var(--row-hover); }
 .v-options label.sel {
-  background: rgba(31, 111, 208, .12);
-  border-color: var(--blue2, #1f6fd0);
+  background: rgba(49, 106, 197, .12);
+  border-color: var(--blue2, #316ac5);
 }
 .v-options input { width: auto; margin: 0; }
 .v-options .q-badge {
   font-size: 10.5px; font-weight: 700; padding: 2px 6px;
-  border-radius: 4px; letter-spacing: .3px; flex: none;
-  background: rgba(31, 111, 208, .14); color: var(--blue2, #1f6fd0);
+  border-radius: 2px; letter-spacing: .3px; flex: none;
+  background: rgba(49, 106, 197, .14); color: var(--blue2, #316ac5);
 }
 .v-options .q-badge.audio {
   background: rgba(214, 137, 16, .16); color: #b7791f;
@@ -258,11 +347,11 @@ body.no-side .sidebar { display: none; }
 .v-options .q-size {
   margin-left: auto; font-weight: 700; font-size: 12.5px;
   font-variant-numeric: tabular-nums;
-  padding: 2px 8px; border-radius: 999px;
+  padding: 2px 8px; border-radius: 2px;
   background: var(--panel2, #eef3f8); color: var(--text);
 }
 .v-options .q-size.exact {
-  background: rgba(31, 111, 208, .15); color: var(--blue2, #1f6fd0);
+  background: rgba(49, 106, 197, .15); color: var(--blue2, #316ac5);
 }
 
 /* options + scheduler modals */
@@ -270,10 +359,35 @@ body.no-side .sidebar { display: none; }
 .opt-row > span { flex: 0 0 168px; }
 .opt-row .opt-unit { flex: 0 0 auto; }
 .opt-row input, .opt-row select {
-  flex: 1; min-width: 0; margin-top: 0; padding: 8px 9px; border-radius: 6px;
+  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 2px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
 }
 .opt-row input:focus, .opt-row select:focus { border-color: var(--blue2); }
+/* fields gated off by their mode (Options proxy modes, N-01)
+   read as inert, the way a disabled control does in IDM */
+.opt-row input:disabled, .opt-row select:disabled { opacity: .5; }
+.opt-row textarea {
+  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 2px;
+  border: 1px solid var(--line); background: var(--input-bg); color: var(--text);
+  font: inherit; font-size: 13px; outline: none; resize: vertical;
+}
+.opt-row textarea:focus { border-color: var(--blue2); }
+/* a row whose label is a whole sentence (Scheduler power action):
+   stack label over control so the dropdown gets the full card width
+   and its value is never truncated */
+.opt-row.stack { flex-direction: column; align-items: stretch; gap: 6px; }
+.opt-row.stack > span { flex: none; }
+.grid th.sortable { cursor: pointer; }
+.grid th.sortable:hover { color: var(--text); }
+.opt-tabs { margin-bottom: 12px; }
+/* the five Options tabs must fit the card on ONE line — the
+   longest label ("Proxy & Site Logins") used to wrap to two
+   lines at the shared .tab padding. Slightly tighter padding
+   and type for this strip only, labels never wrap, and the
+   strip bleeds a few px into the card padding like the title
+   bar does, which buys the last of the room it needs. */
+.opt-tabs { margin-left: -8px; margin-right: -8px; }
+.opt-tabs .tab { white-space: nowrap; padding: 6px 5px; font-size: 11.5px; }
 .opt-row input[type="number"] { flex: 0 0 90px; }
 .opt-check {
   display: flex; align-items: center; gap: 8px; margin-bottom: 11px;
@@ -296,7 +410,7 @@ body.no-side .sidebar { display: none; }
 .grab-kinds { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .grab-kinds label {
   display: inline-flex; align-items: center; gap: 6px; margin: 0;
-  padding: 4px 10px; border: 1px solid var(--line); border-radius: 20px;
+  padding: 4px 10px; border: 1px solid var(--line); border-radius: 2px;
   background: var(--panel2); color: var(--text); font-size: 12px; cursor: pointer;
 }
 .grab-kinds label:hover { background: var(--hover); }
@@ -306,7 +420,7 @@ body.no-side .sidebar { display: none; }
 .grab-selrow .tool { padding: 4px 10px; }
 #gCount { margin-left: auto; color: var(--dim); font-size: 12px; }
 .grab-list {
-  border: 1px solid var(--line); border-radius: 6px; margin-bottom: 12px;
+  border: 1px solid var(--line); border-radius: 2px; margin-bottom: 12px;
   max-height: 250px; overflow-y: auto; background: var(--panel);
 }
 .grab-item {
@@ -328,14 +442,21 @@ body.no-side .sidebar { display: none; }
 
 /* audit additions: transient message + completion options */
 .flash {
-  margin: 8px 12px 0; padding: 8px 12px; border-radius: 8px;
+  margin: 8px 12px 0; padding: 8px 12px; border-radius: 2px;
   background: #fdecec; color: #a12622; border: 1px solid #f3c2c0;
   font-size: 13px;
 }
 [data-theme="dark"] .flash { background: #3d2323; color: #f0a9a5; border-color: #6e3a38; }
+/* informational messages (up-to-date, export done, counts) are not
+   errors — they get a neutral banner, in both themes */
+.flash.info { background: var(--panel2); color: var(--text); border-color: var(--line); }
 .comp-note { margin: 4px 0 8px; color: var(--text); }
 .comp-note.dim { color: var(--dim); font-size: 12px; }
-.comp-opt { display: block; padding: 4px 0; cursor: pointer; }
+/* one flex row per option: the radio/checkbox is vertically centred
+   on its own label's line, and the label's click target is exactly
+   the row the user sees (completion tab, Options proxy radios,
+   Grabber Step 3) */
+.comp-opt { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
 
 /* generic visibility utility (component-scoped rules exist for modal/detail;
    the flash line and completion panel rely on this one) */
@@ -345,15 +466,15 @@ body.no-side .sidebar { display: none; }
 .ctx-menu {
   position: fixed; z-index: 90; min-width: 210px; padding: 4px;
   background: var(--panel, #ffffff); color: inherit;
-  border: 1px solid var(--line, #ccd4db); border-radius: 8px;
-  box-shadow: 0 10px 30px rgba(15, 30, 45, .22);
+  border: 1px solid var(--line, #ccd4db); border-radius: 3px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .2);
 }
 .ctx-menu button {
   display: block; width: 100%; text-align: left; background: none;
   border: none; padding: 6px 10px; font: inherit; font-size: 13px;
-  cursor: pointer; border-radius: 5px; color: inherit;
+  cursor: pointer; border-radius: 2px; color: inherit;
 }
-.ctx-menu button:hover:not(:disabled) { background: rgba(31, 111, 208, .12); }
+.ctx-menu button:hover:not(:disabled) { background: rgba(49, 106, 197, .14); }
 .ctx-menu button:disabled { opacity: .45; cursor: default; }
 .ctx-menu .ctx-sep { border-top: 1px solid var(--line, #dde3e8); margin: 4px 2px; }
 .ctx-menu .ctx-head {
@@ -364,7 +485,7 @@ body.no-side .sidebar { display: none; }
 /* scheduler "files in the queue" list */
 .s-files {
   max-height: 150px; overflow-y: auto; margin: 4px 0 8px;
-  border: 1px solid var(--line, #dde3e8); border-radius: 6px;
+  border: 1px solid var(--line, #dde3e8); border-radius: 2px;
 }
 .s-file-row {
   display: flex; align-items: center; gap: 8px; padding: 5px 8px;
@@ -375,7 +496,7 @@ body.no-side .sidebar { display: none; }
 .s-file-row .s-st { opacity: .7; font-size: 11.5px; }
 .s-file-row button {
   border: 1px solid var(--line, #ccd4db); background: none; color: inherit;
-  border-radius: 4px; width: 22px; height: 22px; cursor: pointer; line-height: 1;
+  border-radius: 2px; width: 22px; height: 22px; cursor: pointer; line-height: 1;
 }
 .s-file-row button:disabled { opacity: .35; cursor: default; }
 .s-files .s-empty { padding: 8px; font-size: 12px; opacity: .65; }
@@ -389,26 +510,35 @@ body.no-side .sidebar { display: none; }
 .login-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
 .login-row {
   display: grid; grid-template-columns: 1.4fr 1fr .6fr auto; gap: 8px; align-items: center;
-  padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; font-size: 12.5px;
+  padding: 5px 8px; border: 1px solid var(--line); border-radius: 2px; font-size: 12.5px;
 }
 .login-row .login-site { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .grab-steps { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 12px; }
 .g-step {
-  font-size: 11.5px; padding: 4px 9px; border-radius: 999px;
+  font-size: 11.5px; padding: 4px 9px; border-radius: 2px;
   border: 1px solid var(--line); color: var(--dim); background: var(--th-bg);
 }
 .g-step.on { color: #fff; background: var(--blue2); border-color: var(--blue2); font-weight: 600; }
 .g-panel select, .grab-field select {
-  width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px;
-  background: var(--card, #fff); color: inherit; font-size: 13px;
+  width: 100%; padding: 7px 9px; border: 1px solid var(--line); border-radius: 2px;
+  background: var(--input-bg, #fff); color: inherit; font-size: 13px;
 }
 .col-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; max-height: 320px; overflow-y: auto; }
 .col-row {
   display: flex; gap: 8px; align-items: center; padding: 5px 8px;
-  border: 1px solid var(--line); border-radius: 8px; font-size: 13px;
+  border: 1px solid var(--line); border-radius: 2px; font-size: 13px;
 }
 .col-row .col-name { flex: 1; }
-.col-row input[type="number"] { width: 70px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }
+.col-row input[type="number"] { width: 70px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 2px; }
 .col-row input[type="checkbox"] { width: auto; margin: 0; }
 .toolbar.tb-small .tool { padding: 4px 8px; font-size: 12px; }
 .modal-btns.left { justify-content: flex-start; }
+
+/* the Options card is a fixed frame (N-02): title bar, tab strip
+   and the Save/Cancel row never scroll — only the active panel
+   does. The whole card used to be the scroller, so on the tall
+   tabs the dialog outgrew the window, the header scrolled away
+   and the tab strip painted clipped. */
+#omodal .modal-card { display: flex; flex-direction: column; overflow: hidden; }
+#omodal .opt-panel { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+#omodal .modal-head, #omodal .opt-tabs, #omodal .modal-btns { flex: none; }

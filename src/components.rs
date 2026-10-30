@@ -30,7 +30,7 @@ pub struct ComponentSpec {
     pub zipped: bool,
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "x86_64"))]
 pub fn specs() -> Vec<ComponentSpec> {
     vec![
         ComponentSpec {
@@ -50,7 +50,7 @@ pub fn specs() -> Vec<ComponentSpec> {
     ]
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(target_os = "windows"), target_arch = "aarch64"))]
 pub fn specs() -> Vec<ComponentSpec> {
     vec![
         ComponentSpec {
@@ -70,9 +70,71 @@ pub fn specs() -> Vec<ComponentSpec> {
     ]
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+// Windows assets are different files entirely — an OS-blind table
+// fetched the Linux binaries there and installed them without the
+// .exe names find_tool looks for, so the video engine could never
+// become ready. Hashes below were taken from the publishers'
+// own checksum files for these exact releases.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub fn specs() -> Vec<ComponentSpec> {
+    vec![
+        ComponentSpec {
+            name: "yt-dlp",
+            asset: "yt-dlp.exe",
+            url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp.exe",
+            sha256: "f5389d3698ecde4ef06f4e6b1ce0294fe9ac1396228c8990b8d3416d6d177a7d",
+            zipped: false,
+        },
+        ComponentSpec {
+            name: "deno",
+            asset: "deno-x86_64-pc-windows-msvc.zip",
+            url: "https://github.com/denoland/deno/releases/download/v2.9.8/deno-x86_64-pc-windows-msvc.zip",
+            sha256: "cba84b26e0df5ae7f74fc66b86a95b866872a86292ebd84fa1e959927edd93bf",
+            zipped: true,
+        },
+    ]
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+pub fn specs() -> Vec<ComponentSpec> {
+    vec![
+        ComponentSpec {
+            name: "yt-dlp",
+            asset: "yt-dlp_arm64.exe",
+            url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_arm64.exe",
+            sha256: "0066dbac3c124028e2dcae2a197fccee33cd91f456313d24f7af89fd54590e98",
+            zipped: false,
+        },
+        ComponentSpec {
+            name: "deno",
+            asset: "deno-aarch64-pc-windows-msvc.zip",
+            url: "https://github.com/denoland/deno/releases/download/v2.9.8/deno-aarch64-pc-windows-msvc.zip",
+            sha256: "b413b92b735b50c198e8fe3b85af1aa50e29d5f72e229aab701d132286e14cef",
+            zipped: true,
+        },
+    ]
+}
+
+#[cfg(not(any(
+    all(not(target_os = "windows"), target_arch = "x86_64"),
+    all(not(target_os = "windows"), target_arch = "aarch64"),
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "aarch64"),
+)))]
 pub fn specs() -> Vec<ComponentSpec> {
     Vec::new()
+}
+
+/// The file name the binary is installed under in the components
+/// dir — and, for zipped components, the entry name inside the
+/// archive. `find_tool` appends `.exe` on Windows, so the installed
+/// file must carry it there (the deno archives ship `deno.exe`).
+fn installed_name(spec: &ComponentSpec) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{}.exe", spec.name)
+    } else {
+        spec.name.to_string()
+    }
 }
 
 /// One progress report while a component downloads. `phase` is
@@ -181,7 +243,7 @@ pub fn download_component(
             spec.name
         ));
     }
-    let final_path = dir.join(spec.name);
+    let final_path = dir.join(installed_name(spec));
     if spec.zipped {
         on_progress(Progress {
             name: spec.name.to_string(),
@@ -189,7 +251,7 @@ pub fn download_component(
             total,
             phase: "extracting".to_string(),
         });
-        if let Err(e) = extract_binary(&part, spec.name, &final_path) {
+        if let Err(e) = extract_binary(&part, &installed_name(spec), &final_path) {
             let _ = std::fs::remove_file(&part);
             return Err(e);
         }

@@ -12,7 +12,21 @@ if (TAURI) {
 /* ---------- state ---------- */
 const items = new Map();       // id -> DownloadInfo
 const deletedIds = new Set();  // ids removed this session (tombstones)
+/* completion announcements (N-03): the backend's download_complete
+   event does not fire for every finish — a download that was
+   paused and resumed finalizes without one, so its "Download
+   complete" dialog never appeared (fresh finishes got theirs).
+   render() watches the list itself for the same transition and
+   synthesizes the announcement; this set, shared with the real
+   event listener, makes sure each finish is announced exactly
+   once, whichever path saw it first. An id leaves the set when
+   its entry is seen in a non-finished state again, so a file
+   re-downloaded later announces its second finish too. */
+const completeAnnounced = new Set();
+const prevStatusById = new Map();
 let selectedId = null;
+const selectedIds = new Set(); // multi-selection (Ctrl/Shift+click, Ctrl+A); selectedId stays the primary row
+let selectAnchor = null;       // row a Shift+click range extends from
 let currentCat = 'All Downloads';
 let pulse = 0;                 // animation phase for active blocks
 
@@ -81,6 +95,38 @@ function fillQueueSelect(sel, selectedName) {
   }
 }
 
+/* every category name the File dialog may offer: the built-ins,
+   plus any the user gave a folder or a type list in Options, plus
+   any created from the dialog itself */
+function categoryNames() {
+  return [...new Set([
+    'General',
+    ...Object.keys(BUILTIN_CATEGORY_EXTS),
+    ...Object.keys(settings.category_dirs || {}),
+    ...Object.keys(settings.category_exts || {}),
+  ])];
+}
+
+/* Fill a <select> with the category choices. The first entry is
+   "Auto": no explicit category, so the backend routes by file type
+   exactly as it did before the dropdown existed. */
+function fillCategorySelect(sel, selected) {
+  if (!sel) return;
+  const names = categoryNames();
+  sel.innerHTML = '';
+  const auto = document.createElement('option');
+  auto.value = '';
+  auto.textContent = 'Auto (by file type)';
+  sel.appendChild(auto);
+  for (const n of names) {
+    const o = document.createElement('option');
+    o.value = n;
+    o.textContent = n;
+    sel.appendChild(o);
+  }
+  sel.value = selected && names.includes(selected) ? selected : '';
+}
+
 /* the Q column: the queue's 1-based number, IDM-style */
 function queueShort(qname) {
   const names = (settings.queues || []).map(q => q.name);
@@ -114,7 +160,10 @@ async function saveSettings() {
 }
 
 /* ---------- rendering ---------- */
-let sortKey = 'date'; // View menu: name | date | size | status
+let sortKey = 'date'; // View menu + header clicks: name | date | size | status
+let sortDir = 1;      // 1 = ascending (▲), -1 = descending (▼) — for EVERY key
+/* which sort key a list column drives (header click, IDM-style) */
+const SORT_FOR_COL = { name: 'name', size: 'size', status: 'status', added: 'date' };
 function visibleItems() {
   const all = [...items.values()];
   let out = all;
@@ -123,13 +172,17 @@ function visibleItems() {
   else if (currentCat.startsWith('queue:')) out = all.filter(d => d.queue === currentCat.slice(6));
   else if (currentCat !== 'All Downloads') out = all.filter(d => d.category === currentCat);
   const numId = id => parseInt(String(id).replace(/\D+/g, ''), 10) || 0;
+  // every comparator is ASCENDING in the key's own terms, so the
+  // ▲/▼ marker means the same thing on every column (Windows/IDM
+  // convention). Size used to be the odd one out — descending
+  // while its arrow claimed ascending (N-05).
   const by = {
     name: (a, b) => a.name.localeCompare(b.name),
     date: (a, b) => numId(a.id) - numId(b.id),
-    size: (a, b) => (b.total || 0) - (a.total || 0),
+    size: (a, b) => (a.total || 0) - (b.total || 0),
     status: (a, b) => a.status.localeCompare(b.status),
   }[sortKey];
-  return by ? [...out].sort(by) : out;
+  return by ? [...out].sort((a, b) => by(a, b) * sortDir) : out;
 }
 
 let queueListSig = '';
@@ -220,9 +273,38 @@ function applyColumns() {
     const th = document.createElement('th');
     th.textContent = (COLUMN_DEFS.find(d => d.id === c.id) || {}).label || c.id;
     if (c.id === 'name') th.className = 'c-name';
+    // IDM sorts from the header: clicking a sortable column sorts
+    // by it; clicking the active column again reverses direction
+    if (SORT_FOR_COL[c.id]) {
+      th.classList.add('sortable');
+      th.title = 'Click to sort';
+      th.addEventListener('click', () => {
+        const key = SORT_FOR_COL[c.id];
+        if (sortKey === key) sortDir = -sortDir;
+        else { sortKey = key; sortDir = 1; }
+        updateSortIndicators();
+        render();
+      });
+    }
     hr.appendChild(th);
   }
+  updateSortIndicators();
   lastStructSig = '__columns_changed__'; // force one structural rebuild
+}
+
+/* paint the ▲/▼ marker on the header that owns the current sort */
+function updateSortIndicators() {
+  const hr = $('headRow');
+  if (!hr) return;
+  const cols = visibleColumns();
+  [...hr.children].forEach((th, i) => {
+    const c = cols[i];
+    if (!c) return;
+    const def = COLUMN_DEFS.find(d => d.id === c.id) || {};
+    const arrow = SORT_FOR_COL[c.id] && SORT_FOR_COL[c.id] === sortKey
+      ? (sortDir > 0 ? ' ▲' : ' ▼') : '';
+    th.textContent = (def.label || c.id) + arrow;
+  });
 }
 
 /* ---------- toolbar customization (IDM's toolbar "Customize…") ---------- */
@@ -261,9 +343,10 @@ function applyToolbar() {
 /* ---------- Columns / Toolbar dialogs ---------- */
 let colEdit = null;
 function openColumns() {
+  if (anotherModalOpen('colmodal')) return; // one modal layer (N-08)
   colEdit = columnCfg.map(c => ({ ...c }));
   renderColEdit();
-  $('colmodal').classList.remove('hidden');
+  revealModal($('colmodal'));
 }
 function renderColEdit() {
   const box = $('colList');
@@ -314,10 +397,11 @@ $('colOk').onclick = () => {
 
 let tbEdit = null;
 function openToolbarCfg() {
+  if (anotherModalOpen('tbmodal')) return; // one modal layer (N-08)
   tbEdit = { hidden: [...toolbarCfg.hidden], size: toolbarCfg.size };
   renderTbEdit();
   $('tbSize').value = tbEdit.size;
-  $('tbmodal').classList.remove('hidden');
+  revealModal($('tbmodal'));
 }
 function renderTbEdit() {
   const box = $('tbList');
@@ -418,33 +502,99 @@ function updateRowCells(tr, d) {
   // this WebKit drops percentage widths written into inline styles
   const fill = tr.querySelector('.pbar i');
   if (fill) fill.style.width = fill.dataset.pct + '%';
-  const sel = d.id === selectedId;
+  const sel = selectedIds.has(d.id) || d.id === selectedId;
   if (tr.classList.contains('selected') !== sel) tr.classList.toggle('selected', sel);
 }
 
 function buildRow(d) {
   const tr = document.createElement('tr');
   for (const _c of visibleColumns()) tr.appendChild(document.createElement('td'));
-  // Single-click ONLY selects the row in the full-height table (like IDM)
-  tr.addEventListener('click', () => select(d.id, false));
+  // Single-click ONLY selects the row in the full-height table (like IDM);
+  // Ctrl+click toggles one row, Shift+click extends a range — the
+  // multi-selection batch actions (Delete above all) act on
+  tr.addEventListener('click', e => {
+    // ctrlHeld backs up e.ctrlKey: this WebKit can deliver the
+    // click without the modifier even while Ctrl is physically
+    // down, and a Ctrl+click then silently REPLACED the selection
+    // instead of toggling the row into it (F-22)
+    if (e.ctrlKey || e.metaKey || ctrlHeld) { toggleSelect(d.id); return; }
+    if (e.shiftKey || shiftHeld) { rangeSelect(d.id); return; }
+    selectAnchor = d.id;
+    select(d.id, false);
+  });
   // Double-click opens the Download Status / Properties dialog —
   // IDM never opens the file itself from the list; opening lives
   // on the dialog and in the context menu
   tr.addEventListener('dblclick', () => select(d.id, true));
-  // Right-click: IDM's per-download context menu
+  // Right-click: IDM's per-download context menu. Right-clicking a row
+  // outside the selection selects just it; right-clicking inside a
+  // multi-selection keeps the whole selection (IDM does the same)
   tr.addEventListener('contextmenu', e => {
     e.preventDefault();
-    selectedId = d.id;
-    render();
-    showCtxMenu(e.clientX, e.clientY, d);
+    if (!selectedIds.has(d.id)) { selectAnchor = d.id; select(d.id, false); }
+    else { selectedId = d.id; render(); }
+    showCtxMenu(e.clientX, e.clientY, d.id);
   });
   updateRowCells(tr, d);
   return tr;
 }
 
+/* True while the user is in the middle of editing a field inside a
+   dialog (the floating detail dialog excluded — it is built to
+   update live). Background renders churn the DOM at the progress
+   cadence; in this WebKit that churn eats keystrokes aimed at the
+   focused field, and the corrupted value is then saved (F-08).
+   While an edit is in progress the list render is skipped whole —
+   the data keeps accumulating in `items`, and the repaint lands on
+   the next tick after the field loses focus. */
+function editingInBlockingModal() {
+  const a = document.activeElement;
+  if (!a || !/^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return false;
+  const m = a.closest('.modal');
+  return !!m && m.id !== 'detail' && !m.classList.contains('hidden');
+}
+document.addEventListener('focusout', () => scheduleRender());
+
 function render() {
+  if (editingInBlockingModal()) return; // never churn under an in-progress edit
+  /* finish detection (N-03): an entry that reaches 'finished'
+     from a live state gets its completion announcement even when
+     the backend event never arrives (resumed finishes). Runs over
+     EVERY entry, not just the visible ones — the announcement is
+     not a property of the current filter. Seeding matters: an
+     entry first seen already-finished (present at launch) has no
+     recorded previous state and stays silent. */
+  for (const d of items.values()) {
+    const prev = prevStatusById.get(d.id);
+    prevStatusById.set(d.id, d.status);
+    if (d.status !== 'finished') { completeAnnounced.delete(d.id); continue; }
+    if (prev && prev !== 'finished' && !completeAnnounced.has(d.id)) {
+      completeAnnounced.add(d.id);
+      completeQueue.push({
+        id: d.id, name: d.name, url: d.url,
+        path: d.save_to || '', total: d.total || 0,
+      });
+      showNextComplete();
+    }
+  }
   renderQueueFilters();
   const list = visibleItems();
+  /* selection repair: toolbar/menu actions act on the selection, so
+     the selection must never point at a row the current filter
+     hides — acting on an invisible download (Delete above all)
+     is a nasty surprise (F-24). Keep the selection inside the
+     visible set; fall back to the first visible row, like the
+     app's startup auto-select. */
+  {
+    const visIds = new Set(list.map(d => d.id));
+    for (const id of [...selectedIds]) {
+      if (!visIds.has(id)) selectedIds.delete(id);
+    }
+    if (selectedId && !visIds.has(selectedId)) {
+      selectedId = list.length ? list[0].id : null;
+      if (selectedId) selectedIds.add(selectedId);
+    }
+  }
   const structSig = JSON.stringify([
     list.map(d => d.id),
     visibleColumns().map(c => c.id + ':' + c.width),
@@ -466,12 +616,31 @@ function render() {
       if (tr) updateRowCells(tr, d);
     }
   }
-  $('emptyMsg').style.display = list.length ? 'none' : 'block';
+  const em = $('emptyMsg');
+  em.style.display = list.length ? 'none' : 'block';
+  if (!list.length) {
+    // the empty text must reflect WHY the list is empty: with a
+    // category/queue filter active, "No downloads yet" is a lie
+    em.textContent = currentCat === 'All Downloads'
+      ? 'No downloads yet — click “Add URL” to start one.'
+      : currentCat.startsWith('queue:')
+        ? 'No downloads in this queue.'
+        : currentCat === 'Finished'
+          ? 'No finished downloads.'
+          : currentCat === 'Unfinished'
+            ? 'No unfinished downloads.'
+            : 'No downloads in this category.';
+  }
 
   const all = [...items.values()];
-  const dl = all.filter(d => d.status === 'downloading');
-  $('sideStatus').textContent = `${all.length} files (${dl.length} downloading)`;
-  $('totalSpeed').textContent = 'Total speed: ' + fmtRate(dl.reduce((a, d) => a + d.speed_bps, 0)).replace('—', '0 B/s');
+  const dlAll = all.filter(d => d.status === 'downloading');
+  // the counts describe the VIEW: with a category/queue filter
+  // active the bar used to keep quoting the unfiltered totals
+  // (N-06). Total speed stays global — it is a live system stat,
+  // not a property of the filtered rows.
+  const dl = list.filter(d => d.status === 'downloading');
+  $('sideStatus').textContent = `${list.length} files (${dl.length} downloading)`;
+  $('totalSpeed').textContent = 'Total speed: ' + fmtRate(dlAll.reduce((a, d) => a + d.speed_bps, 0)).replace('—', '0 B/s');
 
   const cur = items.get(selectedId);
   const curFinished = cur && cur.status === 'finished';
@@ -479,7 +648,7 @@ function render() {
   const curCanResume = cur && !curFinished && !curDownloading;
   if ($('btnPause')) $('btnPause').disabled = !curDownloading;
   if ($('btnResume')) $('btnResume').disabled = !curCanResume;
-  if ($('btnDelete')) $('btnDelete').disabled = !cur;
+  if ($('btnDelete')) $('btnDelete').disabled = !cur && selectedIds.size === 0;
 
   if (!detailEl.classList.contains('hidden')) {
     renderDetail();
@@ -515,11 +684,33 @@ function renderDetail() {
   const isDownloading = d.status === 'downloading';
   if ($('dPause')) $('dPause').disabled = !isDownloading;
   if ($('dResumeBtn')) $('dResumeBtn').disabled = isFinished || isDownloading;
-  $('dOpen').disabled = $('dOpenFolder').disabled = d.status === 'queued';
+  // Open hands the backend a file — IDM enables it only once the
+  // file is complete, not merely "not queued" (a paused/downloading
+  // entry would open a partial file)
+  $('dOpen').disabled = $('dOpenFolder').disabled = d.status !== 'finished';
   $('dRefresh').disabled = isDownloading || isFinished;
-  document.querySelectorAll('input[name="compAct"]').forEach(r => {
-    r.checked = r.value === (d.completion || '');
-  });
+  // sync the completion radios from the entry — but never while
+  // the user is interacting with them: a progress tick landing
+  // between mousedown and click would flip the checked radio back
+  // and the click would land on the wrong option
+  {
+    const ae = document.activeElement;
+    const touching = ae && ae.name === 'compAct';
+    if (!touching) {
+      document.querySelectorAll('input[name="compAct"]').forEach(r => {
+        r.checked = r.value === (d.completion || '');
+      });
+    }
+  }
+  // the Speed Limiter tab gets the same treatment while it is the
+  // visible tab — it used to keep showing the previously viewed
+  // download's limit (and Apply then wrote that value onto this one).
+  // The guard keeps a re-render from clobbering a value mid-edit.
+  if ($('panelLimiter') && !$('panelLimiter').classList.contains('hidden')
+      && document.activeElement !== $('dLimitVal')
+      && document.activeElement !== $('dLimitOn')) {
+    syncLimiterPanel();
+  }
   $('dUrl').textContent = d.url;
   $('dStatus').textContent = cap(d.status) + (d.error ? ' — ' + d.error : '');
   $('dSize').textContent = d.total > 0 || d.status === 'finished' ? fmtSize(d.total) : 'Unknown';
@@ -564,8 +755,11 @@ function renderDetail() {
    Colors come from the active theme's CSS variables. */
 function drawSegMap(blocks, status) {
   const cv = $('segMap'), ctx = cv.getContext('2d');
-  const W = cv.width = cv.clientWidth || 760;
-  const H = cv.height = 86;
+  // assigning canvas.width (even the same value) resets the bitmap
+  // and forces a full repaint — only do it when the size changed
+  const W = cv.clientWidth || 760;
+  if (cv.width !== W) cv.width = W;
+  const H = cv.height;
   ctx.clearRect(0, 0, W, H);
   if (!blocks && status !== 'finished') return;
   const css = getComputedStyle(document.documentElement);
@@ -607,15 +801,99 @@ $('themeToggle').onclick = () => {
 };
 syncThemeButton();
 
-/* transient error/info line under the toolbar */
+/* transient message line under the toolbar. The default style is
+   the pink error banner; kind 'info' renders the SAME line in a
+   neutral style — informational messages ("NDM is up to date",
+   export/count confirmations) are not errors and must not look
+   like one. */
 let flashTimer = null;
-function toast(msg) {
+function toast(msg, kind) {
   const el = $('flashMsg');
   el.textContent = msg;
+  el.classList.toggle('info', kind === 'info');
   el.classList.remove('hidden');
   clearTimeout(flashTimer);
   flashTimer = setTimeout(() => el.classList.add('hidden'), 5000);
 }
+
+/* Force one full repaint of a dialog card a frame after it is
+   shown. On this WebKit the FIRST paint of a card whose top
+   lands near the top of the viewport drops the title bar's
+   paint — the Scheduler's head stayed blank (box laid out,
+   clicks landing, background/text never drawn; pixel-measured:
+   only the strip's bottom sliver survives) until some later
+   in-dialog rebuild happened to repaint it (F-11). Other
+   dialogs escaped only because they incidentally force a
+   post-reveal repaint (a focus call, an rAF style write); the
+   Scheduler's open path did nothing after reveal.
+   R2's one-frame transform toggle did NOT cure it (measured
+   again in R3): with compositing disabled a transform neither
+   promotes a layer nor invalidates paint, so the toggle was a
+   no-op. The strip loss itself turned out to be stacking, not
+   staleness — the menubar's rows ate the modal's paint, cured
+   by the modal's z-index in styles.css (see the F-11 note
+   there). What remains here is the repaint this function was
+   always meant to force: a display toggle with a layout flush
+   between invalidates paint in the software renderer where a
+   transform does not, so the card is painted again from
+   scratch a frame after reveal and once more after
+   fonts/layout settle (the card's final height can land after
+   the first paint). Skipped while a field inside the card
+   holds focus — hiding an ancestor would drop the focus
+   mid-edit (F-08). */
+function nudgeRepaint(card) {
+  if (!card) return;
+  const repaint = () => {
+    const a = document.activeElement;
+    if (a && card.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) return;
+    card.style.display = 'none';
+    void card.offsetHeight; // flush layout while hidden
+    card.style.display = '';
+  };
+  requestAnimationFrame(repaint);
+  setTimeout(repaint, 350);
+}
+
+/* Show a modal scrolled to the top: the container and its card keep
+   their scroll positions between opens, so a dialog used to reopen
+   wherever it was last left — title off-screen (F-09). */
+function revealModal(el) {
+  el.classList.remove('hidden');
+  el.scrollTop = 0;
+  const card = el.querySelector('.modal-card');
+  if (card) card.scrollTop = 0;
+  nudgeRepaint(card);
+}
+
+/* The app's own styled confirmation (Scheduler guards used to pop
+   raw browser confirm() dialogs titled "JavaScript - tauri://…").
+   Resolves true on Confirm, false on Cancel/×/backdrop/Escape. */
+let confirmResolve = null;
+function showConfirm(msg, yesLabel) {
+  return new Promise(res => {
+    if (confirmResolve) confirmResolve(false); // never stack two asks
+    confirmResolve = res;
+    $('cfMsg').textContent = msg;
+    $('cfYes').textContent = yesLabel || 'Confirm';
+    revealModal($('cfmodal'));
+    $('cfYes').focus();
+  });
+}
+function settleConfirm(v) {
+  $('cfmodal').classList.add('hidden');
+  if (confirmResolve) { const r = confirmResolve; confirmResolve = null; r(v); }
+}
+$('cfYes').onclick = () => settleConfirm(true);
+$('cfNo').onclick = $('cfModalClose').onclick = () => settleConfirm(false);
+$('cfmodal').addEventListener('click', e => { if (e.target === $('cfmodal')) settleConfirm(false); });
+
+/* WebKit's default context menu (Back / Reload / Inspect Element)
+   is browser chrome, not app UI — suppress it everywhere except
+   the download rows, whose own handler builds the app menu. */
+document.addEventListener('contextmenu', e => {
+  if (e.target.closest && e.target.closest('#rows tr')) return;
+  e.preventDefault();
+});
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -631,17 +909,70 @@ function scheduleRender() {
 
 function select(id, openDetail) {
   selectedId = id;
+  selectedIds.clear();
+  if (id) selectedIds.add(id);
   if (openDetail) {
-    detailEl.classList.remove('hidden');
+    revealModal(detailEl);
     requestAnimationFrame(() => renderDetail());
   }
+  render();
+}
+
+/* physical modifier state, tracked independently of click events
+   (see the row click handler — e.ctrlKey is not reliable here) */
+let ctrlHeld = false;
+let shiftHeld = false;
+window.addEventListener('keydown', e => {
+  if (e.key === 'Control') ctrlHeld = true;
+  if (e.key === 'Shift') shiftHeld = true;
+}, true);
+window.addEventListener('keyup', e => {
+  if (e.key === 'Control') ctrlHeld = false;
+  if (e.key === 'Shift') shiftHeld = false;
+}, true);
+window.addEventListener('blur', () => { ctrlHeld = false; shiftHeld = false; });
+
+/* Ctrl+click: toggle one row in the multi-selection. The primary row
+   (selectedId — what Pause/Resume/detail act on) follows the click;
+   toggling the primary off hands the role to a remaining row. */
+function toggleSelect(id) {
+  selectAnchor = id;
+  if (selectedIds.has(id)) {
+    selectedIds.delete(id);
+    if (selectedId === id) selectedId = selectedIds.values().next().value || null;
+  } else {
+    selectedIds.add(id);
+    selectedId = id;
+  }
+  render();
+}
+
+/* Shift+click: the selection becomes the visible range from the
+   anchor row (last plain/Ctrl click) to the clicked row. */
+function rangeSelect(id) {
+  const list = visibleItems();
+  const to = list.findIndex(x => x.id === id);
+  if (to < 0) return;
+  let from = list.findIndex(x => x.id === selectAnchor);
+  if (from < 0) from = list.findIndex(x => x.id === selectedId);
+  if (from < 0) from = to;
+  const a = Math.min(from, to), b = Math.max(from, to);
+  selectedIds.clear();
+  for (let i = a; i <= b; i++) selectedIds.add(list[i].id);
+  selectedId = id;
   render();
 }
 
 /* ---------- row context menu (IDM's right-click menu) ---------- */
 const ctxMenu = $('ctxMenu');
 function hideCtxMenu() { ctxMenu.classList.add('hidden'); }
-function showCtxMenu(x, y, d) {
+function showCtxMenu(x, y, id) {
+  // look the item up NOW, and again inside the handlers: rows are
+  // built once and progress payloads REPLACE the item object, so an
+  // object captured at row-build time freezes the menu in the past
+  // (a finished download kept offering Pause, with Open disabled)
+  const d = items.get(id);
+  if (!d) return;
   ctxMenu.innerHTML = '';
   const add = (label, fn, disabled) => {
     const b = document.createElement('button');
@@ -659,27 +990,34 @@ function showCtxMenu(x, y, d) {
     st === 'downloading' || st === 'finished');
   add('Pause', () => actOnSelected(id => TAURI ? invoke('pause_download', { id }) : demoPause(id)),
     st !== 'downloading');
-  add('Properties / Status…', () => select(d.id, true));
+  add('Properties / Status…', () => select(id, true));
   const sep1 = document.createElement('div'); sep1.className = 'ctx-sep'; ctxMenu.appendChild(sep1);
-  add('Open File', () => { selectedId = d.id; openSelected(false); }, st !== 'finished');
-  add('Open Folder', () => { selectedId = d.id; openSelected(true); }, st === 'queued');
+  add('Open File', () => { selectedId = id; openSelected(false); }, st !== 'finished');
+  add('Open Folder', () => { selectedId = id; openSelected(true); }, st === 'queued');
   const queues = (settings.queues || []).map(q => q.name);
   if (queues.length > 1) {
     const sep2 = document.createElement('div'); sep2.className = 'ctx-sep'; ctxMenu.appendChild(sep2);
     const qh = document.createElement('div'); qh.className = 'ctx-head'; qh.textContent = 'Move to queue'; ctxMenu.appendChild(qh);
     for (const qn of queues) {
       add((d.queue === qn ? '✓ ' : '') + qn, async () => {
-        if (!TAURI || d.queue === qn) return;
+        const cur = items.get(id);
+        if (!TAURI || !cur || cur.queue === qn) return;
         try {
-          await invoke('set_entry_queue', { id: d.id, queue: qn });
-          d.queue = qn;
+          await invoke('set_entry_queue', { id, queue: qn });
+          cur.queue = qn;
           render();
         } catch (e) { toast('Could not move the download: ' + e); }
       });
     }
   }
   const sep3 = document.createElement('div'); sep3.className = 'ctx-sep'; ctxMenu.appendChild(sep3);
-  add('Delete…', () => { selectedId = d.id; openDeleteConfirm(); });
+  add('Delete…', () => {
+    // a right-clicked row inside a multi-selection deletes the whole
+    // selection (one confirmation); outside it, just that row
+    if (!selectedIds.has(id)) { selectAnchor = id; select(id, false); }
+    else selectedId = id;
+    openDeleteConfirm();
+  });
   ctxMenu.classList.remove('hidden');
   const w = ctxMenu.offsetWidth, h = ctxMenu.offsetHeight;
   ctxMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 8)) + 'px';
@@ -699,45 +1037,95 @@ $('btnPause').onclick = () => actOnSelected(id => TAURI ? invoke('pause_download
 $('btnResume').onclick = () => actOnSelected(id => TAURI ? invoke('resume_download', { id }) : demoResume(id));
 /* Delete asks first (IDM does) — removing the wrong row used to be
    one stray Delete keystroke away, with no way back. The dialog
-   also offers deleting the file itself, not just the list entry. */
-let deleteTargetId = null;
+   also offers deleting the file itself, not just the list entry.
+   A multi-selection gets ONE dialog for the whole batch (IDM asks
+   once, not once per file): one checkbox, one Delete click, then
+   the per-entry removes run silently underneath. */
+let deleteTargets = null;
 function openDeleteConfirm() {
-  const d = items.get(selectedId);
-  if (!d) return;
-  deleteTargetId = d.id;
-  $('delName').textContent = 'Delete "' + (d.name || 'download') + '" from the list?';
+  if (anotherModalOpen('delmodal')) return; // one modal layer (N-08)
+  // the rows Delete acts on: the whole multi-selection when the
+  // primary row is part of one, otherwise just the primary row
+  let targets;
+  if (selectedId && selectedIds.has(selectedId) && selectedIds.size > 1) {
+    targets = [...selectedIds].filter(id => items.has(id));
+  } else {
+    targets = selectedId && items.has(selectedId) ? [selectedId] : [];
+  }
+  if (!targets.length) return;
+  deleteTargets = targets;
+  if (targets.length === 1) {
+    const d = items.get(targets[0]);
+    $('delName').textContent = 'Delete "' + (d.name || 'download') + '" from the list?';
+    $('delFileLbl').textContent = 'Also delete the downloaded file from the disk';
+    $('delFileChk').disabled = d.status !== 'finished';
+  } else {
+    $('delName').textContent = 'Delete ' + targets.length + ' downloads from the list?';
+    $('delFileLbl').textContent = 'Also delete the downloaded files from the disk';
+    // the disk-file checkbox applies to the finished entries of the
+    // batch; it stays disabled only when none of them is finished
+    $('delFileChk').disabled = !targets.some(id => items.get(id).status === 'finished');
+  }
   $('delFileChk').checked = false;
-  $('delFileChk').disabled = d.status !== 'finished';
-  $('delmodal').classList.remove('hidden');
+  revealModal($('delmodal'));
   $('delConfirm').focus();
 }
 $('btnDelete').onclick = openDeleteConfirm;
-$('delModalClose').onclick = $('delCancel').onclick = () => $('delmodal').classList.add('hidden');
-$('delmodal').addEventListener('click', e => { if (e.target === $('delmodal')) $('delmodal').classList.add('hidden'); });
+function closeDeleteConfirm() { deleteTargets = null; $('delmodal').classList.add('hidden'); }
+$('delModalClose').onclick = $('delCancel').onclick = closeDeleteConfirm;
+$('delmodal').addEventListener('click', e => { if (e.target === $('delmodal')) closeDeleteConfirm(); });
 $('delConfirm').onclick = async () => {
-  const id = deleteTargetId;
-  deleteTargetId = null;
+  const targets = (deleteTargets || []).filter(id => items.has(id));
+  deleteTargets = null;
   $('delmodal').classList.add('hidden');
-  const d = items.get(id);
-  if (!d) return;
-  const detailWasShowingIt = !detailEl.classList.contains('hidden') && selectedId === id;
+  if (!targets.length) return;
+  const delFile = $('delFileChk').checked;
+  // the status dialog must not silently retarget to another
+  // download when its own entry is deleted — close it instead
+  const detailWasShowingIt = !detailEl.classList.contains('hidden') && targets.includes(selectedId);
   if (TAURI) {
-    try {
-      await invoke('remove_download', { id, deleteFile: $('delFileChk').checked ? true : null });
-    } catch (e) { console.error(e); toast(String(e)); return; }
-    deletedIds.add(id); // a late progress emit must not resurrect the row
-    items.delete(id);
-    if (selectedId === id) selectedId = items.keys().next().value || null;
-    // the status dialog must not silently retarget to another
-    // download when its own entry is deleted — close it instead
+    let failed = 0;
+    for (const id of targets) {
+      const d = items.get(id);
+      try {
+        // the same remove the single delete uses (it stops an active
+        // download first); the disk-file choice only ever applied to
+        // finished entries, so it is honoured per entry that way
+        await invoke('remove_download', { id, deleteFile: delFile && d && d.status === 'finished' ? true : null });
+      } catch (e) {
+        console.error(e);
+        if (targets.length === 1) { toast(String(e)); return; }
+        failed++; // a batch keeps going, like Delete All Completed
+        continue;
+      }
+      deletedIds.add(id); // a late progress emit must not resurrect the row
+      items.delete(id);
+      selectedIds.delete(id);
+      prevStatusById.delete(id);
+      completeAnnounced.delete(id);
+    }
+    if (selectedId && !items.has(selectedId)) selectedId = items.keys().next().value || null;
     if (detailWasShowingIt) detailEl.classList.add('hidden');
     render();
-  } else demoRemove(id);
+    if (failed) toast(failed + ' download' + (failed > 1 ? 's' : '') + ' could not be deleted');
+  } else {
+    for (const id of targets) { items.delete(id); selectedIds.delete(id); }
+    if (selectedId && !items.has(selectedId)) selectedId = items.keys().next().value || null;
+    if (detailWasShowingIt) detailEl.classList.add('hidden');
+    render();
+  }
 };
 if ($('btnStatus')) {
   $('btnStatus').onclick = () => {
     if (!selectedId && items.size > 0) selectedId = items.keys().next().value;
-    if (!selectedId) { toast('Select a download first'); return; }
+    if (!selectedId) {
+      // say WHICH nothing: an empty list, or a filter that hides
+      // every row (the silent no-op this used to be — F-24)
+      toast(items.size > 0 && !visibleItems().length
+        ? 'Nothing to show — the current filter hides every download'
+        : 'Select a download first', 'info');
+      return;
+    }
     select(selectedId, true);
   };
 }
@@ -755,9 +1143,9 @@ if ($('dQueueSel')) $('dQueueSel').addEventListener('change', async () => {
 });
 $('dPause').onclick = $('btnPause').onclick;
 $('dResumeBtn').onclick = $('btnResume').onclick;
-$('dHide').onclick = () => detailEl.classList.add('hidden');
-if ($('dModalClose')) $('dModalClose').onclick = () => detailEl.classList.add('hidden');
-detailEl.addEventListener('click', e => { if (e.target === detailEl) detailEl.classList.add('hidden'); });
+$('dHide').onclick = () => { detailEl.classList.add('hidden'); showNextComplete(); };
+if ($('dModalClose')) $('dModalClose').onclick = () => { detailEl.classList.add('hidden'); showNextComplete(); };
+detailEl.addEventListener('click', e => { if (e.target === detailEl) { detailEl.classList.add('hidden'); showNextComplete(); } });
 $('btnStopAll').onclick = async () => {
   for (const d of items.values()) {
     if (d.status !== 'downloading') continue;
@@ -791,6 +1179,8 @@ modal.addEventListener('click', e => { if (e.target === modal) closeFileDialog()
    user did not use never lingers on disk. */
 const fileLinkQueue = [];
 let presentedFile = null; // { url, cookies, referer } while shown
+let fileCatTouched = false; // the user picked a category themselves —
+                            // the probe must not override their choice
 function queueFileLink(payload) {
   const url = payload && payload.url;
   if (!url) return;
@@ -808,21 +1198,110 @@ function anyBlockingModalOpen() {
   return [...document.querySelectorAll('.modal:not(.hidden)')]
     .some(m => m.id !== 'detail');
 }
+/* One modal layer (N-08): the menu bar renders above the modal
+   backdrop, so it stays clickable while a dialog is up — and
+   without a guard a second dialog could be opened over the
+   first, which then waited underneath as a zombie (an Add URL
+   dialog with a stale error survived a whole batch add that
+   way). Dialog openers refuse while a DIFFERENT dialog is
+   visible. A dialog may always re-open itself (the Scheduler
+   re-runs its opener when a queue is created or deleted). The
+   floating detail window does not count — dialogs may open over
+   it, as before. The styled Confirm and the Refresh-URL dialog
+   are exempt by design: they are sub-dialogs of the dialog that
+   invoked them, and they settle back to it. */
+function anotherModalOpen(selfId) {
+  return [...document.querySelectorAll('.modal:not(.hidden)')]
+    .some(m => m.id !== 'detail' && m.id !== selfId);
+}
 function pumpFileLinks() {
   if (anyBlockingModalOpen()) return; // a dialog is busy
   const next = fileLinkQueue.shift();
   if (next) openFileDialog(next);
 }
 setInterval(() => {
-  if ((fileLinkQueue.length || videoLinkQueue.length) && !anyBlockingModalOpen()) {
+  if ((fileLinkQueue.length || videoLinkQueue.length || grabLinkQueue.length) && !anyBlockingModalOpen()) {
     pumpFileLinks();
     pumpVideoLinks();
+    pumpGrabLinks();
   }
+  // queued completions surface as soon as no user dialog is in
+  // the way (showNextComplete does the yielding check itself)
+  if (completeQueue.length && !completeCurrent) showNextComplete();
+  // a deferred update dialog (N-08) shows once the way is clear
+  if (pendingUpdate && !anotherModalOpen('umodal')) showUpdate(pendingUpdate);
 }, 700);
+
+/* Drag & drop onto the main window (IDM parity): the basket's
+   exact mechanism — an HTML5 window drop, the same candidate
+   extraction (text/uri-list's first non-comment line, else
+   text/plain) and the same http(s) gate — feeding the same
+   incoming-file queue a basket drop reaches through basket_add,
+   so the offer is the same probed File Info dialog under its own
+   title and waits behind an open modal like every other incoming
+   link. Non-URL drops (random text, local files) are ignored
+   silently: a file path is not a download. A drop onto a text
+   field keeps its native behaviour — the text lands in the
+   field and no offer opens. */
+const dropZone = document.querySelector('main.layout');
+function dropHighlight(on) {
+  if (dropZone) dropZone.style.boxShadow = on ? 'inset 0 0 0 3px #316ac5' : '';
+}
+function dropOnEditable(e) {
+  const t = e.target;
+  return !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+}
+for (const ev of ['dragenter', 'dragover']) {
+  window.addEventListener(ev, e => {
+    if (dropOnEditable(e)) { dropHighlight(false); return; }
+    e.preventDefault(); // allows the drop; keeps the webview from navigating
+    dropHighlight(true);
+  });
+}
+window.addEventListener('dragleave', e => {
+  if (!e.relatedTarget) dropHighlight(false);
+});
+window.addEventListener('drop', e => {
+  dropHighlight(false);
+  if (dropOnEditable(e)) return; // native text drop into the field
+  e.preventDefault();
+  if (!e.dataTransfer) return;
+  const uriList = e.dataTransfer.getData('text/uri-list') || '';
+  const plain = e.dataTransfer.getData('text/plain') || '';
+  const candidate = (uriList.split(/\r?\n/).find(l => l && !l.startsWith('#')) || plain).trim();
+  if (!/^https?:\/\//i.test(candidate)) return; // not a web link: no junk entry
+  queueFileLink({ url: candidate, title: '', pageUrl: '', cookies: '', source: 'drop' });
+});
 let fileProbeSeq = 0;
 let fileProbeTimer = null;
+let fileProbeTotal = 0; // bytes from the last good probe of the CURRENT
+                        // address — handed to add_download so a
+                        // Download Later entry is born knowing its
+                        // size instead of "Unknown" (F-03)
+
+/* validation / add failures belong INSIDE the dialog the user is
+   looking at, in plain language — a banner in the main window
+   renders behind the modal and reads as raw probe output (F-01/F-02) */
+function setFileError(msg) {
+  const e = $('fError');
+  if (!e) return;
+  e.textContent = msg || '';
+  e.classList.toggle('hidden', !msg);
+  $('inUrl').classList.toggle('invalid', !!msg);
+}
+function plainAddError(err) {
+  const s = String(err);
+  if (/bad url|parse|invalid url|not a valid/i.test(s)) {
+    return 'That address could not be understood — check it and try again.';
+  }
+  if (/probe|connect|network|timed? ?out|dns|refused/i.test(s)) {
+    return 'NDM could not reach that address — check the address and your connection, then try again.';
+  }
+  return 'Could not add the download. ' + (s.length > 120 ? s.slice(0, 120) + '…' : s);
+}
 
 function resetFileProbeUi() {
+  fileProbeTotal = 0;
   $('fCat').textContent = '—';
   $('fSize').textContent = '—';
   $('fResume').textContent = '—';
@@ -848,7 +1327,14 @@ async function runFileProbe() {
     const password = $('inAuth').checked ? ($('inPassword').value || null) : null;
     const info = await invoke('probe_file', { url, cookies, referer, login, password });
     if (mySeq !== fileProbeSeq || $('inUrl').value.trim() !== url) return;
+    fileProbeTotal = info.total > 0 ? info.total : 0;
     $('fCat').textContent = info.category || 'General';
+    // preselect what the probe detected in the Category dropdown,
+    // unless the user already picked a category in this session
+    if (!fileCatTouched && $('inCat')) {
+      const det = info.category || 'General';
+      if (categoryNames().includes(det)) $('inCat').value = det;
+    }
     $('fSize').textContent = info.total > 0 ? fmtSize(info.total) : 'Unknown';
     $('fResume').textContent = info.resumable ? 'Yes' : 'No';
     $('fResume').className = info.resumable ? 'yes' : 'no';
@@ -863,6 +1349,8 @@ async function runFileProbe() {
 }
 
 $('inUrl').addEventListener('input', () => {
+  setFileError('');
+  fileProbeTotal = 0; // the address changed — the old probe is stale
   clearTimeout(fileProbeTimer);
   fileProbeTimer = setTimeout(runFileProbe, 350);
 });
@@ -871,28 +1359,57 @@ $('inAuth').addEventListener('change', () => {
   clearTimeout(fileProbeTimer);
   fileProbeTimer = setTimeout(runFileProbe, 350);
 });
+if ($('inCat')) $('inCat').addEventListener('change', () => { fileCatTouched = true; });
+if ($('inCatAdd')) $('inCatAdd').onclick = async () => {
+  const name = (prompt('New category name:') || '').trim();
+  if (!name) return;
+  const existing = categoryNames().find(c => c.toLowerCase() === name.toLowerCase());
+  if (existing) {
+    $('inCat').value = existing;
+    fileCatTouched = true;
+    return;
+  }
+  // a new category persists as an (initially empty) type list —
+  // the same slot the Options editor stores its overrides in, so
+  // the name survives restarts and Options saves alike
+  settings = {
+    ...settings,
+    category_exts: { ...(settings.category_exts || {}), [name]: [] },
+  };
+  await saveSettings();
+  fillCategorySelect($('inCat'), name);
+  fileCatTouched = true;
+};
 
 function openFileDialog(payload) {
+  if (anotherModalOpen('modal')) return; // one modal layer (N-08)
   presentedFile = payload
     ? { url: payload.url, cookies: payload.cookies || '', referer: payload.pageUrl || '' }
     : null;
   fillQueueSelect($('inQueue'));
+  fillCategorySelect($('inCat'), '');
+  fileCatTouched = false;
+  if ($('inRememberCat')) $('inRememberCat').checked = false;
   $('inAuth').checked = false;
   $('inAuthBox').classList.add('hidden');
   $('inLogin').value = '';
   $('inPassword').value = '';
   if ($('inDesc')) $('inDesc').value = '';
-  // IDM names the clipboard prompt exactly; the basket gets its
-  // own wording; everything else is the plain File Info dialog
+  // IDM names the clipboard prompt exactly; the basket and a
+  // main-window drop get their own wording; everything else is
+  // the plain File Info dialog
   if ($('fileModalTitle')) {
     $('fileModalTitle').textContent =
       payload && payload.source === 'clipboard'
         ? 'Download link was found in clipboard. Do you want to download it?'
         : payload && payload.source === 'basket'
           ? 'Link dropped on the basket — download it?'
-          : 'Download File Info';
+          : payload && payload.source === 'drop'
+            ? 'Link dropped — download it?'
+            : 'Download File Info';
   }
   resetFileProbeUi();
+  setFileError('');
   if (payload) {
     $('inUrl').value = payload.url;
     $('inName').value = (payload.title || '').split(/[\\/]/).pop() || '';
@@ -900,7 +1417,7 @@ function openFileDialog(payload) {
     $('inUrl').value = '';
     $('inName').value = '';
   }
-  modal.classList.remove('hidden');
+  revealModal(modal);
   $('inUrl').focus();
   if ($('inUrl').value.trim()) runFileProbe();
 }
@@ -919,22 +1436,49 @@ function closeFileDialog() {
 async function submitAdd(later) {
   const url = $('inUrl').value.trim();
   const dir = $('inDir').value.trim() || '~/Downloads';
-  if (!url) { $('inUrl').focus(); return; }
+  if (!url) {
+    // an empty submit must SAY why nothing happened, inside the
+    // dialog — silently staying open reads as a hang (F-01)
+    setFileError('Enter a download address first, then press Start Download.');
+    $('inUrl').focus();
+    return;
+  }
+  setFileError('');
+  const beforeIds = new Set(items.keys()); // for selecting the new row after (F-07)
   const name = $('inName').value.trim() || null;
+  const category = ($('inCat') && $('inCat').value) || null;
   const session = presentedFile;
   presentedFile = null; // the new entry owns the session from here
   modal.classList.add('hidden');
   if (TAURI) {
     try {
       const args = {
-        url, dir, later, category: null, name,
+        url, dir, later, category, name,
         cookies: session ? (session.cookies || null) : null,
         referer: session ? (session.referer || null) : null,
         queue: $('inQueue').value || null,
         login: $('inAuth').checked ? ($('inLogin').value.trim() || null) : null,
         password: $('inAuth').checked ? ($('inPassword').value || null) : null,
         description: ($('inDesc') && $('inDesc').value.trim()) || null,
+        // the size the probe just measured for this address — the
+        // entry (Download Later above all) is born knowing it
+        ...(fileProbeTotal > 0 ? { total: fileProbeTotal } : {}),
       };
+      // "Remember this path for this category": the chosen folder
+      // becomes that category's own folder for future downloads.
+      // With no explicit pick, the category is the one the probe
+      // detected (shown in the info box)
+      if ($('inRememberCat') && $('inRememberCat').checked) {
+        const det = $('fCat').textContent;
+        const cat = category || (categoryNames().includes(det) ? det : null);
+        if (cat) {
+          settings = {
+            ...settings,
+            category_dirs: { ...(settings.category_dirs || {}), [cat]: dir },
+          };
+          await saveSettings();
+        }
+      }
       try {
         await invoke('add_download', args);
       } catch (e) {
@@ -950,13 +1494,32 @@ async function submitAdd(later) {
       }
       $('inUrl').value = '';
       $('inName').value = '';
+      // the just-added entry becomes the selection (IDM behaviour),
+      // so Pause/Stop act on IT — the Start path used to leave the
+      // selection on some older row and Pause stayed greyed (F-07).
+      // The entry is found by diffing the refreshed list, which
+      // works whatever shape add_download returns.
+      try {
+        const list = await invoke('list_downloads');
+        for (const nd of list) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
+        const fresh = list.find(d => !beforeIds.has(d.id));
+        if (fresh) {
+          selectedId = fresh.id;
+          selectedIds.clear();
+          selectedIds.add(fresh.id);
+          selectAnchor = fresh.id;
+        }
+        render();
+      } catch (e) { /* selection is a nicety — never fail the add over it */ }
     } catch (e) {
       // reopen with the address intact: a failure must not eat the
-      // URL the user typed — they may only need to fix the folder
+      // URL the user typed — they may only need to fix the folder.
+      // The reason renders INSIDE the dialog in plain language
+      // (the old toast sat hidden behind this modal — F-02).
       console.error('add_download failed', e);
-      toast('Could not add the download: ' + e);
       presentedFile = session;
-      modal.classList.remove('hidden');
+      revealModal(modal);
+      setFileError(plainAddError(e));
       $('inUrl').focus();
     }
   } else {
@@ -1009,12 +1572,13 @@ function closeVideoModal() {
 }
 
 function openVideoModal(url, cookies) {
+  if (anotherModalOpen('vmodal')) return; // one modal layer (N-08)
   gateComponents();
   presentedVideoUrl = url || null;
   presentedVideoCookies = cookies || '';
   fillQueueSelect($('vInQueue'));
   if ($('vInDesc')) $('vInDesc').value = '';
-  vmodal.classList.remove('hidden');
+  revealModal(vmodal);
   if (url) { $('vInUrl').value = url; }
   $('vInUrl').focus();
   if (url && TAURI) fetchVideoInfo();
@@ -1189,8 +1753,14 @@ async function fetchVideoInfo() {
     opts.forEach((o, i) => {
       const lab = document.createElement('label');
       if (i === preselect) lab.classList.add('sel');
-      const extBadge = (o.ext || (o.audio ? 'MP3' : 'MP4')).toUpperCase();
-      const sizeStr = o.size_text || (o.size_bytes ? fmtSize(o.size_bytes) : (o.id === 'best' ? 'Auto' : 'Stream'));
+      // the badge must name the format the job will really
+      // produce: the probe's own ext, else the selector's explicit
+      // [ext=…] preference — never an invented container (an audio
+      // option used to be badged "MP3" by pure assumption while
+      // the job produced an .m4a file, N-09)
+      const selExt = /\[ext=([a-z0-9]+)\]/i.exec(o.selector || '');
+      const extBadge = (o.ext || (selExt && selExt[1]) || (o.audio ? 'Audio' : 'MP4')).toUpperCase();
+      const sizeStr = o.size_text || (o.size_bytes ? fmtSize(o.size_bytes) : (o.selector === 'best' ? 'Auto' : 'Stream'));
       const noteOnly = (o.note || '').split('•').filter(p => !/MB|GB|KB/i.test(p)).join('•').trim();
       lab.innerHTML = `<input type="radio" name="vq" value="${i}" ${i === preselect ? 'checked' : ''}>
         <span class="q-badge ${o.audio ? 'audio' : ''}">${escapeHtml(extBadge)}</span>
@@ -1275,7 +1845,10 @@ async function submitVideo(later) {
     }
   } catch (e) {
     console.error('add_video failed', e);
-    toast('Could not add the video: ' + e);
+    // inside the dialog, like its Fetch errors — a toast would
+    // render behind this modal (same family as F-02)
+    $('vStatus').textContent = plainAddError(e);
+    $('vStatus').classList.add('error');
     $('vStart').disabled = false;
     if ($('vLater')) $('vLater').disabled = false;
     if ($('vAll')) $('vAll').disabled = false;
@@ -1315,7 +1888,7 @@ if ($('vAll')) $('vAll').onclick = async () => {
       skipped++;
     }
   }
-  toast(`Download all: ${sent} qualities added${skipped ? `, ${skipped} skipped` : ''}`);
+  toast(`Download all: ${sent} qualities added${skipped ? `, ${skipped} skipped` : ''}`, 'info');
 };
 
 /* ---------- Site Logins editor (Options) ---------- */
@@ -1337,8 +1910,11 @@ function renderLoginsEdit() {
     const s = document.createElement('span');
     s.className = 'login-site';
     s.textContent = l.site;
+    // the cell clips long values — the full text stays one hover away
+    s.title = l.site;
     const u = document.createElement('span');
     u.textContent = l.login;
+    u.title = l.login;
     const p = document.createElement('span');
     p.textContent = '••••••';
     const del = document.createElement('button');
@@ -1364,7 +1940,63 @@ if ($('oLoginAdd')) $('oLoginAdd').onclick = () => {
 
 /* ---------- Options modal ---------- */
 const omodal = $('omodal');
+/* the Options dialog is tabbed like IDM's configuration dialog —
+   the existing sections/fields grouped under General / Connection /
+   Downloads / Proxy & Site Logins / Categories. Field ids and the
+   save/load logic are untouched; only the grouping changed. */
+const OPT_PANELS = ['opGeneral', 'opConnection', 'opDownloads', 'opProxy', 'opCategories'];
+function showOptionsTab(panelId) {
+  document.querySelectorAll('#optTabs .tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.opanel === panelId);
+  });
+  for (const id of OPT_PANELS) {
+    const p = $(id);
+    if (p) p.classList.toggle('hidden', id !== panelId);
+  }
+  // the panels scroll internally now (N-02) — the newly shown one
+  // starts at its top, and the card gets the same repaint nudge
+  // as a fresh reveal: switching to a tall tab used to clip the
+  // tab strip's paint the way F-11 clipped the Scheduler's head
+  const panel = $(panelId);
+  if (panel) panel.scrollTop = 0;
+  nudgeRepaint(omodal.querySelector('.modal-card'));
+}
+document.querySelectorAll('#optTabs .tab').forEach(t => {
+  t.onclick = () => showOptionsTab(t.dataset.opanel);
+});
+/* The proxy fields belong to their mode: the PAC address only
+   means something in PAC mode, the server fields only in Manual
+   mode. They used to stay editable under every mode (N-01) —
+   values typed under "No proxy" were silently ignored when the
+   settings composed the live proxy string, yet read as live
+   settings. Gating is purely presentational: stored values are
+   kept untouched, so switching back to a mode restores its
+   fields exactly as they were. The browser-fallback checkbox is
+   deliberately not gated — it is a behaviour toggle that applies
+   under any mode. */
+function syncProxyMode() {
+  const mode = (document.querySelector('input[name="proxyMode"]:checked') || {}).value || 'none';
+  if ($('oProxyPac')) $('oProxyPac').disabled = mode !== 'pac';
+  for (const id of ['oProxyScheme', 'oProxyHost', 'oProxyPort', 'oProxyUser', 'oProxyPass', 'oProxyHttp', 'oProxyHttps', 'oProxyFtp']) {
+    const el = $(id);
+    if (el) el.disabled = mode !== 'manual';
+  }
+}
+document.querySelectorAll('input[name="proxyMode"]').forEach(r => {
+  r.addEventListener('change', syncProxyMode);
+});
+
+/* category types are long comma lists — a single-line input cut
+   them off mid-list; the textareas grow with their content */
+function growCatTypes(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(132, Math.max(38, el.scrollHeight)) + 'px';
+}
+document.querySelectorAll('.cat-types').forEach(t => {
+  t.addEventListener('input', () => growCatTypes(t));
+});
 function openOptions() {
+  if (anotherModalOpen('omodal')) return; // one modal layer (N-08)
   $('oDir').value = settings.default_dir;
   $('oConns').value = settings.max_connections;
   $('oLimitOn').checked = settings.speed_limit_bps > 0;
@@ -1389,6 +2021,7 @@ function openOptions() {
     $('oProxyHttps').checked = settings.proxy_https !== false;
     $('oProxyFtp').checked = settings.proxy_ftp !== false;
     $('oProxyBrowser').checked = !!settings.proxy_from_browser_on_error;
+    syncProxyMode();
   }
   loginsEdit = (settings.site_logins || []).map(l => ({ ...l }));
   renderLoginsEdit();
@@ -1416,7 +2049,10 @@ function openOptions() {
       ? 'Ready (yt-dlp + deno installed)'
       : 'Sets itself up automatically in the background';
   }).catch(() => { $('oEngine').textContent = '—'; });
-  omodal.classList.remove('hidden');
+  showOptionsTab('opGeneral');
+  revealModal(omodal);
+  // size the category-types textareas to their (just-filled) content
+  requestAnimationFrame(() => document.querySelectorAll('.cat-types').forEach(growCatTypes));
 }
 $('btnOptions').onclick = openOptions;
 $('oModalClose').onclick = $('oCancel').onclick = () => omodal.classList.add('hidden');
@@ -1452,9 +2088,17 @@ $('oSave').onclick = async () => {
         .filter(([, v]) => v)),
     // only categories whose type list differs from the built-in
     // table are stored — an untouched editor must not freeze the
-    // built-ins forever
-    category_exts: Object.fromEntries(
-      Object.keys(BUILTIN_CATEGORY_EXTS)
+    // built-ins forever. A field the user EMPTIED is a difference
+    // too: the explicit [] is kept, or the built-in list silently
+    // came back on the next open and the category could never be
+    // cleared
+    category_exts: Object.fromEntries([
+      // categories created outside this editor (the File dialog's
+      // "+" button) live in category_exts too — keep them across
+      // an Options save instead of dropping unknown keys
+      ...Object.entries(settings.category_exts || {})
+        .filter(([c]) => !(c in BUILTIN_CATEGORY_EXTS)),
+      ...Object.keys(BUILTIN_CATEGORY_EXTS)
         .map(c => {
           const list = [...new Set(
             $('oCatExt' + c).value.split(/[,\s]+/)
@@ -1465,7 +2109,8 @@ $('oSave').onclick = async () => {
             && list.every(x => builtin.includes(x));
           return [c, same ? null : list];
         })
-        .filter(([, v]) => v && v.length)),
+        .filter(([, v]) => v !== null),
+    ]),
     conn_exceptions: $('oConnExc').value.split(',').map(s => s.trim()).filter(Boolean),
     exit_when_done: $('oExitDone').checked,
     sound_events: $('oSounds').checked,
@@ -1498,16 +2143,35 @@ function fillSchedulerFields() {
   $('sMax').value = cfg.max_simultaneous || 0;
   $('schedDelete').disabled = schedSel === 'Main download queue';
   schedDirty = false;
+  // the staged file order starts from the queue's current order;
+  // nothing reaches the backend until Save (F-13)
+  schedOrder = [...items.values()]
+    .filter(d => (d.queue || 'Main download queue') === schedSel)
+    .map(d => d.id);
   renderSchedFiles();
 }
 /* IDM's Scheduler has a "Files in the queue" tab: the queue's
    downloads in start order, reorderable. The pump claims queued
-   entries in list order, so the order shown here IS the priority. */
+   entries in list order, so the order shown here IS the priority.
+   Reordering is a STAGED edit like the dialog's other fields: the
+   arrows only rearrange the local staged order (schedOrder); the
+   backend order changes on Save, and the discard confirm really
+   does revert an unsaved reorder (F-13). */
+let schedOrder = null; // staged entry-id order for the selected queue
 function renderSchedFiles() {
   const box = $('sFiles');
   if (!box) return;
   const mine = [...items.values()]
     .filter(d => (d.queue || 'Main download queue') === schedSel);
+  if (schedOrder) {
+    // order by the staged list; entries that arrived while the
+    // dialog is open (not yet staged) keep their natural order
+    // at the end, and the staged list resyncs to reality
+    const pos = new Map(schedOrder.map((id, i) => [id, i]));
+    mine.sort((a, b) => (pos.has(a.id) ? pos.get(a.id) : 1e9)
+      - (pos.has(b.id) ? pos.get(b.id) : 1e9));
+    schedOrder = mine.map(d => d.id);
+  }
   box.innerHTML = '';
   if (!mine.length) {
     const e = document.createElement('div');
@@ -1526,18 +2190,13 @@ function renderSchedFiles() {
     const st = document.createElement('span');
     st.className = 's-st';
     st.textContent = cap(d.status || '');
-    const move = async upWanted => {
-      if (!TAURI) return;
-      try {
-        await invoke('move_in_queue', { id: d.id, up: upWanted });
-        // the backend's order list is authoritative (the local map
-        // keeps insertion order and would show the stale sequence)
-        const list = await invoke('list_downloads');
-        items.clear();
-        for (const nd of list) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
-        renderSchedFiles();
-        render();
-      } catch (e) { $('sStatus').textContent = 'Could not reorder: ' + e; }
+    const move = upWanted => {
+      if (!schedOrder) return;
+      const j = upWanted ? i - 1 : i + 1;
+      if (j < 0 || j >= schedOrder.length) return;
+      [schedOrder[i], schedOrder[j]] = [schedOrder[j], schedOrder[i]];
+      schedDirty = true;
+      renderSchedFiles();
     };
     const up = document.createElement('button');
     up.textContent = '↑';
@@ -1554,19 +2213,25 @@ function renderSchedFiles() {
   });
 }
 function openScheduler() {
+  if (anotherModalOpen('smodal')) return; // one modal layer (N-08); self re-open stays legal
   fillQueueSelect($('schedQueueSel'), schedSel);
   schedSel = $('schedQueueSel').value || 'Main download queue';
   fillSchedulerFields();
   $('sStatus').textContent = '';
-  smodal.classList.remove('hidden');
+  revealModal(smodal);
 }
-$('schedQueueSel').addEventListener('change', () => {
-  // switching queues used to throw away unsaved edits silently
-  if (schedDirty && !confirm(`Discard the unsaved changes for "${schedSel}"?`)) {
+$('schedQueueSel').addEventListener('change', async () => {
+  // switching queues must not throw away unsaved edits silently —
+  // ask with the app's own dialog, holding the select on the old
+  // queue while the question is up
+  const target = $('schedQueueSel').value;
+  if (schedDirty) {
     $('schedQueueSel').value = schedSel;
-    return;
+    const ok = await showConfirm(`Discard the unsaved changes for "${schedSel}"?`, 'Discard');
+    if (!ok) return;
   }
-  schedSel = $('schedQueueSel').value;
+  schedSel = target;
+  $('schedQueueSel').value = target;
   fillSchedulerFields();
 });
 for (const fid of ['sEnabled', 'sStart', 'sStop', 'schedExitDone', 'sMax', 'sPowerWhenDone']) {
@@ -1574,6 +2239,9 @@ for (const fid of ['sEnabled', 'sStart', 'sStop', 'schedExitDone', 'sMax', 'sPow
   $(fid).addEventListener('input', () => { schedDirty = true; });
 }
 $('schedNew').onclick = async () => {
+  // the same dirty guard as the queue switch: creating a queue
+  // refills every field, so unsaved edits must be confirmed first
+  if (schedDirty && !await showConfirm(`Discard the unsaved changes for "${schedSel}"?`, 'Discard')) return;
   const name = $('schedNewName').value.trim();
   if (!name) { $('sStatus').textContent = 'Type a name for the new queue first'; return; }
   if ((settings.queues || []).some(q => q.name.toLowerCase() === name.toLowerCase())) {
@@ -1593,8 +2261,10 @@ $('schedNew').onclick = async () => {
 };
 $('schedDelete').onclick = async () => {
   if (schedSel === 'Main download queue') return;
+  // same dirty guard as the queue switch (deleting refills the fields)
+  if (schedDirty && !await showConfirm(`Discard the unsaved changes for "${schedSel}"?`, 'Discard')) return;
   const gone = schedSel;
-  if (!confirm(`Delete the queue "${gone}"?\nIts downloads move to the Main download queue.`)) return;
+  if (!await showConfirm(`Delete the queue "${gone}"?\nIts downloads move to the Main download queue.`, 'Delete queue')) return;
   settings = {
     ...settings,
     queues: (settings.queues || []).filter(q => q.name !== gone),
@@ -1660,8 +2330,42 @@ $('sSave').onclick = async () => {
     };
   }
   await saveSettings();
+  // apply the staged file order (arrows only rearranged it locally
+  // until now): walk the target order, moving each out-of-place
+  // entry up into its slot with the same move_in_queue the dialog
+  // used to call per click
+  if (TAURI && schedOrder) {
+    try {
+      const list = await invoke('list_downloads');
+      const cur = list
+        .filter(d => (d.queue || 'Main download queue') === schedSel)
+        .map(d => d.id)
+        .filter(id => schedOrder.includes(id));
+      const target = schedOrder.filter(id => cur.includes(id));
+      for (let i = 0; i < target.length; i++) {
+        if (cur[i] === target[i]) continue;
+        const j = cur.indexOf(target[i], i);
+        for (let k = j; k > i; k--) {
+          await invoke('move_in_queue', { id: target[i], up: true });
+        }
+        cur.splice(j, 1);
+        cur.splice(i, 0, target[i]);
+      }
+      const fresh = await invoke('list_downloads');
+      items.clear();
+      for (const nd of fresh) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
+      render();
+    } catch (e) {
+      // the settings saved but the order did not — keep the dialog
+      // open and say so, rather than closing over a half-save
+      $('sStatus').textContent = 'Could not save the file order: ' + e;
+      return;
+    }
+  }
   schedDirty = false;
-  $('sStatus').textContent = 'Saved';
+  // Save closes the dialog, like Options (F-12) — a lingering
+  // "Saved" note left users unsure whether saving had finished
+  smodal.classList.add('hidden');
 };
 
 /* ---------- Site Grabber wizard (IDM's 4-step Grabber + projects) ---------- */
@@ -1789,12 +2493,12 @@ $('gProjSave').onclick = async () => {
   await saveSettings();
   fillGrabProjects();
   $('gProjSel').value = p.name;
-  toast(`Grabber project "${p.name}" saved`);
+  toast(`Grabber project "${p.name}" saved`, 'info');
 };
 $('gProjLoad').onclick = () => {
   const name = $('gProjSel').value;
   const p = (settings.grab_projects || []).find(x => x.name === name);
-  if (p) { applyGrabProject(p); toast(`Project "${name}" loaded`); }
+  if (p) { applyGrabProject(p); toast(`Project "${name}" loaded`, 'info'); }
 };
 $('gProjDelete').onclick = async () => {
   const name = $('gProjSel').value;
@@ -1805,7 +2509,7 @@ $('gProjDelete').onclick = async () => {
   };
   await saveSettings();
   fillGrabProjects();
-  toast(`Project "${name}" deleted`);
+  toast(`Project "${name}" deleted`, 'info');
 };
 /* choosing a template pre-fills the filters and the explore depth,
    exactly what IDM's template dropdown does on Step 1 */
@@ -1817,6 +2521,13 @@ $('gTemplate').addEventListener('change', () => {
     document.querySelectorAll('input[name="gExploreMode"]').forEach(r => {
       r.checked = r.value === 'whole';
     });
+  } else {
+    // a depth-limited template must also switch the mode back —
+    // it used to only ever SET whole-site, so "Audio, 1 level"
+    // chosen after a whole-site template crawled the entire site
+    document.querySelectorAll('input[name="gExploreMode"]').forEach(r => {
+      r.checked = r.value === 'levels';
+    });
   }
   if (t.depth_same != null) $('gDepthSame').value = t.depth_same;
 });
@@ -1826,6 +2537,7 @@ $('gInclPreset').addEventListener('change', () => {
 });
 
 function openGrabber() {
+  if (anotherModalOpen('gmodal')) return; // one modal layer (N-08)
   grabItems = [];
   grabUnchecked.clear();
   grabKindsOff.clear();
@@ -1839,9 +2551,30 @@ function openGrabber() {
   updateGrabCount();
   fillGrabProjects();
   showGrabStep(1);
-  gmodal.classList.remove('hidden');
+  revealModal(gmodal);
 }
 $('btnGrabber').onclick = openGrabber;
+
+/* Pages handed over for grabbing (the extension's grab-all-links)
+   wait in this queue like file/video links while another dialog is
+   busy; when pumped, the wizard opens with the address filled in
+   and the exploration already running */
+const grabLinkQueue = [];
+function queueGrabLink(payload) {
+  const url = payload && payload.url;
+  if (!url) return;
+  if (grabLinkQueue.some(q => q.url === url)) return;
+  grabLinkQueue.push({ url });
+  pumpGrabLinks();
+}
+function pumpGrabLinks() {
+  if (anyBlockingModalOpen()) return; // a dialog is busy
+  const next = grabLinkQueue.shift();
+  if (!next) return;
+  openGrabber();
+  $('gUrl').value = next.url;
+  fetchGrab();
+}
 $('gModalClose').onclick = $('gCancel').onclick = () => gmodal.classList.add('hidden');
 gmodal.addEventListener('click', e => { if (e.target === gmodal) gmodal.classList.add('hidden'); });
 
@@ -1859,6 +2592,9 @@ function updateGrabCount() {
   $('gCount').textContent = vis === sel.length
     ? `${sel.length} selected`
     : `${sel.length} selected (${vis} in current view)`;
+  // and the button itself carries the true count it will download:
+  // a hidden-but-checked file must never be a surprise (F-25)
+  $('gDownload').textContent = `Download Selected (${sel.length})`;
   $('gDownload').disabled = sel.length === 0;
 }
 
@@ -1956,26 +2692,45 @@ async function fetchGrab() {
   }
 }
 $('gFetch').onclick = fetchGrab;
-$('gUrl').addEventListener('keydown', e => { if (e.key === 'Enter') showGrabStep(2); });
+$('gUrl').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  // the same empty-URL guard as the Next button — Enter used to
+  // jump to Step 2 unconditionally
+  if (!$('gUrl').value.trim()) { $('gUrl').focus(); return; }
+  showGrabStep(2);
+});
 $('gFilter').addEventListener('input', renderGrabList);
 
+/* Select All / Select None mean the ENTIRE result set — the
+   category chips and the text filter only change the VIEW, never
+   the selection's scope (F-25) */
 $('gSelAll').onclick = () => {
-  grabItems.forEach((it, i) => { if (grabVisible(it)) grabUnchecked.delete(i); });
+  grabUnchecked.clear();
   renderGrabList();
 };
 $('gSelNone').onclick = () => {
-  grabItems.forEach((it, i) => { if (grabVisible(it)) grabUnchecked.add(i); });
+  grabItems.forEach((it, i) => { grabUnchecked.add(i); });
   renderGrabList();
 };
 
 /* a grabbed file keeps its place on the site when "use original
    relative subfolders" is on: <save dir>/<the file's folders below
-   the start page's root> */
+   the start page's own folder> — relative to where the grab
+   started, not to the host root (grabbing …/site/ must not add a
+   "site" level IDM does not create) */
 function grabDirFor(baseDir, startUrl, itemUrl) {
   try {
     const u = new URL(itemUrl);
     const parts = u.pathname.split('/').filter(Boolean);
     parts.pop(); // the file name itself
+    try {
+      const s = new URL(startUrl);
+      if (s.host === u.host) {
+        const root = s.pathname.split('/').filter(Boolean);
+        if (!s.pathname.endsWith('/')) root.pop(); // the start page itself
+        if (root.every((seg, i) => parts[i] === seg)) parts.splice(0, root.length);
+      }
+    } catch (e) { /* unparsable start URL: keep the item's full path */ }
     if (!parts.length) return baseDir;
     const sep = baseDir.includes('\\') && !baseDir.includes('/') ? '\\' : '/';
     return baseDir.replace(/[/\\]+$/, '') + sep + parts.join(sep);
@@ -2000,26 +2755,45 @@ $('gDownload').onclick = async () => {
         url: it.url, dir, later: p.add_as_queue, category: 'Grabber',
       });
     }
-    catch (e) { failed++; if (!firstErr) firstErr = String(e); console.error('add_download failed', it.url, e); toast('Could not add ' + it.name + ': ' + e); }
+    catch (e) { failed++; if (!firstErr) firstErr = String(e); console.error('add_download failed', it.url, e); }
   }
   if (failed) {
-    // keep the modal open so the actual reason can be read, not just counted
-    setGrabStatus(`${failed} of ${chosen.length} could not be added — ${firstErr}`, true);
+    // keep the modal open so the actual reason can be read, not just
+    // counted — in plain language: a raw internal id ("duplicate:
+    // dl-16") tells the user nothing
+    const why = firstErr.startsWith('duplicate')
+      ? 'already in the download list'
+      : (firstErr.length > 90 ? firstErr.slice(0, 90) + '…' : firstErr);
+    setGrabStatus(`${failed} of ${chosen.length} could not be added — ${why}`, true);
     $('gDownload').disabled = false;
     return;
   }
   gmodal.classList.add('hidden');
 };
 
-/* demo data so the grabber is fully previewable in a plain browser */
+/* demo data so the grabber is fully previewable in a plain browser.
+   The wizard's own filters still apply — templates write their
+   extension lists into the Step 4 fields, so filtering by the
+   wizard state exercises the template wiring too */
 function demoGrab() {
   const base = $('gUrl').value.trim().replace(/\/+$/, '');
-  grabItems = [
+  const p = grabWizardState();
+  const all = [
     { url: `${base}/brochure-2026.pdf`, name: 'brochure-2026.pdf', kind: 'Documents', size: 4821760, label: 'Company brochure (PDF)' },
     { url: `${base}/theme-song.mp3`, name: 'theme-song.mp3', kind: 'Music', size: 8388608, label: '' },
     { url: `${base}/assets-backup.zip`, name: 'assets-backup.zip', kind: 'Compressed', size: null, label: 'Full asset backup' },
     { url: `${base}/promo-clip.mp4`, name: 'promo-clip.mp4', kind: 'Video', size: 157286400, label: 'Promo clip — 1080p' },
   ];
+  grabItems = all.filter(it => {
+    const ext = (it.name.split('.').pop() || '').toLowerCase();
+    if (p.include_exts.length && !p.include_exts.includes(ext)) return false;
+    if (p.exclude_exts.includes(ext)) return false;
+    if (it.size != null) {
+      if (p.min_kb > 0 && it.size < p.min_kb * 1024) return false;
+      if (p.max_mb > 0 && it.size > p.max_mb * 1024 * 1024) return false;
+    }
+    return true;
+  });
   grabUnchecked.clear();
   grabKindsOff.clear();
   renderGrabKinds();
@@ -2064,11 +2838,11 @@ if ($('dLimitApply')) {
     const valMb = Math.max(0.1, Number($('dLimitVal').value) || 1);
     const bps = on ? Math.round(valMb * 1024 * 1024) : 0;
     if (TAURI) {
-      try { await invoke('set_entry_limit', { id: d.id, bps }); }
+      try { await invoke('set_entry_limit', { id: d.id, limit: bps }); }
       catch (e) { toast('Could not set the limit: ' + e); return; }
     }
     d.speed_limit = bps;
-    toast(on ? `This download is limited to ${valMb} MB/s` : 'Per-download speed limit removed');
+    toast(on ? `This download is limited to ${valMb} MB/s` : 'Per-download speed limit removed', 'info');
   };
 }
 
@@ -2092,11 +2866,20 @@ document.querySelectorAll('input[name="compAct"]').forEach(r => {
   r.addEventListener('change', async () => {
     const d = items.get(selectedId);
     if (!d) return;
-    d.completion = r.value;
     if (TAURI) {
       try { await invoke('set_completion', { id: d.id, action: r.value }); }
-      catch (e) { console.error(e); toast(String(e)); }
+      catch (e) {
+        console.error(e); toast(String(e));
+        // the backend never saved it — put the radios back on the
+        // value the entry actually has instead of showing a lie
+        const prev = d.completion || '';
+        document.querySelectorAll('input[name="compAct"]').forEach(x => {
+          x.checked = x.value === prev;
+        });
+        return;
+      }
     }
+    d.completion = r.value;
   });
 });
 
@@ -2114,7 +2897,7 @@ const rmodal = $('rmodal');
 $('dRefresh').onclick = () => {
   if (!items.get(selectedId)) return;
   $('rUrl').value = '';
-  rmodal.classList.remove('hidden');
+  revealModal(rmodal);
   $('rUrl').focus();
 };
 $('rModalClose').onclick = $('rCancel').onclick = () => rmodal.classList.add('hidden');
@@ -2140,9 +2923,23 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Delete' || e.key === 'Del') {
     const active = document.activeElement;
     if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
-    if (selectedId && !document.querySelector('.modal:not(.hidden)')) {
+    if ((selectedId || selectedIds.size) && !document.querySelector('.modal:not(.hidden)')) {
       $('btnDelete').click();
     }
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'a') {
+    // Ctrl+A marks every visible download (IDM does the same) — the
+    // selection Delete then confirms once for the whole batch
+    const active = document.activeElement;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+    if (document.querySelector('.modal:not(.hidden)')) return;
+    e.preventDefault();
+    const list = visibleItems();
+    selectedIds.clear();
+    for (const d of list) selectedIds.add(d.id);
+    if (!selectedId || !selectedIds.has(selectedId)) selectedId = list.length ? list[0].id : null;
+    render();
     return;
   }
   if (e.key !== 'Escape') return;
@@ -2157,6 +2954,9 @@ document.addEventListener('keydown', e => {
     .filter(m => !(m.id === 'umodal' && m.dataset.mandatory === '1'));
   if (!open.length) return;
   const top = open[open.length - 1];
+  // the styled confirm must SETTLE (as a "no"), not just hide —
+  // hiding it would leave the awaiting guard pending forever
+  if (top.id === 'cfmodal') { settleConfirm(false); return; }
   // the video and Add dialogs own cleanup — a captured browser
   // session must be discarded and the queue pumped — so Escape goes
   // through the same close path as their Cancel buttons
@@ -2167,6 +2967,8 @@ document.addEventListener('keydown', e => {
   // dialog ever appeared again for the rest of the session
   if (top.id === 'cmodal') { closeComplete(null); return; }
   top.classList.add('hidden');
+  // closing a dialog may un-block a queued completion dialog
+  showNextComplete();
 });
 $('inUrl').addEventListener('keydown', e => { if (e.key === 'Enter') submitAdd(false); });
 $('vInUrl').addEventListener('keydown', e => { if (e.key === 'Enter') fetchVideoInfo(); });
@@ -2201,17 +3003,59 @@ async function initTauri() {
   await listen('quota_exceeded', () => {
     toast(`Download limit reached (${settings.quota_mb} MB per ${settings.quota_hours} h). Downloads are paused until the next period.`);
   });
-  await listen('download_complete', e => {
-    completeQueue.push(e.payload || {});
+  await listen('download_complete', async e => {
+    const p = e.payload || {};
+    // the render-side detector (N-03) may have announced this
+    // finish already — the real event is then the duplicate and
+    // must not queue a second dialog for the same finish
+    if (p.id && completeAnnounced.has(p.id)) {
+      // fall through: the list refresh below still applies
+    } else {
+      if (p.id) completeAnnounced.add(p.id);
+      completeQueue.push(p);
+    }
+    // make the finish land in the list/detail even if this entry's
+    // last progress payload never arrived — one authoritative pull
+    // (F-16: a row frozen at "Paused 67%" after finishing under an
+    // open detail dialog)
+    try {
+      const list = await invoke('list_downloads');
+      for (const nd of list) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
+      scheduleRender();
+    } catch (err) { /* the progress events usually carry it */ }
     showNextComplete();
   });
+  // while the detail dialog is open it (and the list behind it)
+  // must keep tracking the live state: re-sync from the backend
+  // every few seconds so a dropped payload can never freeze the
+  // displayed state again (F-16/F-17 UI half — the engine-side
+  // stall that caused it is a backend finding)
+  setInterval(async () => {
+    if (detailEl.classList.contains('hidden')) return;
+    try {
+      const list = await invoke('list_downloads');
+      for (const nd of list) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
+      scheduleRender();
+    } catch (err) { /* next tick retries */ }
+  }, 4000);
   await listen('components_progress', e => { onComponentsProgress(e.payload || {}); });
   await listen('update_available', e => { showUpdate(e.payload || {}); });
   await listen('update_installed', e => {
     const v = (e.payload && e.payload.version) || '';
-    toast(v ? `NDM ${v} is installed — restart NDM to use it.` : 'Update installed — restart NDM to use it.');
+    toast(v ? `NDM ${v} is installed — restart NDM to use it.` : 'Update installed — restart NDM to use it.', 'info');
   });
   await listen('update_progress', e => { onUpdateProgress(e.payload || {}); });
+  // an entry removed on the backend's side (the extension's host
+  // path cancelling/discarding it) leaves the list too — without
+  // this the row stayed behind as a ghost the backend no longer
+  // knew about (X-REF). The tombstone keeps the progress/render
+  // paths from resurrecting it from a late payload.
+  await listen('entry_removed', e => {
+    const id = e.payload.id;
+    deletedIds.add(id);
+    items.delete(id);
+    render();
+  });
   // file downloads caught by the extension open the Add URL dialog
   await listen('incoming_file', e => {
     invoke('take_pending_files').catch(() => {});
@@ -2221,6 +3065,15 @@ async function initTauri() {
     const pendingFiles = await invoke('take_pending_files');
     for (const p of pendingFiles || []) queueFileLink(p);
   } catch (e) { console.error('take_pending_files failed', e); }
+  // a page sent for grabbing opens the Site Grabber on its results
+  await listen('incoming_grab', e => {
+    invoke('take_pending_grabs').catch(() => {});
+    queueGrabLink(e.payload || {});
+  });
+  try {
+    const pendingGrabs = await invoke('take_pending_grabs');
+    for (const p of pendingGrabs || []) queueGrabLink(p);
+  } catch (e) { console.error('take_pending_grabs failed', e); }
   render();
 }
 function normalize(d) {
@@ -2233,8 +3086,57 @@ let completeCurrent = null;
 function showNextComplete() {
   const cm = $('cmodal');
   if (!cm || completeCurrent || !completeQueue.length) return;
+  // a completion whose entry has since been deleted must not
+  // surface — the announcement outlived the download it was
+  // about (R3: the dialog appeared after its entry was deleted).
+  // Checked at show time, not queue time: the entry exists when
+  // the finish is queued, so only a later deletion can stale it.
+  // Payloads without an id cannot be checked and are left alone.
+  for (let i = completeQueue.length - 1; i >= 0; i--) {
+    const p = completeQueue[i];
+    if (p.id && (!items.has(p.id) || deletedIds.has(p.id))) {
+      completeQueue.splice(i, 1);
+    }
+  }
+  if (!completeQueue.length) return;
   if (settings.show_complete_dialog === false) { completeQueue.length = 0; return; }
+  // completions YIELD to user-initiated dialogs: a Grabber, an
+  // incoming-link dialog or the detail dialog must never be buried
+  // under a stack of "Download complete" boxes. The completion
+  // waits in the queue — the pump and every modal-close path call
+  // back here — and is shown once the way is clear (it is never
+  // dropped: a download that finished under an open detail dialog
+  // still gets its dialog, right after the detail closes)
+  const blocked = [...document.querySelectorAll('.modal:not(.hidden)')]
+    .some(m => m.id !== 'cmodal');
+  if (blocked) return;
+  if (completeQueue.length > 1) {
+    // rapid successive completions (Start All finishing a batch)
+    // fold into ONE summary instead of N dialogs in a row (F-26)
+    const batch = completeQueue.splice(0, completeQueue.length);
+    completeCurrent = { summary: true, batch };
+    $('cName').textContent = `${batch.length} downloads completed`;
+    if ($('cAddr')) {
+      const names = batch.map(p => p.name || 'Download');
+      $('cAddr').textContent = names.slice(0, 12).join('\n')
+        + (names.length > 12 ? `\n…and ${names.length - 12} more` : '');
+    }
+    $('cPath').textContent = '';
+    const totalBytes = batch.reduce((a, p) => a + (p.total || 0), 0);
+    $('cSize').textContent = totalBytes
+      ? 'Downloaded ' + fmtSize(totalBytes) + ' in total'
+      : '';
+    // a summary has no single file to open — Close only
+    if ($('cOpen')) $('cOpen').style.display = 'none';
+    if ($('cOpenFolder')) $('cOpenFolder').style.display = 'none';
+    $('cDontShow').checked = false;
+    revealModal(cm);
+    if ($('cClose')) $('cClose').focus();
+    return;
+  }
   completeCurrent = completeQueue.shift();
+  if ($('cOpen')) $('cOpen').style.display = '';
+  if ($('cOpenFolder')) $('cOpenFolder').style.display = '';
   $('cName').textContent = completeCurrent.name || 'Download';
   if ($('cAddr')) {
     $('cAddr').textContent = completeCurrent.url ? 'Address: ' + completeCurrent.url : '';
@@ -2244,7 +3146,7 @@ function showNextComplete() {
     ? 'Downloaded ' + fmtSize(completeCurrent.total) + ' (' + completeCurrent.total + ' bytes)'
     : '';
   $('cDontShow').checked = false;
-  cm.classList.remove('hidden');
+  revealModal(cm);
   // IDM focuses Open — Enter opens the file right away
   if ($('cOpen')) $('cOpen').focus();
 }
@@ -2257,7 +3159,7 @@ async function closeComplete(openMode) {
     settings = { ...settings, show_complete_dialog: false };
     await saveSettings();
   }
-  if (cur && openMode) {
+  if (cur && openMode && !cur.summary && cur.id) {
     try { await invoke('open_path', { id: cur.id, folder: openMode === 'folder' }); }
     catch (e) {
       // a failed Open used to fail silently — the dialog closed
@@ -2339,7 +3241,6 @@ function demoAdd(url, later) {
 }
 function demoPause(id) { const d = items.get(id); if (d && d.status === 'downloading') { d.status = 'paused'; d.speed_bps = 0; d.blocks = blocksString(d); } scheduleRender(); }
 function demoResume(id) { const d = items.get(id); if (d && (d.status === 'paused' || d.status === 'queued')) d.status = 'downloading'; scheduleRender(); }
-function demoRemove(id) { items.delete(id); if (selectedId === id) selectedId = items.keys().next().value || null; render(); }
 
 /* ---------- boot ---------- */
 setInterval(() => {
@@ -2356,6 +3257,7 @@ let basketShown = false;
 const umodal = $('umodal');
 let updateInfo = null;
 let updateInstalling = false;
+let updateInstalled = false; // a mandatory dialog unlocks once installed
 
 function closeMenus() {
   document.querySelectorAll('.menu-drop').forEach(d => d.classList.add('hidden'));
@@ -2392,7 +3294,7 @@ async function startAllDownloads() {
       else { demoResume(d.id); n++; }
     }
   }
-  toast(n ? `Started ${n} download${n > 1 ? 's' : ''}` : 'Nothing to start');
+  toast(n ? `Started ${n} download${n > 1 ? 's' : ''}` : 'Nothing to start', 'info');
 }
 async function pauseAllDownloads() {
   let n = 0;
@@ -2402,26 +3304,37 @@ async function pauseAllDownloads() {
       else { demoPause(d.id); n++; }
     }
   }
-  toast(n ? `Paused ${n} download${n > 1 ? 's' : ''}` : 'Nothing is downloading');
+  toast(n ? `Paused ${n} download${n > 1 ? 's' : ''}` : 'Nothing is downloading', 'info');
 }
 async function deleteCompleted() {
   const done = [...items.values()].filter(d => d.status === 'finished');
-  if (!done.length) { toast('No completed downloads'); return; }
+  if (!done.length) { toast('No completed downloads', 'info'); return; }
   for (const d of done) {
     if (TAURI) {
       try { await invoke('remove_download', { id: d.id }); } catch (e) { continue; }
     }
     deletedIds.add(d.id);
     items.delete(d.id);
+    selectedIds.delete(d.id);
+    prevStatusById.delete(d.id);
+    completeAnnounced.delete(d.id);
   }
   if (selectedId && !items.has(selectedId)) selectedId = items.keys().next().value || null;
   render();
-  toast(`Deleted ${done.length} completed download${done.length > 1 ? 's' : ''} from the list`);
+  toast(`Deleted ${done.length} completed download${done.length > 1 ? 's' : ''} from the list`, 'info');
 }
 
+let pendingUpdate = null; // an update that arrived while a dialog was up (N-08)
 function showUpdate(info) {
   if (!info || info.status !== 'available') return;
+  // one modal layer (N-08): the update dialog waits while another
+  // dialog is up instead of stacking over it; the 700 ms pump
+  // retries until the way is clear. A mandatory update still
+  // cannot be dismissed once it is actually shown.
+  if (anotherModalOpen('umodal')) { pendingUpdate = info; return; }
+  pendingUpdate = null;
   updateInfo = info;
+  updateInstalled = false;
   $('uTitle').textContent = `NDM ${info.version} is available`;
   $('uNotes').textContent = info.mandatory
     ? 'This update is required — downloads pause until it is installed. ' + (info.notes || '')
@@ -2432,15 +3345,15 @@ function showUpdate(info) {
   $('uLater').classList.toggle('hidden', !!info.mandatory);
   $('uModalClose').style.display = info.mandatory ? 'none' : '';
   umodal.dataset.mandatory = info.mandatory ? '1' : '';
-  umodal.classList.remove('hidden');
+  revealModal(umodal);
 }
 async function manualUpdateCheck() {
   if (!TAURI) { toast('Update checks need the NDM desktop app'); return; }
-  toast('Checking for updates…');
+  toast('Checking for updates…', 'info');
   try {
     const r = await invoke('check_update');
     if (r.status === 'available') showUpdate(r);
-    else if (r.status === 'current') toast(`NDM is up to date (${r.version})`);
+    else if (r.status === 'current') toast(`NDM is up to date (${r.version})`, 'info');
     else toast('Could not reach the update server — try again later');
   } catch (e) { toast('Update check failed: ' + e); }
 }
@@ -2457,6 +3370,7 @@ function onUpdateProgress(p) {
     $('uBar').style.width = '100%';
   } else if (p.phase === 'installed') {
     updateInstalling = false;
+    updateInstalled = true;
     $('uBarText').textContent = 'Update installed.';
     $('uUpdate').classList.add('hidden');
     $('uLater').classList.add('hidden');
@@ -2484,12 +3398,24 @@ $('uUpdate').onclick = async () => {
 };
 $('uRestart').onclick = () => { if (TAURI) invoke('restart_app'); };
 $('uLater').onclick = () => umodal.classList.add('hidden');
-$('uModalClose').onclick = () => { if (!updateInfo || !updateInfo.mandatory) umodal.classList.add('hidden'); };
-umodal.addEventListener('click', e => { if (e.target === umodal && (!updateInfo || !updateInfo.mandatory)) umodal.classList.add('hidden'); });
+$('uModalClose').onclick = () => { if (!updateInfo || !updateInfo.mandatory || updateInstalled) umodal.classList.add('hidden'); };
+umodal.addEventListener('click', e => { if (e.target === umodal && (!updateInfo || !updateInfo.mandatory || updateInstalled)) umodal.classList.add('hidden'); });
 
 /* batch add */
 const bmodal = $('bmodal');
-function openBatch() { $('bDir').value = settings.default_dir; $('bStatus').textContent = ''; bmodal.classList.remove('hidden'); }
+function openBatch() {
+  if (anotherModalOpen('bmodal')) return; // one modal layer (N-08)
+  $('bDir').value = settings.default_dir;
+  $('bStatus').textContent = '';
+  $('bStatus').classList.remove('error');
+  revealModal(bmodal);
+  // the textarea is the whole point of this dialog — focus it,
+  // so links typed or pasted the moment it opens actually land
+  // (it used to open with focus nowhere and the first typing
+  // was lost). Being a field inside the modal, the focus also
+  // arms the F-08 editing guard for the typing that follows.
+  $('bUrls').focus();
+}
 $('bModalClose').onclick = $('bCancel').onclick = () => bmodal.classList.add('hidden');
 bmodal.addEventListener('click', e => { if (e.target === bmodal) bmodal.classList.add('hidden'); });
 $('bAdd').onclick = async () => {
@@ -2499,14 +3425,41 @@ $('bAdd').onclick = async () => {
   const dir = $('bDir').value.trim() || settings.default_dir;
   $('bAdd').disabled = true;
   let ok = 0;
+  const failed = []; // { url, reason } — the backend returns an
+                     // accurate per-URL reason now (N-07)
   for (const url of urls) {
     try { await invoke('add_download', { url, dir, later: false }); ok++; }
-    catch (e) { /* count at the end */ }
+    catch (e) {
+      let reason = String(e || 'unknown error');
+      // the duplicate marker is an internal id string ("duplicate:
+      // dl-16") — say what it means instead of echoing it raw
+      if (reason.startsWith('duplicate:')) reason = 'already in the download list';
+      failed.push({ url, reason: reason.length > 140 ? reason.slice(0, 140) + '…' : reason });
+    }
   }
   $('bAdd').disabled = false;
-  $('bUrls').value = '';
-  bmodal.classList.add('hidden');
-  toast(`Added ${ok} of ${urls.length} downloads`);
+  if (!failed.length) {
+    $('bUrls').value = '';
+    $('bStatus').textContent = '';
+    $('bStatus').classList.remove('error');
+    bmodal.classList.add('hidden');
+    toast(`Added ${ok} of ${urls.length} downloads`, 'info');
+    return;
+  }
+  // partial (or total) failure: keep the dialog open and name
+  // every failed URL with its reason — a bare "Added 1 of 3"
+  // count used to be the only trace of the failures (N-07).
+  // The URLs that DID add leave the textarea, so what remains
+  // is exactly what still needs attention — and a retry cannot
+  // duplicate the successes.
+  const failedUrls = new Set(failed.map(f => f.url));
+  $('bUrls').value = urls.filter(u => failedUrls.has(u)).join('\n');
+  const shown = failed.slice(0, 12);
+  $('bStatus').textContent =
+    `Added ${ok} of ${urls.length} — ${failed.length} failed:\n`
+    + shown.map(f => `• ${f.url} — ${f.reason}`).join('\n')
+    + (failed.length > shown.length ? `\n…and ${failed.length - shown.length} more` : '');
+  $('bStatus').classList.add('error');
 };
 
 /* import */
@@ -2530,19 +3483,31 @@ $('iGo').onclick = async () => {
   }
   $('iText').value = '';
   imodal.classList.add('hidden');
-  toast(`Imported ${ok} download${ok === 1 ? '' : 's'} (paused — start them when ready)`);
+  toast(`Imported ${ok} download${ok === 1 ? '' : 's'} (paused — start them when ready)`, 'info');
 };
 
 /* about */
 const amodal = $('amodal');
 async function openAbout() {
-  amodal.classList.remove('hidden');
-  if (!TAURI) { $('aVersion').textContent = 'Version — (browser preview)'; return; }
-  try { $('aVersion').textContent = 'Version ' + await invoke('app_version'); } catch (e) {}
+  if (anotherModalOpen('amodal')) return; // one modal layer (N-08)
+  if (!TAURI) { $('aVersion').textContent = 'Version — (browser preview)'; revealModal(amodal); return; }
+  // fill BEFORE revealing: the dialog used to open on its
+  // placeholder text and swap the real values in whenever the
+  // IPC answers landed — under load that left "Version —" on
+  // screen for a visible beat (R3). The version comes from the
+  // backend's app_version command (the packaged crate version,
+  // never a string hardcoded here); the Tauri app API reports
+  // the same packaged version if that call ever fails.
+  try { $('aVersion').textContent = 'Version ' + await invoke('app_version'); }
+  catch (e) {
+    try { $('aVersion').textContent = 'Version ' + await window.__TAURI__.app.getVersion(); }
+    catch (e2) { /* keep the placeholder rather than invent one */ }
+  }
   try {
     const st = await invoke('components_status');
     $('aEngine').textContent = 'Video engine: ' + (st.ready ? 'ready' : 'setting up in the background');
   } catch (e) {}
+  revealModal(amodal);
 }
 $('aModalClose').onclick = $('aOk').onclick = () => amodal.classList.add('hidden');
 amodal.addEventListener('click', e => { if (e.target === amodal) amodal.classList.add('hidden'); });
@@ -2557,10 +3522,13 @@ const menuActions = {
   add: () => $('btnAdd').click(),
   video: () => $('btnVideo').click(),
   batch: openBatch,
-  import: () => { $('iStatus').textContent = ''; imodal.classList.remove('hidden'); },
+  import: () => {
+    if (anotherModalOpen('imodal')) return; // one modal layer (N-08)
+    $('iStatus').textContent = ''; revealModal(imodal);
+  },
   export: async () => {
     if (!TAURI) { toast('Export needs the NDM desktop app'); return; }
-    try { toast('Exported to ' + await invoke('export_downloads')); }
+    try { toast('Exported to ' + await invoke('export_downloads'), 'info'); }
     catch (e) { toast('Export failed: ' + e); }
   },
   quit: () => { if (TAURI) invoke('quit_app'); },
@@ -2580,15 +3548,18 @@ const menuActions = {
     try { await invoke('set_basket_visible', { visible: basketShown }); }
     catch (e) { basketShown = !basketShown; toast('Could not toggle the basket: ' + e); }
   },
-  'sort-name': () => { sortKey = 'name'; render(); },
-  'sort-date': () => { sortKey = 'date'; render(); },
-  'sort-size': () => { sortKey = 'size'; render(); },
-  'sort-status': () => { sortKey = 'status'; render(); },
+  'sort-name': () => { sortKey = 'name'; sortDir = 1; updateSortIndicators(); render(); },
+  'sort-date': () => { sortKey = 'date'; sortDir = 1; updateSortIndicators(); render(); },
+  'sort-size': () => { sortKey = 'size'; sortDir = 1; updateSortIndicators(); render(); },
+  'sort-status': () => { sortKey = 'status'; sortDir = 1; updateSortIndicators(); render(); },
   columns: () => openColumns(),
   toolbar: () => openToolbarCfg(),
   refresh: async () => { if (TAURI) { try { const list = await invoke('list_downloads'); for (const d of list) if (!deletedIds.has(d.id)) items.set(d.id, normalize(d)); render(); } catch (e) {} } },
   update: manualUpdateCheck,
-  shortcuts: () => kmodal.classList.remove('hidden'),
+  shortcuts: () => {
+    if (anotherModalOpen('kmodal')) return; // one modal layer (N-08)
+    revealModal(kmodal);
+  },
   about: openAbout,
 };
 document.querySelectorAll('.menu-drop > button').forEach(b => {

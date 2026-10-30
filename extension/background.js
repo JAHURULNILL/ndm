@@ -1,5 +1,5 @@
 'use strict';
-/* NDM — Nill Download Manager: background service worker.
+/* Nill Download Manager: background service worker.
  *
  * Communicates with the desktop app through the Native Messaging
  * host "com.ndm.host":
@@ -11,6 +11,29 @@
  */
 
 const HOST_NAME = 'com.ndm.host';
+
+/* Streaming services whose videos are DRM-protected — the same list
+   content.js uses to suppress its panel. The background layer must
+   honour it too: no stream recording and no page-video action on
+   these hosts. */
+const DRM_HOSTS = [
+  'netflix.com',
+  'primevideo.com',
+  'disneyplus.com',
+  'hotstar.com',
+  'open.spotify.com',
+];
+
+function isDrmUrl(url) {
+  if (!url) return false;
+  let h;
+  try {
+    h = new URL(url).hostname.toLowerCase();
+  } catch (e) {
+    return false;
+  }
+  return DRM_HOSTS.some(d => h === d || h.endsWith('.' + d));
+}
 
 /* ------------------------------------------------------------------ */
 /* URL classification                                                  */
@@ -88,6 +111,10 @@ function isDownloadableFile(urlOrName) {
 /* ------------------------------------------------------------------ */
 
 const tabMediaStreams = new Map();
+/* Last main-frame URL per tab: a stream is tagged with the page it
+   was seen on, so one tab's registry can tell two videos apart
+   (two players on one page, or SPA navigation between videos). */
+const tabPageUrls = new Map();
 const STREAM_TTL_MS = 15 * 60 * 1000;
 const STREAMS_PER_TAB = 12;
 
@@ -100,26 +127,41 @@ function recordTabStream(tabId, url) {
   if (!/^https?:\/\//i.test(url)) return;
   // Ignore YouTube/Facebook raw segment requests because yt-dlp handles page URLs directly
   if (/googlevideo\.com\/videoplayback|fbcdn\.net.*bytestart=/i.test(url)) return;
+  const page = tabPageUrls.get(tabId) || '';
   let list = tabMediaStreams.get(tabId) || [];
   list = list.filter(e => e.url !== url && Date.now() - e.ts < STREAM_TTL_MS);
   // A master-looking manifest stays ahead of sub-variant playlists:
   // the newest response is very often just one variant of the show.
   if (isSubVariantPlaylist(url)) {
-    list.push({ url, ts: Date.now() });
+    list.push({ url, page, ts: Date.now() });
   } else {
-    list.unshift({ url, ts: Date.now() });
+    list.unshift({ url, page, ts: Date.now() });
   }
   tabMediaStreams.set(tabId, list.slice(0, STREAMS_PER_TAB));
   if (tabMediaStreams.size > 300) {
     tabMediaStreams.delete(tabMediaStreams.keys().next().value);
   }
+  // A sniffed stream is media worth offering the panel for, even
+  // before the content script's own report lands (F-EXT-15).
+  if (!tabHasMedia.get(tabId)) {
+    tabHasMedia.set(tabId, true);
+    applyPageVideoMenuVisibility();
+  }
 }
 
-function tabStreamList(tabId) {
-  const list = tabMediaStreams.get(tabId) || [];
-  return list
-    .filter(e => Date.now() - e.ts < STREAM_TTL_MS)
-    .map(e => e.url);
+function tabStreamList(tabId, preferPage, preferKey) {
+  const list = (tabMediaStreams.get(tabId) || [])
+    .filter(e => Date.now() - e.ts < STREAM_TTL_MS);
+  // Streams seen on the page the caller is asking about come first:
+  // a tab's older streams (previous SPA video, another player) must
+  // not outrank the current page's own.
+  const pref = [];
+  const rest = [];
+  for (const e of list) {
+    if (preferPage && (e.page === preferPage || e.page === preferKey)) pref.push(e.url);
+    else rest.push(e.url);
+  }
+  return pref.concat(rest);
 }
 
 /* Pick the stream URL that actually describes the whole show: fetch
@@ -127,12 +169,12 @@ function tabStreamList(tabId) {
    master playlist (#EXT-X-STREAM-INF) — a variant URL handed to the
    probe collapses the quality ladder to that single variant. */
 const masterPickCache = new Map();
-async function pickMasterStream(tabId) {
-  const list = tabStreamList(tabId);
+async function pickMasterStream(tabId, preferPage, preferKey) {
+  const list = tabStreamList(tabId, preferPage, preferKey);
   if (!list.length) return '';
   const manifests = list.filter(u => /\.m3u8(\?|$)/i.test(u.split('#')[0]));
   if (!manifests.length) return list[0];
-  const cacheKey = tabId + '|' + manifests[0];
+  const cacheKey = tabId + '|' + (preferPage || '') + '|' + manifests[0];
   const cached = masterPickCache.get(cacheKey);
   if (cached && Date.now() - cached.ts < 60 * 1000) return cached.url;
   let fallback = '';
@@ -159,8 +201,12 @@ if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
       if (details.tabId < 0) return;
       if (details.type === 'main_frame') {
         tabMediaStreams.delete(details.tabId);
+        tabPageUrls.set(details.tabId, details.url || '');
         return;
       }
+      // DRM pages: never record their streams (content.js also
+      // suppresses the panel there — the layers must agree).
+      if (isDrmUrl(tabPageUrls.get(details.tabId) || '')) return;
       const u = details.url || '';
       const clean = u.split(/[?#]/)[0].toLowerCase();
       if (
@@ -174,6 +220,112 @@ if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
     { urls: ['<all_urls>'] }
   );
 }
+
+chrome.tabs.onRemoved.addListener(tabId => {
+  tabMediaStreams.delete(tabId);
+  tabPageUrls.delete(tabId);
+  tabHasMedia.delete(tabId);
+});
+
+/* ------------------------------------------------------------------ */
+/* Alt+Shift "prevent" gestures (F-EXT-13)                             */
+/* ------------------------------------------------------------------ */
+
+/* The click layer notes every Alt+Shift click (URL + time). A
+   browser download that starts within a few seconds for a noted
+   URL is the browser keeping a file the user explicitly gave
+   it — the downloads layer must not grab it after the fact. */
+const recentPrevents = new Map(); // url -> timestamp
+const PREVENT_WINDOW_MS = 5000;
+
+function notePrevent(url) {
+  if (!url) return;
+  recentPrevents.set(url, Date.now());
+  if (recentPrevents.size > 100) {
+    const cutoff = Date.now() - PREVENT_WINDOW_MS;
+    for (const [u, at] of recentPrevents) {
+      if (at < cutoff) recentPrevents.delete(u);
+    }
+  }
+}
+
+function recentPreventFor(url) {
+  if (!url) return false;
+  const at = recentPrevents.get(url);
+  if (!at) return false;
+  if (Date.now() - at > PREVENT_WINDOW_MS) {
+    recentPrevents.delete(url);
+    return false;
+  }
+  return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Per-tab media presence → context-menu visibility (F-EXT-15)         */
+/* ------------------------------------------------------------------ */
+
+/* "Download this page's video with NDM" must not be offered on
+   pages with no media. Content scripts report their page's
+   media state (and a sniffed stream counts too); Chrome's menu
+   visibility is global, so the item mirrors the ACTIVE tab. */
+const tabHasMedia = new Map(); // tabId -> bool
+
+function applyPageVideoMenuVisibility() {
+  const applyFor = tabs => {
+    const t = tabs && tabs[0];
+    const has = !!(
+      t &&
+      t.id != null &&
+      (tabHasMedia.get(t.id) || tabStreamList(t.id).length > 0)
+    );
+    try {
+      chrome.contextMenus.update(MENU_PAGE_VIDEO, { visible: has }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (e) {}
+  };
+  try {
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }, tabs => {
+      if (tabs && tabs.length) applyFor(tabs);
+      else chrome.tabs.query({ active: true }, applyFor);
+    });
+  } catch (e) {}
+}
+
+chrome.tabs.onActivated.addListener(() => applyPageVideoMenuVisibility());
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === 'loading') {
+    // A fresh page has reported nothing yet: the item hides
+    // until its content script reports media (or a stream is
+    // sniffed on it).
+    tabHasMedia.delete(tabId);
+    applyPageVideoMenuVisibility();
+  }
+});
+
+/* Per-tab pause (ndmTabOff) lives in chrome.storage.session, whose
+   default access level is TRUSTED_CONTEXTS only: storage change
+   events for it are never delivered to content scripts, so the
+   popup's "Pause link interception on this tab" toggle silently
+   did nothing on already-open pages — it only took effect after a
+   reload, when the content script's at-load ndm-tab-state ask read
+   the stored value (R2-EXT-06). Opening the area to untrusted
+   contexts lets the content script's existing onChanged listener
+   actually receive the change and re-ask for its tab state, so the
+   toggle applies immediately. The stored data and its semantics
+   (a per-tab-id map that dies with the browser session) are
+   unchanged. Guarded: older browsers / Firefox may lack the API. */
+try {
+  if (
+    chrome.storage.session &&
+    typeof chrome.storage.session.setAccessLevel === 'function'
+  ) {
+    const p = chrome.storage.session.setAccessLevel({
+      accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS',
+    });
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  }
+} catch (e) {}
 
 /* ------------------------------------------------------------------ */
 /* Native messaging                                                    */
@@ -201,6 +353,8 @@ function hostKnownMissing() {
   return false;
 }
 
+let settingsLoaded = false;
+
 /* Both interception gates (enabled flag + host status + site
    exceptions) load through this one promise: events that wake the
    service worker await it instead of acting on default values that
@@ -221,6 +375,7 @@ const settingsReady = (async () => {
       ndmSiteExceptions = new Set(v.ndmSiteExceptions);
     }
   } catch (e) {}
+  settingsLoaded = true;
 })();
 
 function setHostStatus(status) {
@@ -240,7 +395,19 @@ function setHostStatus(status) {
 const inflightSends = new Map();
 
 function sendToNdm(message) {
-  const key = `${message.kind || ''}|${message.url || ''}`;
+  // Direct kinds carry the user's actual choices: a retry with a
+  // different quality/folder/force must not join an earlier send
+  // that only shares kind+URL.
+  const keyParts = [message.kind || '', message.url || ''];
+  if (message.kind === 'video_direct' || message.kind === 'file_direct') {
+    keyParts.push(
+      message.selector || '',
+      message.dir || '',
+      message.force ? '1' : '0',
+      message.later ? '1' : '0'
+    );
+  }
+  const key = keyParts.join('|');
   if (message.url && inflightSends.has(key)) {
     return inflightSends.get(key);
   }
@@ -329,6 +496,29 @@ function sendControl(type, entry) {
   const timeout = new Promise(r =>
     setTimeout(() => r({ ok: false, error: 'Timed out waiting for NDM app.' }), 20000)
   );
+  return Promise.race([attempt, timeout]);
+}
+
+/* One native call whose FULL reply object is handed back — the
+   progress channel's reply IS the payload, not just an ok flag.
+   Every failure collapses to {ok:false} (and deliberately does NOT
+   touch the host status: a 1 s poll against an older host without
+   the progress type must not flap the recorded status). */
+function sendNativeFull(msg) {
+  const attempt = new Promise(resolve => {
+    try {
+      chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false });
+          return;
+        }
+        resolve(response && typeof response === 'object' ? response : { ok: false });
+      });
+    } catch (e) {
+      resolve({ ok: false });
+    }
+  });
+  const timeout = new Promise(r => setTimeout(() => r({ ok: false }), 5000));
   return Promise.race([attempt, timeout]);
 }
 
@@ -463,6 +653,7 @@ function pingHostAndRecord() {
 const MENU_LINK = 'ndm-link';
 const MENU_VIDEO = 'ndm-video';
 const MENU_PAGE_VIDEO = 'ndm-page-video';
+const MENU_ALL_LINKS = 'ndm-all-links';
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -482,6 +673,13 @@ chrome.runtime.onInstalled.addListener(() => {
       contexts: ['page'],
       documentUrlPatterns: ['*://*/*'],
     });
+    chrome.contextMenus.create({
+      id: MENU_ALL_LINKS,
+      title: 'Download all links with NDM',
+      contexts: ['page'],
+      documentUrlPatterns: ['*://*/*'],
+    });
+    applyPageVideoMenuVisibility();
   });
 });
 
@@ -496,7 +694,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         // a video-page link gets the same in-page dialog as the
         // other menu entries (it used to skip straight to the app)
         try {
-          const res = await chrome.tabs.sendMessage(tab.id, { action: 'ndm-open-video-modal' });
+          const res = await chrome.tabs.sendMessage(
+            tab.id,
+            { action: 'ndm-open-video-modal' },
+            { frameId: 0 }
+          );
           if (res && res.ok) return;
         } catch (e) {}
       } else {
@@ -518,21 +720,41 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
     const url = src && !src.startsWith('blob:') ? src : pageUrl;
     if (tab && tab.id != null) {
       try {
-        const res = await chrome.tabs.sendMessage(tab.id, { action: 'ndm-open-video-modal' });
+        // frameId 0 + the clicked element's own srcUrl: only the top
+        // frame opens the dialog, and for the video the user
+        // actually right-clicked — not the largest one on the page
+        const res = await chrome.tabs.sendMessage(
+          tab.id,
+          { action: 'ndm-open-video-modal', srcUrl: src },
+          { frameId: 0 }
+        );
         if (res && res.ok) return;
       } catch (e) {}
     }
     sendToNdm({ kind: 'video', url, pageUrl, title, cookies: await captureCookies(url, pageUrl) });
   }
 
+  if (info.menuItemId === MENU_ALL_LINKS && pageUrl) {
+    // IDM's second context-menu verb: hand the page to the app's
+    // Grabber, which opens on this page's links.
+    sendToNdm({ kind: 'grab', url: pageUrl, pageUrl, title });
+    return;
+  }
+
   if (info.menuItemId === MENU_PAGE_VIDEO) {
+    // DRM pages are excluded by design (see DRM_HOSTS).
+    if (isDrmUrl(pageUrl)) return;
     if (tab && tab.id != null) {
       try {
-        const res = await chrome.tabs.sendMessage(tab.id, { action: 'ndm-open-video-modal' });
+        const res = await chrome.tabs.sendMessage(
+          tab.id,
+          { action: 'ndm-open-video-modal' },
+          { frameId: 0 }
+        );
         if (res && res.ok) return;
       } catch (e) {}
     }
-    const sniffed = tab && tab.id != null ? await pickMasterStream(tab.id) : '';
+    const sniffed = tab && tab.id != null ? await pickMasterStream(tab.id, pageUrl) : '';
     const url = isVideoPageUrl(pageUrl) ? pageUrl : (sniffed || pageUrl);
     sendToNdm({ kind: 'video', url, pageUrl, title, cookies: await captureCookies(url, pageUrl) });
   }
@@ -583,10 +805,46 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ streamUrl: '' });
       return false;
     }
-    pickMasterStream(tabId)
+    const preferPage = message.pageUrl || (sender.tab && sender.tab.url) || '';
+    pickMasterStream(tabId, preferPage, message.key || '')
       .then(u => sendResponse({ streamUrl: u || '' }))
       .catch(() => sendResponse({ streamUrl: '' }));
     return true;
+  }
+
+  if (message.action === 'ndm-spa-navigated') {
+    // SPA navigation: the tab's sniffed streams belong to the page
+    // that was left behind — clear them so the next video's dialog
+    // can never be handed the previous video's streams.
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    if (tabId != null) {
+      tabMediaStreams.delete(tabId);
+      for (const k of [...masterPickCache.keys()]) {
+        if (k.startsWith(tabId + '|')) masterPickCache.delete(k);
+      }
+      if (message.url) tabPageUrls.set(tabId, message.url);
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.action === 'ndm-note-prevent') {
+    // An Alt+Shift click in some page: remember it so the
+    // downloads layer stays out of the browser download it is
+    // about to produce (F-EXT-13).
+    notePrevent(message.url || '');
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  if (message.action === 'ndm-media-state') {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    if (tabId != null) {
+      tabHasMedia.set(tabId, !!message.hasMedia);
+      applyPageVideoMenuVisibility();
+    }
+    sendResponse({ ok: true });
+    return false;
   }
 
   if (message.action === 'ndm-host-ping') {
@@ -594,9 +852,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message.action === 'ndm-pause-entry' || message.action === 'ndm-cancel-entry') {
-    const type = message.action === 'ndm-pause-entry' ? 'pause_entry' : 'cancel_entry';
+  if (
+    message.action === 'ndm-pause-entry' ||
+    message.action === 'ndm-cancel-entry' ||
+    message.action === 'ndm-resume-entry'
+  ) {
+    const type =
+      message.action === 'ndm-pause-entry'
+        ? 'pause_entry'
+        : message.action === 'ndm-cancel-entry'
+          ? 'cancel_entry'
+          : 'resume_entry';
     sendControl(type, String(message.entry || '')).then(r => sendResponse(r));
+    return true;
+  }
+
+  if (message.action === 'ndm-entry-progress') {
+    sendNativeFull({ type: 'progress', id: String(message.id || '') })
+      .then(r => sendResponse(r || { ok: false }))
+      .catch(() => sendResponse({ ok: false }));
     return true;
   }
 
@@ -631,8 +905,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === 'ndm-classify-url') {
     // the popup asks instead of carrying its own copy of the video
-    // host patterns (the copies had already diverged once)
-    sendResponse({ video: isVideoPageUrl(message.url || '') });
+    // host patterns (the copies had already diverged once). It also
+    // asks whether this tab is known to HAVE media — a recognised
+    // video-page URL, a content-script media report, or a sniffed
+    // stream — so it can withhold the video offer entirely on
+    // media-less pages instead of surfacing a raw probe error there
+    // (R2-EXT-08).
+    const video = isVideoPageUrl(message.url || '');
+    const tabId =
+      message.tabId != null
+        ? message.tabId
+        : sender && sender.tab
+          ? sender.tab.id
+          : null;
+    const hasMedia =
+      video ||
+      (tabId != null &&
+        (tabHasMedia.get(tabId) === true || tabStreamList(tabId).length > 0));
+    sendResponse({ video, hasMedia });
     return false;
   }
 
@@ -641,7 +931,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       let disabled = false;
       try {
-        const v = await chrome.storage.local.get({ ndmTabOff: {} });
+        // Per-tab pause lives in SESSION storage: tab ids are
+        // recycled across restarts, so a persistent map would let
+        // an unrelated later tab inherit the pause (EX-m6).
+        const store = chrome.storage.session || chrome.storage.local;
+        const v = await store.get({ ndmTabOff: {} });
         disabled = !!(v.ndmTabOff && tabId != null && v.ndmTabOff[tabId]);
       } catch (e) {}
       sendResponse({ disabled, tabId });
@@ -733,13 +1027,27 @@ function siteExceptedFor(url) {
   }
 }
 
+/* "Never intercept on this site" names the site the user was ON —
+   the page that started the download (the item's referrer), exactly
+   as the popup and the click layer mean it. The file's own host is
+   only the fallback for downloads with no referrer. */
+function siteExceptedForItem(item) {
+  const ref = (item && item.referrer) || '';
+  if (ref) {
+    try {
+      return ndmSiteExceptions.has(new URL(ref).hostname.toLowerCase());
+    } catch (e) {}
+  }
+  return siteExceptedFor((item && (item.finalUrl || item.url)) || '');
+}
+
 function shouldInterceptItem(item) {
   if (!ndmInterceptEnabled || !item) return false;
   // Host known missing (freshly verified) → inert, like IDM's module
   if (hostKnownMissing()) return false;
   const url = item.finalUrl || item.url || '';
   if (!/^https?:\/\//i.test(url)) return false;
-  if (siteExceptedFor(url)) return false;
+  if (siteExceptedForItem(item)) return false;
   const mimeHit =
     !!item.mime &&
     (item.mime.startsWith('application/') ||
@@ -761,6 +1069,65 @@ function eraseBrowserItem(id) {
   try {
     chrome.downloads.erase({ id }, () => {});
   } catch (e) {}
+}
+
+/* The tab that started a download: matched by referrer, with
+   the active tab as fallback (the same targeting the dialog
+   placement below uses). */
+async function findReferrerTab(referrer) {
+  try {
+    const tabs = await chrome.tabs.query({});
+    if (referrer) {
+      const t =
+        tabs.find(t => t.url === referrer) ||
+        tabs.find(t => {
+          try {
+            return t.url && new URL(t.url).origin === new URL(referrer).origin;
+          } catch (e) {
+            return false;
+          }
+        });
+      if (t) return t;
+    }
+    return (
+      tabs.find(t => t.active && t.lastFocusedWindow) ||
+      tabs.find(t => t.active) ||
+      null
+    );
+  } catch (e) {
+    return null;
+  }
+}
+
+/* Was this download produced by an Alt+Shift "prevent" click
+   (F-EXT-13)? Two witnesses, either is enough: the click layer's
+   timestamped note for this URL, or the source tab's content
+   script reporting the gesture (held now / clicked seconds
+   ago). The query is timeout-bounded and fails open — no answer
+   means today's behaviour, never a stuck download. */
+async function preventGestureForItem(item) {
+  if (!item) return false;
+  if (
+    recentPreventFor(item.finalUrl || '') ||
+    recentPreventFor(item.url || '')
+  ) {
+    return true;
+  }
+  const tab = await findReferrerTab(item.referrer || '');
+  if (!tab || tab.id == null) return false;
+  try {
+    const res = await Promise.race([
+      chrome.tabs.sendMessage(
+        tab.id,
+        { action: 'ndm-prevent-state' },
+        { frameId: 0 }
+      ),
+      new Promise(r => setTimeout(() => r(null), 400)),
+    ]);
+    return !!(res && (res.held || res.recent));
+  } catch (e) {
+    return false;
+  }
 }
 
 function notifyTakeoverProblem(name) {
@@ -786,6 +1153,11 @@ async function handleInterceptedDownload(item, suggestedFilename) {
   await settingsReady;
   if (!shouldInterceptItem(item)) return;
 
+  // Alt+Shift "prevent" (F-EXT-13): the user explicitly gave
+  // this file to the browser — this layer stays out completely,
+  // exactly like the click layer does.
+  if (await preventGestureForItem(item)) return;
+
   // Take the download over: cancel the browser's copy, but do NOT
   // erase it yet. Erasing happens only once NDM has CONFIRMED it
   // owns the download (the in-page dialog opened, or a send acked
@@ -807,25 +1179,7 @@ async function handleInterceptedDownload(item, suggestedFilename) {
   // from a background tab used to pop the dialog over an unrelated
   // page and hand it that page's URL as the referrer — login-gated
   // downloads then failed and the context was simply wrong.
-  let targetTab = null;
-  try {
-    const tabs = await chrome.tabs.query({});
-    if (referrer) {
-      targetTab =
-        tabs.find(t => t.url === referrer) ||
-        tabs.find(t => {
-          try {
-            return t.url && new URL(t.url).origin === new URL(referrer).origin;
-          } catch (e) {
-            return false;
-          }
-        });
-    }
-    if (!targetTab) {
-      targetTab =
-        tabs.find(t => t.active && t.lastFocusedWindow) || tabs.find(t => t.active);
-    }
-  } catch (e) {}
+  const targetTab = await findReferrerTab(referrer);
   if (targetTab && targetTab.id != null) {
     const opened = await openFileModalInTab(targetTab.id, {
       url,
@@ -883,14 +1237,27 @@ async function handleInterceptedDownload(item, suggestedFilename) {
 
 if (chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    // An Alt+Shift prevent click seconds ago already decided
+    // this file belongs to the browser (F-EXT-13) — don't even
+    // steer its filename. (The async gate in
+    // handleInterceptedDownload re-checks with the tab query.)
+    if (recentPreventFor(item.finalUrl || '') || recentPreventFor(item.url || '')) {
+      return;
+    }
     if (shouldInterceptItem(item)) {
-      // Steer the filename so no Save-As dialog flashes; the actual
-      // takeover (cancel first, erase only after NDM confirms) runs
-      // in the async handler above.
       const suggested = (item && item.filename) || '';
-      try {
-        suggest({ filename: suggested || 'ndm-intercept.tmp', conflictAction: 'uniquify' });
-      } catch (e) {}
+      // Steer the filename so no Save-As dialog flashes — but only
+      // when the LAST KNOWN settings positively say interception is
+      // on and the host is present. On stale/cold defaults the
+      // rename used to land even when no takeover followed, leaving
+      // the browser's copy named ndm-intercept.tmp. The takeover
+      // itself (cancel first, erase only after NDM confirms) runs
+      // in the async handler above and re-checks the real gates.
+      if (settingsLoaded && ndmInterceptEnabled && ndmHostStatusStr === 'ok') {
+        try {
+          suggest({ filename: suggested || 'ndm-intercept.tmp', conflictAction: 'uniquify' });
+        } catch (e) {}
+      }
       handleInterceptedDownload(item, suggested);
     }
   });

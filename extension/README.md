@@ -1,6 +1,6 @@
 # NDM Browser Extension
 
-Companion extension for **NDM — Nill Download Manager**. It hands downloads
+Companion extension for **Nill Download Manager**. It hands downloads
 from the browser to the NDM desktop app, the way a classic download-manager
 extension does:
 

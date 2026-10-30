@@ -104,6 +104,7 @@
     let bestAudioBytes = 0;
     let bestM4aBytes = 0;
     let bestAudioKbps = 128;
+    let bestM4aKbps = 128;
 
     for (const f of allFormats) {
       const mime = (f.mimeType || '').toLowerCase();
@@ -118,6 +119,7 @@
       }
       if (mime.includes('mp4') && est > bestM4aBytes) {
         bestM4aBytes = est;
+        bestM4aKbps = kbps;
       }
     }
     if (bestAudioBytes === 0 && duration > 0) {
@@ -156,11 +158,15 @@
     const heights = [...byHeight.keys()].sort((a, b) => b - a);
     if (!heights.length) return null;
 
+    // The generated selectors all force ba[ext=m4a]: the audio a
+    // download will actually carry is the largest M4A stream, so
+    // size estimates pair with THAT — not the largest audio of any
+    // codec (a high-bitrate Opus used to inflate every total).
     const options = [];
     for (const h of heights) {
       const item = byHeight.get(h);
       const totalBytes = item.vBytes > 0
-        ? item.vBytes + (item.hasBundledAudio ? 0 : bestAudioBytes)
+        ? item.vBytes + (item.hasBundledAudio ? 0 : bestM4aBytes)
         : 0;
       const sizeText = fmtSize(totalBytes);
       const tag = heightTag(h);
@@ -182,13 +188,15 @@
       });
     }
 
-    const mp3SizeText = fmtSize(bestAudioBytes);
+    // This row's selector is also m4a-first (ba[ext=m4a]/ba/b), so
+    // its size/kbps are the M4A stream's, not the largest audio's.
+    const mp3SizeText = fmtSize(bestM4aBytes);
     options.push({
       selector: 'ba[ext=m4a]/ba/b',
       label: 'Audio Only (MP3 — High Quality)',
       ext: 'mp3',
-      note: ['MP3', `${bestAudioKbps} kbps`, mp3SizeText].filter(Boolean).join(' • '),
-      size_bytes: bestAudioBytes,
+      note: ['MP3', `${bestM4aKbps} kbps`, mp3SizeText].filter(Boolean).join(' • '),
+      size_bytes: bestM4aBytes,
       size_text: mp3SizeText,
       audio: true,
       height: 0,

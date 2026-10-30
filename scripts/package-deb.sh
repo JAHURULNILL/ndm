@@ -56,7 +56,7 @@ Comment=NDM — fast, resumable downloads for Linux and Windows
 Exec=ndm-app
 StartupWMClass=ndm-app
 Icon=ndm-app
-Name=NDM
+Name=Nill Download Manager
 Terminal=false
 Type=Application
 EOF
