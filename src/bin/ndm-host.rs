@@ -72,11 +72,13 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
     let line = obj.to_string() + "\n";
     // Several browser processes can hand over downloads at the same
     // moment; a bare append from each can interleave bytes and corrupt
-    // a queue line. Take a small lock file first (bounded spin — after
-    // ~2 s, fall back to the plain append rather than losing the job).
+    // a queue line (one line can be ~600 KB with cookies — far beyond
+    // a single atomic write). Take a small lock file first; the spin
+    // is generous (~15 s) because the unlocked fallback can corrupt
+    // BOTH lines, while a late append only delays this one.
     let lock_path = path.with_extension("lock");
     let mut _guard: Option<std::fs::File> = None;
-    for _ in 0..40 {
+    for _ in 0..300 {
         match OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -143,12 +145,13 @@ fn category_for_name(name: &str) -> &'static str {
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "tgz" | "tbz2" | "txz" => {
             "Compressed"
         }
-        "exe" | "msi" | "deb" | "rpm" | "dmg" | "pkg" | "appimage" | "apk" | "bin" | "iso"
-        | "img" | "flatpakref" => "Programs",
+        "exe" | "msi" | "msix" | "msixbundle" | "deb" | "rpm" | "dmg" | "pkg" | "appimage" | "apk"
+        | "bin" | "run" | "cab" | "jar" | "war" | "vmdk" | "qcow2" | "vdi" | "iso" | "img"
+        | "flatpakref" => "Programs",
         "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "wmv" | "m4v" | "ts" => "Video",
-        "mp3" | "m4a" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" => "Music",
+        "mp3" | "m4a" | "m4b" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" => "Music",
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv"
-        | "epub" | "mobi" => "Documents",
+        | "rtf" | "epub" | "mobi" => "Documents",
         _ => "General",
     }
 }
@@ -269,13 +272,25 @@ fn wait_for_ack_and_result(id: &str, timeout_secs: u64) -> Value {
     while std::time::Instant::now() < deadline {
         if ack_file.is_file() {
             let _ = std::fs::remove_file(&ack_file);
-            if let Ok(raw) = std::fs::read_to_string(&res_file) {
-                let _ = std::fs::remove_file(&res_file);
-                if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                    return v;
+            // The app writes the result just before the ack; give a
+            // torn/raced read a few retries before believing there is
+            // no result. Reporting ok:true WITHOUT the result hid real
+            // outcomes (e.g. a duplicate refusal) from the extension,
+            // which then told the user the send was clean.
+            for _ in 0..10 {
+                if let Ok(raw) = std::fs::read_to_string(&res_file) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&raw) {
+                        let _ = std::fs::remove_file(&res_file);
+                        return v;
+                    }
                 }
+                std::thread::sleep(std::time::Duration::from_millis(60));
             }
-            return json!({ "ok": true, "id": id });
+            return json!({
+                "ok": false,
+                "id": id,
+                "error": "NDM acknowledged the request but its result could not be read"
+            });
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
     }

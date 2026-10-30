@@ -68,11 +68,15 @@
     <div class="menu-drop hidden" id="menu-view">
       <button data-act="theme">Dark Theme</button>
       <button data-act="sidebar">Categories Sidebar</button>
+      <button data-act="basket">Drop Basket</button>
       <div class="menu-sep"></div>
       <button data-act="sort-name">Sort by Name</button>
       <button data-act="sort-date">Sort by Date Added</button>
       <button data-act="sort-size">Sort by Size</button>
       <button data-act="sort-status">Sort by Status</button>
+      <div class="menu-sep"></div>
+      <button data-act="columns">Columns…</button>
+      <button data-act="toolbar">Customize Toolbar…</button>
       <div class="menu-sep"></div>
       <button data-act="refresh">Refresh List<span class="mkey">F5</span></button>
     </div>
@@ -114,6 +118,7 @@
       <li data-cat="Music">🎵 Music</li>
       <li data-cat="Programs">⚙ Programs</li>
       <li data-cat="Video">🎬 Video</li>
+      <li data-cat="General">📁 General</li>
       <li data-cat="Unfinished">▸ Unfinished</li>
       <li data-cat="Finished">✓ Finished</li>
       <li data-cat="Grabber">↗ Grabber projects</li>
@@ -126,11 +131,9 @@
   <section class="content">
     <div class="grid-wrap">
     <table class="grid">
+      <colgroup id="colGroup"></colgroup>
       <thead>
-        <tr>
-          <th class="c-name">File Name</th><th>Size</th><th>Status</th>
-          <th>Time Left</th><th>Transfer Rate</th><th>Added</th>
-        </tr>
+        <tr id="headRow"></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -152,7 +155,10 @@
         <dt>Transfer rate:</dt><dd id="dRate">—</dd>
         <dt>Time left:</dt><dd id="dLeft">—</dd>
         <dt>Resume capability:</dt><dd id="dResume">—</dd>
+        <dt>Save to:</dt><dd id="dSaveTo">—</dd>
+        <dt>Referer:</dt><dd id="dReferer">—</dd>
       </dl>
+      <div class="opt-row"><span>Description</span><input id="dDesc" type="text" placeholder="(your note for this download)" spellcheck="false"></div>
       <div class="bar"><div id="dBarFill"></div><span id="dBarText">0.0%</span></div>
       <div class="seg-label">Download progress by connection:</div>
       <canvas id="segMap" width="760" height="86"></canvas>
@@ -168,12 +174,14 @@
       <label class="comp-opt"><input type="radio" name="compAct" value=""> Do nothing</label>
       <label class="comp-opt"><input type="radio" name="compAct" value="open_file"> Open the file</label>
       <label class="comp-opt"><input type="radio" name="compAct" value="open_folder"> Open the folder</label>
+      <label class="comp-opt"><input type="radio" name="compAct" value="turn_off_pc"> Turn off the computer</label>
+      <label class="comp-opt"><input type="radio" name="compAct" value="restart_pc"> Restart the computer</label>
       <p class="comp-note dim">Applies to the selected download only, and is remembered across restarts.</p>
     </div>
     <div class="detail-body hidden" id="panelLimiter">
-      <p class="comp-note">Speed Limiter for active downloads:</p>
+      <p class="comp-note">Speed Limiter for <b>this download only</b> (IDM sets the limit per download; the global limit lives in Options):</p>
       <label class="comp-opt">
-        <input type="checkbox" id="dLimitOn"> Use Speed Limiter
+        <input type="checkbox" id="dLimitOn"> Use Speed Limiter for this download
       </label>
       <div style="margin: 12px 0; display: flex; align-items: center; gap: 8px;">
         <label for="dLimitVal">Maximum download speed:</label>
@@ -183,16 +191,19 @@
       <div class="detail-btns" style="margin-top: 14px;">
         <button id="dLimitApply" class="tool primary">Apply</button>
       </div>
-      <p class="comp-note dim" style="margin-top: 12px;">Limits download bandwidth in real time across connections, matching IDM speed limiter.</p>
+      <p class="comp-note dim" style="margin-top: 12px;">Applies immediately to the running download and is remembered across restarts.</p>
     </div>
   </div>
 </div>
 
 <div id="modal" class="modal hidden">
   <div class="modal-card">
-    <div class="modal-head">Download File Info <span id="modalClose">×</span></div>
+    <div class="modal-head"><span id="fileModalTitle">Download File Info</span> <span id="modalClose">×</span></div>
     <label>Download URL
       <input id="inUrl" type="text" placeholder="https://example.com/file.zip" spellcheck="false">
+    </label>
+    <label>Description
+      <input id="inDesc" type="text" placeholder="(optional note)" spellcheck="false">
     </label>
     <div id="fProbeBox" class="f-probe-box">
       <div class="f-probe-item"><span>Category</span><b id="fCat">—</b></div>
@@ -236,6 +247,9 @@
     </label>
     <label>Queue
       <select id="vInQueue"></select>
+    </label>
+    <label>Description
+      <input id="vInDesc" type="text" placeholder="(optional note)" spellcheck="false">
     </label>
     <div class="modal-btns left">
       <button id="vFetch" class="tool primary">Fetch Info</button>
@@ -300,14 +314,63 @@
         <option value="audio">Audio only (MP3)</option>
       </select>
     </div>
-    <div class="opt-row"><span>Proxy (optional)</span><input id="oProxy" type="text" placeholder="http://127.0.0.1:8080" spellcheck="false"></div>
-    <div class="opt-note">Applies to new connections — files, the grabber and video. Empty = direct connection.</div>
-    <div class="opt-note" style="font-weight:600;color:inherit">Category folders — a category's own folder is used when a download would otherwise go to the default folder (like IDM's category rules). Empty = default folder.</div>
+    <div class="opt-note" style="font-weight:600;color:inherit">Proxy / Socks — how downloads reach the internet</div>
+    <div class="opt-radios">
+      <label class="comp-opt"><input type="radio" name="proxyMode" value="none"> No proxy — direct connection</label>
+      <label class="comp-opt"><input type="radio" name="proxyMode" value="system"> Use system settings</label>
+      <label class="comp-opt"><input type="radio" name="proxyMode" value="pac"> Use automatic configuration script (PAC)</label>
+      <label class="comp-opt"><input type="radio" name="proxyMode" value="manual"> Manual proxy configuration</label>
+    </div>
+    <div class="opt-row"><span>Configuration script address</span><input id="oProxyPac" type="text" placeholder="http://example.com/proxy.pac" spellcheck="false"></div>
+    <div class="opt-row"><span>Proxy type</span>
+      <select id="oProxyScheme">
+        <option value="http">HTTP</option>
+        <option value="socks5">SOCKS5</option>
+        <option value="socks4">SOCKS4</option>
+      </select>
+    </div>
+    <div class="opt-row"><span>Proxy server address</span><input id="oProxyHost" type="text" placeholder="127.0.0.1" spellcheck="false"></div>
+    <div class="opt-row"><span>Port</span><input id="oProxyPort" type="number" min="0" max="65535" placeholder="8080"></div>
+    <div class="opt-row"><span>Proxy user name</span><input id="oProxyUser" type="text" spellcheck="false" autocomplete="off"></div>
+    <div class="opt-row"><span>Proxy password</span><input id="oProxyPass" type="password" autocomplete="off"></div>
+    <div class="opt-row"><span>Use this proxy for</span>
+      <span class="opt-inline">
+        <label><input id="oProxyHttp" type="checkbox"> HTTP</label>
+        <label><input id="oProxyHttps" type="checkbox"> HTTPS</label>
+        <label><input id="oProxyFtp" type="checkbox"> FTP</label>
+      </span>
+    </div>
+    <label class="opt-check"><input id="oProxyBrowser" type="checkbox"> If a download caught from the browser fails, retry it once through the system proxy</label>
+    <div class="opt-note">Applies to new connections — files, the grabber and video.</div>
+    <div class="opt-note" style="font-weight:600;color:inherit">Site Logins — user names and passwords for servers/sites. A saved login is used automatically for downloads from that site (a site may include a path, e.g. example.com/members).</div>
+    <div id="oLoginList" class="login-list"></div>
+    <div class="opt-row"><span>Site / path</span><input id="oLoginSite" type="text" placeholder="example.com/members" spellcheck="false"></div>
+    <div class="opt-row"><span>User name</span><input id="oLoginUser" type="text" spellcheck="false" autocomplete="off"></div>
+    <div class="opt-row"><span>Password</span><input id="oLoginPass" type="password" autocomplete="off"></div>
+    <div class="modal-btns left"><button id="oLoginAdd" class="tool">Add login</button></div>
+    <div class="opt-note" style="font-weight:600;color:inherit">When all downloads finish</div>
+    <div class="opt-row"><span>Computer power action</span>
+      <select id="oPowerWhenDone">
+        <option value="">Do nothing</option>
+        <option value="shutdown">Shut down</option>
+        <option value="restart">Restart</option>
+        <option value="sleep">Sleep</option>
+        <option value="hibernate">Hibernate</option>
+        <option value="logoff">Log off</option>
+      </select>
+    </div>
+    <label class="opt-check"><input id="oPowerForce" type="checkbox"> Force running programs to close with the power action</label>
+    <div class="opt-note" style="font-weight:600;color:inherit">Categories — each category has its own folder (used when a download would otherwise go to the default folder) and its own file types, like IDM's category editor. Editing the types changes how the app classifies new downloads; the browser extension keeps the built-in list.</div>
     <div class="opt-row"><span>Compressed folder</span><input id="oCatCompressed" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Compressed types</span><input id="oCatExtCompressed" type="text" spellcheck="false"></div>
     <div class="opt-row"><span>Documents folder</span><input id="oCatDocuments" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Documents types</span><input id="oCatExtDocuments" type="text" spellcheck="false"></div>
     <div class="opt-row"><span>Music folder</span><input id="oCatMusic" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Music types</span><input id="oCatExtMusic" type="text" spellcheck="false"></div>
     <div class="opt-row"><span>Video folder</span><input id="oCatVideo" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Video types</span><input id="oCatExtVideo" type="text" spellcheck="false"></div>
     <div class="opt-row"><span>Programs folder</span><input id="oCatPrograms" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-row"><span>Programs types</span><input id="oCatExtPrograms" type="text" spellcheck="false"></div>
     <div class="opt-row"><span>General folder</span><input id="oCatGeneral" type="text" placeholder="~/Downloads" spellcheck="false"></div>
     <div class="opt-row"><span>Per-server connections</span><input id="oConnExc" type="text" placeholder="Example: slow-server.com = 1, *.example.org = 2" spellcheck="false"></div>
     <div class="opt-note">Servers listed here get fewer parallel connections than the global setting (IDM's connection exceptions). Separate entries with commas.</div>
@@ -328,6 +391,7 @@
   <div class="modal-card">
     <div class="modal-head">Download complete <span id="cModalClose">×</span></div>
     <div class="opt-row"><span id="cName" style="font-weight:600"></span></div>
+    <div class="opt-note" id="cAddr" style="word-break:break-all"></div>
     <div class="opt-note" id="cPath" style="word-break:break-all"></div>
     <div class="opt-note" id="cSize"></div>
     <label class="opt-check"><input id="cDontShow" type="checkbox"> Don't show this dialog again</label>
@@ -347,7 +411,19 @@
     <div class="opt-row"><span>Start downloads at</span><input id="sStart" type="time"></div>
     <div class="opt-row"><span>Stop downloads at</span><input id="sStop" type="time"></div>
     <label class="opt-check"><input id="schedExitDone" type="checkbox"> Exit NDM when this queue finishes</label>
-    <div class="opt-note">Max simultaneous downloads per queue: <b id="sSimulVal">—</b> (set in Options)</div>
+    <div class="opt-row"><span>When this queue finishes, turn off computer</span>
+      <select id="sPowerWhenDone">
+        <option value="">Use the Options power setting</option>
+        <option value="shutdown">Shut down</option>
+        <option value="restart">Restart</option>
+        <option value="sleep">Sleep</option>
+        <option value="hibernate">Hibernate</option>
+        <option value="logoff">Log off</option>
+      </select>
+    </div>
+    <div class="opt-row"><span>Max simultaneous downloads in this queue (0 = use the Options value)</span><input id="sMax" type="number" min="0" max="10"></div>
+    <div class="opt-note" style="font-weight:600;color:inherit">Files in this queue — queued downloads start in this order:</div>
+    <div id="sFiles" class="s-files"></div>
     <div class="opt-row"><input id="schedNewName" type="text" placeholder="New queue name" spellcheck="false"><button id="schedNew" class="tool">New queue</button><button id="schedDelete" class="tool">Delete queue</button></div>
     <div class="modal-btns left">
       <button id="sStartNow" class="tool">▶ Start Queue Now</button>
@@ -363,27 +439,110 @@
 
 <div id="gmodal" class="modal hidden">
   <div class="modal-card wide grabber">
-    <div class="modal-head">Site Grabber <span id="gModalClose">×</span></div>
-    <span class="grab-cap">Page URL</span>
-    <div class="grab-row">
-      <input id="gUrl" type="text" placeholder="https://example.com/page.html" spellcheck="false">
-      <button id="gFetch" class="tool primary">Explore</button>
+    <div class="modal-head"><span id="gStepTitle">Site Grabber — Step 1: Set start page</span> <span id="gModalClose">×</span></div>
+    <div class="grab-steps">
+      <span class="g-step on" data-step="1">1 · Start page</span>
+      <span class="g-step" data-step="2">2 · Save files</span>
+      <span class="g-step" data-step="3">3 · Explore</span>
+      <span class="g-step" data-step="4">4 · File filters</span>
+      <span class="g-step" data-step="5">Results</span>
     </div>
-    <div class="grab-field">
-      <span class="grab-cap">Save to folder</span>
-      <input id="gDir" type="text" spellcheck="false">
+
+    <div id="gStep1" class="g-panel">
+      <div class="grab-field">
+        <span class="grab-cap">Grabber project name</span>
+        <input id="gProjName" type="text" placeholder="project_1" spellcheck="false">
+      </div>
+      <div class="grab-field">
+        <span class="grab-cap">Saved projects</span>
+        <div class="grab-row">
+          <select id="gProjSel"></select>
+          <button id="gProjLoad" class="tool">Load</button>
+          <button id="gProjSave" class="tool">Save project</button>
+          <button id="gProjDelete" class="tool">Delete</button>
+        </div>
+      </div>
+      <div class="grab-field">
+        <span class="grab-cap">Start page / address</span>
+        <input id="gUrl" type="text" placeholder="https://example.com/page.html" spellcheck="false">
+      </div>
+      <div class="grab-field">
+        <span class="grab-cap">Project template</span>
+        <select id="gTemplate">
+          <option value="custom">Custom settings</option>
+          <option value="pictures">All pictures of the web site</option>
+          <option value="audio">Audio files from the start page and one next level</option>
+          <option value="video">All video files of the web site</option>
+          <option value="all_except_pages">All files of the web site except web pages and images</option>
+          <option value="all_files">The whole web site — all files</option>
+          <option value="complete_page">Complete start page with all pictures, styles and scripts (offline browsing)</option>
+        </select>
+      </div>
+      <div class="opt-note">Downloads from a site with a saved login (Options → Site Logins) use that login automatically.</div>
     </div>
-    <div id="gStatus" class="v-status">Enter a page URL and click Explore</div>
-    <div id="gKinds" class="grab-kinds"></div>
-    <input id="gFilter" type="text" placeholder="Filter by name or URL…" spellcheck="false">
-    <div class="grab-selrow">
-      <button id="gSelAll" class="tool">Select All</button>
-      <button id="gSelNone" class="tool">Select None</button>
-      <span id="gCount">0 selected</span>
+
+    <div id="gStep2" class="g-panel hidden">
+      <div class="grab-field">
+        <span class="grab-cap">Save all files to the following folder</span>
+        <input id="gDir" type="text" spellcheck="false">
+      </div>
+      <label class="opt-check"><input id="gSubfolders" type="checkbox"> Use the original relative subfolders</label>
+      <label class="opt-check"><input id="gAddQueue" type="checkbox"> Add the files as a queue (Download Later) instead of starting them at once</label>
     </div>
-    <div id="gList" class="grab-list"></div>
+
+    <div id="gStep3" class="g-panel hidden">
+      <label class="comp-opt"><input type="radio" name="gExploreMode" value="whole"> Explore the whole site</label>
+      <label class="comp-opt"><input type="radio" name="gExploreMode" value="levels" checked> Explore the specified number of link levels:</label>
+      <div class="opt-row"><span>Levels within the start site</span><input id="gDepthSame" type="number" min="0" max="10" value="1"></div>
+      <div class="opt-row"><span>Levels on other sites</span><input id="gDepthOther" type="number" min="0" max="10" value="0"></div>
+      <label class="opt-check"><input id="gNoParent" type="checkbox"> Don't explore parent directories</label>
+      <div class="opt-note">Exploration follows page links in static HTML. Pages built entirely by JavaScript are the browser extension's territory — the same split IDM uses.</div>
+    </div>
+
+    <div id="gStep4" class="g-panel hidden">
+      <div class="grab-field">
+        <span class="grab-cap">Download the following files (filter preset)</span>
+        <select id="gInclPreset">
+          <option value="">All file types</option>
+          <option value="images">Images files</option>
+          <option value="video">Video files</option>
+          <option value="audio">Audio files</option>
+          <option value="pdf">PDF document files</option>
+          <option value="exe">Executable files</option>
+          <option value="compressed">Compressed files</option>
+          <option value="page_assets">Complete start page (assets)</option>
+        </select>
+      </div>
+      <div class="grab-field">
+        <span class="grab-cap">…or list extensions yourself (comma separated)</span>
+        <input id="gInclExts" type="text" placeholder="e.g. zip, pdf, mp4" spellcheck="false">
+      </div>
+      <div class="grab-field">
+        <span class="grab-cap">Don't download these extensions</span>
+        <input id="gExclExts" type="text" placeholder="e.g. exe, dmg" spellcheck="false">
+      </div>
+      <label class="opt-check"><input id="gSameSiteOnly" type="checkbox" checked> Search files on this site only</label>
+      <div class="opt-row"><span>Download if file size is not less than (KB)</span><input id="gMinKb" type="number" min="0" value="0"></div>
+      <div class="opt-row"><span>…and not more than (MB, 0 = no limit)</span><input id="gMaxMb" type="number" min="0" value="0"></div>
+    </div>
+
+    <div id="gStepR" class="g-panel hidden">
+      <div id="gStatus" class="v-status">Enter a page URL and click Explore</div>
+      <div id="gKinds" class="grab-kinds"></div>
+      <input id="gFilter" type="text" placeholder="Filter by name or URL…" spellcheck="false">
+      <div class="grab-selrow">
+        <button id="gSelAll" class="tool">Select All</button>
+        <button id="gSelNone" class="tool">Select None</button>
+        <span id="gCount">0 selected</span>
+      </div>
+      <div id="gList" class="grab-list"></div>
+    </div>
+
     <div class="modal-btns">
-      <button id="gDownload" class="tool primary" disabled>Download Selected</button>
+      <button id="gBack" class="tool" disabled>‹ Back</button>
+      <button id="gNext" class="tool primary">Next ›</button>
+      <button id="gFetch" class="tool primary hidden">Explore</button>
+      <button id="gDownload" class="tool primary hidden" disabled>Download Selected</button>
       <button id="gCancel" class="tool">Cancel</button>
     </div>
   </div>
@@ -475,6 +634,50 @@
       <button id="uUpdate" class="tool primary">Update Now</button>
       <button id="uRestart" class="tool primary hidden">Restart NDM</button>
       <button id="uLater" class="tool">Later</button>
+    </div>
+  </div>
+</div>
+
+<div id="colmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Columns <span id="colModalClose">×</span></div>
+    <div class="opt-note">Choose which columns the download list shows, their order and width — like IDM's header "Columns…" picker. Saved on this computer.</div>
+    <div id="colList" class="col-list"></div>
+    <div class="modal-btns">
+      <button id="colReset" class="tool">Defaults</button>
+      <button id="colOk" class="tool primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="tbmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Customize Toolbar <span id="tbModalClose">×</span></div>
+    <div class="opt-note">Choose which buttons the toolbar shows (IDM's toolbar "Customize…"). Saved on this computer.</div>
+    <div id="tbList" class="col-list"></div>
+    <div class="opt-row"><span>Button size</span>
+      <select id="tbSize">
+        <option value="large">Large buttons</option>
+        <option value="small">Small buttons</option>
+      </select>
+    </div>
+    <div class="modal-btns">
+      <button id="tbReset" class="tool">Defaults</button>
+      <button id="tbOk" class="tool primary">OK</button>
+    </div>
+  </div>
+</div>
+
+<div id="ctxMenu" class="ctx-menu hidden"></div>
+
+<div id="delmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">Delete download <span id="delModalClose">×</span></div>
+    <div class="opt-note" id="delName" style="word-break:break-all"></div>
+    <label class="opt-check"><input id="delFileChk" type="checkbox"> Also delete the downloaded file from the disk</label>
+    <div class="modal-btns">
+      <button id="delConfirm" class="tool primary">Delete</button>
+      <button id="delCancel" class="tool">Cancel</button>
     </div>
   </div>
 </div>

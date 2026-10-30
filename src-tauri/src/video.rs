@@ -95,6 +95,7 @@ fn find_final_file(
     dir: &Path,
     before: &HashMap<String, (u64, SystemTime)>,
     audio: bool,
+    stem_hint: &str,
 ) -> Option<PathBuf> {
     let mut cands: Vec<(SystemTime, PathBuf)> = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -117,15 +118,36 @@ fn find_final_file(
     }
     cands.sort_by_key(|(t, _)| *t);
     let want = if audio { "mp3" } else { "mp4" };
-    cands
-        .iter()
-        .rev()
-        .find(|(_, p)| {
-            p.extension().map(|x| x.to_string_lossy().to_lowercase())
-                == Some(want.to_string())
-        })
-        .or_else(|| cands.last())
-        .map(|(_, p)| p.clone())
+    let pick = |pool: &[&(SystemTime, PathBuf)]| -> Option<PathBuf> {
+        pool.iter()
+            .rev()
+            .find(|(_, p)| {
+                p.extension().map(|x| x.to_string_lossy().to_lowercase())
+                    == Some(want.to_string())
+            })
+            .or_else(|| pool.last())
+            .map(|(_, p)| p.clone())
+    };
+    // This job's own stem wins first: with two video jobs sharing one
+    // download folder (the normal case), the directory-wide newest
+    // file can be the OTHER job's result, and certifying it would
+    // report this download finished with someone else's video.
+    if !stem_hint.is_empty() {
+        let prefix = format!("{stem_hint}.");
+        let own: Vec<&(SystemTime, PathBuf)> = cands
+            .iter()
+            .filter(|(_, p)| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with(&prefix))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if let Some(p) = pick(&own) {
+            return Some(p);
+        }
+    }
+    let all: Vec<&(SystemTime, PathBuf)> = cands.iter().collect();
+    pick(&all)
 }
 
 /// Parse the output file path from yt-dlp status lines when present.
@@ -279,6 +301,9 @@ pub struct VideoJob {
     /// app must fetch and mux itself; yt-dlp's generic extractor cannot
     /// pair it with the chosen variant
     pair_audio_url: Mutex<Option<String>>,
+    /// this entry's own speed limit in bytes/sec (0 = none) — applied
+    /// to every engine stream and to the yt-dlp fallback
+    limit_bps: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -332,6 +357,7 @@ impl VideoJob {
             gen: std::sync::atomic::AtomicU64::new(0),
             expect_audio: Mutex::new(false),
             pair_audio_url: Mutex::new(None),
+            limit_bps: std::sync::atomic::AtomicU64::new(0),
         });
         job.spawn(components_dir)?;
         Ok(job)
@@ -549,6 +575,10 @@ impl VideoJob {
             };
             match ndm::start_with_auth(&st.url, &part, per_stream_conn, ndm::DEFAULT_BLOCK, auth) {
                 Ok(dl) => {
+                    let lim = self.limit();
+                    if lim > 0 {
+                        dl.set_limit(lim);
+                    }
                     part_paths.push(part);
                     dls.push(dl);
                 }
@@ -556,10 +586,11 @@ impl VideoJob {
                     for d in &dls {
                         d.control.cancel();
                     }
-                    for p in &part_paths {
-                        let _ = std::fs::remove_file(p);
-                        let _ = std::fs::remove_file(ndm::state_path_for(p));
-                    }
+                    // KEEP the part files and their resume state: a
+                    // stream that failed to START must not destroy the
+                    // bytes the other stream already fetched — a retry
+                    // resumes them instead of restarting from byte 0
+                    // (only a user cancel deletes partials).
                     return false;
                 }
             }
@@ -647,10 +678,10 @@ impl VideoJob {
                 for d in &dls {
                     d.control.cancel();
                 }
-                for p in &part_paths {
-                    let _ = std::fs::remove_file(p);
-                    let _ = std::fs::remove_file(ndm::state_path_for(p));
-                }
+                // KEEP part files + resume state (see above): the
+                // yt-dlp fallback uses different file names, so the
+                // engine partials cost nothing to keep and a later
+                // retry resumes instead of re-downloading gigabytes.
                 self.active_downloads.lock().unwrap().clear();
                 return false; // Fall back to yt-dlp
             }
@@ -738,6 +769,26 @@ impl VideoJob {
             let _ = std::fs::remove_file(ndm::state_path_for(p));
         }
 
+        // A cancel that landed DURING the merge (which can take
+        // seconds) must win over the merge result: publishing
+        // "finished" here would resurrect a download the user just
+        // cancelled and leave the merged file in place.
+        if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+            return true; // a newer job owns the progress now
+        }
+        if let Some(flag) = self.stop_flag.lock().unwrap().clone() {
+            if flag == "cancelled" {
+                if merge_ok {
+                    let _ = std::fs::remove_file(&final_path);
+                }
+                let mut p = self.progress.lock().unwrap();
+                p.status = "cancelled".to_string();
+                p.speed_bps = 0.0;
+                p.conns = 0;
+                return true;
+            }
+        }
+
         if merge_ok {
             match self.ensure_audio(&final_path, components_dir) {
                 Ok(verified) => {
@@ -819,6 +870,19 @@ impl VideoJob {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "video".to_string());
         let audio_tmpl = self.dir.join(format!(".{stem}.ndm_audio.%(ext)s"));
+        // Clear any stale audio left by an earlier failed attempt:
+        // the fetch uses --no-overwrites with this fixed template and
+        // the result scan below ignores pre-existing names, so a
+        // leftover would strand the retry with "could not be
+        // downloaded" even though a usable file is sitting there.
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            let stale_prefix = format!(".{stem}.ndm_audio.");
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&stale_prefix) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
         let before = dir_snapshot(&self.dir);
         let mut args = base_args_for_url(&pair_url, components_dir, self.cookies.as_deref());
         args.push("-f".into());
@@ -913,7 +977,12 @@ impl VideoJob {
             }
         }
 
-        // 3. Replace the silent file with the muxed one.
+        // 3. Replace the silent file with the muxed one. One rename
+        // over the destination is atomic where the platform allows
+        // it; deleting first would leave a crash window in which NO
+        // file exists at the final path (only the hidden mux temp,
+        // which nothing would ever pick up again).
+        #[cfg(windows)]
         let _ = std::fs::remove_file(final_path);
         std::fs::rename(&mux_path, final_path).map_err(|e| {
             format!("the sound was joined but the file could not be saved in place: {e}")
@@ -981,6 +1050,11 @@ impl VideoJob {
                 args.push("mp4".into());
                 args.push("--postprocessor-args".into());
                 args.push("Merger+ffmpeg_o1:-c:v copy -c:a aac -b:a 192k".into());
+            }
+            let lim = job.limit();
+            if lim > 0 {
+                args.push("--limit-rate".into());
+                args.push(lim.to_string());
             }
             let frags = ndm::global_connections().clamp(1, 32);
             args.push("--concurrent-fragments".into());
@@ -1150,10 +1224,16 @@ impl VideoJob {
                 Outcome::Stopped(flag)
             } else if succeeded {
                 let prev_final = job.progress.lock().unwrap().final_path.clone();
+                let stem_hint = job
+                    .chosen_stem
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_default();
                 let found = detected_final
                     .filter(|fp| fp.is_file())
                     .or_else(|| prev_final.filter(|fp| fp.is_file()))
-                    .or_else(|| find_final_file(&job.dir, &before, job.audio));
+                    .or_else(|| find_final_file(&job.dir, &before, job.audio, &stem_hint));
                 match found {
                     Some(fp) => match job.ensure_audio(&fp, &comp_dir) {
                         Ok(verified) => Outcome::Finished(verified),
@@ -1214,6 +1294,21 @@ impl VideoJob {
             }
         });
         Ok(())
+    }
+
+    /// Set this job's own speed limit (bytes/sec, 0 = none): live
+    /// engine streams adopt it immediately; the yt-dlp fallback reads
+    /// it when (re)spawned.
+    pub fn set_limit(&self, bytes_per_sec: u64) {
+        self.limit_bps
+            .store(bytes_per_sec, std::sync::atomic::Ordering::Relaxed);
+        for d in self.active_downloads.lock().unwrap().iter() {
+            d.set_limit(bytes_per_sec);
+        }
+    }
+
+    pub fn limit(&self) -> u64 {
+        self.limit_bps.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn pause(&self) {

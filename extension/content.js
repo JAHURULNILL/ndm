@@ -12,6 +12,14 @@
  */
 
 (() => {
+  // The background can inject this script as a fallback AND the
+  // manifest can run it in the same frame: two instances would mean
+  // duplicate listeners, two pills/modals and two speculative sends
+  // per click. Run at most once per frame (page-hook.js already
+  // guards itself the same way).
+  if (window.__ndmContentLoaded) return;
+  window.__ndmContentLoaded = true;
+
   // Streaming services whose videos are DRM-protected: never show a panel.
   const DRM_HOSTS = [
     'netflix.com',
@@ -32,6 +40,20 @@
   let dismissed = false;  // user closed the pill on this page
   let modalOpen = false;  // whether the in-browser modal is currently open
   let activeProbeToken = 0;
+  // The open modal's own dismiss logic (Cancel semantics: discard or
+  // pause the entry that started while the dialog was open). Every
+  // close path — backdrop, pill ×, SPA navigation, modal replacement
+  // — must go through it; the raw teardown alone would leave a
+  // "dismissed" download running invisibly in the app.
+  let activeModalDismiss = null;
+
+  function dismissActiveModal() {
+    if (activeModalDismiss) {
+      activeModalDismiss();
+    } else {
+      closeBrowserModal();
+    }
+  }
 
   function isKnownVideoSite() {
     if (
@@ -327,7 +349,7 @@
     } catch (e) {}
   }
 
-  function fetchOrReuseProbe(targetUrl) {
+  function fetchOrReuseProbe(targetUrl, warm) {
     const key = canonicalVideoKey(targetUrl);
     if (localProbeCache.has(key)) {
       return Promise.resolve({ ok: true, info: localProbeCache.get(key) });
@@ -340,6 +362,10 @@
         action: 'ndm-probe',
         url: key,
         pageUrl: location.href,
+        // a "warm" probe only pre-fetches formats for a pill the
+        // user may click: it must not carry the user's session
+        // cookies for a download they never asked about
+        warm: !!warm,
       })
       .then(res => {
         inFlightProbes.delete(key);
@@ -360,6 +386,13 @@
     requestMainWorldPlayerInfo();
     const curAnchor = anchor || pickAnchor();
     if (!curAnchor && !isKnownVideoSite()) return;
+    // Feed pages hold many videos: firing a real (cookie-bearing)
+    // probe for whichever one is momentarily dominant while the
+    // user scrolls is exactly the passive-surveillance pattern IDM
+    // never does — it resolves formats when its panel is clicked.
+    // Warm only a page's main video, and warm probes carry no
+    // session cookies (see fetchOrReuseProbe).
+    if (document.querySelectorAll('video').length > 3) return;
     const targetUrl = await resolveVideoUrl(curAnchor);
     const key = canonicalVideoKey(targetUrl);
     if (!key || key === lastPreProbedUrl || localProbeCache.has(key)) return;
@@ -367,7 +400,7 @@
     // Wait briefly for MAIN-world page-hook on YouTube; if not populated, warm cache via ndm-host
     setTimeout(() => {
       if (!localProbeCache.has(key)) {
-        fetchOrReuseProbe(key).catch(() => {});
+        fetchOrReuseProbe(key, true).catch(() => {});
       }
     }, 120);
   }
@@ -406,6 +439,7 @@
     activeProbeToken++;
     onInstantInfoCallback = null;
     modalOpen = false;
+    activeModalDismiss = null;
     if (modalEl) {
       modalEl.remove();
       modalEl = null;
@@ -415,7 +449,7 @@
 
   async function openBrowserModal(pillBtn, pillContainer) {
     if (!shadowRoot) return;
-    closeBrowserModal();
+    dismissActiveModal();
     modalOpen = true;
     const myToken = ++activeProbeToken;
 
@@ -439,7 +473,10 @@
     }
     backdrop.addEventListener('click', e => {
       e.stopPropagation();
-      if (e.target === backdrop) closeBrowserModal();
+      // clicking outside the dialog is a Cancel, with full Cancel
+      // semantics (the speculative entry is discarded) — the raw
+      // teardown used to leave it downloading invisibly
+      if (e.target === backdrop) dismissVideoCancel();
     });
 
     const dialog = document.createElement('div');
@@ -553,8 +590,10 @@
 
     btnClose.addEventListener('click', () => dismissVideoCancel());
     btnCancel.addEventListener('click', () => dismissVideoCancel());
+    activeModalDismiss = dismissVideoCancel;
 
     btnApp.addEventListener('click', async () => {
+      if (vspec.inflight) return;
       if (vspec.id) {
         // already downloading in the app (started while this dialog
         // was open): just show the app
@@ -730,6 +769,7 @@
       selector: null,
       failed: false,
       pending: null,
+      pendingSelector: null, // quality switch clicked mid-start
       closed: false,
     };
     let allQualities = [];
@@ -782,6 +822,12 @@
       vspec.inflight = true;
       vspec.started = true;
       vspec.selector = q.selector;
+      // lock the fields the entry is about to be created from (see
+      // the file dialog: edits during a cold-start round trip used
+      // to be silently discarded)
+      titleIn.disabled = true;
+      dirIn.disabled = true;
+      btnApp.disabled = true;
       let resp = null;
       try {
         resp = await chrome.runtime.sendMessage({
@@ -799,6 +845,7 @@
         });
       } catch (e) {}
       vspec.inflight = false;
+      btnApp.disabled = false;
       const gone = vspec.closed || myToken !== activeProbeToken;
       if (resp && resp.ok && resp.id) {
         vspec.id = resp.id;
@@ -810,12 +857,21 @@
         if (vspec.pending === 'cancel') { dismissVideoCancel(); return; }
         if (vspec.pending === 'later') { dismissVideoLater(); return; }
         if (vspec.pending === 'keep') { dismissVideoKeep(); return; }
-        titleIn.disabled = true;
-        dirIn.disabled = true;
+        if (vspec.pendingSelector && vspec.pendingSelector.selector !== q.selector) {
+          // a quality switch clicked DURING the start was recorded,
+          // not dropped: apply it now (cancel this entry, start the
+          // chosen one) instead of silently downloading the quality
+          // the user already moved away from
+          const next = vspec.pendingSelector;
+          vspec.pendingSelector = null;
+          vspecSwitch(next);
+          return;
+        }
         statusEl.style.display = 'block';
         statusEl.className = 'ndm-m-status';
         statusEl.textContent = '⬇ Downloading in NDM…';
         btnStart.textContent = '✓ Keep downloading';
+        btnLater.textContent = '⏸ Pause in NDM';
       } else if (
         resp &&
         typeof resp.error === 'string' &&
@@ -825,12 +881,16 @@
         // Start becomes the explicit "Download again" (force path)
         vspec.failed = true;
         pendingForce = true;
+        titleIn.disabled = false;
+        dirIn.disabled = false;
         if (!gone) {
           showError('This quality is already in your download list. Press "Download again" to save a second copy.');
           btnStart.textContent = '⬇ Download again';
         }
       } else if (!gone) {
         vspec.failed = true;
+        titleIn.disabled = false;
+        dirIn.disabled = false;
       }
     }
 
@@ -840,7 +900,13 @@
         vspecStart(q);
         return;
       }
-      if (vspec.inflight) return;
+      if (vspec.inflight) {
+        // record it — vspecStart applies the switch when its ack
+        // lands (dropping it used to download the wrong quality
+        // while the dialog showed the new one selected)
+        vspec.pendingSelector = q;
+        return;
+      }
       if (vspec.id && vspec.selector !== q.selector) {
         const old = vspec.id;
         vspec.id = null;
@@ -1017,10 +1083,10 @@
   function categoryForName(name) {
     const ext = (name.split('.').pop() || '').toLowerCase();
     if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz'].includes(ext)) return 'Compressed';
-    if (['exe', 'msi', 'deb', 'rpm', 'dmg', 'pkg', 'appimage', 'apk', 'bin', 'iso', 'img', 'flatpakref'].includes(ext)) return 'Programs';
+    if (['exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'appimage', 'apk', 'bin', 'run', 'cab', 'jar', 'war', 'vmdk', 'qcow2', 'vdi', 'iso', 'img', 'flatpakref'].includes(ext)) return 'Programs';
     if (['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'wmv', 'm4v', 'ts'].includes(ext)) return 'Video';
-    if (['mp3', 'm4a', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma'].includes(ext)) return 'Music';
-    if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'csv', 'epub', 'mobi'].includes(ext)) return 'Documents';
+    if (['mp3', 'm4a', 'm4b', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma'].includes(ext)) return 'Music';
+    if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'csv', 'rtf', 'epub', 'mobi'].includes(ext)) return 'Documents';
     return 'General';
   }
 
@@ -1032,7 +1098,7 @@
     if (!panelHost || !panelHost.isConnected || !shadowRoot) {
       buildPanel();
     }
-    closeBrowserModal();
+    dismissActiveModal();
     modalOpen = true;
     const myToken = ++activeProbeToken;
     const targetUrl = (opts && opts.url) || '';
@@ -1136,8 +1202,15 @@
 
     btnClose.addEventListener('click', () => dismissAsCancel());
     btnCancel.addEventListener('click', () => dismissAsCancel());
+    activeModalDismiss = dismissAsCancel;
+    // the file dialog's backdrop behaves like the video dialog's:
+    // an outside click is a Cancel, not a shrug
+    backdrop.addEventListener('click', e => {
+      if (e.target === backdrop) dismissAsCancel();
+    });
 
     btnApp.addEventListener('click', async () => {
+      if (spec.inflight) return;
       if (spec.id) {
         // the download is already running in the app (it started
         // while this dialog was open): just show the app
@@ -1235,6 +1308,7 @@
       dupe: false, // the entry already existed (not ours to discard)
       failed: false, // speculative start failed → classic buttons
       pending: null, // 'keep' | 'later' | 'cancel' clicked mid-flight
+      timer: null, // the 4 s probe-hang fallback start
       closed: false,
     };
 
@@ -1277,6 +1351,7 @@
     function dismissAsCancel() {
       if (spec.closed) return;
       spec.closed = true;
+      if (spec.timer) clearTimeout(spec.timer);
       if (spec.owned && spec.id) {
         specControl('ndm-cancel-entry');
       } else if (spec.inflight) {
@@ -1286,9 +1361,16 @@
     }
 
     async function specStart() {
-      if (spec.started || spec.closed) return;
+      if (spec.started || spec.closed || myToken !== activeProbeToken) return;
       spec.started = true;
       spec.inflight = true;
+      // lock the fields the entry is about to be created from: on a
+      // cold app start the ack can take seconds, and edits typed in
+      // that window used to be silently discarded (the entry kept
+      // the pre-edit name/folder while the dialog showed the edits)
+      nameIn.disabled = true;
+      dirIn.disabled = true;
+      btnApp.disabled = true;
       const chosenDir = dirIn.value.trim() || '~/Downloads';
       const chosenName = nameIn.value.trim() || initialName;
       let resp = null;
@@ -1305,6 +1387,7 @@
         });
       } catch (e) {}
       spec.inflight = false;
+      btnApp.disabled = false;
       const gone = spec.closed || myToken !== activeProbeToken;
       if (resp && resp.ok && resp.id) {
         spec.id = resp.id;
@@ -1336,14 +1419,19 @@
           btnStart.textContent = 'OK';
           btnLater.disabled = true;
         } else {
-          // lock the fields the running entry already took
-          nameIn.disabled = true;
-          dirIn.disabled = true;
           specNote('⬇ Downloading in NDM…');
           btnStart.textContent = '✓ Keep downloading';
+          // honest label: the file is already downloading, so
+          // "Later" now pauses it in the app (IDM's Later never
+          // starts the file, but this dialog's download has started)
+          btnLater.textContent = '⏸ Pause in NDM';
         }
       } else if (!gone) {
         spec.failed = true;
+        // the speculative start failed → classic send-on-click:
+        // the fields must be editable again
+        nameIn.disabled = false;
+        dirIn.disabled = false;
       }
     }
 
@@ -1378,8 +1466,13 @@
       }
     });
 
-    // if the probe hangs, start anyway with what the page gave us
-    setTimeout(() => specStart(), 4000);
+    // if the probe hangs, start anyway with what the page gave us —
+    // but never after this dialog is gone: the timer used to outlive
+    // raw closes and start a "ghost" download seconds later
+    spec.timer = setTimeout(() => {
+      if (spec.closed || myToken !== activeProbeToken || !backdrop.isConnected) return;
+      specStart();
+    }, 4000);
 
     // Probe exact file size, resumability & Content-Disposition filename in background
     try {
@@ -1397,19 +1490,25 @@
         } else {
           sizeEl.textContent = 'Stream / Unknown size';
         }
-        if (res.suggested_name && !userEditedName && !spec.id) {
+        if (res.suggested_name && !userEditedName && !spec.started) {
+          // !spec.started, not !spec.id: once a speculative send is
+          // in flight the entry is being created with the name the
+          // dialog already had — a late probe must not rename the
+          // field under it (screen and disk would disagree)
           nameIn.value = res.suggested_name;
           catEl.textContent = res.category || categoryForName(res.suggested_name);
         }
         resumeEl.textContent = res.resumable !== false
           ? 'Resumable'
           : 'Single-stream download';
-      } else if (currentBytes <= 0) {
-        sizeEl.textContent = 'Ready to download';
+      } else {
+        resumeEl.textContent = '—';
+        if (currentBytes <= 0) sizeEl.textContent = 'Ready to download';
       }
     } catch (e) {
-      if (myToken === activeProbeToken && currentBytes <= 0) {
-        sizeEl.textContent = 'Ready to download';
+      if (myToken === activeProbeToken) {
+        resumeEl.textContent = '—';
+        if (currentBytes <= 0) sizeEl.textContent = 'Ready to download';
       }
     }
     // the probe has settled (or failed): start the download now,
@@ -1836,7 +1935,7 @@
   }
 
   function removePanel() {
-    closeBrowserModal();
+    dismissActiveModal();
     if (panelHost) {
       panelHost.remove();
       panelHost = null;
@@ -1875,22 +1974,63 @@
   // a bare .mp4/.webm link click is only ever seen by THIS layer
   // (the browser would otherwise just play the file in a tab).
   const INTERCEPT_EXTS = new Set([
-    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz', 'cab',
-    'exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'run', 'appimage', 'flatpakref',
-    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'txt', 'rtf', 'epub', 'mobi',
-    'mp3', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flac', 'aac', 'ogg', 'm4a', 'm4b', 'opus', 'wav', 'wma', 'flv', 'wmv', '3gp', 'm4v', 'ts',
+    'zip', 'rar', '7z', 'tar', 'gz', 'gzip', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz', 'cab', 'ace', 'arj', 'lzh', 'sit', 'sitx',
+    'exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'run', 'appimage', 'flatpakref', 'msu',
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pps', 'rtf', 'epub', 'mobi', 'tif', 'tiff',
+    'mp3', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flac', 'aac', 'ogg', 'ogv', 'm4a', 'm4b', 'opus', 'wav', 'wma', 'flv', 'wmv', '3gp', 'm4v', 'ts',
+    'mpg', 'mpeg', 'mpa', 'mpe', 'asf', 'rm', 'rmvb', 'aif',
     'torrent', 'jar', 'war', 'whl', 'vmdk', 'qcow2', 'vdi',
   ]);
 
   let ndmInterceptActive = true;
   // IDM parity, same as the background layer: while the native host
   // is KNOWN to be missing the module stays inert — a click must
-  // behave as if the extension were not there at all.
+  // behave as if the extension were not there at all. "Known" has a
+  // shelf life: a status older than ~60 s is re-probed, not trusted
+  // forever (one transient crash used to disable interception
+  // indefinitely).
   let ndmHostKnownMissing = false;
+  let ndmHostStatusStr = '';
+  let ndmHostStatusAt = 0;
+  let hostRepollAsked = false;
+  function evalHostMissing() {
+    const fresh = Date.now() - ndmHostStatusAt < 60000;
+    ndmHostKnownMissing = ndmHostStatusAt > 0 && fresh && ndmHostStatusStr === 'host-missing';
+    if (ndmHostStatusStr === 'host-missing' && !fresh && !hostRepollAsked) {
+      hostRepollAsked = true;
+      try {
+        chrome.runtime.sendMessage({ action: 'ndm-host-ping' }).catch(() => {});
+      } catch (e) {}
+    }
+  }
+  // IDM's escape hatches: hold Del (or Ins) while clicking to leave
+  // one link to the browser; per-site exception list; per-tab off.
+  let ndmPreventHeld = false;
+  let ndmSiteExcepted = false;
+  let ndmTabDisabled = false;
+  addEventListener('keydown', e => {
+    if (e.key === 'Delete' || e.key === 'Insert') ndmPreventHeld = true;
+  }, true);
+  addEventListener('keyup', e => {
+    if (e.key === 'Delete' || e.key === 'Insert') ndmPreventHeld = false;
+  }, true);
+  addEventListener('blur', () => { ndmPreventHeld = false; });
   try {
-    chrome.storage.local.get({ ndmIntercept: true, ndmHostStatus: '' }).then(v => {
+    chrome.storage.local.get({
+      ndmIntercept: true,
+      ndmHostStatus: '',
+      ndmHostStatusAt: 0,
+      ndmSiteExceptions: [],
+    }).then(v => {
       ndmInterceptActive = v.ndmIntercept !== false;
-      ndmHostKnownMissing = v.ndmHostStatus === 'host-missing';
+      ndmHostStatusStr = v.ndmHostStatus || '';
+      ndmHostStatusAt = Number(v.ndmHostStatusAt) || 0;
+      evalHostMissing();
+      const list = Array.isArray(v.ndmSiteExceptions) ? v.ndmSiteExceptions : [];
+      ndmSiteExcepted = list.includes(host);
+    }).catch(() => {});
+    chrome.runtime.sendMessage({ action: 'ndm-tab-state' }).then(r => {
+      if (r) ndmTabDisabled = !!r.disabled;
     }).catch(() => {});
     chrome.storage.onChanged.addListener((changes, area) => {
       if (area !== 'local') return;
@@ -1898,7 +2038,23 @@
         ndmInterceptActive = changes.ndmIntercept.newValue !== false;
       }
       if (changes.ndmHostStatus) {
-        ndmHostKnownMissing = changes.ndmHostStatus.newValue === 'host-missing';
+        ndmHostStatusStr = changes.ndmHostStatus.newValue || '';
+        evalHostMissing();
+      }
+      if (changes.ndmHostStatusAt) {
+        ndmHostStatusAt = Number(changes.ndmHostStatusAt.newValue) || 0;
+        evalHostMissing();
+      }
+      if (changes.ndmSiteExceptions) {
+        const list = Array.isArray(changes.ndmSiteExceptions.newValue)
+          ? changes.ndmSiteExceptions.newValue
+          : [];
+        ndmSiteExcepted = list.includes(host);
+      }
+      if (changes.ndmTabOff) {
+        chrome.runtime.sendMessage({ action: 'ndm-tab-state' }).then(r => {
+          if (r) ndmTabDisabled = !!r.disabled;
+        }).catch(() => {});
       }
     });
   } catch (e) {}
@@ -1925,8 +2081,14 @@
   document.addEventListener(
     'click',
     e => {
+      // sub-frame clicks are not intercepted here: the dialog would
+      // open inside a possibly tiny iframe (the background-driven
+      // path already refuses non-top frames). The browser-download
+      // layer still catches the file if it becomes a download.
+      if (window.top !== window.self) return;
       if (!ndmInterceptActive) return;
       if (ndmHostKnownMissing) return;
+      if (ndmPreventHeld || ndmSiteExcepted || ndmTabDisabled) return;
       if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
       const target = e.target && e.target.closest ? e.target.closest('a[href]') : null;
       if (!target || !isDirectDownloadLink(target)) return;
@@ -1950,9 +2112,13 @@
       dismissed = false;
       if (!panelHost || !panelHost.isConnected) buildPanel();
       const btn = cardEl ? cardEl.querySelector('.label') : null;
-      openBrowserModal(btn, cardEl);
-      sendResponse({ ok: true });
-      return false;
+      // answer only once the open attempt has settled, and only
+      // claim success if a modal actually exists — the old instant
+      // ok:true left callers with no fallback when the open failed
+      openBrowserModal(btn, cardEl)
+        .then(() => sendResponse({ ok: !!(modalOpen && modalEl) }))
+        .catch(() => sendResponse({ ok: false }));
+      return true;
     }
     if (msg.action === 'ndm-open-file-modal') {
       if (window.self !== window.top) {
@@ -1976,7 +2142,7 @@
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       dismissed = false;
-      closeBrowserModal();
+      dismissActiveModal();
       refresh();
     } else {
       place();

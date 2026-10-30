@@ -44,10 +44,25 @@ const DEFAULT_SETTINGS = {
   default_dir: '~/Downloads', max_connections: 8, speed_limit_bps: 0,
   max_simultaneous: 0, auto_resume: false, scheduler_enabled: false,
   sched_start: '22:00', sched_stop: '06:00', video_quality: 'best', proxy: '',
-  category_dirs: {}, conn_exceptions: [], exit_when_done: false,
+  proxy_mode: '', proxy_scheme: 'http', proxy_host: '', proxy_port: 0,
+  proxy_user: '', proxy_pass: '', proxy_http: true, proxy_https: true, proxy_ftp: true,
+  proxy_pac_url: '', proxy_from_browser_on_error: false,
+  site_logins: [], power_when_done: '', power_force: false, grab_projects: [],
+  category_dirs: {}, category_exts: {}, conn_exceptions: [], exit_when_done: false,
   sound_events: true, show_complete_dialog: true,
-  queues: [{ name: 'Main download queue', use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false }],
-  quota_mb: 0, quota_hours: 5, clipboard_monitor: true,
+  queues: [{ name: 'Main download queue', use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false, power_when_done: '', max_simultaneous: 0 }],
+  quota_mb: 0, quota_hours: 5, clipboard_monitor: false,
+};
+
+/* the built-in category → extensions table (mirrors the backend's
+   category_for); the Options editor shows these until the user
+   overrides a category, and only overrides are saved */
+const BUILTIN_CATEGORY_EXTS = {
+  Compressed: ['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz'],
+  Programs: ['exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'appimage', 'apk', 'bin', 'run', 'cab', 'jar', 'war', 'vmdk', 'qcow2', 'vdi', 'iso', 'img', 'flatpakref'],
+  Video: ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'wmv', 'm4v', 'ts'],
+  Music: ['mp3', 'm4a', 'm4b', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma'],
+  Documents: ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'csv', 'rtf', 'epub', 'mobi'],
 };
 let settings = { ...DEFAULT_SETTINGS };
 
@@ -64,6 +79,13 @@ function fillQueueSelect(sel, selectedName) {
     if (n === selectedName) o.selected = true;
     sel.appendChild(o);
   }
+}
+
+/* the Q column: the queue's 1-based number, IDM-style */
+function queueShort(qname) {
+  const names = (settings.queues || []).map(q => q.name);
+  const i = names.indexOf(qname || 'Main download queue');
+  return i >= 0 ? String(i + 1) : '1';
 }
 
 function syncLimiterLabel() {
@@ -117,7 +139,9 @@ function renderQueueFilters() {
   const counts = {};
   for (const d of items.values()) counts[d.queue || 'Main download queue'] = (counts[d.queue || 'Main download queue'] || 0) + 1;
   const names = (settings.queues || []).map(q => q.name);
-  const sig = names.join('|') + '#' + names.map(n => counts[n] || 0).join(',') + '#' + currentCat;
+  // JSON encoding: queue names containing '|' or ',' used to be
+  // able to forge a collision and freeze the sidebar
+  const sig = JSON.stringify([names, names.map(n => counts[n] || 0), currentCat]);
   if (sig === queueListSig) return;
   queueListSig = sig;
   ul.innerHTML = '';
@@ -136,49 +160,312 @@ function renderQueueFilters() {
   }
 }
 
+
+/* ---------- list columns: IDM's "Columns…" customization ----------
+   Which columns show, in which order, at which width — persisted in
+   localStorage like the theme. The header and every row are built
+   from this one definition, so the picker can never disagree with
+   the list. */
+const COLUMN_DEFS = [
+  { id: 'name', label: 'File Name', defW: 0 },
+  { id: 'size', label: 'Size', defW: 90 },
+  { id: 'status', label: 'Status', defW: 175 },
+  { id: 'timeleft', label: 'Time Left', defW: 80 },
+  { id: 'rate', label: 'Transfer Rate', defW: 105 },
+  { id: 'q', label: 'Q', defW: 36 },
+  { id: 'desc', label: 'Description', defW: 150 },
+  { id: 'added', label: 'Date Added', defW: 135 },
+  { id: 'category', label: 'Category', defW: 100, defOff: true },
+  { id: 'saveto', label: 'Save To', defW: 240, defOff: true },
+];
+function defaultColumnCfg() {
+  return COLUMN_DEFS.map(c => ({ id: c.id, visible: !c.defOff, width: c.defW }));
+}
+function loadColumnCfg() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('ndm-columns-v1') || 'null');
+    if (!Array.isArray(raw)) return defaultColumnCfg();
+    const out = [];
+    for (const r of raw) {
+      const def = COLUMN_DEFS.find(c => c.id === r.id);
+      if (def && !out.some(o => o.id === r.id)) {
+        out.push({ id: r.id, visible: r.visible !== false, width: Math.max(0, parseInt(r.width, 10) || 0) });
+      }
+    }
+    for (const c of defaultColumnCfg()) {
+      if (!out.some(o => o.id === c.id)) out.push(c);
+    }
+    // the name column is the list's anchor — it cannot be hidden
+    const nm = out.find(o => o.id === 'name');
+    if (nm) nm.visible = true;
+    return out;
+  } catch (e) { return defaultColumnCfg(); }
+}
+let columnCfg = loadColumnCfg();
+function saveColumnCfg() {
+  try { localStorage.setItem('ndm-columns-v1', JSON.stringify(columnCfg)); } catch (e) { /* private mode */ }
+}
+function visibleColumns() { return columnCfg.filter(c => c.visible); }
+
+function applyColumns() {
+  const cg = $('colGroup');
+  const hr = $('headRow');
+  if (!cg || !hr) return;
+  cg.innerHTML = '';
+  hr.innerHTML = '';
+  for (const c of visibleColumns()) {
+    const col = document.createElement('col');
+    if (c.width > 0) col.style.width = c.width + 'px';
+    cg.appendChild(col);
+    const th = document.createElement('th');
+    th.textContent = (COLUMN_DEFS.find(d => d.id === c.id) || {}).label || c.id;
+    if (c.id === 'name') th.className = 'c-name';
+    hr.appendChild(th);
+  }
+  lastStructSig = '__columns_changed__'; // force one structural rebuild
+}
+
+/* ---------- toolbar customization (IDM's toolbar "Customize…") ---------- */
+const TOOLBAR_DEFS = [
+  { id: 'btnAdd', label: 'Add URL' },
+  { id: 'btnVideo', label: 'Add Video' },
+  { id: 'btnGrabber', label: 'Site Grabber' },
+  { id: 'btnResume', label: 'Resume' },
+  { id: 'btnPause', label: 'Pause' },
+  { id: 'btnStopAll', label: 'Stop All' },
+  { id: 'btnDelete', label: 'Delete' },
+  { id: 'btnStatus', label: 'Status' },
+  { id: 'btnScheduler', label: 'Scheduler' },
+  { id: 'btnOptions', label: 'Options' },
+];
+function loadToolbarCfg() {
+  try {
+    const raw = JSON.parse(localStorage.getItem('ndm-toolbar-v1') || 'null');
+    if (!raw || !Array.isArray(raw.hidden)) return { hidden: [], size: 'large' };
+    return { hidden: raw.hidden.filter(id => TOOLBAR_DEFS.some(d => d.id === id)), size: raw.size === 'small' ? 'small' : 'large' };
+  } catch (e) { return { hidden: [], size: 'large' }; }
+}
+let toolbarCfg = loadToolbarCfg();
+function saveToolbarCfg() {
+  try { localStorage.setItem('ndm-toolbar-v1', JSON.stringify(toolbarCfg)); } catch (e) { /* private mode */ }
+}
+function applyToolbar() {
+  for (const d of TOOLBAR_DEFS) {
+    const el = $(d.id);
+    if (el) el.style.display = toolbarCfg.hidden.includes(d.id) ? 'none' : '';
+  }
+  const tb = document.querySelector('.toolbar');
+  if (tb) tb.classList.toggle('tb-small', toolbarCfg.size === 'small');
+}
+
+/* ---------- Columns / Toolbar dialogs ---------- */
+let colEdit = null;
+function openColumns() {
+  colEdit = columnCfg.map(c => ({ ...c }));
+  renderColEdit();
+  $('colmodal').classList.remove('hidden');
+}
+function renderColEdit() {
+  const box = $('colList');
+  box.innerHTML = '';
+  colEdit.forEach((c, i) => {
+    const def = COLUMN_DEFS.find(d => d.id === c.id) || {};
+    const row = document.createElement('div');
+    row.className = 'col-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = c.visible;
+    cb.disabled = c.id === 'name';
+    cb.onchange = () => { c.visible = cb.checked; };
+    const lab = document.createElement('span');
+    lab.className = 'col-name';
+    lab.textContent = def.label || c.id;
+    const w = document.createElement('input');
+    w.type = 'number';
+    w.min = '0';
+    w.max = '800';
+    w.value = c.width;
+    w.title = 'Width in pixels (0 = automatic)';
+    w.onchange = () => { c.width = Math.max(0, parseInt(w.value, 10) || 0); };
+    const up = document.createElement('button');
+    up.className = 'tool';
+    up.textContent = '↑';
+    up.disabled = i === 0;
+    up.onclick = () => { [colEdit[i - 1], colEdit[i]] = [colEdit[i], colEdit[i - 1]]; renderColEdit(); };
+    const dn = document.createElement('button');
+    dn.className = 'tool';
+    dn.textContent = '↓';
+    dn.disabled = i === colEdit.length - 1;
+    dn.onclick = () => { [colEdit[i + 1], colEdit[i]] = [colEdit[i], colEdit[i + 1]]; renderColEdit(); };
+    row.append(cb, lab, w, up, dn);
+    box.appendChild(row);
+  });
+}
+$('colModalClose').onclick = () => $('colmodal').classList.add('hidden');
+$('colmodal').addEventListener('click', e => { if (e.target === $('colmodal')) $('colmodal').classList.add('hidden'); });
+$('colReset').onclick = () => { colEdit = defaultColumnCfg(); renderColEdit(); };
+$('colOk').onclick = () => {
+  columnCfg = colEdit;
+  saveColumnCfg();
+  applyColumns();
+  $('colmodal').classList.add('hidden');
+  render();
+};
+
+let tbEdit = null;
+function openToolbarCfg() {
+  tbEdit = { hidden: [...toolbarCfg.hidden], size: toolbarCfg.size };
+  renderTbEdit();
+  $('tbSize').value = tbEdit.size;
+  $('tbmodal').classList.remove('hidden');
+}
+function renderTbEdit() {
+  const box = $('tbList');
+  box.innerHTML = '';
+  for (const d of TOOLBAR_DEFS) {
+    const row = document.createElement('div');
+    row.className = 'col-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !tbEdit.hidden.includes(d.id);
+    cb.onchange = () => {
+      if (cb.checked) tbEdit.hidden = tbEdit.hidden.filter(x => x !== d.id);
+      else tbEdit.hidden.push(d.id);
+    };
+    const lab = document.createElement('span');
+    lab.className = 'col-name';
+    lab.textContent = d.label;
+    row.append(cb, lab);
+    box.appendChild(row);
+  }
+}
+$('tbModalClose').onclick = () => $('tbmodal').classList.add('hidden');
+$('tbmodal').addEventListener('click', e => { if (e.target === $('tbmodal')) $('tbmodal').classList.add('hidden'); });
+$('tbReset').onclick = () => { tbEdit = { hidden: [], size: 'large' }; $('tbSize').value = 'large'; renderTbEdit(); };
+$('tbOk').onclick = () => {
+  tbEdit.size = $('tbSize').value === 'small' ? 'small' : 'large';
+  toolbarCfg = tbEdit;
+  saveToolbarCfg();
+  applyToolbar();
+  $('tbmodal').classList.add('hidden');
+};
+
+/* ---------- the list itself ----------
+   IDM updates its list in place: at the 200 ms progress cadence only
+   the cells of rows that are already on screen change — the row
+   elements themselves are never rebuilt, so selection, scroll
+   position and hover survive every tick. A full rebuild happens
+   only when the visible SET of rows changes (add, delete, filter,
+   sort, columns). */
+const rowEls = new Map();   // id -> <tr>
+let lastStructSig = '';
+
+function cellHtml(colId, d, st, left) {
+  switch (colId) {
+    case 'name':
+      return `${escapeHtml(d.name)}${d.status === 'downloading' && d.total === 0 ? '<div class="pbar ind"></div>' : `<div class="pbar"><i data-pct="${pctOf(d).toFixed(1)}"></i></div>`}`;
+    case 'size':
+      return d.total > 0 || st === 'finished' ? fmtSize(d.total) : 'Unknown';
+    case 'status':
+      return `${cap(st)}${st !== 'finished' && d.total > 0 ? ' ' + pctOf(d).toFixed(0) + '%' : ''}${st === 'error' && d.error ? ' — ' + escapeHtml(d.error.length > 60 ? d.error.slice(0, 60) + '…' : d.error) : ''}`;
+    case 'timeleft':
+      return st === 'finished' ? '—' : fmtLeft(left);
+    case 'rate':
+      return st === 'downloading' ? fmtRate(d.speed_bps) : '—';
+    case 'q':
+      return escapeHtml(queueShort(d.queue));
+    case 'desc':
+      return d.description ? escapeHtml(d.description) : '';
+    case 'added':
+      return escapeHtml(d.added || '');
+    case 'category':
+      return escapeHtml(d.category || '');
+    case 'saveto':
+      return escapeHtml(d.save_to || '');
+    default:
+      return '';
+  }
+}
+
+function updateRowCells(tr, d) {
+  const left = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
+    ? (d.total - d.done_bytes) / d.speed_bps : null;
+  // status is interpolated into HTML — pin it to the known vocabulary
+  const st = KNOWN_STATUS.includes(d.status) ? d.status : 'error';
+  const cols = visibleColumns();
+  for (let i = 0; i < cols.length; i++) {
+    const td = tr.children[i];
+    if (!td) break;
+    const colId = cols[i].id;
+    const html = cellHtml(colId, d, st, left);
+    if (td._h !== html) {
+      td.innerHTML = html;
+      td._h = html;
+    }
+    if (colId === 'status') {
+      const cls = 'st-' + st;
+      if (td.className !== cls) td.className = cls;
+      const title = st === 'error' && d.error ? d.error : '';
+      if (td.title !== title) td.title = title;
+    }
+    if (colId === 'q') {
+      const t = d.queue || 'Main download queue';
+      if (td.title !== t) td.title = t;
+    }
+    if (colId === 'name' && td.className !== 'name') td.className = 'name';
+  }
+  // the row fill goes through the DOM, never the innerHTML string:
+  // this WebKit drops percentage widths written into inline styles
+  const fill = tr.querySelector('.pbar i');
+  if (fill) fill.style.width = fill.dataset.pct + '%';
+  const sel = d.id === selectedId;
+  if (tr.classList.contains('selected') !== sel) tr.classList.toggle('selected', sel);
+}
+
+function buildRow(d) {
+  const tr = document.createElement('tr');
+  for (const _c of visibleColumns()) tr.appendChild(document.createElement('td'));
+  // Single-click ONLY selects the row in the full-height table (like IDM)
+  tr.addEventListener('click', () => select(d.id, false));
+  // Double-click opens the Download Status / Properties dialog —
+  // IDM never opens the file itself from the list; opening lives
+  // on the dialog and in the context menu
+  tr.addEventListener('dblclick', () => select(d.id, true));
+  // Right-click: IDM's per-download context menu
+  tr.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    selectedId = d.id;
+    render();
+    showCtxMenu(e.clientX, e.clientY, d);
+  });
+  updateRowCells(tr, d);
+  return tr;
+}
+
 function render() {
   renderQueueFilters();
   const list = visibleItems();
-  rowsEl.innerHTML = '';
-  for (const d of list) {
-    const tr = document.createElement('tr');
-    if (d.id === selectedId) tr.className = 'selected';
-    const left = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
-      ? (d.total - d.done_bytes) / d.speed_bps : null;
-    // status is interpolated into HTML — pin it to the known vocabulary
-    const st = KNOWN_STATUS.includes(d.status) ? d.status : 'error';
-    tr.innerHTML = `
-      <td class="name">${escapeHtml(d.name)}${d.status === 'downloading' && d.total === 0 ? '<div class="pbar ind"></div>' : `<div class="pbar"><i data-pct="${pctOf(d).toFixed(1)}"></i></div>`}</td>
-      <td>${d.total > 0 || st === 'finished' ? fmtSize(d.total) : 'Unknown'}</td>
-      <td class="st-${st}"${st === 'error' && d.error ? ` title="${escapeHtml(d.error)}"` : ''}>${cap(st)}${st !== 'finished' && d.total > 0 ? ' ' + pctOf(d).toFixed(0) + '%' : ''}${st === 'error' && d.error ? ' — ' + escapeHtml(d.error.length > 60 ? d.error.slice(0, 60) + '…' : d.error) : ''}</td>
-      <td>${st === 'finished' ? '—' : fmtLeft(left)}</td>
-      <td>${st === 'downloading' ? fmtRate(d.speed_bps) : '—'}</td>
-      <td>${escapeHtml(d.added || '')}</td>`;
-    // Single-click ONLY selects the row in the full-height table (like IDM)
-    tr.addEventListener('click', () => select(d.id, false));
-    // Double-click opens a finished file, or opens the floating Download Status dialog for active/paused items (like IDM)
-    tr.addEventListener('dblclick', () => {
-      if (d.status === 'finished') {
-        select(d.id, false);
-        openSelected(false);
-      } else {
-        select(d.id, true);
-      }
-    });
-    // Right-click opens the floating Download Status / Details dialog for any row
-    tr.addEventListener('contextmenu', e => {
-      e.preventDefault();
-      select(d.id, true);
-    });
-    rowsEl.appendChild(tr);
+  const structSig = JSON.stringify([
+    list.map(d => d.id),
+    visibleColumns().map(c => c.id + ':' + c.width),
+  ]);
+  if (structSig !== lastStructSig) {
+    // structural change: rebuild the row set once
+    lastStructSig = structSig;
+    rowsEl.innerHTML = '';
+    rowEls.clear();
+    for (const d of list) {
+      const tr = buildRow(d);
+      rowEls.set(d.id, tr);
+      rowsEl.appendChild(tr);
+    }
+  } else {
+    // the 200 ms cadence: patch the cells of the rows already shown
+    for (const d of list) {
+      const tr = rowEls.get(d.id);
+      if (tr) updateRowCells(tr, d);
+    }
   }
-  // row progress fills go through the DOM, never the innerHTML
-  // string: this WebKit drops percentage widths and var()-gradient
-  // stops written into inline style attributes (measured live with
-  // a DOM probe), while DOM-set widths — the detail bar's way — work
-  rowsEl.querySelectorAll('.pbar i').forEach(el => {
-    el.style.width = el.dataset.pct + '%';
-  });
   $('emptyMsg').style.display = list.length ? 'none' : 'block';
 
   const all = [...items.values()];
@@ -205,6 +492,9 @@ function renderDetail() {
     if ($('dTitle')) $('dTitle').textContent = 'Download Status';
     $('dUrl').textContent = $('dStatus').textContent = $('dSize').textContent = '—';
     $('dDone').textContent = $('dRate').textContent = $('dLeft').textContent = $('dResume').textContent = '—';
+    if ($('dSaveTo')) $('dSaveTo').textContent = '—';
+    if ($('dReferer')) $('dReferer').textContent = '—';
+    if ($('dDesc') && document.activeElement !== $('dDesc')) $('dDesc').value = '';
     $('dBarFill').style.width = '0%'; $('dBarText').textContent = '0.0%';
     if ($('dPause')) $('dPause').disabled = true;
     if ($('dResumeBtn')) $('dResumeBtn').disabled = true;
@@ -213,8 +503,12 @@ function renderDetail() {
     return;
   }
   if ($('dTitle')) {
+    // a finished download is 100% by definition — a 0-byte file
+    // used to title itself "0%", looking broken when it was done
+    const pctTxt = d.total > 0 ? pctOf(d).toFixed(0)
+      : (d.status === 'finished' ? '100' : '0');
     $('dTitle').textContent = d.name
-      ? `${pctOf(d).toFixed(0)}% — ${d.name}`
+      ? `${pctTxt}% — ${d.name}`
       : 'Download Status';
   }
   const isFinished = d.status === 'finished';
@@ -236,6 +530,13 @@ function renderDetail() {
   $('dLeft').textContent = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
     ? fmtLeft((d.total - d.done_bytes) / d.speed_bps) : '—';
   $('dResume').textContent = d.resume_capability || '—';
+  if ($('dSaveTo')) $('dSaveTo').textContent = d.save_to || '—';
+  if ($('dReferer')) $('dReferer').textContent = d.referer || '—';
+  // the description is an editable field — never clobber it while
+  // the user is typing (this dialog re-renders on every progress tick)
+  if ($('dDesc') && document.activeElement !== $('dDesc')) {
+    $('dDesc').value = d.description || '';
+  }
   // per-connection table (IDM shows one row per connection)
   const dc = $('dConns');
   if (dc) {
@@ -253,9 +554,9 @@ function renderDetail() {
   }
   const ind = d.status === 'downloading' && d.total === 0;
   $('dBarFill').classList.toggle('ind', ind);
-  $('dBarFill').style.width = ind ? '' : pctOf(d).toFixed(1) + '%';
+  $('dBarFill').style.width = ind ? '' : (d.total > 0 ? pctOf(d).toFixed(1) : (isFinished ? 100 : 0)) + '%';
   $('dBarText').textContent = d.total > 0 ? pctOf(d).toFixed(1) + '%'
-    : (d.status === 'downloading' ? fmtSize(d.done_bytes) : '—');
+    : (d.status === 'downloading' ? fmtSize(d.done_bytes) : (isFinished ? '100%' : '—'));
   drawSegMap(d.blocks || '', d.status);
 }
 
@@ -337,6 +638,56 @@ function select(id, openDetail) {
   render();
 }
 
+/* ---------- row context menu (IDM's right-click menu) ---------- */
+const ctxMenu = $('ctxMenu');
+function hideCtxMenu() { ctxMenu.classList.add('hidden'); }
+function showCtxMenu(x, y, d) {
+  ctxMenu.innerHTML = '';
+  const add = (label, fn, disabled) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    if (disabled) b.disabled = true;
+    b.onclick = () => { hideCtxMenu(); fn(); };
+    ctxMenu.appendChild(b);
+  };
+  const head = document.createElement('div');
+  head.className = 'ctx-head';
+  head.textContent = d.name && d.name.length > 34 ? d.name.slice(0, 34) + '…' : (d.name || 'Download');
+  ctxMenu.appendChild(head);
+  const st = d.status;
+  add('Resume', () => actOnSelected(id => TAURI ? invoke('resume_download', { id }) : demoResume(id)),
+    st === 'downloading' || st === 'finished');
+  add('Pause', () => actOnSelected(id => TAURI ? invoke('pause_download', { id }) : demoPause(id)),
+    st !== 'downloading');
+  add('Properties / Status…', () => select(d.id, true));
+  const sep1 = document.createElement('div'); sep1.className = 'ctx-sep'; ctxMenu.appendChild(sep1);
+  add('Open File', () => { selectedId = d.id; openSelected(false); }, st !== 'finished');
+  add('Open Folder', () => { selectedId = d.id; openSelected(true); }, st === 'queued');
+  const queues = (settings.queues || []).map(q => q.name);
+  if (queues.length > 1) {
+    const sep2 = document.createElement('div'); sep2.className = 'ctx-sep'; ctxMenu.appendChild(sep2);
+    const qh = document.createElement('div'); qh.className = 'ctx-head'; qh.textContent = 'Move to queue'; ctxMenu.appendChild(qh);
+    for (const qn of queues) {
+      add((d.queue === qn ? '✓ ' : '') + qn, async () => {
+        if (!TAURI || d.queue === qn) return;
+        try {
+          await invoke('set_entry_queue', { id: d.id, queue: qn });
+          d.queue = qn;
+          render();
+        } catch (e) { toast('Could not move the download: ' + e); }
+      });
+    }
+  }
+  const sep3 = document.createElement('div'); sep3.className = 'ctx-sep'; ctxMenu.appendChild(sep3);
+  add('Delete…', () => { selectedId = d.id; openDeleteConfirm(); });
+  ctxMenu.classList.remove('hidden');
+  const w = ctxMenu.offsetWidth, h = ctxMenu.offsetHeight;
+  ctxMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 8)) + 'px';
+  ctxMenu.style.top = Math.max(4, Math.min(y, window.innerHeight - h - 8)) + 'px';
+}
+document.addEventListener('click', e => { if (!e.target.closest('#ctxMenu')) hideCtxMenu(); });
+window.addEventListener('blur', hideCtxMenu);
+
 /* ---------- actions ---------- */
 async function actOnSelected(fn) {
   const d = items.get(selectedId);
@@ -346,17 +697,42 @@ async function actOnSelected(fn) {
 }
 $('btnPause').onclick = () => actOnSelected(id => TAURI ? invoke('pause_download', { id }) : demoPause(id));
 $('btnResume').onclick = () => actOnSelected(id => TAURI ? invoke('resume_download', { id }) : demoResume(id));
-$('btnDelete').onclick = async () => {
+/* Delete asks first (IDM does) — removing the wrong row used to be
+   one stray Delete keystroke away, with no way back. The dialog
+   also offers deleting the file itself, not just the list entry. */
+let deleteTargetId = null;
+function openDeleteConfirm() {
   const d = items.get(selectedId);
   if (!d) return;
+  deleteTargetId = d.id;
+  $('delName').textContent = 'Delete "' + (d.name || 'download') + '" from the list?';
+  $('delFileChk').checked = false;
+  $('delFileChk').disabled = d.status !== 'finished';
+  $('delmodal').classList.remove('hidden');
+  $('delConfirm').focus();
+}
+$('btnDelete').onclick = openDeleteConfirm;
+$('delModalClose').onclick = $('delCancel').onclick = () => $('delmodal').classList.add('hidden');
+$('delmodal').addEventListener('click', e => { if (e.target === $('delmodal')) $('delmodal').classList.add('hidden'); });
+$('delConfirm').onclick = async () => {
+  const id = deleteTargetId;
+  deleteTargetId = null;
+  $('delmodal').classList.add('hidden');
+  const d = items.get(id);
+  if (!d) return;
+  const detailWasShowingIt = !detailEl.classList.contains('hidden') && selectedId === id;
   if (TAURI) {
-    try { await invoke('remove_download', { id: d.id }); } catch (e) { console.error(e); toast(String(e)); return; }
-    deletedIds.add(d.id); // a late progress emit must not resurrect the row
-    items.delete(d.id);
-    if (selectedId === d.id) selectedId = items.keys().next().value || null;
-    if (!selectedId) detailEl.classList.add('hidden');
+    try {
+      await invoke('remove_download', { id, deleteFile: $('delFileChk').checked ? true : null });
+    } catch (e) { console.error(e); toast(String(e)); return; }
+    deletedIds.add(id); // a late progress emit must not resurrect the row
+    items.delete(id);
+    if (selectedId === id) selectedId = items.keys().next().value || null;
+    // the status dialog must not silently retarget to another
+    // download when its own entry is deleted — close it instead
+    if (detailWasShowingIt) detailEl.classList.add('hidden');
     render();
-  } else demoRemove(d.id);
+  } else demoRemove(id);
 };
 if ($('btnStatus')) {
   $('btnStatus').onclick = () => {
@@ -367,7 +743,14 @@ if ($('btnStatus')) {
 }
 if ($('dQueueSel')) $('dQueueSel').addEventListener('change', async () => {
   if (!selectedId || !TAURI) return;
-  try { await invoke('set_entry_queue', { id: selectedId, queue: $('dQueueSel').value }); }
+  const d = items.get(selectedId);
+  try {
+    await invoke('set_entry_queue', { id: selectedId, queue: $('dQueueSel').value });
+    // keep the local row in sync — without this the Q column and
+    // the queue filters kept showing the old queue until the next
+    // progress event happened to arrive
+    if (d) { d.queue = $('dQueueSel').value; render(); }
+  }
   catch (e) { toast('Could not move the download: ' + e); }
 });
 $('dPause').onclick = $('btnPause').onclick;
@@ -416,11 +799,26 @@ function queueFileLink(payload) {
   fileLinkQueue.push(payload);
   pumpFileLinks();
 }
+/* Incoming links (extension, clipboard, basket) must never stack
+   their dialog over a dialog the user is already working in — an
+   Options or Scheduler edit could be discarded by the surprise
+   dialog's Escape. They wait in their queues; a slow pump retries
+   while any other modal (except the floating status dialog) is up. */
+function anyBlockingModalOpen() {
+  return [...document.querySelectorAll('.modal:not(.hidden)')]
+    .some(m => m.id !== 'detail');
+}
 function pumpFileLinks() {
-  if (!modal.classList.contains('hidden')) return; // dialog is busy
+  if (anyBlockingModalOpen()) return; // a dialog is busy
   const next = fileLinkQueue.shift();
   if (next) openFileDialog(next);
 }
+setInterval(() => {
+  if ((fileLinkQueue.length || videoLinkQueue.length) && !anyBlockingModalOpen()) {
+    pumpFileLinks();
+    pumpVideoLinks();
+  }
+}, 700);
 let fileProbeSeq = 0;
 let fileProbeTimer = null;
 
@@ -483,10 +881,24 @@ function openFileDialog(payload) {
   $('inAuthBox').classList.add('hidden');
   $('inLogin').value = '';
   $('inPassword').value = '';
+  if ($('inDesc')) $('inDesc').value = '';
+  // IDM names the clipboard prompt exactly; the basket gets its
+  // own wording; everything else is the plain File Info dialog
+  if ($('fileModalTitle')) {
+    $('fileModalTitle').textContent =
+      payload && payload.source === 'clipboard'
+        ? 'Download link was found in clipboard. Do you want to download it?'
+        : payload && payload.source === 'basket'
+          ? 'Link dropped on the basket — download it?'
+          : 'Download File Info';
+  }
   resetFileProbeUi();
   if (payload) {
     $('inUrl').value = payload.url;
     $('inName').value = (payload.title || '').split(/[\\/]/).pop() || '';
+  } else {
+    $('inUrl').value = '';
+    $('inName').value = '';
   }
   modal.classList.remove('hidden');
   $('inUrl').focus();
@@ -521,6 +933,7 @@ async function submitAdd(later) {
         queue: $('inQueue').value || null,
         login: $('inAuth').checked ? ($('inLogin').value.trim() || null) : null,
         password: $('inAuth').checked ? ($('inPassword').value || null) : null,
+        description: ($('inDesc') && $('inDesc').value.trim()) || null,
       };
       try {
         await invoke('add_download', args);
@@ -575,7 +988,7 @@ function queueVideoLink(url, cookies) {
   pumpVideoLinks();
 }
 function pumpVideoLinks() {
-  if (!vmodal.classList.contains('hidden')) return; // a video is being handled
+  if (anyBlockingModalOpen()) return; // a dialog is busy
   const next = videoLinkQueue.shift();
   if (next) openVideoModal(next.url, next.cookies);
 }
@@ -600,6 +1013,7 @@ function openVideoModal(url, cookies) {
   presentedVideoUrl = url || null;
   presentedVideoCookies = cookies || '';
   fillQueueSelect($('vInQueue'));
+  if ($('vInDesc')) $('vInDesc').value = '';
   vmodal.classList.remove('hidden');
   if (url) { $('vInUrl').value = url; }
   $('vInUrl').focus();
@@ -613,8 +1027,10 @@ vmodal.addEventListener('click', e => { if (e.target === vmodal) closeVideoModal
 function pickQualityIndex(options) {
   const q = settings.video_quality || 'best';
   if (q === 'best') {
-    const hd = options.findIndex(o => !o.audio && (o.height === 1080 || o.label.startsWith('1080p')));
-    return hd >= 0 ? hd : 0;
+    // the options list is best-first: "Best quality" means the
+    // FIRST row. It used to hunt for a 1080p row and silently
+    // preselect it over an available 2160p.
+    return 0;
   }
   if (q === 'audio') {
     const i = options.findIndex(o => o.audio);
@@ -718,6 +1134,7 @@ async function fetchVideoInfo() {
   $('vInfo').classList.add('hidden');
   $('vStart').disabled = true;
   if ($('vLater')) $('vLater').disabled = true;
+  if ($('vAll')) $('vAll').disabled = true;
   vInfo = null;
   const mySeq = ++probeSeq;
   try {
@@ -824,37 +1241,48 @@ async function submitVideo(later) {
   const customTitle = ($('vTitleInput') && $('vTitleInput').value.trim()) || vInfo.title || '';
   const cookies = (presentedVideoUrl && url === presentedVideoUrl)
     ? (presentedVideoCookies || null) : null;
+  if (!TAURI) { closeVideoModal(); return; }
+  // the dialog stays OPEN until the backend accepts the download —
+  // it used to close first, so a failure (bad folder, offline)
+  // destroyed the dialog and the user's edited title with it, the
+  // exact bug the file dialog's submitAdd was already fixed for
+  $('vStart').disabled = true;
+  if ($('vLater')) $('vLater').disabled = true;
+  if ($('vAll')) $('vAll').disabled = true;
+  try {
+    const args = {
+      url,
+      dir,
+      selector: opt.selector,
+      audio: !!opt.audio,
+      title: customTitle,
+      cookies,
+      later: !!later,
+      total: Number(opt.size_bytes) || 0,
+      queue: $('vInQueue').value || null,
+      description: ($('vInDesc') && $('vInDesc').value.trim()) || null,
+    };
+    try {
+      await invoke('add_video', args);
+    } catch (e) {
+      // IDM asks what to do about a duplicate link — so do we
+      if (String(e).startsWith('duplicate:') &&
+          confirm('This video quality is already in the download list.\nDownload it again as a new copy?')) {
+        await invoke('add_video', { ...args, force: true });
+      } else if (!String(e).startsWith('duplicate:')) {
+        throw e;
+      }
+    }
+  } catch (e) {
+    console.error('add_video failed', e);
+    toast('Could not add the video: ' + e);
+    $('vStart').disabled = false;
+    if ($('vLater')) $('vLater').disabled = false;
+    if ($('vAll')) $('vAll').disabled = false;
+    return;
+  }
   if (cookies) presentedTokenConsumed = true;
   closeVideoModal();
-  if (TAURI) {
-    try {
-      const args = {
-        url,
-        dir,
-        selector: opt.selector,
-        audio: !!opt.audio,
-        title: customTitle,
-        cookies,
-        later: !!later,
-        total: Number(opt.size_bytes) || 0,
-        queue: $('vInQueue').value || null,
-      };
-      try {
-        await invoke('add_video', args);
-      } catch (e) {
-        // IDM asks what to do about a duplicate link — so do we
-        if (String(e).startsWith('duplicate:') &&
-            confirm('This video quality is already in the download list.\nDownload it again as a new copy?')) {
-          await invoke('add_video', { ...args, force: true });
-        } else if (!String(e).startsWith('duplicate:')) {
-          throw e;
-        }
-      }
-    } catch (e) {
-      console.error('add_video failed', e);
-      toast('Could not add the video: ' + e);
-    }
-  }
 }
 $('vStart').onclick = () => submitVideo(false);
 if ($('vLater')) $('vLater').onclick = () => submitVideo(true);
@@ -890,6 +1318,50 @@ if ($('vAll')) $('vAll').onclick = async () => {
   toast(`Download all: ${sent} qualities added${skipped ? `, ${skipped} skipped` : ''}`);
 };
 
+/* ---------- Site Logins editor (Options) ---------- */
+let loginsEdit = [];
+function renderLoginsEdit() {
+  const box = $('oLoginList');
+  if (!box) return;
+  box.innerHTML = '';
+  if (!loginsEdit.length) {
+    const e = document.createElement('div');
+    e.className = 'opt-note';
+    e.textContent = 'No saved logins yet.';
+    box.appendChild(e);
+    return;
+  }
+  loginsEdit.forEach((l, i) => {
+    const row = document.createElement('div');
+    row.className = 'login-row';
+    const s = document.createElement('span');
+    s.className = 'login-site';
+    s.textContent = l.site;
+    const u = document.createElement('span');
+    u.textContent = l.login;
+    const p = document.createElement('span');
+    p.textContent = '••••••';
+    const del = document.createElement('button');
+    del.className = 'tool';
+    del.textContent = 'Remove';
+    del.onclick = () => { loginsEdit.splice(i, 1); renderLoginsEdit(); };
+    row.append(s, u, p, del);
+    box.appendChild(row);
+  });
+}
+if ($('oLoginAdd')) $('oLoginAdd').onclick = () => {
+  const site = $('oLoginSite').value.trim();
+  const login = $('oLoginUser').value.trim();
+  const password = $('oLoginPass').value;
+  if (!site || !login) { toast('Give the site and the user name first'); return; }
+  const existing = loginsEdit.findIndex(l =>
+    l.site.toLowerCase() === site.toLowerCase() && l.login.toLowerCase() === login.toLowerCase());
+  if (existing >= 0) loginsEdit[existing] = { site, login, password };
+  else loginsEdit.push({ site, login, password });
+  $('oLoginSite').value = $('oLoginUser').value = $('oLoginPass').value = '';
+  renderLoginsEdit();
+};
+
 /* ---------- Options modal ---------- */
 const omodal = $('omodal');
 function openOptions() {
@@ -901,10 +1373,34 @@ function openOptions() {
   $('oSimul').value = settings.max_simultaneous;
   $('oAutoResume').checked = settings.auto_resume;
   $('oVideoQ').value = settings.video_quality;
-  $('oProxy').value = settings.proxy || '';
+  {
+    const mode = settings.proxy_mode
+      || (settings.proxy ? 'manual' : 'none');
+    document.querySelectorAll('input[name="proxyMode"]').forEach(r => {
+      r.checked = r.value === mode;
+    });
+    $('oProxyPac').value = settings.proxy_pac_url || '';
+    $('oProxyScheme').value = settings.proxy_scheme || 'http';
+    $('oProxyHost').value = settings.proxy_host || '';
+    $('oProxyPort').value = settings.proxy_port || '';
+    $('oProxyUser').value = settings.proxy_user || '';
+    $('oProxyPass').value = settings.proxy_pass || '';
+    $('oProxyHttp').checked = settings.proxy_http !== false;
+    $('oProxyHttps').checked = settings.proxy_https !== false;
+    $('oProxyFtp').checked = settings.proxy_ftp !== false;
+    $('oProxyBrowser').checked = !!settings.proxy_from_browser_on_error;
+  }
+  loginsEdit = (settings.site_logins || []).map(l => ({ ...l }));
+  renderLoginsEdit();
+  $('oPowerWhenDone').value = settings.power_when_done || '';
+  $('oPowerForce').checked = !!settings.power_force;
   const cd = settings.category_dirs || {};
   for (const c of ['Compressed', 'Documents', 'Music', 'Video', 'Programs', 'General']) {
     $('oCat' + c).value = cd[c] || '';
+  }
+  const ce = settings.category_exts || {};
+  for (const c of Object.keys(BUILTIN_CATEGORY_EXTS)) {
+    $('oCatExt' + c).value = (ce[c] || BUILTIN_CATEGORY_EXTS[c]).join(', ');
   }
   $('oConnExc').value = (settings.conn_exceptions || []).join(', ');
   $('oExitDone').checked = !!settings.exit_when_done;
@@ -936,11 +1432,40 @@ $('oSave').onclick = async () => {
     auto_resume: $('oAutoResume').checked,
     auto_update: $('oAutoUpdate').checked,
     video_quality: $('oVideoQ').value,
-    proxy: $('oProxy').value.trim(),
+    proxy_mode: (document.querySelector('input[name="proxyMode"]:checked') || {}).value || 'none',
+    proxy_pac_url: $('oProxyPac').value.trim(),
+    proxy_scheme: $('oProxyScheme').value,
+    proxy_host: $('oProxyHost').value.trim(),
+    proxy_port: Math.min(65535, Math.max(0, parseInt($('oProxyPort').value, 10) || 0)),
+    proxy_user: $('oProxyUser').value.trim(),
+    proxy_pass: $('oProxyPass').value,
+    proxy_http: $('oProxyHttp').checked,
+    proxy_https: $('oProxyHttps').checked,
+    proxy_ftp: $('oProxyFtp').checked,
+    proxy_from_browser_on_error: $('oProxyBrowser').checked,
+    site_logins: loginsEdit.map(l => ({ ...l })),
+    power_when_done: $('oPowerWhenDone').value,
+    power_force: $('oPowerForce').checked,
     category_dirs: Object.fromEntries(
       ['Compressed', 'Documents', 'Music', 'Video', 'Programs', 'General']
         .map(c => [c, $('oCat' + c).value.trim()])
         .filter(([, v]) => v)),
+    // only categories whose type list differs from the built-in
+    // table are stored — an untouched editor must not freeze the
+    // built-ins forever
+    category_exts: Object.fromEntries(
+      Object.keys(BUILTIN_CATEGORY_EXTS)
+        .map(c => {
+          const list = [...new Set(
+            $('oCatExt' + c).value.split(/[,\s]+/)
+              .map(s => s.trim().replace(/^\./, '').toLowerCase())
+              .filter(Boolean))];
+          const builtin = BUILTIN_CATEGORY_EXTS[c];
+          const same = list.length === builtin.length
+            && list.every(x => builtin.includes(x));
+          return [c, same ? null : list];
+        })
+        .filter(([, v]) => v && v.length)),
     conn_exceptions: $('oConnExc').value.split(',').map(s => s.trim()).filter(Boolean),
     exit_when_done: $('oExitDone').checked,
     sound_events: $('oSounds').checked,
@@ -958,9 +1483,10 @@ $('oSave').onclick = async () => {
 /* ---------- Scheduler modal ---------- */
 const smodal = $('smodal');
 let schedSel = 'Main download queue';
+let schedDirty = false; // unsaved edits in the scheduler fields
 function schedCfgOf(name) {
   return (settings.queues || []).find(q => q.name === name)
-    || { name, use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false };
+    || { name, use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false, power_when_done: '', max_simultaneous: 0 };
 }
 function fillSchedulerFields() {
   const cfg = schedCfgOf(schedSel);
@@ -968,21 +1494,85 @@ function fillSchedulerFields() {
   $('sStart').value = cfg.start || '22:00';
   $('sStop').value = cfg.stop || '06:00';
   $('schedExitDone').checked = !!cfg.exit_when_done;
+  if ($('sPowerWhenDone')) $('sPowerWhenDone').value = cfg.power_when_done || '';
+  $('sMax').value = cfg.max_simultaneous || 0;
   $('schedDelete').disabled = schedSel === 'Main download queue';
+  schedDirty = false;
+  renderSchedFiles();
+}
+/* IDM's Scheduler has a "Files in the queue" tab: the queue's
+   downloads in start order, reorderable. The pump claims queued
+   entries in list order, so the order shown here IS the priority. */
+function renderSchedFiles() {
+  const box = $('sFiles');
+  if (!box) return;
+  const mine = [...items.values()]
+    .filter(d => (d.queue || 'Main download queue') === schedSel);
+  box.innerHTML = '';
+  if (!mine.length) {
+    const e = document.createElement('div');
+    e.className = 's-empty';
+    e.textContent = 'No downloads in this queue';
+    box.appendChild(e);
+    return;
+  }
+  mine.forEach((d, i) => {
+    const row = document.createElement('div');
+    row.className = 's-file-row';
+    const nm = document.createElement('span');
+    nm.className = 's-name';
+    nm.textContent = d.name || d.url;
+    nm.title = d.url;
+    const st = document.createElement('span');
+    st.className = 's-st';
+    st.textContent = cap(d.status || '');
+    const move = async upWanted => {
+      if (!TAURI) return;
+      try {
+        await invoke('move_in_queue', { id: d.id, up: upWanted });
+        // the backend's order list is authoritative (the local map
+        // keeps insertion order and would show the stale sequence)
+        const list = await invoke('list_downloads');
+        items.clear();
+        for (const nd of list) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
+        renderSchedFiles();
+        render();
+      } catch (e) { $('sStatus').textContent = 'Could not reorder: ' + e; }
+    };
+    const up = document.createElement('button');
+    up.textContent = '↑';
+    up.title = 'Start earlier';
+    up.disabled = i === 0;
+    up.onclick = () => move(true);
+    const dn = document.createElement('button');
+    dn.textContent = '↓';
+    dn.title = 'Start later';
+    dn.disabled = i === mine.length - 1;
+    dn.onclick = () => move(false);
+    row.append(nm, st, up, dn);
+    box.appendChild(row);
+  });
 }
 function openScheduler() {
   fillQueueSelect($('schedQueueSel'), schedSel);
   schedSel = $('schedQueueSel').value || 'Main download queue';
   fillSchedulerFields();
-  $('sSimulVal').textContent = settings.max_simultaneous > 0
-    ? String(settings.max_simultaneous) : 'Unlimited';
   $('sStatus').textContent = '';
   smodal.classList.remove('hidden');
 }
 $('schedQueueSel').addEventListener('change', () => {
+  // switching queues used to throw away unsaved edits silently
+  if (schedDirty && !confirm(`Discard the unsaved changes for "${schedSel}"?`)) {
+    $('schedQueueSel').value = schedSel;
+    return;
+  }
   schedSel = $('schedQueueSel').value;
   fillSchedulerFields();
 });
+for (const fid of ['sEnabled', 'sStart', 'sStop', 'schedExitDone', 'sMax', 'sPowerWhenDone']) {
+  $(fid).addEventListener('change', () => { schedDirty = true; });
+  $(fid).addEventListener('input', () => { schedDirty = true; });
+}
 $('schedNew').onclick = async () => {
   const name = $('schedNewName').value.trim();
   if (!name) { $('sStatus').textContent = 'Type a name for the new queue first'; return; }
@@ -993,7 +1583,7 @@ $('schedNew').onclick = async () => {
   settings = {
     ...settings,
     queues: [...(settings.queues || []),
-      { name, use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false }],
+      { name, use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false, power_when_done: '', max_simultaneous: 0 }],
   };
   await saveSettings();
   schedSel = name;
@@ -1003,15 +1593,29 @@ $('schedNew').onclick = async () => {
 };
 $('schedDelete').onclick = async () => {
   if (schedSel === 'Main download queue') return;
-  if (!confirm(`Delete the queue "${schedSel}"?\nIts downloads move to the Main download queue.`)) return;
+  const gone = schedSel;
+  if (!confirm(`Delete the queue "${gone}"?\nIts downloads move to the Main download queue.`)) return;
   settings = {
     ...settings,
-    queues: (settings.queues || []).filter(q => q.name !== schedSel),
+    queues: (settings.queues || []).filter(q => q.name !== gone),
   };
   await saveSettings();
   schedSel = 'Main download queue';
   openScheduler();
-  renderList();
+  // the sidebar may be filtered to the queue that just vanished —
+  // fall back to All Downloads instead of an empty phantom filter
+  if (currentCat === 'queue:' + gone) {
+    currentCat = 'All Downloads';
+    document.querySelectorAll('#queueList li').forEach(x => x.classList.remove('active'));
+    document.querySelectorAll('#catList li').forEach(x =>
+      x.classList.toggle('active', x.dataset.cat === 'All Downloads'));
+  }
+  // entries the backend moved to Main need their local queue updated
+  for (const d of items.values()) {
+    if ((d.queue || 'Main download queue') === gone) d.queue = 'Main download queue';
+  }
+  queueListSig = '';
+  render();
 };
 $('btnScheduler').onclick = openScheduler;
 $('sModalClose').onclick = $('sCancel').onclick = () => smodal.classList.add('hidden');
@@ -1041,6 +1645,8 @@ $('sSave').onclick = async () => {
         start: $('sStart').value || '22:00',
         stop: $('sStop').value || '06:00',
         exit_when_done: $('schedExitDone').checked,
+        power_when_done: $('sPowerWhenDone') ? $('sPowerWhenDone').value : (q.power_when_done || ''),
+        max_simultaneous: Math.min(10, Math.max(0, parseInt($('sMax').value, 10) || 0)),
       }
     : q);
   settings = { ...settings, queues };
@@ -1054,14 +1660,37 @@ $('sSave').onclick = async () => {
     };
   }
   await saveSettings();
+  schedDirty = false;
   $('sStatus').textContent = 'Saved';
 };
 
-/* ---------- Site Grabber modal ---------- */
+/* ---------- Site Grabber wizard (IDM's 4-step Grabber + projects) ---------- */
 const gmodal = $('gmodal');
-let grabItems = [];              // items from the last grab_page result
-const grabUnchecked = new Set(); // urls the user unchecked (items start checked)
+let grabItems = [];              // items from the last exploration
+const grabUnchecked = new Set(); // ROW INDICES the user unchecked (items start
+                                 // checked) — keyed by index, not URL: two links
+                                 // to the same URL used to share one checkbox
 const grabKindsOff = new Set();  // kinds hidden via their filter chip
+let grabStep = 1;                // 1..4 wizard steps, 5 = results
+
+const GRAB_TEMPLATES = {
+  custom: {},
+  pictures: { include: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tif', 'tiff'], depth_same: 10, whole: true },
+  audio: { include: ['mp3', 'm4a', 'm4b', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma'], depth_same: 1 },
+  video: { include: ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'wmv', 'm4v', 'ts'], depth_same: 10, whole: true },
+  all_except_pages: { exclude: ['html', 'htm', 'php', 'asp', 'aspx', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg'], depth_same: 10, whole: true },
+  all_files: { depth_same: 10, whole: true },
+  complete_page: { include: ['html', 'htm', 'js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico', 'woff', 'woff2', 'ttf'], depth_same: 0 },
+};
+const GRAB_PRESETS = {
+  images: ['gif', 'jpg', 'jpeg', 'jpe', 'bmp', 'png', 'webp', 'svg', 'ico', 'tif', 'tiff'],
+  video: ['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'wmv', 'm4v', 'ts'],
+  audio: ['mp3', 'm4a', 'm4b', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma'],
+  pdf: ['pdf'],
+  exe: ['exe', 'msi', 'deb', 'rpm', 'dmg', 'pkg', 'appimage', 'apk', 'bin', 'run'],
+  compressed: ['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz'],
+  page_assets: ['html', 'htm', 'js', 'css', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'ico'],
+};
 
 function setGrabStatus(msg, isError) {
   const st = $('gStatus');
@@ -1069,19 +1698,148 @@ function setGrabStatus(msg, isError) {
   st.classList.toggle('error', !!isError);
 }
 
+const GRAB_STEP_TITLES = {
+  1: 'Site Grabber — Step 1: Set start page',
+  2: 'Site Grabber — Step 2: Save files to',
+  3: 'Site Grabber — Step 3: Set explorer filters',
+  4: 'Site Grabber — Step 4: Set file filters',
+  5: 'Site Grabber — Exploration results',
+};
+function showGrabStep(n) {
+  grabStep = n;
+  for (const i of [1, 2, 3, 4]) $('gStep' + i).classList.toggle('hidden', n !== i);
+  $('gStepR').classList.toggle('hidden', n !== 5);
+  document.querySelectorAll('.g-step').forEach(el => {
+    el.classList.toggle('on', Number(el.dataset.step) === n);
+  });
+  $('gStepTitle').textContent = GRAB_STEP_TITLES[n];
+  $('gBack').disabled = n === 1;
+  $('gNext').classList.toggle('hidden', n >= 4);
+  $('gFetch').classList.toggle('hidden', n !== 4);
+  $('gDownload').classList.toggle('hidden', n !== 5);
+  if (n === 1) $('gUrl').focus();
+}
+$('gBack').onclick = () => showGrabStep(Math.max(1, grabStep - 1));
+$('gNext').onclick = () => {
+  if (grabStep === 1 && !$('gUrl').value.trim()) { $('gUrl').focus(); return; }
+  showGrabStep(Math.min(4, grabStep + 1));
+};
+
+function fillGrabProjects() {
+  const sel = $('gProjSel');
+  sel.innerHTML = '';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '(no saved project selected)';
+  sel.appendChild(none);
+  for (const p of settings.grab_projects || []) {
+    const o = document.createElement('option');
+    o.value = p.name;
+    o.textContent = p.name;
+    sel.appendChild(o);
+  }
+}
+function grabWizardState() {
+  const mode = (document.querySelector('input[name="gExploreMode"]:checked') || {}).value || 'levels';
+  return {
+    name: $('gProjName').value.trim(),
+    start_url: $('gUrl').value.trim(),
+    template: $('gTemplate').value,
+    save_dir: $('gDir').value.trim(),
+    use_subfolders: $('gSubfolders').checked,
+    add_as_queue: $('gAddQueue').checked,
+    depth_same: Math.min(10, Math.max(0, parseInt($('gDepthSame').value, 10) || 0)),
+    depth_other: Math.min(10, Math.max(0, parseInt($('gDepthOther').value, 10) || 0)),
+    whole_site: mode === 'whole',
+    no_parent: $('gNoParent').checked,
+    same_site_files_only: $('gSameSiteOnly').checked,
+    include_exts: $('gInclExts').value.split(/[,\s]+/).map(s => s.trim().replace(/^\./, '').toLowerCase()).filter(Boolean),
+    exclude_exts: $('gExclExts').value.split(/[,\s]+/).map(s => s.trim().replace(/^\./, '').toLowerCase()).filter(Boolean),
+    min_kb: Math.max(0, parseInt($('gMinKb').value, 10) || 0),
+    max_mb: Math.max(0, parseInt($('gMaxMb').value, 10) || 0),
+  };
+}
+function applyGrabProject(p) {
+  if (!p) return;
+  $('gProjName').value = p.name || '';
+  $('gUrl').value = p.start_url || '';
+  $('gTemplate').value = p.template || 'custom';
+  $('gDir').value = p.save_dir || settings.default_dir || '~/Downloads';
+  $('gSubfolders').checked = !!p.use_subfolders;
+  $('gAddQueue').checked = !!p.add_as_queue;
+  $('gDepthSame').value = p.depth_same != null ? p.depth_same : 1;
+  $('gDepthOther').value = p.depth_other != null ? p.depth_other : 0;
+  document.querySelectorAll('input[name="gExploreMode"]').forEach(r => {
+    r.checked = r.value === (p.whole_site ? 'whole' : 'levels');
+  });
+  $('gNoParent').checked = !!p.no_parent;
+  $('gSameSiteOnly').checked = p.same_site_files_only !== false;
+  $('gInclExts').value = (p.include_exts || []).join(', ');
+  $('gExclExts').value = (p.exclude_exts || []).join(', ');
+  $('gMinKb').value = p.min_kb || 0;
+  $('gMaxMb').value = p.max_mb || 0;
+}
+$('gProjSave').onclick = async () => {
+  const p = grabWizardState();
+  if (!p.name) { $('gProjName').focus(); toast('Give the project a name first'); return; }
+  if (!p.start_url) { $('gUrl').focus(); toast('Give the project a start page first'); return; }
+  const list = (settings.grab_projects || []).filter(x => x.name.toLowerCase() !== p.name.toLowerCase());
+  list.push(p);
+  settings = { ...settings, grab_projects: list };
+  await saveSettings();
+  fillGrabProjects();
+  $('gProjSel').value = p.name;
+  toast(`Grabber project "${p.name}" saved`);
+};
+$('gProjLoad').onclick = () => {
+  const name = $('gProjSel').value;
+  const p = (settings.grab_projects || []).find(x => x.name === name);
+  if (p) { applyGrabProject(p); toast(`Project "${name}" loaded`); }
+};
+$('gProjDelete').onclick = async () => {
+  const name = $('gProjSel').value;
+  if (!name) return;
+  settings = {
+    ...settings,
+    grab_projects: (settings.grab_projects || []).filter(x => x.name !== name),
+  };
+  await saveSettings();
+  fillGrabProjects();
+  toast(`Project "${name}" deleted`);
+};
+/* choosing a template pre-fills the filters and the explore depth,
+   exactly what IDM's template dropdown does on Step 1 */
+$('gTemplate').addEventListener('change', () => {
+  const t = GRAB_TEMPLATES[$('gTemplate').value] || {};
+  if (t.include) $('gInclExts').value = t.include.join(', ');
+  if (t.exclude) $('gExclExts').value = t.exclude.join(', ');
+  if (t.whole) {
+    document.querySelectorAll('input[name="gExploreMode"]').forEach(r => {
+      r.checked = r.value === 'whole';
+    });
+  }
+  if (t.depth_same != null) $('gDepthSame').value = t.depth_same;
+});
+$('gInclPreset').addEventListener('change', () => {
+  const list = GRAB_PRESETS[$('gInclPreset').value];
+  if (list) $('gInclExts').value = list.join(', ');
+});
+
 function openGrabber() {
   grabItems = [];
   grabUnchecked.clear();
   grabKindsOff.clear();
   $('gUrl').value = '';
+  $('gProjName').value = '';
   $('gDir').value = settings.default_dir || '~/Downloads';
   $('gFilter').value = '';
   $('gKinds').innerHTML = '';
   $('gList').innerHTML = '';
-  setGrabStatus('Enter a page URL and click Explore');
+  setGrabStatus('The exploration results will appear here');
   updateGrabCount();
+  fillGrabProjects();
+  showGrabStep(1);
   gmodal.classList.remove('hidden');
-  $('gUrl').focus();
 }
 $('btnGrabber').onclick = openGrabber;
 $('gModalClose').onclick = $('gCancel').onclick = () => gmodal.classList.add('hidden');
@@ -1094,7 +1852,7 @@ function grabVisible(it) {
 }
 
 function updateGrabCount() {
-  const sel = grabItems.filter(it => !grabUnchecked.has(it.url));
+  const sel = grabItems.filter((it, i) => !grabUnchecked.has(i));
   const vis = sel.filter(grabVisible).length;
   // the selection is global — it survives filter changes, like IDM's
   // grabber — so say plainly when part of it is filtered out of view
@@ -1127,16 +1885,16 @@ function renderGrabKinds() {
 function renderGrabList() {
   const box = $('gList');
   box.innerHTML = '';
-  for (const it of grabItems) {
+  for (const [i, it] of grabItems.entries()) {
     if (!grabVisible(it)) continue;
     const row = document.createElement('div');
     row.className = 'grab-item';
     row.title = it.url;
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.checked = !grabUnchecked.has(it.url);
+    cb.checked = !grabUnchecked.has(i);
     cb.addEventListener('change', () => {
-      if (cb.checked) grabUnchecked.delete(it.url); else grabUnchecked.add(it.url);
+      if (cb.checked) grabUnchecked.delete(i); else grabUnchecked.add(i);
       updateGrabCount();
     });
     const name = document.createElement('span');
@@ -1162,19 +1920,35 @@ function renderGrabList() {
 }
 
 async function fetchGrab() {
-  const url = $('gUrl').value.trim();
-  if (!url) { $('gUrl').focus(); return; }
+  const p = grabWizardState();
+  if (!p.start_url) { showGrabStep(1); $('gUrl').focus(); return; }
+  showGrabStep(5);
   if (!TAURI) { demoGrab(); return; }
   $('gFetch').disabled = true;
-  setGrabStatus('Loading…');
+  setGrabStatus('Exploring…');
   try {
-    const res = await invoke('grab_page', { url });
+    // struct arguments cross IPC with their serde (snake_case) field
+    // names — the same convention the Settings object already uses
+    const res = await invoke('grab_explore', {
+      args: {
+        url: p.start_url,
+        depth_same: p.depth_same,
+        depth_other: p.depth_other,
+        whole_site: p.whole_site,
+        no_parent: p.no_parent,
+        same_site_files_only: p.same_site_files_only,
+        include_exts: p.include_exts,
+        exclude_exts: p.exclude_exts,
+        min_kb: p.min_kb,
+        max_mb: p.max_mb,
+      },
+    });
     grabItems = res.items || [];
     grabUnchecked.clear();
     grabKindsOff.clear();
     renderGrabKinds();
     renderGrabList();
-    setGrabStatus(`Found ${grabItems.length} files on “${res.title || url}”`);
+    setGrabStatus(`Explored ${res.pages_visited} page${res.pages_visited === 1 ? '' : 's'} — found ${grabItems.length} files on "${res.title || p.start_url}"`);
   } catch (e) {
     setGrabStatus(String(e), true);
   } finally {
@@ -1182,28 +1956,50 @@ async function fetchGrab() {
   }
 }
 $('gFetch').onclick = fetchGrab;
-$('gUrl').addEventListener('keydown', e => { if (e.key === 'Enter') fetchGrab(); });
+$('gUrl').addEventListener('keydown', e => { if (e.key === 'Enter') showGrabStep(2); });
 $('gFilter').addEventListener('input', renderGrabList);
 
 $('gSelAll').onclick = () => {
-  for (const it of grabItems) if (grabVisible(it)) grabUnchecked.delete(it.url);
+  grabItems.forEach((it, i) => { if (grabVisible(it)) grabUnchecked.delete(i); });
   renderGrabList();
 };
 $('gSelNone').onclick = () => {
-  for (const it of grabItems) if (grabVisible(it)) grabUnchecked.add(it.url);
+  grabItems.forEach((it, i) => { if (grabVisible(it)) grabUnchecked.add(i); });
   renderGrabList();
 };
 
+/* a grabbed file keeps its place on the site when "use original
+   relative subfolders" is on: <save dir>/<the file's folders below
+   the start page's root> */
+function grabDirFor(baseDir, startUrl, itemUrl) {
+  try {
+    const u = new URL(itemUrl);
+    const parts = u.pathname.split('/').filter(Boolean);
+    parts.pop(); // the file name itself
+    if (!parts.length) return baseDir;
+    const sep = baseDir.includes('\\') && !baseDir.includes('/') ? '\\' : '/';
+    return baseDir.replace(/[/\\]+$/, '') + sep + parts.join(sep);
+  } catch (e) {
+    return baseDir;
+  }
+}
+
 $('gDownload').onclick = async () => {
-  const chosen = grabItems.filter(it => !grabUnchecked.has(it.url));
+  const chosen = grabItems.filter((it, i) => !grabUnchecked.has(i));
   if (!chosen.length) return;
   if (!TAURI) { gmodal.classList.add('hidden'); return; }
-  const dir = $('gDir').value.trim() || '~/Downloads';
+  const p = grabWizardState();
+  const baseDir = p.save_dir || '~/Downloads';
   $('gDownload').disabled = true;
   let failed = 0;
   let firstErr = '';
   for (const it of chosen) {
-    try { await invoke('add_download', { url: it.url, dir, later: false, category: 'Grabber' }); }
+    const dir = p.use_subfolders ? grabDirFor(baseDir, p.start_url, it.url) : baseDir;
+    try {
+      await invoke('add_download', {
+        url: it.url, dir, later: p.add_as_queue, category: 'Grabber',
+      });
+    }
     catch (e) { failed++; if (!firstErr) firstErr = String(e); console.error('add_download failed', it.url, e); toast('Could not add ' + it.name + ': ' + e); }
   }
   if (failed) {
@@ -1228,12 +2024,17 @@ function demoGrab() {
   grabKindsOff.clear();
   renderGrabKinds();
   renderGrabList();
-  setGrabStatus(`Found ${grabItems.length} files on “Demo Page”`);
+  setGrabStatus(`Explored 3 pages — found ${grabItems.length} files on "Demo Page"`);
 }
+
 
 /* ---------- detail tabs + completion options + speed limiter + open/refresh ---------- */
 function syncLimiterPanel() {
-  const bps = settings.speed_limit_bps || 0;
+  // IDM's Speed Limiter tab is PER DOWNLOAD — it used to read and
+  // write the GLOBAL limit, so "limiting this download" silently
+  // throttled everything (and the label disagreed with Options)
+  const d = items.get(selectedId);
+  const bps = (d && d.speed_limit) || 0;
   if ($('dLimitOn')) $('dLimitOn').checked = bps > 0;
   if ($('dLimitVal')) {
     $('dLimitVal').value = bps > 0
@@ -1257,13 +2058,34 @@ if ($('tabLimiter')) $('tabLimiter').onclick = () => showDetailTab('limiter');
 
 if ($('dLimitApply')) {
   $('dLimitApply').onclick = async () => {
+    const d = items.get(selectedId);
+    if (!d) return;
     const on = $('dLimitOn').checked;
     const valMb = Math.max(0.1, Number($('dLimitVal').value) || 1);
     const bps = on ? Math.round(valMb * 1024 * 1024) : 0;
-    settings.speed_limit_bps = bps;
-    await saveSettings();
-    toast(on ? `Speed limit set to ${valMb} MB/s` : 'Speed limiter turned off');
+    if (TAURI) {
+      try { await invoke('set_entry_limit', { id: d.id, bps }); }
+      catch (e) { toast('Could not set the limit: ' + e); return; }
+    }
+    d.speed_limit = bps;
+    toast(on ? `This download is limited to ${valMb} MB/s` : 'Per-download speed limit removed');
   };
+}
+
+/* description edits save on change (IDM's Properties field) */
+if ($('dDesc')) {
+  $('dDesc').addEventListener('change', async () => {
+    const d = items.get(selectedId);
+    if (!d) return;
+    const text = $('dDesc').value.trim();
+    if ((d.description || '') === text) return;
+    if (TAURI) {
+      try { await invoke('set_entry_description', { id: d.id, description: text }); }
+      catch (e) { toast('Could not save the description: ' + e); return; }
+    }
+    d.description = text;
+    render();
+  });
 }
 
 document.querySelectorAll('input[name="compAct"]').forEach(r => {
@@ -1324,6 +2146,12 @@ document.addEventListener('keydown', e => {
     return;
   }
   if (e.key !== 'Escape') return;
+  // menus and the context menu are the topmost layer
+  if (!ctxMenu.classList.contains('hidden')) { hideCtxMenu(); return; }
+  if ([...document.querySelectorAll('.menu-drop')].some(d => !d.classList.contains('hidden'))) {
+    closeMenus();
+    return;
+  }
   const open = [...document.querySelectorAll('.modal:not(.hidden)')]
     // a mandatory update dialog cannot be dismissed, not even by Esc
     .filter(m => !(m.id === 'umodal' && m.dataset.mandatory === '1'));
@@ -1334,6 +2162,10 @@ document.addEventListener('keydown', e => {
   // through the same close path as their Cancel buttons
   if (top.id === 'vmodal') { closeVideoModal(); return; }
   if (top.id === 'modal') { closeFileDialog(); return; }
+  // the completion dialog owns a QUEUE: hiding it directly (the old
+  // behaviour) left completeCurrent set forever, so no completion
+  // dialog ever appeared again for the rest of the session
+  if (top.id === 'cmodal') { closeComplete(null); return; }
   top.classList.add('hidden');
 });
 $('inUrl').addEventListener('keydown', e => { if (e.key === 'Enter') submitAdd(false); });
@@ -1375,6 +2207,10 @@ async function initTauri() {
   });
   await listen('components_progress', e => { onComponentsProgress(e.payload || {}); });
   await listen('update_available', e => { showUpdate(e.payload || {}); });
+  await listen('update_installed', e => {
+    const v = (e.payload && e.payload.version) || '';
+    toast(v ? `NDM ${v} is installed — restart NDM to use it.` : 'Update installed — restart NDM to use it.');
+  });
   await listen('update_progress', e => { onUpdateProgress(e.payload || {}); });
   // file downloads caught by the extension open the Add URL dialog
   await listen('incoming_file', e => {
@@ -1400,12 +2236,17 @@ function showNextComplete() {
   if (settings.show_complete_dialog === false) { completeQueue.length = 0; return; }
   completeCurrent = completeQueue.shift();
   $('cName').textContent = completeCurrent.name || 'Download';
+  if ($('cAddr')) {
+    $('cAddr').textContent = completeCurrent.url ? 'Address: ' + completeCurrent.url : '';
+  }
   $('cPath').textContent = 'Saved to: ' + (completeCurrent.path || '');
   $('cSize').textContent = completeCurrent.total
     ? 'Downloaded ' + fmtSize(completeCurrent.total) + ' (' + completeCurrent.total + ' bytes)'
     : '';
   $('cDontShow').checked = false;
   cm.classList.remove('hidden');
+  // IDM focuses Open — Enter opens the file right away
+  if ($('cOpen')) $('cOpen').focus();
 }
 async function closeComplete(openMode) {
   const cm = $('cmodal');
@@ -1418,7 +2259,12 @@ async function closeComplete(openMode) {
   }
   if (cur && openMode) {
     try { await invoke('open_path', { id: cur.id, folder: openMode === 'folder' }); }
-    catch (e) { console.error('open_path failed', e); }
+    catch (e) {
+      // a failed Open used to fail silently — the dialog closed
+      // and nothing happened, indistinguishable from success
+      console.error('open_path failed', e);
+      toast('Could not open it: ' + e);
+    }
   }
   showNextComplete();
 }
@@ -1498,11 +2344,15 @@ function demoRemove(id) { items.delete(id); if (selectedId === id) selectedId = 
 /* ---------- boot ---------- */
 setInterval(() => {
   pulse++;
+  // only repaint the segment map while its dialog is actually
+  // visible — it used to redraw a hidden canvas twice a second
+  if (detailEl.classList.contains('hidden')) return;
   const d = items.get(selectedId);
   if (d && d.status === 'downloading') drawSegMap(d.blocks || '', d.status);
 }, 500);
 window.addEventListener('resize', () => { if (selectedId) renderDetail(); });
 /* =============== 1.5: menu bar, batch, import, about, updater =============== */
+let basketShown = false;
 const umodal = $('umodal');
 let updateInfo = null;
 let updateInstalling = false;
@@ -1536,7 +2386,10 @@ async function startAllDownloads() {
   let n = 0;
   for (const d of items.values()) {
     if (d.status === 'paused' || d.status === 'error' || d.status === 'queued') {
-      try { await invoke('resume_download', { id: d.id }); n++; } catch (e) { /* keep going */ }
+      // these used to call a null invoke() in the browser demo and
+      // report "Nothing to start" while demo items sat paused
+      if (TAURI) { try { await invoke('resume_download', { id: d.id }); n++; } catch (e) { /* keep going */ } }
+      else { demoResume(d.id); n++; }
     }
   }
   toast(n ? `Started ${n} download${n > 1 ? 's' : ''}` : 'Nothing to start');
@@ -1545,7 +2398,8 @@ async function pauseAllDownloads() {
   let n = 0;
   for (const d of items.values()) {
     if (d.status === 'downloading') {
-      try { await invoke('pause_download', { id: d.id }); n++; } catch (e) { /* keep going */ }
+      if (TAURI) { try { await invoke('pause_download', { id: d.id }); n++; } catch (e) { /* keep going */ } }
+      else { demoPause(d.id); n++; }
     }
   }
   toast(n ? `Paused ${n} download${n > 1 ? 's' : ''}` : 'Nothing is downloading');
@@ -1554,7 +2408,9 @@ async function deleteCompleted() {
   const done = [...items.values()].filter(d => d.status === 'finished');
   if (!done.length) { toast('No completed downloads'); return; }
   for (const d of done) {
-    try { await invoke('remove_download', { id: d.id }); } catch (e) { continue; }
+    if (TAURI) {
+      try { await invoke('remove_download', { id: d.id }); } catch (e) { continue; }
+    }
     deletedIds.add(d.id);
     items.delete(d.id);
   }
@@ -1718,10 +2574,18 @@ const menuActions = {
   options: openOptions,
   theme: () => $('themeToggle').click(),
   sidebar: () => document.body.classList.toggle('no-side'),
+  basket: async () => {
+    if (!TAURI) { toast('The drop basket needs the NDM desktop app'); return; }
+    basketShown = !basketShown;
+    try { await invoke('set_basket_visible', { visible: basketShown }); }
+    catch (e) { basketShown = !basketShown; toast('Could not toggle the basket: ' + e); }
+  },
   'sort-name': () => { sortKey = 'name'; render(); },
   'sort-date': () => { sortKey = 'date'; render(); },
   'sort-size': () => { sortKey = 'size'; render(); },
   'sort-status': () => { sortKey = 'status'; render(); },
+  columns: () => openColumns(),
+  toolbar: () => openToolbarCfg(),
   refresh: async () => { if (TAURI) { try { const list = await invoke('list_downloads'); for (const d of list) if (!deletedIds.has(d.id)) items.set(d.id, normalize(d)); render(); } catch (e) {} } },
   update: manualUpdateCheck,
   shortcuts: () => kmodal.classList.remove('hidden'),
@@ -1735,9 +2599,10 @@ document.querySelectorAll('.menu-drop > button').forEach(b => {
   });
 });
 
-/* global shortcuts (the ones the Help dialog lists — all real) */
+/* global shortcuts (the ones the Help dialog lists — all real).
+   Escape is handled by the single stack-aware handler above —
+   there used to be a second one here racing it. */
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') closeMenus();
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement && document.activeElement.tagName || '');
   if (typing) return;
   if (e.ctrlKey && !e.shiftKey && e.key.toLowerCase() === 'n') { e.preventDefault(); $('btnAdd').click(); }
@@ -1746,4 +2611,6 @@ document.addEventListener('keydown', e => {
   else if (e.key === 'F5') { e.preventDefault(); menuActions.refresh(); }
 });
 
+applyColumns();
+applyToolbar();
 if (TAURI) initTauri(); else { loadSettings(); demoSeed(); }

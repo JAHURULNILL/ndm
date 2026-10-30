@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NDM Drop Basket</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    font-family: "Segoe UI", Roboto, Arial, sans-serif;
+    background: linear-gradient(135deg, #1f6fd0, #155a9e);
+    color: #fff; user-select: none; -webkit-user-select: none;
+  }
+  #basket {
+    height: 100%; box-sizing: border-box; padding: 10px 12px;
+    display: flex; flex-direction: column; gap: 2px;
+    border: 2px dashed rgba(255,255,255,.0); border-radius: 10px;
+    cursor: grab;
+  }
+  #basket.over { border-color: rgba(255,255,255,.85); background: rgba(255,255,255,.08); }
+  .row { display: flex; align-items: center; justify-content: space-between; }
+  .title { font-size: 15px; font-weight: 700; }
+  #close {
+    background: rgba(255,255,255,.18); color: #fff; border: none;
+    width: 20px; height: 20px; border-radius: 50%; cursor: pointer;
+    font-size: 12px; line-height: 1; padding: 0;
+  }
+  #close:hover { background: rgba(255,255,255,.35); }
+  .hint { font-size: 11px; opacity: .85; }
+  #msg { font-size: 11px; min-height: 14px; color: #d9f2df; }
+</style>
+</head>
+<body>
+  <div id="basket" data-tauri-drag-region>
+    <div class="row">
+      <span class="title">⬇ NDM Basket</span>
+      <button id="close" title="Hide the basket">×</button>
+    </div>
+    <div class="hint">Drop a download link here</div>
+    <div id="msg"></div>
+  </div>
+  <script src="basket.js"></script>
+</body>
+</html>

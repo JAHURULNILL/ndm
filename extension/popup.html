@@ -31,6 +31,12 @@
   button.main:hover:not(:disabled) { background: #1a61b8; }
   button.main:disabled { opacity: .45; cursor: default; }
   button.main.sent { background: #2e9e63; }
+  button.link {
+    width: 100%; background: none; border: none; color: #1f6fd0;
+    font-size: 12px; padding: 4px; cursor: pointer; text-align: left;
+  }
+  button.link:disabled { color: #9aa7b1; cursor: default; }
+  .sep { border-top: 1px solid #e3e9ee; margin: 10px 0 2px; }
 </style>
 </head>
 <body>
@@ -45,6 +51,15 @@
     <input type="checkbox" id="chkIntercept">
     <span>Intercept browser downloads (send files to NDM)</span>
   </label>
+
+  <div class="sep"></div>
+
+  <label class="opt">
+    <input type="checkbox" id="chkTabOff">
+    <span>Pause link interception on this tab</span>
+  </label>
+
+  <button id="btnSite" class="link" disabled>Never intercept on this site</button>
 
   <script src="popup.js"></script>
 </body>

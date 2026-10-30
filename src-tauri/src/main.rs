@@ -38,6 +38,15 @@ struct ProgressPayload {
     /// cumulative bytes per connection this session (IDM's
     /// per-connection progress table); empty for video jobs
     conns_detail: Vec<u64>,
+    /// the user's own note for this download (IDM's Description)
+    description: String,
+    /// this download's own speed limit in bytes/sec (0 = none)
+    speed_limit: u64,
+    /// where the file is saved (shown in the status dialog, IDM's
+    /// "Save To"); for videos this is the folder
+    save_to: String,
+    /// the page this download came from ("" = none)
+    referer: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -88,6 +97,14 @@ struct SavedEntry {
     login: String,
     #[serde(default)]
     password: String,
+    /// the user's own note for this download (IDM's Description,
+    /// shown in its own list column and editable in Properties)
+    #[serde(default)]
+    description: String,
+    /// this download's own speed limit in bytes/sec, 0 = none
+    /// (IDM's per-download Speed Limiter tab)
+    #[serde(default)]
+    speed_limit: u64,
 }
 
 fn default_kind() -> String {
@@ -100,6 +117,56 @@ fn default_category() -> String {
 
 fn default_status() -> String {
     "paused".to_string()
+}
+
+/// One saved server/site login (IDM's Options -> Site Logins table):
+/// when a download's address matches `site` (host, optionally with a
+/// path prefix), this login is offered automatically.
+#[derive(Clone, Serialize, Deserialize)]
+struct SiteLogin {
+    #[serde(default)]
+    site: String,
+    #[serde(default)]
+    login: String,
+    #[serde(default)]
+    password: String,
+}
+
+/// One saved Site Grabber project (IDM's Grabber projects): the whole
+/// wizard state, restorable from the Grabber dialog and listed under
+/// the sidebar's "Grabber projects".
+#[derive(Clone, Serialize, Deserialize)]
+struct GrabProject {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    start_url: String,
+    #[serde(default)]
+    template: String,
+    #[serde(default)]
+    save_dir: String,
+    #[serde(default)]
+    use_subfolders: bool,
+    #[serde(default)]
+    add_as_queue: bool,
+    #[serde(default)]
+    depth_same: u32,
+    #[serde(default)]
+    depth_other: u32,
+    #[serde(default)]
+    whole_site: bool,
+    #[serde(default)]
+    no_parent: bool,
+    #[serde(default)]
+    same_site_files_only: bool,
+    #[serde(default)]
+    include_exts: Vec<String>,
+    #[serde(default)]
+    exclude_exts: Vec<String>,
+    #[serde(default)]
+    min_kb: u64,
+    #[serde(default)]
+    max_mb: u64,
 }
 
 /// User preferences, persisted to <app data>/settings.json. Field names are
@@ -134,11 +201,65 @@ struct Settings {
     /// "socks5://host:1080"; empty = direct connection
     #[serde(default)]
     proxy: String,
+    /// IDM's Proxy/Socks tab, in full: how the proxy is chosen
+    /// ("none" | "system" | "pac" | "manual"; "" = the legacy single
+    /// `proxy` field above, migrated by sanitize). `proxy` itself is
+    /// kept as the EFFECTIVE proxy URL the engine consumes, recomputed
+    /// by sanitize() from these fields on every load and save.
+    #[serde(default)]
+    proxy_mode: String,
+    #[serde(default)]
+    proxy_scheme: String,
+    #[serde(default)]
+    proxy_host: String,
+    #[serde(default)]
+    proxy_port: u16,
+    #[serde(default)]
+    proxy_user: String,
+    #[serde(default)]
+    proxy_pass: String,
+    #[serde(default = "def_true")]
+    proxy_http: bool,
+    #[serde(default = "def_true")]
+    proxy_https: bool,
+    #[serde(default = "def_true")]
+    proxy_ftp: bool,
+    #[serde(default)]
+    proxy_pac_url: String,
+    /// use the system (browser-environment) proxy as a one-time
+    /// fallback when a browser-caught download cannot even be probed
+    /// (IDM's "Use proxy/socks from a browser's request if there are
+    /// download errors for the downloads intercepted from the browser")
+    #[serde(default)]
+    proxy_from_browser_on_error: bool,
+    /// Options -> Site Logins: saved logins, applied automatically to
+    /// downloads whose address matches (see site_login_for)
+    #[serde(default)]
+    site_logins: Vec<SiteLogin>,
+    /// what the computer does when all downloads finish (IDM's
+    /// Scheduler "Turn off computer when done"): "" | "shutdown" |
+    /// "restart" | "sleep" | "hibernate" | "logoff"
+    #[serde(default)]
+    power_when_done: String,
+    /// force running programs to close with the power action
+    #[serde(default)]
+    power_force: bool,
+    /// saved Site Grabber projects (managed from the Grabber wizard)
+    #[serde(default)]
+    grab_projects: Vec<GrabProject>,
     /// IDM-style category routing: category name → its own default
     /// folder. Applies when a download is headed for the ordinary
     /// default folder; an explicitly chosen folder always wins.
     #[serde(default)]
     category_dirs: std::collections::HashMap<String, String>,
+    /// user-edited category rules (Options → Categories): category
+    /// name → the extensions that belong to it. An extension listed
+    /// here wins over the built-in table in `category_for`; empty =
+    /// built-in table only. The browser extension keeps its own
+    /// built-in copy (it cannot read app settings), so this steers
+    /// the app's own classification and probing.
+    #[serde(default)]
+    category_exts: std::collections::HashMap<String, Vec<String>>,
     /// IDM-style per-server connection exceptions, one per line as
     /// "host-or-*.domain = max-connections" (see conns_for_url).
     #[serde(default)]
@@ -167,8 +288,12 @@ struct Settings {
     #[serde(default = "def_quota_hours")]
     quota_hours: u64,
     /// watch the clipboard for download links and offer them in the
-    /// Add URL dialog (IDM's clipboard monitoring)
-    #[serde(default = "def_true")]
+    /// Add URL dialog (IDM's clipboard monitoring). IDM's equivalent
+    /// option is OFF by default — clipboard capture is opt-in, so a
+    /// fresh install does not raise the app over the user's work on
+    /// every copied link. A value already saved by the user (either
+    /// way) is always respected.
+    #[serde(default)]
     clipboard_monitor: bool,
 }
 
@@ -198,6 +323,10 @@ fn main_queue_name() -> String {
 /// carry its own daily window and exit-when-done action.
 #[derive(Clone, Serialize, Deserialize)]
 struct QueueCfg {
+    // a queue object missing its name used to fail the WHOLE
+    // settings parse and silently factory-reset every preference —
+    // it now just becomes the Main queue
+    #[serde(default = "main_queue_name")]
     name: String,
     #[serde(default)]
     use_schedule: bool,
@@ -207,6 +336,15 @@ struct QueueCfg {
     stop: String,
     #[serde(default)]
     exit_when_done: bool,
+    /// this queue's own "turn off computer when done" action
+    /// ("" = fall back to the global Options power setting)
+    #[serde(default)]
+    power_when_done: String,
+    /// this queue's own simultaneous-download cap (IDM's Scheduler
+    /// "Max simultaneous downloads" is per queue); 0 = fall back to
+    /// the global Options value
+    #[serde(default)]
+    max_simultaneous: usize,
 }
 
 impl Default for QueueCfg {
@@ -217,6 +355,8 @@ impl Default for QueueCfg {
             start: def_sched_start(),
             stop: def_sched_stop(),
             exit_when_done: false,
+            power_when_done: String::new(),
+            max_simultaneous: 0,
         }
     }
 }
@@ -245,7 +385,23 @@ impl Default for Settings {
             auto_update: true,
             install_counted: false,
             proxy: String::new(),
+            proxy_mode: String::new(),
+            proxy_scheme: String::new(),
+            proxy_host: String::new(),
+            proxy_port: 0,
+            proxy_user: String::new(),
+            proxy_pass: String::new(),
+            proxy_http: true,
+            proxy_https: true,
+            proxy_ftp: true,
+            proxy_pac_url: String::new(),
+            proxy_from_browser_on_error: false,
+            site_logins: Vec::new(),
+            power_when_done: String::new(),
+            power_force: false,
+            grab_projects: Vec::new(),
             category_dirs: std::collections::HashMap::new(),
+            category_exts: std::collections::HashMap::new(),
             conn_exceptions: Vec::new(),
             exit_when_done: false,
             sound_events: true,
@@ -253,7 +409,7 @@ impl Default for Settings {
             queues: vec![QueueCfg::default()],
             quota_mb: 0,
             quota_hours: def_quota_hours(),
-            clipboard_monitor: true,
+            clipboard_monitor: false,
         }
     }
 }
@@ -274,10 +430,65 @@ impl Settings {
             self.video_quality = def_vq();
         }
         self.proxy = self.proxy.trim().to_string();
+        self.sanitize_proxy();
+        // site logins: trimmed, host required, no exact duplicates
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.site_logins.retain(|l| {
+                let site = l.site.trim().to_lowercase();
+                !site.is_empty()
+                    && !l.login.trim().is_empty()
+                    && seen.insert(format!("{site}|{}", l.login.trim().to_lowercase()))
+            });
+            for l in &mut self.site_logins {
+                l.site = l.site.trim().to_string();
+                l.login = l.login.trim().to_string();
+            }
+        }
+        // the global power action must be one of the known actions
+        if !POWER_ACTIONS.contains(&self.power_when_done.as_str()) {
+            self.power_when_done = String::new();
+        }
+        for q in &mut self.queues {
+            if !POWER_ACTIONS.contains(&q.power_when_done.as_str()) {
+                q.power_when_done = String::new();
+            }
+        }
+        // grabber projects: named, addressed, depths clamped, unique names
+        {
+            let mut seen = std::collections::HashSet::new();
+            self.grab_projects.retain(|p| {
+                !p.name.trim().is_empty()
+                    && !p.start_url.trim().is_empty()
+                    && seen.insert(p.name.trim().to_lowercase())
+            });
+            for p in &mut self.grab_projects {
+                p.name = p.name.trim().to_string();
+                p.start_url = p.start_url.trim().to_string();
+                p.depth_same = p.depth_same.min(10);
+                p.depth_other = p.depth_other.min(10);
+            }
+        }
         self.category_dirs = self
             .category_dirs
             .drain()
             .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+            .collect();
+        // category rules: normalize extensions (lowercase, no dots,
+        // no blanks, no duplicates within a category)
+        self.category_exts = self
+            .category_exts
+            .drain()
+            .map(|(k, v)| {
+                let mut seen = std::collections::HashSet::new();
+                let exts: Vec<String> = v
+                    .iter()
+                    .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|e| !e.is_empty() && seen.insert(e.clone()))
+                    .collect();
+                (k.trim().to_string(), exts)
+            })
             .filter(|(k, v)| !k.is_empty() && !v.is_empty())
             .collect();
         self.conn_exceptions = self
@@ -296,6 +507,8 @@ impl Settings {
                 start: self.sched_start.clone(),
                 stop: self.sched_stop.clone(),
                 exit_when_done: false,
+                power_when_done: String::new(),
+                max_simultaneous: 0,
             });
         }
         let mut seen = std::collections::HashSet::new();
@@ -310,6 +523,7 @@ impl Settings {
             q.name = q.name.trim().to_string();
             q.start = normalize_hhmm(&q.start, def_sched_start());
             q.stop = normalize_hhmm(&q.stop, def_sched_stop());
+            q.max_simultaneous = q.max_simultaneous.min(10);
         }
         // keep the legacy global fields mirroring Main, so any reader
         // that still consults them stays consistent
@@ -321,6 +535,255 @@ impl Settings {
         if self.quota_hours == 0 {
             self.quota_hours = def_quota_hours();
         }
+        // unchecked quota arithmetic on hand-edited values could
+        // overflow and make the limit behave randomly — clamp to
+        // sane bounds (1 TB per window, at most a week per window)
+        self.quota_mb = self.quota_mb.min(1_000_000);
+        self.quota_hours = self.quota_hours.min(24 * 7);
+    }
+}
+
+const POWER_ACTIONS: [&str; 6] = ["", "shutdown", "restart", "sleep", "hibernate", "logoff"];
+
+/// Percent-encode the characters that would break a proxy URL's
+/// userinfo part (a password containing "@" must not move the host).
+fn pct_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Parse "scheme://[user[:pass]@]host[:port]" into the manual fields.
+fn parse_proxy_url(url: &str) -> Option<(String, String, u16, String, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (userinfo, hostport) = match rest.rsplit_once('@') {
+        Some((u, h)) => (Some(u), h),
+        None => (None, rest),
+    };
+    let hostport = hostport.split('/').next().unwrap_or("");
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().unwrap_or(0)),
+        None => (hostport, 0),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let (user, pass) = match userinfo {
+        Some(u) => match u.split_once(':') {
+            Some((a, b)) => (a.to_string(), b.to_string()),
+            None => (u.to_string(), String::new()),
+        },
+        None => (String::new(), String::new()),
+    };
+    Some((scheme.to_string(), host.to_string(), port, user, pass))
+}
+
+/// The system proxy as the desktop environment reports it: the
+/// standard proxy environment variables (what browsers launched from
+/// the same session inherit, and what ureq itself honours).
+fn system_proxy_url() -> String {
+    for key in ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    String::new()
+}
+
+impl Settings {
+    /// Recompute the effective `proxy` from the Proxy-tab fields and
+    /// normalize those fields (legacy migration included): a settings
+    /// file written before the full Proxy tab existed carries only the
+    /// single `proxy` string — that becomes a manual configuration.
+    fn sanitize_proxy(&mut self) {
+        let mode = self.proxy_mode.trim().to_ascii_lowercase();
+        match mode.as_str() {
+            "" => {
+                if !self.proxy.is_empty() {
+                    if let Some((scheme, host, port, user, pass)) = parse_proxy_url(&self.proxy) {
+                        self.proxy_mode = "manual".to_string();
+                        self.proxy_scheme = scheme;
+                        self.proxy_host = host;
+                        self.proxy_port = port;
+                        self.proxy_user = user;
+                        self.proxy_pass = pass;
+                    }
+                }
+            }
+            "none" => {
+                self.proxy = String::new();
+                self.proxy_mode = "none".to_string();
+            }
+            "system" => {
+                self.proxy = system_proxy_url();
+                self.proxy_mode = "system".to_string();
+            }
+            "pac" => {
+                self.proxy_pac_url = self.proxy_pac_url.trim().to_string();
+                self.proxy = ndm::resolve_pac_proxy(&self.proxy_pac_url);
+                self.proxy_mode = "pac".to_string();
+            }
+            "manual" => {
+                let scheme = if self.proxy_scheme.trim().is_empty() {
+                    "http".to_string()
+                } else {
+                    self.proxy_scheme.trim().to_ascii_lowercase()
+                };
+                self.proxy_scheme = scheme.clone();
+                self.proxy_host = self.proxy_host.trim().to_string();
+                if self.proxy_host.is_empty() {
+                    self.proxy = String::new();
+                } else {
+                    let auth = if self.proxy_user.is_empty() {
+                        String::new()
+                    } else if self.proxy_pass.is_empty() {
+                        format!("{}@", pct_encode_userinfo(&self.proxy_user))
+                    } else {
+                        format!(
+                            "{}:{}@",
+                            pct_encode_userinfo(&self.proxy_user),
+                            pct_encode_userinfo(&self.proxy_pass)
+                        )
+                    };
+                    let port = if self.proxy_port > 0 {
+                        format!(":{}", self.proxy_port)
+                    } else {
+                        String::new()
+                    };
+                    self.proxy = format!("{scheme}://{auth}{}{port}", self.proxy_host);
+                }
+                self.proxy_mode = "manual".to_string();
+            }
+            _ => {
+                self.proxy_mode = "none".to_string();
+                self.proxy = String::new();
+            }
+        }
+    }
+}
+
+/// The saved login that applies to `url`, if any (IDM's Site Logins):
+/// the site field is a host, optionally with a path prefix; the
+/// longest matching site wins, so a deeper path can override a
+/// host-wide login.
+fn site_login_for(s: &Settings, url: &str) -> Option<(String, String)> {
+    let after = url.split("://").nth(1).unwrap_or("");
+    let (host, path) = match after.find('/') {
+        Some(i) => (
+            after[..i].to_ascii_lowercase(),
+            after[i..].split(['?', '#']).next().unwrap_or("").to_string(),
+        ),
+        None => (after.to_ascii_lowercase(), "/".to_string()),
+    };
+    let mut best: Option<(&SiteLogin, usize)> = None;
+    for l in &s.site_logins {
+        let site = l
+            .site
+            .trim()
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_ascii_lowercase();
+        let (shost, spath) = match site.find('/') {
+            Some(i) => (&site[..i], &site[i..]),
+            None => (site.as_str(), ""),
+        };
+        if shost != host {
+            continue;
+        }
+        if !spath.is_empty() && spath != "/" && !path.starts_with(spath) {
+            continue;
+        }
+        let score = site.len();
+        if best.map(|(_, sc)| score > sc).unwrap_or(true) {
+            best = Some((l, score));
+        }
+    }
+    best.map(|(l, _)| (l.login.clone(), l.password.clone()))
+}
+
+/// Run one "turn off computer when done" power action. The
+/// NDM_POWER_DRY_RUN environment variable (a file path) turns the
+/// action into a marker write instead of a real power call — the
+/// test harness uses it, and it doubles as a safety valve.
+fn do_power_action(action: &str, force: bool) -> bool {
+    if !POWER_ACTIONS.contains(&action) || action.is_empty() {
+        return false;
+    }
+    if let Ok(marker) = std::env::var("NDM_POWER_DRY_RUN") {
+        if !marker.is_empty() {
+            let _ = std::fs::write(&marker, format!("{action} force={force}"));
+            return true;
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("shutdown");
+        match action {
+            "shutdown" => {
+                cmd.args(["/s", "/t", "5"]);
+                if force {
+                    cmd.arg("/f");
+                }
+            }
+            "restart" => {
+                cmd.args(["/r", "/t", "5"]);
+                if force {
+                    cmd.arg("/f");
+                }
+            }
+            "logoff" => {
+                cmd.args(["/l"]);
+                if force {
+                    cmd.arg("/f");
+                }
+            }
+            "sleep" | "hibernate" => {
+                let hib = if action == "hibernate" { "1" } else { "0" };
+                cmd = std::process::Command::new("rundll32.exe");
+                cmd.args(["powrprof.dll,SetSuspendState", hib, "1", "0"]);
+            }
+            _ => return false,
+        }
+        return cmd.spawn().is_ok();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (prog, args): (&str, Vec<&str>) = match action {
+            "shutdown" => ("systemctl", vec!["poweroff"]),
+            "restart" => ("systemctl", vec!["reboot"]),
+            "sleep" => ("systemctl", vec!["suspend"]),
+            "hibernate" => ("systemctl", vec!["hibernate"]),
+            "logoff" => ("loginctl", vec!["terminate-session", "self"]),
+            _ => return false,
+        };
+        let mut cmd = std::process::Command::new(prog);
+        cmd.args(&args);
+        if force && action != "logoff" {
+            cmd.arg("--force");
+        }
+        if cmd.spawn().is_ok() {
+            return true;
+        }
+        // fallbacks for systems without systemd session control
+        let fallback: (&str, Vec<&str>) = match action {
+            "shutdown" => ("shutdown", vec!["-h", "now"]),
+            "restart" => ("shutdown", vec!["-r", "now"]),
+            "logoff" => ("gnome-session-quit", vec!["--logout", "--no-prompt"]),
+            _ => return false,
+        };
+        let mut cmd2 = std::process::Command::new(fallback.0);
+        cmd2.args(&fallback.1);
+        cmd2.spawn().is_ok()
     }
 }
 
@@ -520,24 +983,43 @@ fn load_settings(state: &AppState) {
         return;
     }
     if let Ok(raw) = std::fs::read(&path) {
-        if let Ok(mut s) = serde_json::from_slice::<Settings>(&raw) {
+        let parsed = serde_json::from_slice::<Settings>(&raw).ok().or_else(|| {
+            // tolerant second pass: one malformed element inside the
+            // queues array must not discard EVERY preference (the
+            // downloads store already parses per-record; settings now
+            // gets the same mercy — keep the queues that do parse)
+            let mut v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+            if let Some(arr) = v.get_mut("queues").and_then(|q| q.as_array_mut()) {
+                arr.retain(|el| serde_json::from_value::<QueueCfg>(el.clone()).is_ok());
+            }
+            serde_json::from_value::<Settings>(v).ok()
+        });
+        if let Some(mut s) = parsed {
             s.sanitize();
             ndm::set_global_limit(s.speed_limit_bps);
             ndm::set_global_connections(s.max_connections);
             ndm::set_global_proxy(&s.proxy);
+            ndm::set_proxy_protocols(s.proxy_http, s.proxy_https, s.proxy_ftp);
             *state.settings.lock().unwrap() = s;
         }
     }
 }
 
 fn save_settings(state: &AppState) {
+    // Unlike persist (serialized by save_lock), this writer had NO
+    // lock: the UI's set_settings and the 12 s install-count thread
+    // write the same shared .tmp path concurrently, and one side can
+    // rename the other's half-written file — the next load then fails
+    // and silently reverts every preference to defaults.
+    static SETTINGS_SAVE_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = SETTINGS_SAVE_LOCK.lock().unwrap();
     let path = state.settings_file.lock().unwrap().clone();
     if path.as_os_str().is_empty() {
         return;
     }
     let settings = current_settings(state);
     let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = std::fs::File::create(&tmp) {
+    if let Ok(mut f) = create_private(&tmp) {
         use std::io::Write;
         if serde_json::to_writer(&mut f, &settings).is_ok() && f.flush().is_ok() {
             let _ = std::fs::rename(&tmp, &path);
@@ -579,6 +1061,11 @@ struct Entry {
     emitting: AtomicBool,
     /// the engine is starting (probe in flight) — counts against the cap
     starting: AtomicBool,
+    /// a simultaneous-cap slot was reserved for this entry's pending
+    /// start (closes the check-then-start race between concurrent
+    /// adds: the reservation is visible to other cap checks before
+    /// start_engine's own claim runs)
+    slot_preclaimed: AtomicBool,
     /// the entry was removed; its emit loop must stop at the next tick
     removed: AtomicBool,
     /// pause was pressed while the start probe was still in flight:
@@ -591,6 +1078,10 @@ struct Entry {
     queue: Mutex<String>,
     /// "Use authorization" credentials for this download ("" = none)
     login: String,
+    /// the user's own note for this download (IDM's Description)
+    description: Mutex<String>,
+    /// this download's own speed limit in bytes/sec, 0 = none
+    speed_limit: Mutex<u64>,
     password: String,
 }
 
@@ -611,6 +1102,11 @@ struct AppState {
     /// download-quota bookkeeping: (done-bytes baseline at the window
     /// start, window start epoch seconds, warning already shown)
     quota_state: Mutex<(u64, i64, bool)>,
+    /// bytes downloaded this window by entries that have since been
+    /// REMOVED from the list — the quota meter is total traffic in
+    /// the window, so deleting entries must not refund the budget
+    /// (IDM meters traffic, not list contents)
+    quota_removed: Mutex<u64>,
     /// where quota.json lives (next to downloads.json)
     quota_file: Mutex<PathBuf>,
     /// video links from the extension that arrived before the webview
@@ -675,14 +1171,31 @@ fn category_for(name: &str) -> &'static str {
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "zst" | "tgz" | "tbz2" | "txz" => {
             "Compressed"
         }
-        "exe" | "msi" | "deb" | "rpm" | "dmg" | "pkg" | "appimage" | "apk" | "bin" | "iso"
-        | "img" | "flatpakref" => "Programs",
+        "exe" | "msi" | "msix" | "msixbundle" | "deb" | "rpm" | "dmg" | "pkg" | "appimage" | "apk"
+        | "bin" | "run" | "cab" | "jar" | "war" | "vmdk" | "qcow2" | "vdi" | "iso" | "img"
+        | "flatpakref" => "Programs",
         "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "wmv" | "m4v" | "ts" => "Video",
-        "mp3" | "m4a" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" => "Music",
+        "mp3" | "m4a" | "m4b" | "flac" | "wav" | "ogg" | "opus" | "aac" | "wma" => "Music",
         "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "txt" | "md" | "csv"
-        | "epub" | "mobi" => "Documents",
+        | "rtf" | "epub" | "mobi" => "Documents",
         _ => "General",
     }
+}
+
+/// Settings-aware classification: an extension the user assigned to
+/// a category in Options wins over the built-in table.
+fn category_for_with(name: &str, s: &Settings) -> String {
+    if !s.category_exts.is_empty() {
+        let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+        if !ext.is_empty() {
+            for (cat, exts) in &s.category_exts {
+                if exts.iter().any(|e| e == &ext) {
+                    return cat.clone();
+                }
+            }
+        }
+    }
+    category_for(name).to_string()
 }
 
 fn file_name_for(url: &str) -> String {
@@ -789,6 +1302,10 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             error: p.error.clone().unwrap_or_default(),
             queue: entry_queue(entry),
             conns_detail: Vec::new(),
+            description: entry.description.lock().unwrap().clone(),
+            speed_limit: *entry.speed_limit.lock().unwrap(),
+            save_to: entry.out_path.to_string_lossy().to_string(),
+            referer: entry.referer.clone(),
         };
     }
     let (total, done_bytes, rate, conns, status, blocks, resumable, error_text, conns_detail) =
@@ -866,14 +1383,48 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         error: error_text,
         queue: entry_queue(entry),
         conns_detail,
+        description: entry.description.lock().unwrap().clone(),
+        speed_limit: *entry.speed_limit.lock().unwrap(),
+        save_to: entry.out_path.to_string_lossy().to_string(),
+        referer: entry.referer.clone(),
     }
 }
 
 /// Snapshot the whole list to disk (write-then-rename, crash-safe).
+/// Create a temp file for an atomic rename-write with owner-only
+/// permissions on Unix: downloads.json now holds saved site
+/// passwords, so the stores are not world-readable (the session
+/// cookie files already use 0600 for the same reason).
+fn create_private(tmp: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(tmp)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::create(tmp)
+    }
+}
+
+/// Set when downloads.json's top level was unparseable at startup
+/// and the original was quarantined: persist must then never write
+/// an EMPTY list over the (new) file, or the quarantine is the only
+/// copy of the user's history and the app looks factory-fresh.
+static DOWNLOADS_CORRUPT: AtomicBool = AtomicBool::new(false);
+
 fn persist(state: &AppState) {
     let _guard = state.save_lock.lock().unwrap();
     let path = state.data_file.lock().unwrap().clone();
     if path.as_os_str().is_empty() {
+        return;
+    }
+    if DOWNLOADS_CORRUPT.load(Ordering::Relaxed) && state.entries.lock().unwrap().is_empty() {
         return;
     }
     let order = state.order.lock().unwrap().clone();
@@ -906,11 +1457,13 @@ fn persist(state: &AppState) {
                 queue: entry_queue(&e),
                 login: e.login.clone(),
                 password: e.password.clone(),
+                description: e.description.lock().unwrap().clone(),
+                speed_limit: *e.speed_limit.lock().unwrap(),
             }
         })
         .collect();
     let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = std::fs::File::create(&tmp) {
+    if let Ok(mut f) = create_private(&tmp) {
         use std::io::Write;
         if serde_json::to_writer(&mut f, &saved).is_ok() && f.flush().is_ok() {
             let _ = std::fs::rename(&tmp, &path);
@@ -1060,6 +1613,11 @@ fn error_is_permanent(error: &str) -> bool {
     error.contains("Unsupported URL")
         || error.contains("HTTP Error 404")
         || error.contains("HTTP Error 410")
+        // the engine's own wording for the same dead links (probe
+        // and block-fetch failures) — a gone file must not burn the
+        // whole retry budget either
+        || error.contains("status code 404")
+        || error.contains("status code 410")
         || error.contains("no playable video stream")
         || error.contains("required update")
 }
@@ -1082,14 +1640,36 @@ fn register_retry(state: &AppState, entry: &Entry) {
 }
 
 /// Total bytes recorded as downloaded across all entries right now.
+/// Snapshots the entry list first: payload_of calls into engine code,
+/// and holding the central entries lock across it stalls every other
+/// path (and would poison the central lock if engine code panicked).
 fn total_done_bytes(state: &AppState) -> u64 {
-    state
+    let entries: Vec<Arc<Entry>> = state
         .entries
         .lock()
         .unwrap()
         .values()
-        .map(|e| payload_of(e).done_bytes)
-        .sum()
+        .cloned()
+        .collect();
+    entries.iter().map(|e| payload_of(e).done_bytes).sum()
+}
+
+/// The quota meter: ALL bytes downloaded in the window — entries
+/// still in the list plus entries removed mid-window (their bytes
+/// move into quota_removed at removal time, so deleting a finished
+/// entry never refunds the budget).
+fn quota_meter(state: &AppState) -> u64 {
+    total_done_bytes(state) + *state.quota_removed.lock().unwrap()
+}
+
+/// Record an entry's downloaded bytes into the removed-bytes meter
+/// just before it leaves the list (see quota_meter).
+fn quota_note_removed(state: &AppState, entry: &Entry) {
+    let done = payload_of(entry).done_bytes;
+    if done > 0 {
+        *state.quota_removed.lock().unwrap() += done;
+        save_quota(state);
+    }
 }
 
 fn save_quota(state: &AppState) {
@@ -1097,11 +1677,24 @@ fn save_quota(state: &AppState) {
     if path.as_os_str().is_empty() {
         return;
     }
-    let q = state.quota_state.lock().unwrap();
-    let _ = std::fs::write(
-        &path,
-        serde_json::json!({ "baseline": q.0, "start": q.1 }).to_string(),
-    );
+    let (baseline, start, warned) = *state.quota_state.lock().unwrap();
+    let removed = *state.quota_removed.lock().unwrap();
+    // tmp+rename like the other stores: a bare write torn by a crash
+    // used to silently reset the whole window's accounting
+    let tmp = path.with_extension("json.tmp");
+    let body = serde_json::json!({
+        "baseline": baseline,
+        "removed": removed,
+        "start": start,
+        "warned": warned,
+    })
+    .to_string();
+    if let Ok(mut f) = create_private(&tmp) {
+        use std::io::Write;
+        if f.write_all(body.as_bytes()).is_ok() && f.flush().is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
 }
 
 fn load_quota(state: &AppState) {
@@ -1114,7 +1707,10 @@ fn load_quota(state: &AppState) {
             let baseline = v["baseline"].as_u64().unwrap_or(0);
             let start = v["start"].as_i64().unwrap_or(0);
             if start > 0 {
-                *state.quota_state.lock().unwrap() = (baseline, start, false);
+                let warned = v["warned"].as_bool().unwrap_or(false);
+                *state.quota_state.lock().unwrap() = (baseline, start, warned);
+                *state.quota_removed.lock().unwrap() =
+                    v["removed"].as_u64().unwrap_or(0);
             }
         }
     }
@@ -1131,15 +1727,16 @@ fn quota_blocks(state: &AppState) -> bool {
     let now = chrono::Utc::now().timestamp();
     let expired = {
         let q = state.quota_state.lock().unwrap();
-        q.1 == 0 || now - q.1 >= (s.quota_hours as i64) * 3600
+        q.1 == 0 || now - q.1 >= (s.quota_hours as i64).saturating_mul(3600)
     };
     if expired {
-        *state.quota_state.lock().unwrap() = (total_done_bytes(state), now, false);
+        *state.quota_state.lock().unwrap() = (quota_meter(state), now, false);
         save_quota(state);
         return false;
     }
     let baseline = state.quota_state.lock().unwrap().0;
-    total_done_bytes(state).saturating_sub(baseline) >= s.quota_mb * 1024 * 1024
+    quota_meter(state).saturating_sub(baseline)
+        >= (s.quota_mb as u64).saturating_mul(1024 * 1024)
 }
 
 /// IDM's "Exit when done": when it is on (globally, or on the queue
@@ -1147,10 +1744,25 @@ fn quota_blocks(state: &AppState) -> bool {
 /// nothing is active or queued anymore, the app closes itself.
 fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str) {
     let s = current_settings(state);
-    if !s.exit_when_done && !queue_cfg(&s, finished_queue).exit_when_done {
+    // "Turn off computer when done" (the queue's own action wins over
+    // the global one) shares the exit-when-done trigger conditions:
+    // downloads ran, nothing is active, queued or awaiting retry
+    let qcfg = queue_cfg(&s, finished_queue);
+    let power = if !qcfg.power_when_done.is_empty() {
+        qcfg.power_when_done.clone()
+    } else {
+        s.power_when_done.clone()
+    };
+    if power.is_empty() && !s.exit_when_done && !qcfg.exit_when_done {
         return;
     }
     if !state.had_active.load(Ordering::Relaxed) {
+        return;
+    }
+    // a failed download awaiting its automatic retry is unfinished
+    // queue work, not "done": the app used to close itself over a
+    // pending retry (and over a user's cancel of the last file)
+    if !state.retries.lock().unwrap().is_empty() {
         return;
     }
     if count_active(state) > 0 {
@@ -1163,6 +1775,17 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
         .values()
         .any(|e| e.queued.load(Ordering::Relaxed));
     if !any_queued {
+        if !power.is_empty() {
+            // a dry-run (test/safety valve) writes its marker but
+            // must not then exit as if the machine were going down
+            let dry = std::env::var("NDM_POWER_DRY_RUN")
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            do_power_action(&power, s.power_force);
+            if dry {
+                return;
+            }
+        }
         app.exit(0);
     }
 }
@@ -1170,6 +1793,19 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
 /// The per-download "Options on completion" action, run once at finish.
 fn run_completion_action(entry: &Entry) {
     let action = entry.completion.lock().unwrap().clone();
+    // IDM's "Options on completion" also offers turning the computer
+    // off (or restarting it) when this download finishes
+    match action.as_str() {
+        "turn_off_pc" => {
+            do_power_action("shutdown", false);
+            return;
+        }
+        "restart_pc" => {
+            do_power_action("restart", false);
+            return;
+        }
+        _ => {}
+    }
     let target = match action.as_str() {
         "open_file" => {
             if entry.kind == "video" {
@@ -1237,6 +1873,7 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                             serde_json::json!({
                                 "id": entry.id,
                                 "name": entry.name,
+                                "url": entry.url,
                                 "path": done_path.to_string_lossy(),
                                 "total": total_now,
                             }),
@@ -1279,7 +1916,7 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                     }
                 }
             }
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(200));
         }
         entry.emitting.store(false, Ordering::SeqCst);
     });
@@ -1314,12 +1951,15 @@ fn swap_live(
         sample: Mutex::new((Instant::now(), done0, 0.0)),
         emitting: AtomicBool::new(false),
         starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(stub.completion.lock().unwrap().clone()),
         queue: Mutex::new(entry_queue(&stub)),
         login: stub.login.clone(),
         password: stub.password.clone(),
+        description: Mutex::new(stub.description.lock().unwrap().clone()),
+        speed_limit: Mutex::new(*stub.speed_limit.lock().unwrap()),
     });
     // re-verify under the SAME lock that inserts: a remove landing in
     // the gap after start_engine's own check must not leave a live
@@ -1370,8 +2010,11 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
     // the probe inside ndm::start can take seconds; the entry must count
     // against the simultaneous cap from this moment, not from first bytes.
     // The claim is atomic: two starts for one stub (double resume, pump
-    // racing a manual resume) must not probe and spawn in parallel
-    if stub.starting.swap(true, Ordering::SeqCst) {
+    // racing a manual resume) must not probe and spawn in parallel. A
+    // cap-slot reservation made by the add path (slot_preclaimed) is
+    // adopted instead of treated as a rival claim.
+    let preclaimed = stub.slot_preclaimed.swap(false, Ordering::SeqCst);
+    if stub.starting.swap(true, Ordering::SeqCst) && !preclaimed {
         return Err("the download is already starting".to_string());
     }
     let dl = match tauri::async_runtime::spawn_blocking(move || {
@@ -1431,6 +2074,13 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
     if stub.pause_requested.swap(false, Ordering::SeqCst) {
         if let Some(d) = &live.download {
             d.control.pause();
+        }
+    }
+    // the entry's own speed limit (IDM's per-download limiter tab)
+    let own_limit = *stub.speed_limit.lock().unwrap();
+    if own_limit > 0 {
+        if let Some(d) = &live.download {
+            d.set_limit(own_limit);
         }
     }
     spawn_emit_loop(app, live.clone());
@@ -1498,7 +2148,13 @@ fn unique_out_path(state: &AppState, dir: &Path, name: &str) -> (String, PathBuf
             return (candidate, p);
         }
     }
-    (name.to_string(), first)
+    // 1,000 collisions: the old fallthrough returned the TAKEN first
+    // path, putting two entries on one output file and one engine
+    // state file. A timestamped name preserves the invariant.
+    let stamp = chrono::Utc::now().timestamp_millis();
+    let candidate = format!("{stem}-{stamp}{ext}");
+    let p = dir.join(&candidate);
+    (candidate, p)
 }
 
 /// Register a not-yet-started HTTP download in the list; returns its stub.
@@ -1533,9 +2189,18 @@ fn cookie_header_from_netscape(text: &str) -> Option<String> {
 /// use this to ask — or, on the silent browser path, to point at the
 /// entry that is already there instead of starting a second copy.
 fn find_active_duplicate(state: &AppState, kind: &str, url: &str) -> Option<String> {
-    let entries = state.entries.lock().unwrap();
-    entries
+    // snapshot first, then compute payloads unlocked (payload_of
+    // calls into engine code; holding the central lock across it
+    // stalls — and could poison — every other path)
+    let entries: Vec<Arc<Entry>> = state
+        .entries
+        .lock()
+        .unwrap()
         .values()
+        .cloned()
+        .collect();
+    entries
+        .iter()
         .find(|e| {
             e.kind == kind
                 && e.url == url
@@ -1565,9 +2230,27 @@ fn register_http_stub(
         .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).trim().to_string())
         .filter(|n| !n.is_empty() && n != "." && n != "..")
         .unwrap_or_else(|| file_name_for(url));
+    // a saved Site Login for this address applies automatically when
+    // the caller supplied no credentials of its own — centrally, here,
+    // so EVERY registration path (dialog, silent browser catch,
+    // grabber, batch) behaves the same, like IDM
+    let owned_login: String;
+    let owned_pass: String;
+    let (login, password) = if login.is_empty() {
+        match site_login_for(&current_settings(state), url) {
+            Some((l, p)) => {
+                owned_login = l;
+                owned_pass = p;
+                (owned_login.as_str(), owned_pass.as_str())
+            }
+            None => (login, password),
+        }
+    } else {
+        (login, password)
+    };
     let category = category
         .map(|c| c.to_string())
-        .unwrap_or_else(|| category_for(&base_name).to_string());
+        .unwrap_or_else(|| category_for_with(&base_name, &current_settings(state)));
     // category routing (IDM-style): the category's own folder applies
     // when the caller asked for the ordinary default folder
     let dir = route_category_dir(state, &category, resolve_dir(dir));
@@ -1593,12 +2276,15 @@ fn register_http_stub(
         sample: Mutex::new((Instant::now(), 0, 0.0)),
         emitting: AtomicBool::new(false),
         starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
         queue: Mutex::new(queue.to_string()),
         login: login.to_string(),
         password: password.to_string(),
+        description: Mutex::new(String::new()),
+        speed_limit: Mutex::new(0),
     });
     state
         .entries
@@ -1621,12 +2307,98 @@ fn count_active(state: &AppState) -> usize {
         .count()
 }
 
+/// A live entry whose engine reached a terminal state (error, or a
+/// cancel that left the entry in the list) holds a DEAD handle: its
+/// workers have exited, so control.resume() restarts nothing — in
+/// 1.8.2 that made Resume and every automatic retry on an errored
+/// download a silent no-op. Demote it back to a stub carrying its
+/// last known progress, so the normal start path builds a fresh
+/// engine that resumes from the on-disk state file. Returns the stub
+/// when a demotion happened, None otherwise.
+fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<Entry>> {
+    let dl = entry.download.as_ref()?;
+    if !dl.is_terminal() {
+        return None;
+    }
+    let p = payload_of(entry);
+    if p.status == "finished" {
+        return None;
+    }
+    // the display snapshot comes from the engine's own state file
+    // when it exists (real block map); the payload's blocks are a
+    // downsampled string and cannot seed a Restored record
+    let (snap_total, snap_done, snap_blocks, snap_resumable) =
+        match ndm::peek_state(&entry.url, &entry.out_path) {
+            Some(pk) => (pk.total, pk.done_bytes, pk.blocks, true),
+            None => (p.total, p.done_bytes, Vec::new(), false),
+        };
+    let stub = Arc::new(Entry {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        url: entry.url.clone(),
+        out_path: entry.out_path.clone(),
+        category: entry.category.clone(),
+        added: entry.added.clone(),
+        download: None,
+        video: None,
+        kind: entry.kind.clone(),
+        selector: entry.selector.clone(),
+        cookies: entry.cookies.clone(),
+        referer: entry.referer.clone(),
+        audio: entry.audio,
+        restored: Mutex::new(Some(Restored {
+            total: snap_total,
+            done_bytes: snap_done,
+            blocks: snap_blocks,
+            resumable: snap_resumable,
+            status: "paused".to_string(),
+            error: String::new(),
+        })),
+        queued: AtomicBool::new(entry.queued.load(Ordering::Relaxed)),
+        sample: Mutex::new((Instant::now(), snap_done, 0.0)),
+        emitting: AtomicBool::new(false),
+        starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
+        removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
+        pause_requested: AtomicBool::new(false),
+        completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+        queue: Mutex::new(entry_queue(entry)),
+        login: entry.login.clone(),
+        password: entry.password.clone(),
+        description: Mutex::new(entry.description.lock().unwrap().clone()),
+        speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
+    });
+    let mut entries = state.entries.lock().unwrap();
+    let still_current = entries
+        .get(&entry.id)
+        .map(|e| Arc::ptr_eq(e, entry))
+        .unwrap_or(false);
+    if !still_current || entry.removed.load(Ordering::SeqCst) {
+        return None;
+    }
+    entries.insert(entry.id.clone(), stub.clone());
+    drop(entries);
+    Some(stub)
+}
+
 /// Start one entry that is not currently running: a queued/restored HTTP
 /// entry gets the engine; a restored video entry gets a fresh yt-dlp job
 /// (which continues its .part files); a live-but-paused one just resumes.
 fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
+    if entry.download.is_some() {
+        let state = app.state::<AppState>();
+        if let Some(stub) = demote_terminal_live(&state, &entry) {
+            start_entry(app, stub);
+            return;
+        }
+    }
     if let Some(dl) = &entry.download {
         dl.control.resume();
+        // the emit loop died when it observed the pause — without a
+        // fresh one this download would report no progress and fire
+        // NONE of the finish side-effects (no persist-at-finish, no
+        // queue pump, no Complete dialog, no retry registration)
+        spawn_emit_loop(app.clone(), entry);
         return;
     }
     if entry.kind == "video"
@@ -1657,6 +2429,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
     }
     if let Some(job) = &entry.video {
         let state = app.state::<AppState>();
+        job.set_limit(*entry.speed_limit.lock().unwrap());
         match job.resume(&state.components()) {
             Ok(()) => spawn_emit_loop(app.clone(), entry),
             Err(e) => {
@@ -1692,6 +2465,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             &state.components(),
         ) {
             Ok(job) => {
+            job.set_limit(*entry.speed_limit.lock().unwrap());
             // the entry may have been removed or replaced while the job
             // was being created: never install a live entry the list no
             // longer holds (the video edition of the probe-delete race).
@@ -1718,12 +2492,15 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
                 emitting: AtomicBool::new(false),
                 starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(entry.completion.lock().unwrap().clone()),
                 queue: Mutex::new(entry_queue(&entry)),
                 login: entry.login.clone(),
                 password: entry.password.clone(),
+                description: Mutex::new(entry.description.lock().unwrap().clone()),
+                speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -1764,6 +2541,10 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                     error: e,
                 });
                 let _ = app.emit("progress", payload_of(&entry));
+                // a transient failure (server down, connection
+                // refused) retries itself like any other failure;
+                // permanent ones are filtered inside register_retry
+                register_retry(&state, &entry);
                 persist(&state);
             }
         }
@@ -1790,6 +2571,14 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                         error: start_err,
                     });
                     let _ = app.emit("progress", payload_of(&e));
+                    // probe/start failures (a server that is down or
+                    // refused the connection) never reach an emit
+                    // loop, so nothing ever registered them for the
+                    // automatic retry every other failure gets —
+                    // they sat dead until a manual Resume. Register
+                    // here; dead links (404/410) stay excluded by
+                    // error_is_permanent.
+                    register_retry(&state, &e);
                 }
             }
             persist(&state);
@@ -1829,7 +2618,9 @@ fn count_active_for(state: &AppState, queue: &str) -> usize {
         .filter_map(|id| state.get(id))
         .filter(|e| {
             entry_queue(&e) == queue
-                && (e.starting.load(Ordering::Relaxed) || payload_of(e).status == "downloading")
+                && (e.starting.load(Ordering::Relaxed)
+                    || e.slot_preclaimed.load(Ordering::Relaxed)
+                    || payload_of(e).status == "downloading")
         })
         .count()
 }
@@ -1839,12 +2630,18 @@ fn count_active_for(state: &AppState, queue: &str) -> usize {
 fn pump_queue(app: &AppHandle) {
     let state = app.state::<AppState>();
     let s = current_settings(&state);
-    let max = s.max_simultaneous;
     let order = state.order.lock().unwrap().clone();
     for cfg in &s.queues {
         if entry_blocks(&state, &cfg.name) {
             continue;
         }
+        // a queue's own cap wins; 0 falls back to the global cap
+        // (IDM's Scheduler sets the simultaneous count per queue)
+        let max = if cfg.max_simultaneous > 0 {
+            cfg.max_simultaneous
+        } else {
+            s.max_simultaneous
+        };
         if max == 0 {
             for id in &order {
                 if let Some(e) = state.get(id) {
@@ -1937,6 +2734,7 @@ fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) 
     ndm::set_global_limit(s.speed_limit_bps);
     ndm::set_global_connections(s.max_connections);
     ndm::set_global_proxy(&s.proxy);
+    ndm::set_proxy_protocols(s.proxy_http, s.proxy_https, s.proxy_ftp);
     *state.settings.lock().unwrap() = s.clone();
     save_settings(&state);
     // an entry whose queue was deleted falls back to the Main queue
@@ -1981,6 +2779,117 @@ fn set_entry_queue(
     Ok(())
 }
 
+/// Reorder an entry within its own queue (the Scheduler's "Files in
+/// the queue" tab — IDM starts queued files in list order, so the
+/// order IS the priority). Swaps with the previous/next entry of the
+/// same queue in the global order list and persists.
+#[tauri::command]
+fn move_in_queue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    up: bool,
+) -> Result<(), String> {
+    let entry = state.get(&id).ok_or("unknown download id")?;
+    let q = entry_queue(&entry);
+    let mut order = state.order.lock().unwrap();
+    let pos = order
+        .iter()
+        .position(|x| x == &id)
+        .ok_or("entry is not in the order list")?;
+    // find the nearest neighbour in the same queue, in the requested
+    // direction (entries of other queues in between don't matter —
+    // the pump claims per queue in this order)
+    let neighbour = if up {
+        (0..pos)
+            .rev()
+            .find(|&i| state.get(&order[i]).map(|e| entry_queue(&e) == q).unwrap_or(false))
+    } else {
+        (pos + 1..order.len())
+            .find(|&i| state.get(&order[i]).map(|e| entry_queue(&e) == q).unwrap_or(false))
+    };
+    if let Some(n) = neighbour {
+        order.swap(pos, n);
+    }
+    drop(order);
+    persist(&state);
+    let _ = app.emit("progress", payload_of(&entry));
+    Ok(())
+}
+
+/// A link dropped on the drop basket (or sent by it): offered in the
+/// main window's Add URL dialog, exactly like an extension catch.
+#[tauri::command]
+fn basket_add(app: AppHandle, state: State<'_, AppState>, url: String) -> Result<(), String> {
+    let url = url.trim().to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("not a web link".to_string());
+    }
+    let payload = serde_json::json!({
+        "url": url,
+        "title": "",
+        "pageUrl": "",
+        "cookies": "",
+        "source": "basket",
+    });
+    state.pending_files.lock().unwrap().push(payload.clone());
+    raise_main_window(&app);
+    let _ = app.emit("incoming_file", payload);
+    Ok(())
+}
+
+/// Show or hide the drop-basket window (View menu / basket's own
+/// close button).
+#[tauri::command]
+fn set_basket_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("basket") {
+        if visible {
+            let _ = w.show();
+        } else {
+            let _ = w.hide();
+        }
+    }
+    Ok(())
+}
+
+/// Set one download's own speed limit (bytes/sec, 0 = none) — IDM's
+/// per-download Speed Limiter tab. Applies to the live engine/job
+/// immediately and persists with the entry.
+#[tauri::command]
+fn set_entry_limit(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    limit: u64,
+) -> Result<(), String> {
+    let entry = state.get(&id).ok_or("unknown download id")?;
+    *entry.speed_limit.lock().unwrap() = limit;
+    if let Some(dl) = &entry.download {
+        dl.set_limit(limit);
+    }
+    if let Some(job) = &entry.video {
+        job.set_limit(limit);
+    }
+    persist(&state);
+    let _ = app.emit("progress", payload_of(&entry));
+    Ok(())
+}
+
+/// Edit one download's Description (IDM's File Properties field).
+#[tauri::command]
+fn set_entry_description(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    description: String,
+) -> Result<(), String> {
+    let entry = state.get(&id).ok_or("unknown download id")?;
+    *entry.description.lock().unwrap() = description.chars().take(500).collect::<String>();
+    persist(&state);
+    let _ = app.emit("progress", payload_of(&entry));
+    Ok(())
+}
+
 #[tauri::command]
 fn scheduler_start_now(app: AppHandle, state: State<'_, AppState>, queue: Option<String>) {
     let q = queue.unwrap_or_else(main_queue_name);
@@ -2014,6 +2923,7 @@ async fn add_download(
     queue: Option<String>,
     login: Option<String>,
     password: Option<String>,
+    description: Option<String>,
 ) -> Result<String, String> {
     if state.update_required.load(Ordering::SeqCst) {
         return Err("NDM needs its latest update before it can download. Please install the update first.".to_string());
@@ -2023,6 +2933,16 @@ async fn add_download(
             return Err(format!("duplicate:{existing}"));
         }
     }
+    // a saved Site Login for this address applies automatically when
+    // the caller did not supply its own credentials (IDM behaviour)
+    let (login, password) = if login.as_deref().unwrap_or("").is_empty() {
+        match site_login_for(&current_settings(&state), &url) {
+            Some((l, p)) => (Some(l), Some(p)),
+            None => (login, password),
+        }
+    } else {
+        (login, password)
+    };
     let stub = register_http_stub(
         &state,
         &url,
@@ -2035,12 +2955,26 @@ async fn add_download(
         login.as_deref().unwrap_or(""),
         password.as_deref().unwrap_or(""),
     )?;
+    if let Some(d) = &description {
+        *stub.description.lock().unwrap() = d.chars().take(500).collect();
+    }
     let id = stub.id.clone();
     let is_later = later.unwrap_or(false);
     let max = current_settings(&state).max_simultaneous;
-    let must_wait = is_later
-        || entry_blocks(&state, &entry_queue(&stub))
-        || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
+    // cap check + slot reservation under one gate: two adds landing
+    // together used to both pass the check before either start
+    // claimed its slot, overshooting the queue's cap
+    static START_GATE: Mutex<()> = Mutex::new(());
+    let must_wait = {
+        let _gate = START_GATE.lock().unwrap();
+        let wait = is_later
+            || entry_blocks(&state, &entry_queue(&stub))
+            || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
+        if !wait {
+            stub.slot_preclaimed.store(true, Ordering::SeqCst);
+        }
+        wait
+    };
     if must_wait {
         if is_later {
             // "Download Later" stays paused until the user explicitly starts/resumes it
@@ -2061,7 +2995,34 @@ async fn add_download(
         persist(&state);
         return Ok(id);
     }
-    match start_engine(app, &stub).await {
+    let first_start = start_engine(app.clone(), &stub).await;
+    let first_start = match first_start {
+        Err(e1) => {
+            // IDM's Proxy-tab fallback: for a download intercepted
+            // from the browser, one retry through the system proxy
+            // when the configured route could not reach the server
+            let s = current_settings(&state);
+            let sys = system_proxy_url();
+            if s.proxy_from_browser_on_error
+                && !sys.is_empty()
+                && sys != s.proxy
+                && (!stub.cookies.is_empty() || !stub.referer.is_empty())
+            {
+                ndm::set_global_proxy(&sys);
+                match start_engine(app.clone(), &stub).await {
+                    Ok(v) => Ok(v),
+                    Err(_) => {
+                        ndm::set_global_proxy(&s.proxy);
+                        Err(e1)
+                    }
+                }
+            } else {
+                Err(e1)
+            }
+        }
+        ok => ok,
+    };
+    match first_start {
         Ok(_) => Ok(id),
         Err(e) => {
             // remove only OUR stub: a refresh during the probe replaces
@@ -2097,12 +3058,13 @@ fn pause_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Res
         // Not running: leave the queue and mark paused, keeping any restored
         // progress record intact. (An earlier version replaced the whole
         // entry here and threw the restored progress away.)
-        if entry.starting.load(Ordering::SeqCst) {
-            // the start probe is still in flight: record the press —
-            // the start path honours it the moment the download goes
-            // live, instead of discarding it and starting anyway
-            entry.pause_requested.store(true, Ordering::SeqCst);
-        }
+        // Record the press UNCONDITIONALLY: a start may already be
+        // claimed by the pump but not yet inside start_engine's own
+        // claim, and a pause landing in that gap used to be silently
+        // overwritten when the live entry was installed. The start
+        // paths honour pause_requested the moment the download goes
+        // live; an explicit Resume clears it first.
+        entry.pause_requested.store(true, Ordering::SeqCst);
         entry.queued.store(false, Ordering::Relaxed);
         {
             let mut r = entry.restored.lock().unwrap();
@@ -2146,17 +3108,33 @@ async fn resume_download(
     if payload_of(&entry).status == "finished" {
         return Ok(()); // nothing to resume; guards a silent re-download
     }
+    if state.update_required.load(Ordering::SeqCst) {
+        // the mandatory-update block used to leak through Resume
+        // (and the retry thread) while add paths enforced it
+        return Err("NDM needs its latest update before it can download. Please install the update first.".to_string());
+    }
     // a manual Resume always takes the entry out of the queue
     entry.queued.store(false, Ordering::Relaxed);
     entry.pause_requested.store(false, Ordering::SeqCst);
+    // an errored live entry holds a dead engine handle: demote it to
+    // a stub so the start below builds a fresh engine (control.resume
+    // on the dead handle restarted nothing)
+    let entry = match demote_terminal_live(&state, &entry) {
+        Some(stub) => stub,
+        None => entry,
+    };
     if let Some(dl) = &entry.download {
         dl.control.resume();
         let _ = app.emit("progress", payload_of(&entry));
+        // same emit-loop revival as start_entry: a resumed HTTP
+        // download must keep reporting and must finish properly
+        spawn_emit_loop(app, entry);
         Ok(())
     } else if entry.kind == "video" {
         // live job resumes in place; a restored entry starts a fresh job
         // with the same arguments and yt-dlp continues its .part files
         if let Some(job) = &entry.video {
+            job.set_limit(*entry.speed_limit.lock().unwrap());
             job.resume(&state.components())?;
             spawn_emit_loop(app, entry);
         } else {
@@ -2203,12 +3181,15 @@ async fn resume_download(
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
                 emitting: AtomicBool::new(false),
                 starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(entry.completion.lock().unwrap().clone()),
                 queue: Mutex::new(entry_queue(&entry)),
                 login: entry.login.clone(),
                 password: entry.password.clone(),
+                description: Mutex::new(entry.description.lock().unwrap().clone()),
+                speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -2239,9 +3220,17 @@ async fn resume_download(
 }
 
 #[tauri::command]
-fn remove_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+fn remove_download(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    delete_file: Option<bool>,
+) -> Result<(), String> {
     state.retries.lock().unwrap().remove(&id);
     if let Some(entry) = state.get(&id) {
+        // its downloaded bytes stay on the quota meter even though
+        // the entry leaves the list (deleting must not refund quota)
+        quota_note_removed(&state, &entry);
         entry.removed.store(true, Ordering::SeqCst);
         if let Some(dl) = &entry.download {
             dl.control.cancel();
@@ -2260,6 +3249,17 @@ fn remove_download(app: AppHandle, state: State<'_, AppState>, id: String) -> Re
         // the user's browser session: it must not outlive the entry
         if let Some(path) = state.cookies_path(&entry.cookies) {
             let _ = std::fs::remove_file(path);
+        }
+        // IDM's delete confirmation offers "also delete the file":
+        // only then does the downloaded data itself go (the plain
+        // list removal above always keeps it)
+        if delete_file.unwrap_or(false) {
+            if entry.kind == "video" {
+                let f = resolve_video_file(&entry);
+                let _ = std::fs::remove_file(&f);
+            } else {
+                let _ = std::fs::remove_file(&entry.out_path);
+            }
         }
     }
     state.entries.lock().unwrap().remove(&id);
@@ -2292,7 +3292,10 @@ fn open_path(state: State<'_, AppState>, id: String, folder: bool) -> Result<(),
 
 #[tauri::command]
 fn set_completion(state: State<'_, AppState>, id: String, action: String) -> Result<(), String> {
-    if !matches!(action.as_str(), "" | "open_file" | "open_folder") {
+    if !matches!(
+        action.as_str(),
+        "" | "open_file" | "open_folder" | "turn_off_pc" | "restart_pc"
+    ) {
         return Err("unknown completion action".to_string());
     }
     let entry = state.get(&id).ok_or("unknown download id")?;
@@ -2339,7 +3342,10 @@ fn run_component_setup(app: AppHandle) {
         // background until the setup is complete — the user should
         // never have to think about the video engine at all.
         let mut attempt = 0u32;
-        let result = loop {
+        // panic-isolated: a panic in the setup loop must not leave
+        // components_busy latched true (video would silently never
+        // become available until a restart)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
             let mut pass: Result<(), String> = Ok(());
             for spec in ndm::components::specs() {
                 if video::find_tool(spec.name, &dir).is_some() {
@@ -2372,7 +3378,8 @@ fn run_component_setup(app: AppHandle) {
                     std::thread::sleep(std::time::Duration::from_secs(90));
                 }
             }
-        };
+        }))
+        .unwrap_or_else(|_| Err("the video component setup failed unexpectedly".to_string()));
         let state = app.state::<AppState>();
         state.components_busy.store(false, Ordering::SeqCst);
         if result.is_ok() {
@@ -2498,7 +3505,11 @@ fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
                 serde_json::json!({ "phase": "downloading", "downloaded": done, "total": total }),
             );
         };
-        let outcome = ndm::updater::download_file(&info.deb_url, &dest, &info.deb_sha256, &cb)
+        // panic-isolated: a panic anywhere in the download/install
+        // chain must not leave update_busy latched true (which would
+        // silently disable updates for the rest of the session)
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ndm::updater::download_file(&info.deb_url, &dest, &info.deb_sha256, &cb)
             .and_then(|_| {
                 let _ = app.emit(
                     "update_progress",
@@ -2534,10 +3545,24 @@ fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
                         }
                     }
                 }
-            });
+            })
+        }))
+        .unwrap_or_else(|_| Err("the update failed unexpectedly".to_string()));
         {
             let state = app.state::<AppState>();
             state.update_busy.store(false, Ordering::SeqCst);
+            if matches!(outcome, Ok("installed")) {
+                // the mandatory-update block has served its purpose:
+                // clear it in-process (it used to stay latched, so the
+                // still-running old binary kept refusing downloads
+                // with no hint that a restart completes the update),
+                // and tell the UI to offer that restart
+                state.update_required.store(false, Ordering::SeqCst);
+                let _ = app.emit(
+                    "update_installed",
+                    serde_json::json!({ "version": info.version }),
+                );
+            }
         }
         let payload = match outcome {
             Ok(phase) => serde_json::json!({ "phase": phase }),
@@ -2634,12 +3659,15 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         sample: Mutex::new((Instant::now(), 0, 0.0)),
         emitting: AtomicBool::new(false),
         starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(entry.completion.lock().unwrap().clone()),
         queue: Mutex::new(entry_queue(&entry)),
         login: entry.login.clone(),
         password: entry.password.clone(),
+                description: Mutex::new(entry.description.lock().unwrap().clone()),
+                speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
     });
     state
         .entries
@@ -2696,7 +3724,7 @@ async fn probe_file(
     let suggested = probe
         .suggested_name
         .unwrap_or_else(|| file_name_for(&url_trimmed));
-    let category = category_for(&suggested).to_string();
+    let category = category_for_with(&suggested, &current_settings(&state));
     Ok(serde_json::json!({
         "total": probe.total,
         "resumable": probe.range_ok,
@@ -2788,8 +3816,16 @@ fn do_add_video(
         .unwrap_or_default();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
     if !force {
-        let entries = state.entries.lock().unwrap();
-        let dupe = entries.values().find(|e| {
+        // snapshot first, payloads computed unlocked (see
+        // find_active_duplicate for why the lock must not be held)
+        let entries: Vec<Arc<Entry>> = state
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let dupe = entries.iter().find(|e| {
             e.kind == "video"
                 && e.url == url
                 && e.out_path == dir
@@ -2856,12 +3892,15 @@ fn do_add_video(
             sample: Mutex::new((Instant::now(), 0, 0.0)),
             emitting: AtomicBool::new(false),
             starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(String::new()),
             queue: Mutex::new(queue.clone()),
             login: String::new(),
             password: String::new(),
+            description: Mutex::new(String::new()),
+            speed_limit: Mutex::new(0),
         });
         state
             .entries
@@ -2913,12 +3952,15 @@ fn do_add_video(
         sample: Mutex::new((Instant::now(), 0, 0.0)),
         emitting: AtomicBool::new(false),
         starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
         queue: Mutex::new(queue.clone()),
         login: String::new(),
         password: String::new(),
+            description: Mutex::new(String::new()),
+            speed_limit: Mutex::new(0),
     });
     state
         .entries
@@ -2949,8 +3991,9 @@ async fn add_video(
     total: Option<u64>,
     force: Option<bool>,
     queue: Option<String>,
+    description: Option<String>,
 ) -> Result<String, String> {
-    do_add_video(
+    let id = do_add_video(
         &app,
         &state,
         url,
@@ -2963,7 +4006,14 @@ async fn add_video(
         total.unwrap_or(0),
         force.unwrap_or(false),
         queue.unwrap_or_else(main_queue_name),
-    )
+    )?;
+    if let Some(d) = &description {
+        if let Some(e) = state.get(&id) {
+            *e.description.lock().unwrap() = d.chars().take(500).collect();
+            persist(&state);
+        }
+    }
+    Ok(id)
 }
 
 #[derive(Clone, Serialize)]
@@ -2982,7 +4032,8 @@ struct GrabPageDto {
 }
 
 #[tauri::command]
-async fn grab_page(url: String) -> Result<GrabPageDto, String> {
+async fn grab_page(state: State<'_, AppState>, url: String) -> Result<GrabPageDto, String> {
+    let settings = current_settings(&state);
     let page = tauri::async_runtime::spawn_blocking(move || ndm::grab_page(&url))
         .await
         .map_err(|e| format!("internal join error: {e}"))??;
@@ -2992,7 +4043,85 @@ async fn grab_page(url: String) -> Result<GrabPageDto, String> {
             .items
             .into_iter()
             .map(|it| GrabItemDto {
-                kind: category_for(&it.name).to_string(),
+                kind: category_for_with(&it.name, &settings),
+                url: it.url,
+                name: it.name,
+                size: it.size,
+                label: it.label,
+            })
+            .collect(),
+    })
+}
+
+#[derive(Clone, Deserialize)]
+struct GrabExploreArgs {
+    url: String,
+    #[serde(default)]
+    depth_same: u32,
+    #[serde(default)]
+    depth_other: u32,
+    #[serde(default)]
+    whole_site: bool,
+    #[serde(default)]
+    no_parent: bool,
+    #[serde(default)]
+    same_site_files_only: bool,
+    #[serde(default)]
+    include_exts: Vec<String>,
+    #[serde(default)]
+    exclude_exts: Vec<String>,
+    #[serde(default)]
+    min_kb: u64,
+    #[serde(default)]
+    max_mb: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct GrabSiteDto {
+    title: String,
+    pages_visited: usize,
+    items: Vec<GrabItemDto>,
+}
+
+/// The IDM Grabber exploration: follow page links level by level from
+/// the start page and collect the files passing the project filters.
+#[tauri::command]
+async fn grab_explore(
+    state: State<'_, AppState>,
+    args: GrabExploreArgs,
+) -> Result<GrabSiteDto, String> {
+    let settings = current_settings(&state);
+    let opts = ndm::GrabOptions {
+        depth_same: args.depth_same,
+        depth_other: args.depth_other,
+        whole_site: args.whole_site,
+        no_parent: args.no_parent,
+        same_site_files_only: args.same_site_files_only,
+        include_exts: args.include_exts,
+        exclude_exts: args.exclude_exts,
+        min_size: if args.min_kb > 0 {
+            Some(args.min_kb.saturating_mul(1024))
+        } else {
+            None
+        },
+        max_size: if args.max_mb > 0 {
+            Some(args.max_mb.saturating_mul(1024 * 1024))
+        } else {
+            None
+        },
+    };
+    let url = args.url.clone();
+    let site = tauri::async_runtime::spawn_blocking(move || ndm::grab_site(&url, &opts))
+        .await
+        .map_err(|e| format!("internal join error: {e}"))??;
+    Ok(GrabSiteDto {
+        title: site.title,
+        pages_visited: site.pages_visited,
+        items: site
+            .items
+            .into_iter()
+            .map(|it| GrabItemDto {
+                kind: category_for_with(&it.name, &settings),
                 url: it.url,
                 name: it.name,
                 size: it.size,
@@ -3015,7 +4144,22 @@ fn restore_saved(state: &AppState) {
     // list and the user's history would be gone for good
     let raw_entries: Vec<serde_json::Value> = match serde_json::from_slice(&raw) {
         Ok(s) => s,
-        Err(_) => return,
+        Err(_) => {
+            // The TOP LEVEL itself is unparseable (truncated by an
+            // editor, a disk error, a non-array value). Returning with
+            // an empty list here used to be fatal: the 5 s snapshot
+            // then overwrote downloads.json with that empty list and
+            // the user's whole history was gone. Quarantine the bad
+            // file for inspection and block persist from writing an
+            // empty list over the name until real entries exist.
+            let stamp = chrono::Utc::now().timestamp();
+            let _ = std::fs::rename(
+                &path,
+                path.with_extension(format!("json.corrupt-{stamp}")),
+            );
+            DOWNLOADS_CORRUPT.store(true, Ordering::Relaxed);
+            return;
+        }
     };
     let saved: Vec<SavedEntry> = raw_entries
         .into_iter()
@@ -3032,6 +4176,28 @@ fn restore_saved(state: &AppState) {
             }
         } else {
             s
+        };
+        // normalize the queue name against the settings list: queue
+        // matching elsewhere is case-sensitive and unknown names fall
+        // back silently in some paths and strand the entry in others —
+        // a hand-edited or case-drifted name must land in the queue it
+        // obviously means (or Main), visibly and persistently
+        let s = {
+            let settings = current_settings(state);
+            let canonical = settings
+                .queues
+                .iter()
+                .find(|q| q.name.eq_ignore_ascii_case(&s.queue))
+                .map(|q| q.name.clone())
+                .unwrap_or_else(|| main_queue_name());
+            if canonical != s.queue {
+                SavedEntry {
+                    queue: canonical,
+                    ..s
+                }
+            } else {
+                s
+            }
         };
         if let Some(n) = s.id.strip_prefix("dl-").and_then(|x| x.parse::<u64>().ok()) {
             max_seq = max_seq.max(n);
@@ -3088,12 +4254,15 @@ fn restore_saved(state: &AppState) {
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
                 emitting: AtomicBool::new(false),
                 starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
                 removed: AtomicBool::new(false),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(s.completion.clone()),
                 queue: Mutex::new(s.queue.clone()),
                 login: s.login.clone(),
                 password: s.password.clone(),
+                description: Mutex::new(s.description.clone()),
+                speed_limit: Mutex::new(s.speed_limit),
             });
             state.entries.lock().unwrap().insert(s.id.clone(), entry);
             state.order.lock().unwrap().push(s.id.clone());
@@ -3174,12 +4343,15 @@ fn restore_saved(state: &AppState) {
             sample: Mutex::new((Instant::now(), 0, 0.0)),
             emitting: AtomicBool::new(false),
             starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(s.completion.clone()),
             queue: Mutex::new(s.queue.clone()),
             login: s.login.clone(),
             password: s.password.clone(),
+                description: Mutex::new(s.description.clone()),
+                speed_limit: Mutex::new(s.speed_limit),
         });
         state.entries.lock().unwrap().insert(s.id.clone(), entry);
         state.order.lock().unwrap().push(s.id.clone());
@@ -3300,6 +4472,7 @@ fn prune_acks(queue_dir: &Path) {
 fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
     entry.removed.store(true, Ordering::SeqCst);
     state.retries.lock().unwrap().remove(&entry.id);
+    quota_note_removed(state, entry);
     if let Some(dl) = &entry.download {
         dl.control.cancel();
         // wait for the engine to actually stop: its shutdown writes
@@ -3332,8 +4505,13 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
             }
         }
     }
-    if entry.kind == "video" {
-        // sweep this video's part files from its folder
+    if entry.kind == "video" && payload_of(entry).status != "finished" {
+        // sweep this video's part files from its folder — STRICTLY
+        // its own intermediates. The old pattern (stem prefix + any
+        // ".f" anywhere) could delete FINISHED, unrelated user files:
+        // a video titled "my.film" has stem "my", and the completed
+        // "my.film.mp4" itself matched. Only the engine's hidden
+        // parts and yt-dlp's "{stem}.f<digits>.*.part" files go.
         let stem = entry
             .name
             .rsplit_once('.')
@@ -3342,9 +4520,15 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
         if let Ok(rd) = std::fs::read_dir(&entry.out_path) {
             for f in rd.flatten() {
                 let n = f.file_name().to_string_lossy().to_string();
-                if n.starts_with(&format!(".{stem}.ndm_stream"))
-                    || (n.starts_with(&stem) && (n.ends_with(".part") || n.contains(".f")))
-                {
+                let engine_part = n.starts_with(&format!(".{stem}.ndm_stream"));
+                let ytdlp_part = n.ends_with(".part")
+                    && n
+                        .strip_prefix(&format!("{stem}.f"))
+                        .map(|rest| {
+                            rest.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                if engine_part || ytdlp_part {
                     let _ = std::fs::remove_file(f.path());
                 }
             }
@@ -3678,6 +4862,7 @@ fn main() {
             settings_file: Mutex::new(PathBuf::new()),
             sched_override: Mutex::new(std::collections::HashSet::new()),
             quota_state: Mutex::new((0, 0, false)),
+            quota_removed: Mutex::new(0),
             quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
@@ -3775,6 +4960,15 @@ fn main() {
                     }
                     persist(&state);
                     pump_queue(app.handle());
+                } else {
+                    // restored QUEUED entries (they were waiting for
+                    // a cap slot when the app closed) must be pumped
+                    // once even with auto-resume off: "queued" is a
+                    // live state in IDM, not a parking state — they
+                    // used to sit forever until an unrelated event
+                    // happened to pump. Blocked queues stay blocked
+                    // via entry_blocks inside the pump.
+                    pump_queue(app.handle());
                 }
             }
             // scheduler: every 30 s, start the queue inside the configured
@@ -3785,12 +4979,19 @@ fn main() {
                     std::collections::HashMap::new();
                 loop {
                     std::thread::sleep(Duration::from_secs(30));
+                    // panic-isolated per tick: a panic here used to
+                    // kill scheduling AND automatic retries for the
+                    // whole session with no sign anything was wrong
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let state = handle4.state::<AppState>();
                     let s = current_settings(&state);
-                    // automatic retries (IDM queue semantics): start
-                    // every failed entry whose retry is due and which
-                    // is still sitting in error
-                    {
+                    // automatic retries (IDM queue semantics): a
+                    // failed file goes back into its queue and is
+                    // retried BY THE QUEUE PROCESSOR — it stays
+                    // subject to the queue's window, the download
+                    // quota and the simultaneous cap. The old code
+                    // started retries directly, bypassing all three.
+                    if !state.update_required.load(Ordering::Relaxed) {
                         let due: Vec<String> = {
                             let mut map = state.retries.lock().unwrap();
                             let now = Instant::now();
@@ -3805,13 +5006,18 @@ fn main() {
                             });
                             due
                         };
+                        let mut any = false;
                         for id in due {
                             let entry = state.entries.lock().unwrap().get(&id).cloned();
                             if let Some(e) = entry {
                                 if payload_of(&e).status == "error" {
-                                    start_entry(&handle4, e);
+                                    e.queued.store(true, Ordering::Relaxed);
+                                    any = true;
                                 }
                             }
+                        }
+                        if any {
+                            pump_queue(&handle4);
                         }
                     }
                     // per-queue scheduler windows (IDM's Scheduler):
@@ -3829,7 +5035,10 @@ fn main() {
                             // the window governs again; the manual
                             // override for this queue ends
                             state.sched_override.lock().unwrap().remove(&cfg.name);
-                            if s.max_simultaneous == 0 {
+                            if s.max_simultaneous == 0 && !quota_blocks(&state) {
+                                // start-all respects Download limits:
+                                // an exhausted quota is not overridden
+                                // by a queue window opening
                                 start_all_queued(&handle4, Some(&cfg.name));
                             } else {
                                 pump_queue(&handle4);
@@ -3840,6 +5049,7 @@ fn main() {
                         }
                         was_in_window.insert(cfg.name.clone(), in_win);
                     }
+                    }));
                 }
             });
             // clipboard monitoring (IDM): copying a download link
@@ -3849,30 +5059,46 @@ fn main() {
             let handle5 = app.handle().clone();
             std::thread::spawn(move || {
                 let mut last_seen = String::new();
+                let mut was_enabled = false;
                 let mut prompted: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 let mut cb: Option<arboard::Clipboard> = None;
                 loop {
                     std::thread::sleep(Duration::from_millis(900));
+                    // panic-isolated: one bad tick must not kill
+                    // clipboard monitoring for the whole session
+                    let tick = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let state = handle5.state::<AppState>();
                     if !current_settings(&state).clipboard_monitor {
-                        continue;
+                        was_enabled = false;
+                        return;
                     }
                     if cb.is_none() {
                         cb = arboard::Clipboard::new().ok();
                     }
-                    let Some(c) = cb.as_mut() else { continue };
-                    let Ok(text) = c.get_text() else { continue };
+                    let Some(c) = cb.as_mut() else { return };
+                    if !was_enabled {
+                        // off→on transition: whatever is on the
+                        // clipboard RIGHT NOW was copied while the
+                        // monitor was off — seed it as already-seen
+                        // instead of "discovering" it as a new link
+                        was_enabled = true;
+                        if let Ok(t) = c.get_text() {
+                            last_seen = t.trim().to_string();
+                        }
+                        return;
+                    }
+                    let Ok(text) = c.get_text() else { return };
                     let text = text.trim().to_string();
                     if text == last_seen {
-                        continue;
+                        return;
                     }
                     last_seen = text.clone();
                     if !clipboard_url_qualifies(&text) {
-                        continue;
+                        return;
                     }
                     if !prompted.insert(text.clone()) {
-                        continue;
+                        return;
                     }
                     if prompted.len() > 200 {
                         prompted.clear();
@@ -3883,30 +5109,51 @@ fn main() {
                         "title": "",
                         "pageUrl": "",
                         "cookies": "",
+                        "source": "clipboard",
                     });
                     state.pending_files.lock().unwrap().push(payload.clone());
                     raise_main_window(&handle5);
                     let _ = handle5.emit("incoming_file", payload);
+                    }));
+                    let _ = tick;
                 }
             });
             // periodic snapshot so even a hard power cut keeps a fresh list
             let handle = app.handle().clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(Duration::from_secs(5));
-                let state = handle.state::<AppState>();
-                persist(&state);
-                // download quota (IDM's Download limits): the moment
-                // the window's budget runs out, everything pauses —
-                // re-queued, so the next window resumes it — and the
-                // user is told once per window
-                if quota_blocks(&state) {
-                    let mut q = state.quota_state.lock().unwrap();
-                    if !q.2 {
-                        q.2 = true;
-                        drop(q);
-                        pause_all(&handle, true, None);
-                        let _ = handle.emit("quota_exceeded", serde_json::json!({}));
-                    }
+            std::thread::spawn(move || {
+                let mut was_blocked = false;
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    // panic-isolated: this thread also carries quota
+                    // enforcement — a panic must not kill both quietly
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let state = handle.state::<AppState>();
+                        persist(&state);
+                        // download quota (IDM's Download limits): the
+                        // moment the window's budget runs out,
+                        // everything pauses — re-queued, so the next
+                        // window resumes it — and the user is told
+                        // once per window
+                        let blocked = quota_blocks(&state);
+                        if blocked {
+                            let mut q = state.quota_state.lock().unwrap();
+                            if !q.2 {
+                                q.2 = true;
+                                drop(q);
+                                save_quota(&state);
+                                pause_all(&handle, true, None);
+                                let _ = handle.emit("quota_exceeded", serde_json::json!({}));
+                            }
+                        }
+                        if was_blocked && !blocked {
+                            // the window rolled over: restart what
+                            // the quota paused. Nothing else ever
+                            // pumped here, so quota-paused downloads
+                            // used to stall until an unrelated event.
+                            pump_queue(&handle);
+                        }
+                        was_blocked = blocked;
+                    }));
                 }
             });
             // incoming queue from the browser extension (via ndm-host):
@@ -3915,12 +5162,19 @@ fn main() {
             let handle2 = app.handle().clone();
             let queue_dir = dir.clone();
             std::thread::spawn(move || {
-                prune_acks(&queue_dir);
-                drain_incoming(&handle2, &queue_dir);
+                // panic-isolated per tick: this thread is the ONLY
+                // path by which browser clicks reach the app — its
+                // silent death would look like "NDM stopped working"
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prune_acks(&queue_dir);
+                    drain_incoming(&handle2, &queue_dir);
+                }));
                 let mut ticks = 0u64;
                 loop {
                     std::thread::sleep(Duration::from_millis(200));
-                    drain_incoming(&handle2, &queue_dir);
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        drain_incoming(&handle2, &queue_dir);
+                    }));
                     ticks += 1;
                     if ticks % 300 == 0 {
                         prune_acks(&queue_dir);
@@ -3939,9 +5193,15 @@ fn main() {
             probe_video,
             add_video,
             grab_page,
+            grab_explore,
             get_settings,
             set_settings,
             set_entry_queue,
+            set_entry_limit,
+            set_entry_description,
+            move_in_queue,
+            basket_add,
+            set_basket_visible,
             scheduler_start_now,
             scheduler_stop_now,
             open_path,
@@ -3989,6 +5249,7 @@ mod tests {
             settings_file: Mutex::new(settings_path.clone()),
             sched_override: Mutex::new(std::collections::HashSet::new()),
             quota_state: Mutex::new((0, 0, false)),
+            quota_removed: Mutex::new(0),
             quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
@@ -3996,6 +5257,8 @@ mod tests {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            retries: Mutex::new(HashMap::new()),
+            had_active: AtomicBool::new(false),
         };
         save_settings(&state);
         state.settings.lock().unwrap().max_connections = 32;
@@ -4009,6 +5272,82 @@ mod tests {
         assert_eq!(state.settings.lock().unwrap().max_connections, 16);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manual_proxy_composes_effective_url_with_encoded_userinfo() {
+        let mut s = Settings {
+            proxy_mode: "manual".to_string(),
+            proxy_scheme: "http".to_string(),
+            proxy_host: "127.0.0.1".to_string(),
+            proxy_port: 8080,
+            proxy_user: "u@x".to_string(),
+            proxy_pass: "p:ss".to_string(),
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(s.proxy, "http://u%40x:p%3Ass@127.0.0.1:8080");
+        assert_eq!(s.proxy_mode, "manual");
+    }
+
+    #[test]
+    fn legacy_single_proxy_migrates_to_manual_fields() {
+        let mut s = Settings {
+            proxy: "socks5://bob:secret@proxy.example.com:1080".to_string(),
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(s.proxy_mode, "manual");
+        assert_eq!(s.proxy_scheme, "socks5");
+        assert_eq!(s.proxy_host, "proxy.example.com");
+        assert_eq!(s.proxy_port, 1080);
+        assert_eq!(s.proxy_user, "bob");
+        // and the effective URL round-trips back to the same address
+        assert_eq!(s.proxy, "socks5://bob:secret@proxy.example.com:1080");
+    }
+
+    #[test]
+    fn site_login_for_picks_the_longest_matching_site() {
+        let s = Settings {
+            site_logins: vec![
+                SiteLogin {
+                    site: "example.com".to_string(),
+                    login: "hostuser".to_string(),
+                    password: "p1".to_string(),
+                },
+                SiteLogin {
+                    site: "example.com/members".to_string(),
+                    login: "memberuser".to_string(),
+                    password: "p2".to_string(),
+                },
+            ],
+            ..Settings::default()
+        };
+        assert_eq!(
+            site_login_for(&s, "https://example.com/members/file.zip"),
+            Some(("memberuser".to_string(), "p2".to_string()))
+        );
+        assert_eq!(
+            site_login_for(&s, "https://example.com/public/file.zip"),
+            Some(("hostuser".to_string(), "p1".to_string()))
+        );
+        assert_eq!(site_login_for(&s, "https://other.com/members/file.zip"), None);
+    }
+
+    #[test]
+    fn unknown_power_actions_are_cleared_by_sanitize() {
+        let mut s = Settings {
+            power_when_done: "explode".to_string(),
+            ..Settings::default()
+        };
+        s.sanitize();
+        assert_eq!(s.power_when_done, "");
+        let mut s2 = Settings {
+            power_when_done: "shutdown".to_string(),
+            ..Settings::default()
+        };
+        s2.sanitize();
+        assert_eq!(s2.power_when_done, "shutdown");
     }
 
     #[test]
@@ -4037,6 +5376,7 @@ mod tests {
             settings_file: Mutex::new(PathBuf::new()),
             sched_override: Mutex::new(std::collections::HashSet::new()),
             quota_state: Mutex::new((0, 0, false)),
+            quota_removed: Mutex::new(0),
             quota_file: Mutex::new(PathBuf::new()),
             pending_videos: Mutex::new(Vec::new()),
             pending_files: Mutex::new(Vec::new()),
@@ -4044,6 +5384,8 @@ mod tests {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            retries: Mutex::new(HashMap::new()),
+            had_active: AtomicBool::new(false),
         };
 
         let entry = Arc::new(Entry {
@@ -4072,12 +5414,15 @@ mod tests {
             sample: Mutex::new((Instant::now(), 0, 0.0)),
             emitting: AtomicBool::new(false),
             starting: AtomicBool::new(false),
+                slot_preclaimed: AtomicBool::new(false),
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(String::new()),
             queue: Mutex::new(String::new()),
             login: String::new(),
             password: String::new(),
+            description: Mutex::new(String::new()),
+            speed_limit: Mutex::new(0),
         });
         state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
         state.order.lock().unwrap().push("dl-1".to_string());

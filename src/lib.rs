@@ -85,23 +85,110 @@ pub fn global_proxy() -> String {
     PROXY_URL.read().unwrap().clone()
 }
 
+/// Which protocols the configured proxy serves (IDM's Proxy tab has a
+/// checkbox per protocol: HTTP / HTTPS / FTP). Default: all three.
+static PROXY_PROTOCOLS: std::sync::RwLock<(bool, bool, bool)> =
+    std::sync::RwLock::new((true, true, true));
+
+pub fn set_proxy_protocols(http: bool, https: bool, ftp: bool) {
+    *PROXY_PROTOCOLS.write().unwrap() = (http, https, ftp);
+}
+
+/// The proxy to use for one URL: empty when its protocol is unchecked
+/// on the Proxy tab (the connection then goes direct, exactly like IDM).
+pub fn proxy_for_url(url: &str) -> String {
+    let (http, https, ftp) = *PROXY_PROTOCOLS.read().unwrap();
+    let enabled = if url.starts_with("https://") {
+        https
+    } else if url.starts_with("ftp://") {
+        ftp
+    } else {
+        http
+    };
+    if enabled {
+        global_proxy()
+    } else {
+        String::new()
+    }
+}
 
 /// Attach the configured proxy (if any and parseable) to an agent builder.
 pub(crate) fn apply_proxy(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
-    let url = global_proxy();
+    apply_proxy_url(builder, &global_proxy())
+}
+
+/// Attach the proxy that applies to `url` (protocol-gated).
+pub(crate) fn apply_proxy_for(builder: ureq::AgentBuilder, url: &str) -> ureq::AgentBuilder {
+    let proxy = proxy_for_url(url);
+    apply_proxy_url(builder, &proxy)
+}
+
+fn apply_proxy_url(builder: ureq::AgentBuilder, url: &str) -> ureq::AgentBuilder {
     if url.is_empty() {
         return builder;
     }
-    match ureq::Proxy::new(&url) {
+    match ureq::Proxy::new(url) {
         Ok(p) => builder.proxy(p),
         Err(_) => builder, // a bad proxy string must never break downloads
     }
+}
+
+/// Resolve a PAC (automatic configuration) address to a concrete
+/// proxy: fetch the script and take its first PROXY/SOCKS directive.
+/// Deliberately simple — it covers the overwhelmingly common PAC shape
+/// (a fixed proxy for everything) and fails to "direct", never to a
+/// guessed address.
+pub fn resolve_pac_proxy(pac_url: &str) -> String {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(4))
+        .build();
+    let Ok(resp) = agent.get(pac_url).call() else {
+        return String::new();
+    };
+    let Ok(body) = resp.into_string() else {
+        return String::new();
+    };
+    // find "PROXY host:port" / "SOCKS host:port" pairs in order
+    let words: Vec<&str> = body
+        .split(|c: char| c == ';' || c == '"' || c == '\'' || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+        .collect();
+    for w in words.windows(2) {
+        let kind = w[0].to_ascii_uppercase();
+        if (kind == "PROXY" || kind == "SOCKS" || kind == "SOCKS5") && w[1].contains(':') {
+            let scheme = if kind == "PROXY" { "http" } else { "socks5" };
+            return format!("{scheme}://{}", w[1]);
+        }
+    }
+    String::new()
 }
 
 /// Charge `n` downloaded bytes against the global pacing clock (GCRA-style
 /// slot reservation): every charge reserves n/rate seconds on a shared
 /// timeline and the caller sleeps until its slot begins. Aggregate throughput
 /// converges to exactly the configured rate, with no burst-and-starve cycle.
+/// Per-download pacing (IDM's Speed Limiter tab is per download):
+/// same slot algorithm as the global limiter, but scoped to one
+/// download's Shared state. Both throttles apply — a download obeys
+/// its own limit AND the global one.
+fn throttle_own(shared: &Shared, n: u64, since: Instant) {
+    let rate = shared.own_limit.load(Ordering::Relaxed);
+    if rate == 0 || n == 0 {
+        return;
+    }
+    let sleep_for = {
+        let mut st = shared.own_limit_state.lock().unwrap();
+        let now = Instant::now();
+        let slot = (*st).unwrap_or(now).max(since);
+        let cost = Duration::from_secs_f64(n as f64 / rate as f64);
+        *st = Some(slot + cost);
+        slot.saturating_duration_since(now)
+    };
+    if !sleep_for.is_zero() {
+        std::thread::sleep(sleep_for);
+    }
+}
+
 fn throttle_global(n: u64, since: Instant) {
     let rate = LIMIT_RATE.load(Ordering::Relaxed);
     if rate == 0 || n == 0 {
@@ -224,6 +311,14 @@ struct Shared {
     /// cumulative bytes fetched per worker this session (never reset
     /// mid-session) — IDM's per-connection "Downloaded" column
     conn_bytes: Vec<AtomicU64>,
+    /// (instant, fetched_session) samples for the sliding-window
+    /// transfer rate shown to the user — IDM displays the CURRENT
+    /// rate, not a session average diluted by pauses and slow starts
+    rate_hist: Mutex<std::collections::VecDeque<(Instant, u64)>>,
+    /// this download's own speed limit in bytes/sec (0 = none) —
+    /// IDM's per-download Speed Limiter; composes with the global one
+    own_limit: AtomicU64,
+    own_limit_state: Mutex<Option<Instant>>,
 }
 
 fn save_state(shared: &Shared, force: bool) {
@@ -377,6 +472,17 @@ fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
     req
 }
 
+fn build_agent_for(url: &str) -> ureq::Agent {
+    apply_proxy_for(ureq::AgentBuilder::new(), url)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(30))
+        .timeout_write(Duration::from_secs(30))
+        .max_idle_connections(256)
+        .max_idle_connections_per_host(64)
+        .user_agent(BROWSER_UA)
+        .build()
+}
+
 fn build_agent() -> ureq::Agent {
     apply_proxy(ureq::AgentBuilder::new())
         .timeout_connect(Duration::from_secs(15))
@@ -389,17 +495,17 @@ fn build_agent() -> ureq::Agent {
 }
 
 pub fn probe(url: &str) -> Result<Probe, String> {
-    probe_with(&probe_agent(), url, &Auth::default())
+    probe_with(&probe_agent_for(url), url, &Auth::default())
 }
 
 pub fn probe_with_auth(url: &str, auth: &Auth) -> Result<Probe, String> {
-    probe_with(&probe_agent(), url, auth)
+    probe_with(&probe_agent_for(url), url, auth)
 }
 
 /// Probing must not hang a download start for minutes: a dedicated agent
 /// with a short timeout, separate from the transfer agent.
-fn probe_agent() -> ureq::Agent {
-    apply_proxy(ureq::AgentBuilder::new())
+fn probe_agent_for(url: &str) -> ureq::Agent {
+    apply_proxy_for(ureq::AgentBuilder::new(), url)
         .timeout(Duration::from_secs(15))
         .user_agent(BROWSER_UA)
         .build()
@@ -509,10 +615,12 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
         }
         let (total, range_ok, unknown_size) = match total_opt {
             Some(t) => (t, true, false),
-            None => {
-                let cl = resp.header("Content-Length").and_then(|v| v.parse().ok()).unwrap_or(0);
-                if cl > 0 { (cl, true, false) } else { (0, false, true) }
-            }
+            // Content-Range "bytes 0-0/*": the total is indeterminate.
+            // NEVER derive it from this response's Content-Length — that
+            // is the length of the 1-byte partial body, and trusting it
+            // once produced a "finished" 1-byte file. Unknown size means
+            // a streamed download, exactly like IDM treats it.
+            None => (0, false, true),
         };
         return Ok(Probe {
             total,
@@ -612,18 +720,46 @@ fn download_block_run(
         BlockError::Retry(format!("http: {e}"))
     })?;
     let status = resp.status();
+    // the end of THIS response — a server may legally answer a
+    // shorter range than the run requested; the run's own `end`
+    // stays the target and the worker re-calls us for the remainder
+    let mut resp_end = end;
     if is_gvideo && status == 200 {
-        // googlevideo &range= query parameter returns 200 OK for the requested byte slice
-    } else if status == 206 {
-        let range_ok = resp
-            .header("Content-Range")
-            .and_then(parse_content_range)
-            .map(|(s, e, t)| s == req_start && e == end && (t.is_none() || t == Some(total)))
+        // googlevideo &range= query parameter returns 200 OK for the
+        // requested byte slice — but a 200 can also be the WHOLE file
+        // (range ignored, redirect to a generic mirror), and writing
+        // that body at this run's offset would silently corrupt the
+        // file and still report Finished. The slice length is the one
+        // trustworthy check: require Content-Length to match it
+        // exactly; anything else is a retry, never assembled data.
+        let want = end - req_start + 1;
+        let cl_ok = resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|cl| cl == want)
             .unwrap_or(false);
-        if !range_ok {
+        if !cl_ok {
             return Err(BlockError::Retry(
-                "server answered a range request with the wrong range".to_string(),
+                "googlevideo 200 response length does not match the requested slice".to_string(),
             ));
+        }
+    } else if status == 206 {
+        // RFC 7233 lets a server return FEWER bytes than requested.
+        // Accept a shorter range that starts at the right offset:
+        // this call fills only up to resp_end and returns Ok with
+        // the block cursor short of the run end, and the worker
+        // calls again for the remainder (progress, not a retry).
+        // Only a wrong start offset or a mismatched total fails.
+        let parsed = resp.header("Content-Range").and_then(parse_content_range);
+        match parsed {
+            Some((s, e, t)) if s == req_start && e <= end && (t.is_none() || t == Some(total)) => {
+                resp_end = e;
+            }
+            _ => {
+                return Err(BlockError::Retry(
+                    "server answered a range request with the wrong range".to_string(),
+                ));
+            }
         }
     } else {
         return Err(BlockError::Retry(format!(
@@ -640,7 +776,7 @@ fn download_block_run(
         if shared.control.paused.load(Ordering::Relaxed) {
             return Err(BlockError::Paused);
         }
-        let remaining = end + 1 - *pos;
+        let remaining = resp_end + 1 - *pos;
         if remaining == 0 {
             break;
         }
@@ -680,6 +816,11 @@ fn download_block_run(
                 break;
             }
         }
+        // persist completions continuously (save_state throttles
+        // itself to 1 s / 4 MiB and try-locks): a crash or power loss
+        // must lose at most the in-flight block, never a whole claim
+        // run of up to 256 blocks whose marks existed only in RAM
+        save_state(shared, false);
         if *cur_block < b_end_excl {
             let b_base = (*cur_block as u64) * block_size;
             shared.partial[worker_id].store((*pos).saturating_sub(b_base), Ordering::Relaxed);
@@ -687,12 +828,13 @@ fn download_block_run(
             shared.partial[worker_id].store(0, Ordering::Relaxed);
         }
         throttle_global(n as u64, read_at);
+        throttle_own(shared, n as u64, read_at);
     }
-    if *pos != end + 1 {
+    if *pos != resp_end + 1 {
         return Err(BlockError::Retry(format!(
             "short block run: got {} bytes, expected to reach {}",
             *pos,
-            end + 1
+            resp_end + 1
         )));
     }
     Ok(())
@@ -798,7 +940,16 @@ fn worker(
                     Ok(()) => {
                         shared.partial[id].store(0, Ordering::Relaxed);
                         save_state(&shared, false);
-                        break;
+                        if cur_block >= b_last {
+                            break;
+                        }
+                        // partial run: the server answered a shorter
+                        // range than the sub-run — loop and fetch the
+                        // next chunk of the SAME sub-run. This is
+                        // progress, not a failure: the attempt counter
+                        // must not move, or a server capping responses
+                        // at 512 KiB would burn the retry budget on a
+                        // multi-megabyte run and fail the download.
                     }
                     Err(BlockError::Paused) => {
                         if cur_block < b_last {
@@ -926,8 +1077,33 @@ impl Download {
                 fetched
             },
             fetched_session: fetched,
-            speed_bps: if status == Status::Downloading && elapsed > 0.0 {
-                fetched as f64 / elapsed
+            speed_bps: if status == Status::Downloading {
+                // current transfer rate over a ~6 s sliding window
+                // (IDM shows the live rate); the session average would
+                // decay toward zero across every pause and slow start
+                let mut hist = self.shared.rate_hist.lock().unwrap();
+                let now = Instant::now();
+                if hist.back().map(|(_, b)| *b) != Some(fetched) {
+                    hist.push_back((now, fetched));
+                }
+                while hist.len() > 2
+                    && now.duration_since(hist[0].0) > Duration::from_secs(6)
+                {
+                    hist.pop_front();
+                }
+                match hist.front() {
+                    Some((t0, b0)) => {
+                        let dt = now.duration_since(*t0).as_secs_f64();
+                        if dt >= 1.0 && fetched > *b0 {
+                            (fetched - *b0) as f64 / dt
+                        } else if elapsed > 0.0 {
+                            fetched as f64 / elapsed
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => 0.0,
+                }
             } else {
                 0.0
             },
@@ -942,6 +1118,16 @@ impl Download {
                 .iter()
                 .map(|c| c.load(Ordering::Relaxed))
                 .collect(),
+        }
+    }
+
+    /// Set this download's own speed limit (bytes/sec, 0 = none) —
+    /// IDM's per-download Speed Limiter tab. Applies immediately to a
+    /// running download and composes with the global limit.
+    pub fn set_limit(&self, bytes_per_sec: u64) {
+        self.shared.own_limit.store(bytes_per_sec, Ordering::Relaxed);
+        if bytes_per_sec == 0 {
+            *self.shared.own_limit_state.lock().unwrap() = None;
         }
     }
 
@@ -1000,8 +1186,8 @@ fn start_impl(
     // an absurd block size is clamped, not trusted (overflow bait)
     let block_size = block_size.min(64 * 1024 * 1024);
     let max_conn = max_conn.clamp(1, 64);
-    let agent = build_agent();
-    let probed = probe_with(&probe_agent(), url, auth)?;
+    let agent = build_agent_for(url);
+    let probed = probe_with(&probe_agent_for(url), url, auth)?;
     let state_path = state_path_for(out);
 
     let control = Arc::new(Control {
@@ -1029,11 +1215,20 @@ fn start_impl(
                 && s.block_size <= 64 * 1024 * 1024
                 && (s.block_size == block_size || block_size == DEFAULT_BLOCK)
                 && s.done.len() == s.total.div_ceil(s.block_size) as usize
+                // block values are a closed set: anything but 0/1 makes
+                // the worker's run scan wedge (a value >1 yields an
+                // empty run that completes without progress, forever)
+                && s.done.iter().all(|&b| b <= 1)
                 && (s.etag.is_none() || probed.etag.is_none() || s.etag == probed.etag)
                 && (s.last_modified.is_none()
                     || probed.last_modified.is_none()
                     || s.last_modified == probed.last_modified)
                 && out.exists()
+                // the partial file must still be the preallocated full
+                // size: a truncated/recreated file would make set_len
+                // zero-extend regions the state calls downloaded
+                // (peek_state applies this same guard)
+                && out.metadata().map(|m| m.len()).unwrap_or(0) == s.total
         });
 
     let block_size = match &existing_state {
@@ -1118,6 +1313,9 @@ fn start_impl(
         status: Mutex::new(Status::Downloading),
         partial: (0..max_conn).map(|_| AtomicU64::new(0)).collect(),
         conn_bytes: (0..max_conn).map(|_| AtomicU64::new(0)).collect(),
+        rate_hist: Mutex::new(std::collections::VecDeque::new()),
+        own_limit: AtomicU64::new(0),
+        own_limit_state: Mutex::new(None),
         auth: auth.clone(),
     });
 
@@ -1226,6 +1424,9 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         status: Mutex::new(Status::Finished),
         partial: vec![AtomicU64::new(0)],
         conn_bytes: vec![AtomicU64::new(0)],
+        rate_hist: Mutex::new(std::collections::VecDeque::new()),
+        own_limit: AtomicU64::new(0),
+        own_limit_state: Mutex::new(None),
         auth: Auth::default(),
     });
     Arc::new(Download {
@@ -1271,6 +1472,9 @@ fn start_single_stream(
         status: Mutex::new(Status::Downloading),
         partial: vec![AtomicU64::new(0)],
         conn_bytes: vec![AtomicU64::new(0)],
+        rate_hist: Mutex::new(std::collections::VecDeque::new()),
+        own_limit: AtomicU64::new(0),
+        own_limit_state: Mutex::new(None),
         auth: auth.clone(),
     });
     let download = Arc::new(Download {
@@ -1285,7 +1489,7 @@ fn start_single_stream(
     let out = out.to_path_buf();
     let auth = auth.clone();
     std::thread::spawn(move || {
-        let agent = build_agent();
+        let agent = build_agent_for(&url);
         let result: Result<(), String> = (|| {
             shared.active_workers.store(1, Ordering::Relaxed);
             let resp = apply_auth(agent.get(&url), &auth)
@@ -1329,6 +1533,7 @@ fn start_single_stream(
                     cb.fetch_add(n as u64, Ordering::Relaxed);
                 }
                 throttle_global(n as u64, read_at);
+                throttle_own(&shared, n as u64, read_at);
             }
             // a clean early EOF must not pose as a finished file
             if expected_total > 0 && pos != expected_total {
@@ -1381,6 +1586,7 @@ pub fn peek_state(url: &str, out: &Path) -> Option<Peeked> {
     if s.block_size == 0
         || s.block_size > 64 * 1024 * 1024
         || s.done.len() != s.total.div_ceil(s.block_size) as usize
+        || s.done.iter().any(|&b| b > 1)
     {
         return None;
     }
@@ -1446,8 +1652,8 @@ pub struct GrabPage {
 
 const MAX_GRAB_ITEMS: usize = 300;
 
-fn grab_agent(timeout_secs: u64) -> ureq::Agent {
-    apply_proxy(ureq::AgentBuilder::new())
+fn grab_agent_for(url: &str, timeout_secs: u64) -> ureq::Agent {
+    apply_proxy_for(ureq::AgentBuilder::new(), url)
         .timeout(Duration::from_secs(timeout_secs))
         .user_agent(BROWSER_UA)
         .build()
@@ -1766,7 +1972,7 @@ fn probe_size(agent: &ureq::Agent, url: &str) -> Option<u64> {
 }
 
 pub fn grab_page(url: &str) -> Result<GrabPage, String> {
-    let agent = grab_agent(25);
+    let agent = grab_agent_for(url, 25);
     let resp = agent
         .get(url)
         .set("Accept-Encoding", "identity")
@@ -1818,7 +2024,7 @@ pub fn grab_page(url: &str) -> Result<GrabPage, String> {
     // global time budget so a page full of dead links cannot hold the
     // command open for many minutes — late items just keep size None
     let probe_deadline = Instant::now() + Duration::from_secs(120);
-    let probe_agent = grab_agent(8);
+    let probe_agent = grab_agent_for(url, 8);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let slots: Vec<Mutex<Option<u64>>> = items.iter().map(|_| Mutex::new(None)).collect();
     std::thread::scope(|scope| {
@@ -1840,6 +2046,248 @@ pub fn grab_page(url: &str) -> Result<GrabPage, String> {
     }
 
     Ok(GrabPage { title, items })
+}
+
+
+// ---------- site grabber: multi-level exploration (IDM Grabber) ----------
+// IDM's Grabber is not a one-page link list: starting from a project's
+// start page it EXPLORES — following page links level by level, inside
+// the site and (with its own, usually smaller, level budget) outside
+// it — and collects the files that pass the project's filters. This is
+// that exploration. `grab_page` above stays as the one-page special
+// case used by older callers.
+
+#[derive(Clone, Default)]
+pub struct GrabOptions {
+    /// link levels to explore within the start site (0 = start page only)
+    pub depth_same: u32,
+    /// link levels to explore on other sites
+    pub depth_other: u32,
+    /// explore the whole site (depth_same treated as very large; the
+    /// page cap still applies)
+    pub whole_site: bool,
+    /// do not explore pages above the start page's directory
+    pub no_parent: bool,
+    /// collect files only from the start site
+    pub same_site_files_only: bool,
+    /// if non-empty, only files with one of these extensions are kept
+    pub include_exts: Vec<String>,
+    /// files with one of these extensions are never kept
+    pub exclude_exts: Vec<String>,
+    /// size window in bytes, applied after probing (unknown size keeps
+    /// the file — a size cannot disprove what it never reported)
+    pub min_size: Option<u64>,
+    pub max_size: Option<u64>,
+}
+
+#[derive(Clone, Serialize)]
+pub struct GrabSite {
+    pub title: String,
+    pub items: Vec<GrabItem>,
+    pub pages_visited: usize,
+}
+
+const MAX_GRAB_PAGES: usize = 60;
+const MAX_SITE_ITEMS: usize = 1000;
+
+fn url_host(url: &str) -> String {
+    let after = url.split("://").nth(1).unwrap_or("");
+    after
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn url_path(url: &str) -> String {
+    let after = url.split("://").nth(1).unwrap_or("");
+    match after.find('/') {
+        Some(i) => after[i..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string(),
+        None => "/".to_string(),
+    }
+}
+
+fn url_ext(url: &str) -> String {
+    let path = url_path(url);
+    let last = path.rsplit('/').next().unwrap_or("");
+    match last.rfind('.') {
+        Some(i) if i > 0 => last[i + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// A link worth EXPLORING (an HTML-ish page) vs a file to collect.
+fn is_page_link(url: &str) -> bool {
+    let path = url_path(url);
+    if path.ends_with('/') {
+        return true;
+    }
+    let ext = url_ext(url);
+    ext.is_empty()
+        || matches!(
+            ext.as_str(),
+            "html" | "htm" | "php" | "asp" | "aspx" | "jsp" | "shtml" | "xhtml"
+        )
+}
+
+fn fetch_page(agent: &ureq::Agent, url: &str) -> Option<(String, String)> {
+    let resp = agent.get(url).set("Accept-Encoding", "identity").call().ok()?;
+    let final_url = resp.get_url().to_string();
+    let mut body = Vec::new();
+    {
+        use std::io::Read as _;
+        resp.into_reader()
+            .take(8 * 1024 * 1024)
+            .read_to_end(&mut body)
+            .ok()?;
+    }
+    Some((final_url, String::from_utf8_lossy(&body).to_string()))
+}
+
+pub fn grab_site(start_url: &str, opts: &GrabOptions) -> Result<GrabSite, String> {
+    let start_host = url_host(start_url);
+    if start_host.is_empty() {
+        return Err("the start page address is not a valid URL".to_string());
+    }
+    let start_path = url_path(start_url);
+    let start_dir = match start_path.rfind('/') {
+        Some(p) => start_path[..=p].to_string(),
+        None => "/".to_string(),
+    };
+    let depth_same = if opts.whole_site { 10 } else { opts.depth_same.min(10) };
+    let depth_other = opts.depth_other.min(10);
+    let include: Vec<String> = opts
+        .include_exts
+        .iter()
+        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    let exclude: Vec<String> = opts
+        .exclude_exts
+        .iter()
+        .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+
+    let agent = grab_agent_for(start_url, 25);
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<(String, u32)> = std::collections::VecDeque::new();
+    queue.push_back((start_url.to_string(), 0));
+    visited.insert(start_url.to_string());
+    let mut seen_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut items: Vec<GrabItem> = Vec::new();
+    let mut title = String::new();
+    let mut pages_visited = 0usize;
+
+    while let Some((page_url, depth)) = queue.pop_front() {
+        if pages_visited >= MAX_GRAB_PAGES {
+            break;
+        }
+        let Some((final_url, html)) = fetch_page(&agent, &page_url) else {
+            continue;
+        };
+        pages_visited += 1;
+        if pages_visited == 1 {
+            let lower = html.to_ascii_lowercase();
+            title = (|| {
+                let start = lower.find("<title")?;
+                let gt = lower[start..].find('>')? + start + 1;
+                let end = lower[gt..].find("</title>")? + gt;
+                Some(plain_text(&decode_entities(&html[gt..end])))
+            })()
+            .unwrap_or_default();
+        }
+        for (raw, label) in extract_links(&html) {
+            let Some(resolved) = resolve_url(&final_url, &raw) else {
+                continue;
+            };
+            let same_site = url_host(&resolved) == start_host;
+            if is_page_link(&resolved) {
+                // exploration budget: same-site and other-site links
+                // have their own level allowance, like IDM Step 3
+                let limit = if same_site { depth_same } else { depth_other };
+                if depth >= limit {
+                    continue;
+                }
+                if opts.no_parent && same_site && !url_path(&resolved).starts_with(&start_dir) {
+                    continue;
+                }
+                if visited.insert(resolved.clone()) {
+                    queue.push_back((resolved, depth + 1));
+                }
+            } else {
+                if opts.same_site_files_only && !same_site {
+                    continue;
+                }
+                let ext = url_ext(&resolved);
+                if !include.is_empty() && !include.contains(&ext) {
+                    continue;
+                }
+                if exclude.contains(&ext) {
+                    continue;
+                }
+                if seen_files.insert(resolved.clone()) {
+                    items.push(GrabItem {
+                        name: file_name_of(&resolved),
+                        url: resolved,
+                        label,
+                        size: None,
+                    });
+                    if items.len() >= MAX_SITE_ITEMS {
+                        break;
+                    }
+                }
+            }
+        }
+        if items.len() >= MAX_SITE_ITEMS {
+            break;
+        }
+    }
+    if pages_visited == 0 {
+        return Err("could not fetch the start page".to_string());
+    }
+
+    // probe sizes in parallel, with the same global budget as grab_page
+    let probe_deadline = Instant::now() + Duration::from_secs(120);
+    let probe_agent = grab_agent_for(start_url, 8);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<u64>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= items.len() {
+                    break;
+                }
+                if Instant::now() > probe_deadline {
+                    continue;
+                }
+                *slots[i].lock().unwrap() = probe_size(&probe_agent, &items[i].url);
+            });
+        }
+    });
+    for (item, slot) in items.iter_mut().zip(slots) {
+        item.size = *slot.lock().unwrap();
+    }
+    if opts.min_size.is_some() || opts.max_size.is_some() {
+        items.retain(|it| match it.size {
+            Some(sz) => {
+                opts.min_size.map(|m| sz >= m).unwrap_or(true)
+                    && opts.max_size.map(|m| sz <= m).unwrap_or(true)
+            }
+            None => true,
+        });
+    }
+
+    Ok(GrabSite {
+        title,
+        items,
+        pages_visited,
+    })
 }
 
 #[cfg(test)]
@@ -1878,6 +2326,175 @@ mod tests {
         );
         assert_eq!(parse_content_range("bytes 0-512/*"), Some((0, 512, None)));
         assert_eq!(parse_content_range("invalid"), None);
+    }
+
+    // --- 1.9.0 completion: per-protocol proxy gating + Grabber crawl ---
+
+    #[test]
+    fn proxy_for_url_respects_protocol_toggles() {
+        set_global_proxy("http://127.0.0.1:9999");
+        set_proxy_protocols(true, true, true);
+        assert_eq!(proxy_for_url("http://a.com/f"), "http://127.0.0.1:9999");
+        set_proxy_protocols(false, true, true);
+        assert_eq!(proxy_for_url("http://a.com/f"), "");
+        assert_eq!(proxy_for_url("https://a.com/f"), "http://127.0.0.1:9999");
+        set_proxy_protocols(true, true, true);
+        set_global_proxy("");
+    }
+
+    /// A tiny canned web site on a loopback port: two "hosts"
+    /// (127.0.0.1 and localhost) sharing one server, pages at two
+    /// depths, files of known sizes.
+    fn canned_site() -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("/").to_string();
+                    // drain headers
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let zip = vec![b'z'; 100];
+                    let pdf = vec![b'p'; 200];
+                    let bin = vec![b'b'; 300];
+                    let idx = format!(
+                        "<html><title>Root</title><a href=\"/site/a.zip\">zip</a><a href=\"/site/sub/page.html\">sub</a><a href=\"http://localhost:{port}/ext/page2.html\">ext</a></html>"
+                    );
+                    let sub = "<html><title>Sub</title><a href=\"/site/files/deep.pdf\">pdf</a><a href=\"/site/index.html\">back</a></html>".to_string();
+                    let ext = "<html><title>Ext</title><a href=\"/ext/deep.bin\">bin</a></html>".to_string();
+                    let (ctype, body): (&str, Vec<u8>) = match path.as_str() {
+                        "/site/index.html" => ("text/html", idx.into_bytes()),
+                        "/site/sub/page.html" => ("text/html", sub.into_bytes()),
+                        "/ext/page2.html" => ("text/html", ext.into_bytes()),
+                        "/site/a.zip" => ("application/zip", zip),
+                        "/site/files/deep.pdf" => ("application/pdf", pdf),
+                        "/ext/deep.bin" => ("application/octet-stream", bin),
+                        _ => {
+                            let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            return;
+                        }
+                    };
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                                .as_bytes(),
+                        );
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(&body);
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn grab_names(site: &GrabSite) -> Vec<String> {
+        let mut v: Vec<String> = site.items.iter().map(|i| i.name.clone()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn grab_site_depth_and_filters_follow_idm_rules() {
+        let port = canned_site();
+        let root = format!("http://127.0.0.1:{port}/site/index.html");
+
+        // depth 0: only the start page is read
+        let r = grab_site(&root, &GrabOptions::default()).unwrap();
+        assert_eq!(grab_names(&r), vec!["a.zip".to_string()], "depth0: {:?}", grab_names(&r));
+        assert_eq!(r.pages_visited, 1);
+
+        // one same-site level: the sub page's file appears; the other
+        // site's page is not explored at depth_other = 0
+        let r = grab_site(
+            &root,
+            &GrabOptions { depth_same: 1, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(
+            grab_names(&r),
+            vec!["a.zip".to_string(), "deep.pdf".to_string()],
+            "depth1: {:?}",
+            grab_names(&r)
+        );
+
+        // one other-site level too: the external file appears
+        let r = grab_site(
+            &root,
+            &GrabOptions { depth_same: 1, depth_other: 1, ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(
+            grab_names(&r),
+            vec!["a.zip".to_string(), "deep.bin".to_string(), "deep.pdf".to_string()],
+            "other1: {:?}",
+            grab_names(&r)
+        );
+
+        // same-site-files-only keeps the external PAGE explored out of
+        // the file list even when it is explored
+        let r = grab_site(
+            &root,
+            &GrabOptions {
+                depth_same: 1,
+                depth_other: 1,
+                same_site_files_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            grab_names(&r),
+            vec!["a.zip".to_string(), "deep.pdf".to_string()]
+        );
+
+        // extension include filter + size window (a.zip is 100 B)
+        let r = grab_site(
+            &root,
+            &GrabOptions {
+                depth_same: 1,
+                depth_other: 1,
+                include_exts: vec!["pdf".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(grab_names(&r), vec!["deep.pdf".to_string()]);
+        let r = grab_site(
+            &root,
+            &GrabOptions {
+                depth_same: 1,
+                min_size: Some(150),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(grab_names(&r), vec!["deep.pdf".to_string()]);
     }
 
     #[test]

@@ -44,11 +44,16 @@ function isVideoPageUrl(url) {
 }
 
 // Known downloadable file extensions for browser-download interception.
+// IDM's default File Types list is the base set (its MPG/MPEG/ASF/RM…
+// were missing here, so plain .mpg links were never caught); NDM's
+// own additions (deb, apk, torrent, disk images…) stay. TXT/CSV are
+// deliberately NOT intercepted — IDM leaves them to the browser.
 const FILE_EXTENSIONS = [
-  'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz', 'cab',
-  'exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'run', 'appimage', 'flatpakref',
-  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'txt', 'rtf', 'epub', 'mobi',
-  'mp3', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flac', 'aac', 'ogg', 'm4a', 'm4b', 'opus', 'wav', 'wma', 'flv', 'wmv', '3gp', 'm4v', 'ts',
+  'zip', 'rar', '7z', 'tar', 'gz', 'gzip', 'bz2', 'xz', 'zst', 'tgz', 'tbz2', 'txz', 'cab', 'ace', 'arj', 'lzh', 'sit', 'sitx',
+  'exe', 'msi', 'msix', 'msixbundle', 'deb', 'rpm', 'dmg', 'pkg', 'iso', 'img', 'apk', 'bin', 'run', 'appimage', 'flatpakref', 'msu',
+  'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'pps', 'rtf', 'epub', 'mobi', 'tif', 'tiff',
+  'mp3', 'mp4', 'mkv', 'avi', 'mov', 'webm', 'flac', 'aac', 'ogg', 'ogv', 'm4a', 'm4b', 'opus', 'wav', 'wma', 'flv', 'wmv', '3gp', 'm4v', 'ts',
+  'mpg', 'mpeg', 'mpa', 'mpe', 'asf', 'rm', 'rmvb', 'aif',
   'torrent', 'jar', 'war', 'whl', 'vmdk', 'qcow2', 'vdi',
 ];
 
@@ -180,24 +185,76 @@ if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
    extension does not intercept at all and the browser keeps its own
    download — exactly as if the extension were absent. */
 let ndmHostMissing = false;
-chrome.storage.local
-  .get({ ndmHostStatus: '' })
-  .then(v => {
-    ndmHostMissing = v.ndmHostStatus === 'host-missing';
-  })
-  .catch(() => {});
+let ndmHostStatusStr = '';
+let ndmHostStatusAt = 0;
+let ndmInterceptEnabled = true;
+let ndmSiteExceptions = new Set();
+
+/* "Host missing" has a shelf life: a status older than ~60 s is not
+   trusted (one transient crash used to disable interception
+   indefinitely, because the recorded timestamp was never read). A
+   stale missing-status triggers a re-probe and stops gating. */
+function hostKnownMissing() {
+  if (ndmHostStatusStr !== 'host-missing') return false;
+  if (Date.now() - ndmHostStatusAt < 60000) return true;
+  pingHostAndRecord().catch(() => {});
+  return false;
+}
+
+/* Both interception gates (enabled flag + host status + site
+   exceptions) load through this one promise: events that wake the
+   service worker await it instead of acting on default values that
+   an async storage read has not corrected yet. */
+const settingsReady = (async () => {
+  try {
+    const v = await chrome.storage.local.get({
+      ndmIntercept: true,
+      ndmHostStatus: '',
+      ndmHostStatusAt: 0,
+      ndmSiteExceptions: [],
+    });
+    ndmInterceptEnabled = v.ndmIntercept !== false;
+    ndmHostStatusStr = v.ndmHostStatus || '';
+    ndmHostStatusAt = Number(v.ndmHostStatusAt) || 0;
+    ndmHostMissing = ndmHostStatusStr === 'host-missing';
+    if (Array.isArray(v.ndmSiteExceptions)) {
+      ndmSiteExceptions = new Set(v.ndmSiteExceptions);
+    }
+  } catch (e) {}
+})();
 
 function setHostStatus(status) {
+  ndmHostStatusStr = status;
+  ndmHostStatusAt = Date.now();
   ndmHostMissing = status === 'host-missing';
   chrome.storage.local.set({
     ndmHostStatus: status,
-    ndmHostStatusAt: Date.now(),
+    ndmHostStatusAt: ndmHostStatusAt,
   }).catch(() => {});
 }
 
+/* Sends of the same kind+URL share one in-flight request: after a
+   timeout the underlying native request can STILL create the entry,
+   and a caller that blindly re-sent used to end up with a second
+   copy downloading alongside the timed-out first one. */
+const inflightSends = new Map();
+
 function sendToNdm(message) {
+  const key = `${message.kind || ''}|${message.url || ''}`;
+  if (message.url && inflightSends.has(key)) {
+    return inflightSends.get(key);
+  }
   const msg = { type: 'download', ...message };
-  const attempt = new Promise(resolve => {
+  let answered = false;
+  const promise = new Promise(resolve => {
+    const finish = v => {
+      // the in-flight entry always clears when the native call
+      // settles — even after a timeout already answered the caller
+      inflightSends.delete(key);
+      if (answered) return;
+      answered = true;
+      resolve(v);
+    };
     try {
       chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
         if (chrome.runtime.lastError) {
@@ -205,7 +262,7 @@ function sendToNdm(message) {
           const missing = /not found|No such native/i.test(text);
           setHostStatus(missing ? 'host-missing' : 'fail');
           console.warn('NDM host error:', text);
-          resolve({
+          finish({
             ok: false,
             error: missing
               ? 'NDM native host is not registered. Open the NDM desktop app once to register it.'
@@ -216,7 +273,7 @@ function sendToNdm(message) {
         const ok = !!(response && response.ok);
         setHostStatus(ok ? 'ok' : 'fail');
         if (!ok) console.warn('NDM host rejected the download:', response);
-        resolve({
+        finish({
           ok,
           // the app's entry id and duplicate flag ride along: the
           // in-page dialogs act on them (keep / pause / discard the
@@ -227,18 +284,24 @@ function sendToNdm(message) {
         });
       });
     } catch (e) {
-      setHostStatus('host-missing');
-      console.warn('NDM send failed:', e);
-      resolve({ ok: false, error: String(e) });
-    }
-  });
-  const timeout = new Promise(r =>
-    setTimeout(() => {
       setHostStatus('fail');
-      r({ ok: false, error: 'Timed out waiting for NDM app.' });
-    }, 25000)
-  );
-  return Promise.race([attempt, timeout]);
+      console.warn('NDM send failed:', e);
+      finish({ ok: false, error: String(e) });
+    }
+    setTimeout(() => {
+      // A timeout is NOT a failure: the app may simply be cold-
+      // starting, and the request can still land. Report it as
+      // unknown (no host-status penalty, no automatic re-send —
+      // the shared in-flight entry keeps later callers joined to
+      // this request until it truly settles).
+      if (!answered) {
+        answered = true;
+        resolve({ ok: false, unknown: true, error: 'NDM is still starting — the request was not re-sent.' });
+      }
+    }, 25000);
+  });
+  if (message.url) inflightSends.set(key, promise);
+  return promise;
 }
 
 /* Pause or discard one existing entry (the browser dialog's Later /
@@ -290,7 +353,11 @@ function probeWithNdm(url, cookies) {
           setHostStatus('ok');
           resolve({ ok: true, info: response.info });
         } else {
-          setHostStatus(response ? 'fail' : 'host-missing');
+          // a null response means the host CRASHED once — that is a
+          // failure, not proof the host is unregistered; only the
+          // actual "No such native application" error earns the
+          // sticky host-missing state
+          setHostStatus('fail');
           resolve({
             ok: false,
             error: (response && response.error) || 'Could not read video formats from this page.',
@@ -317,16 +384,23 @@ function probeFileWithNdm(url, pageUrl, cookies) {
     try {
       chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
         if (chrome.runtime.lastError) {
-          resolve({ ok: false, error: chrome.runtime.lastError.message || 'Host error' });
+          const text = chrome.runtime.lastError.message || '';
+          const missing = /not found|No such native/i.test(text);
+          setHostStatus(missing ? 'host-missing' : 'fail');
+          resolve({ ok: false, error: text || 'Host error' });
           return;
         }
+        // record host health like every other host call (this one
+        // used to leave the shared status untouched)
+        setHostStatus(response && response.ok ? 'ok' : 'fail');
         resolve(response || { ok: false });
       });
     } catch (e) {
+      setHostStatus('fail');
       resolve({ ok: false, error: String(e) });
     }
   });
-  const timeout = new Promise(r => setTimeout(() => r({ ok: false, error: 'timeout' }), 15000));
+  const timeout = new Promise(r => setTimeout(() => r({ ok: false, error: 'timeout' }), 12000));
   return Promise.race([attempt, timeout]);
 }
 
@@ -417,14 +491,23 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
   if (info.menuItemId === MENU_LINK && info.linkUrl) {
     const kind = isVideoPageUrl(info.linkUrl) ? 'video' : 'file';
-    if (kind === 'file' && tab && tab.id != null) {
-      const opened = await openFileModalInTab(tab.id, {
-        url: info.linkUrl,
-        filename: '',
-        totalBytes: 0,
-        referrer: pageUrl,
-      });
-      if (opened) return;
+    if (tab && tab.id != null) {
+      if (kind === 'video') {
+        // a video-page link gets the same in-page dialog as the
+        // other menu entries (it used to skip straight to the app)
+        try {
+          const res = await chrome.tabs.sendMessage(tab.id, { action: 'ndm-open-video-modal' });
+          if (res && res.ok) return;
+        } catch (e) {}
+      } else {
+        const opened = await openFileModalInTab(tab.id, {
+          url: info.linkUrl,
+          filename: '',
+          totalBytes: 0,
+          referrer: pageUrl,
+        });
+        if (opened) return;
+      }
     }
     const cookies = await captureCookies(info.linkUrl, pageUrl);
     sendToNdm({ kind, url: info.linkUrl, pageUrl, title, cookies });
@@ -537,9 +620,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const pageUrl = message.pageUrl || (sender.tab && sender.tab.url) || '';
     const targetUrl = message.url || pageUrl;
     (async () => {
-      const cookies = await captureCookies(targetUrl, pageUrl);
+      // warm (passive pre-) probes never carry the user's session
+      await settingsReady;
+      const cookies = message.warm ? '' : await captureCookies(targetUrl, pageUrl);
       const res = await probeWithNdm(targetUrl, cookies);
       sendResponse(res);
+    })();
+    return true;
+  }
+
+  if (message.action === 'ndm-classify-url') {
+    // the popup asks instead of carrying its own copy of the video
+    // host patterns (the copies had already diverged once)
+    sendResponse({ video: isVideoPageUrl(message.url || '') });
+    return false;
+  }
+
+  if (message.action === 'ndm-tab-state') {
+    const tabId = sender && sender.tab ? sender.tab.id : null;
+    (async () => {
+      let disabled = false;
+      try {
+        const v = await chrome.storage.local.get({ ndmTabOff: {} });
+        disabled = !!(v.ndmTabOff && tabId != null && v.ndmTabOff[tabId]);
+      } catch (e) {}
+      sendResponse({ disabled, tabId });
     })();
     return true;
   }
@@ -578,13 +683,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 /* Browser download interception (0ms instant cancel + in-browser UI)  */
 /* ------------------------------------------------------------------ */
 
-let ndmInterceptEnabled = true;
-chrome.storage.local.get({ ndmIntercept: true }).then(v => {
-  ndmInterceptEnabled = v.ndmIntercept !== false;
-}).catch(() => {});
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.ndmIntercept) {
+  if (area !== 'local') return;
+  if (changes.ndmIntercept) {
     ndmInterceptEnabled = changes.ndmIntercept.newValue !== false;
+  }
+  if (changes.ndmSiteExceptions) {
+    const list = Array.isArray(changes.ndmSiteExceptions.newValue)
+      ? changes.ndmSiteExceptions.newValue
+      : [];
+    ndmSiteExceptions = new Set(list);
   }
 });
 
@@ -617,12 +725,21 @@ async function openFileModalInTab(tabId, payload) {
 
 const interceptedIds = new Set();
 
+function siteExceptedFor(url) {
+  try {
+    return ndmSiteExceptions.has(new URL(url).hostname.toLowerCase());
+  } catch (e) {
+    return false;
+  }
+}
+
 function shouldInterceptItem(item) {
   if (!ndmInterceptEnabled || !item) return false;
-  // Host known missing → stay inert like IDM's module without IDM.
-  if (ndmHostMissing) return false;
+  // Host known missing (freshly verified) → inert, like IDM's module
+  if (hostKnownMissing()) return false;
   const url = item.finalUrl || item.url || '';
   if (!/^https?:\/\//i.test(url)) return false;
+  if (siteExceptedFor(url)) return false;
   const mimeHit =
     !!item.mime &&
     (item.mime.startsWith('application/') ||
@@ -640,19 +757,43 @@ function shouldInterceptItem(item) {
   );
 }
 
+function eraseBrowserItem(id) {
+  try {
+    chrome.downloads.erase({ id }, () => {});
+  } catch (e) {}
+}
+
+function notifyTakeoverProblem(name) {
+  try {
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icon128.png',
+      title: 'NDM could not take this download',
+      message: `"${name || 'Download'}" was left in the browser's download list — resume it there, or open the NDM app and try again.`,
+    });
+  } catch (e) {}
+}
+
 async function handleInterceptedDownload(item, suggestedFilename) {
   if (!item || interceptedIds.has(item.id)) return;
   interceptedIds.add(item.id);
   if (interceptedIds.size > 500) {
     interceptedIds.delete(interceptedIds.values().next().value);
   }
+  // Re-check the gates with freshly loaded settings: the download
+  // that woke the service worker must not be taken over on stale
+  // defaults (user had interception off, host known missing…).
+  await settingsReady;
+  if (!shouldInterceptItem(item)) return;
 
-  // Cancel and erase the native browser download IMMEDIATELY (0ms delay)
-  // so the browser's download shelf / Save-As dialog never appears!
+  // Take the download over: cancel the browser's copy, but do NOT
+  // erase it yet. Erasing happens only once NDM has CONFIRMED it
+  // owns the download (the in-page dialog opened, or a send acked
+  // ok). The old flow erased first and asked later — when every
+  // fallback then failed, the download, its partial file and its
+  // shelf record were destroyed with no error shown anywhere.
   try {
-    chrome.downloads.cancel(item.id, () => {
-      chrome.downloads.erase({ id: item.id }, () => {});
-    });
+    chrome.downloads.cancel(item.id, () => {});
   } catch (e) {}
 
   const url = item.finalUrl || item.url || '';
@@ -661,29 +802,44 @@ async function handleInterceptedDownload(item, suggestedFilename) {
   const totalBytes = item.totalBytes && item.totalBytes > 0 ? item.totalBytes : 0;
   const referrer = item.referrer || '';
 
-  // Try to open the IDM Download File Info popup right inside the active browser tab!
+  // Open the dialog in the tab that STARTED the download (matched
+  // by referrer), not whatever tab happens to be active: a download
+  // from a background tab used to pop the dialog over an unrelated
+  // page and hand it that page's URL as the referrer — login-gated
+  // downloads then failed and the context was simply wrong.
+  let targetTab = null;
   try {
-    let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    if (!tabs || !tabs.length) {
-      tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabs = await chrome.tabs.query({});
+    if (referrer) {
+      targetTab =
+        tabs.find(t => t.url === referrer) ||
+        tabs.find(t => {
+          try {
+            return t.url && new URL(t.url).origin === new URL(referrer).origin;
+          } catch (e) {
+            return false;
+          }
+        });
     }
-    if (!tabs || !tabs.length) {
-      tabs = await chrome.tabs.query({ active: true });
-    }
-    const activeTab = tabs && tabs[0];
-    if (activeTab && activeTab.id != null) {
-      const opened = await openFileModalInTab(activeTab.id, {
-        url,
-        filename: cleanName,
-        totalBytes,
-        referrer: referrer || activeTab.url || '',
-      });
-      if (opened) return;
+    if (!targetTab) {
+      targetTab =
+        tabs.find(t => t.active && t.lastFocusedWindow) || tabs.find(t => t.active);
     }
   } catch (e) {}
+  if (targetTab && targetTab.id != null) {
+    const opened = await openFileModalInTab(targetTab.id, {
+      url,
+      filename: cleanName,
+      totalBytes,
+      referrer: referrer || targetTab.url || '',
+    });
+    if (opened) {
+      eraseBrowserItem(item.id);
+      return;
+    }
+  }
 
-  // Fallback if the active tab cannot host content scripts (e.g. blank new tab or restricted page):
-  // start directly in NDM background without forcing the desktop window open or stealing focus!
+  // Fallback if no tab can host the dialog: start directly in NDM.
   const cookies = await captureCookies(url, referrer);
   const sent = await sendToNdm({
     kind: 'file_direct',
@@ -695,52 +851,51 @@ async function handleInterceptedDownload(item, suggestedFilename) {
     later: false,
     total: totalBytes,
   }).catch(() => null);
-  if (!sent || !sent.ok) {
-    // IDM parity: a refused direct start is NEVER handed back to the
-    // browser (IDM never returns downloads). Escalate to the app
-    // itself instead — the entry lands in the app's list/dialog where
-    // the user decides, the way IDM's own dialog is always available.
-    await sendToNdm({
-      kind: 'file',
-      url,
-      pageUrl: referrer,
-      title: cleanName,
-      cookies,
-      dir: '~/Downloads',
-      later: false,
-      total: totalBytes,
-    }).catch(() => null);
+  if (sent && sent.ok) {
+    eraseBrowserItem(item.id);
+    return;
   }
+  if (sent && sent.unknown) {
+    // the request may still land in the app — say so, and leave the
+    // browser copy listed so the user can resume it if it doesn't
+    notifyTakeoverProblem(cleanName);
+    return;
+  }
+  // IDM parity: a refused direct start is NEVER handed back to the
+  // browser. Escalate to the app itself — the entry lands in the
+  // app's list/dialog where the user decides.
+  const escalated = await sendToNdm({
+    kind: 'file',
+    url,
+    pageUrl: referrer,
+    title: cleanName,
+    cookies,
+    dir: '~/Downloads',
+    later: false,
+    total: totalBytes,
+  }).catch(() => null);
+  if (escalated && escalated.ok) {
+    eraseBrowserItem(item.id);
+    return;
+  }
+  notifyTakeoverProblem(cleanName);
 }
 
 if (chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
     if (shouldInterceptItem(item)) {
-      // 1. Cancel and erase IMMEDIATELY BEFORE calling suggest() so Chrome never displays the Save As dialog or shelf!
-      try {
-        chrome.downloads.cancel(item.id, () => {
-          chrome.downloads.erase({ id: item.id }, () => {});
-        });
-      } catch (e) {}
-      // 2. Call suggest to satisfy Chrome's API requirement
+      // Steer the filename so no Save-As dialog flashes; the actual
+      // takeover (cancel first, erase only after NDM confirms) runs
+      // in the async handler above.
       const suggested = (item && item.filename) || '';
       try {
         suggest({ filename: suggested || 'ndm-intercept.tmp', conflictAction: 'uniquify' });
       } catch (e) {}
-      // 3. Delegate to NDM in-page modal / direct start
       handleInterceptedDownload(item, suggested);
-      return;
     }
   });
 }
 
 chrome.downloads.onCreated.addListener(item => {
-  if (shouldInterceptItem(item)) {
-    try {
-      chrome.downloads.cancel(item.id, () => {
-        chrome.downloads.erase({ id: item.id }, () => {});
-      });
-    } catch (e) {}
-    handleInterceptedDownload(item, item.filename || '');
-  }
+  handleInterceptedDownload(item, item.filename || '');
 });
