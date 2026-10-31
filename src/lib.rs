@@ -458,13 +458,22 @@ fn save_state(shared: &Shared, force: bool) {
     let snapshot = plock(&shared.state).clone();
     // write-then-rename keeps the on-disk state valid even if killed mid-save
     let tmp = shared.state_path.with_extension("json.tmp");
+    // The tmp handle is CLOSED before the rename below: on Windows,
+    // renaming a file whose write handle is still open can fail with
+    // a sharing violation, and the save that matters most — the
+    // supervisor's final save, immediately followed by deleting the
+    // state file — is exactly the one that must not silently fail.
+    let write_ok = match File::create(&tmp) {
+        Ok(f) => {
+            let ok = serde_json::to_writer(&f, &snapshot).is_ok();
+            let sync_ok = !force || f.sync_all().is_ok();
+            ok && sync_ok
+        } // f drops here — the handle is closed before the rename
+        Err(_) => false,
+    };
     let mut saved = false;
-    if let Ok(f) = File::create(&tmp) {
-        let write_ok = serde_json::to_writer(&f, &snapshot).is_ok();
-        let sync_ok = !force || f.sync_all().is_ok();
-        if write_ok && sync_ok {
-            saved = std::fs::rename(&tmp, &shared.state_path).is_ok();
-        }
+    if write_ok {
+        saved = std::fs::rename(&tmp, &shared.state_path).is_ok();
     }
     if saved {
         if force {
@@ -476,6 +485,24 @@ fn save_state(shared: &Shared, force: bool) {
         }
         shared.since_save.store(0, Ordering::Relaxed);
         *last = Instant::now();
+    }
+}
+
+/// Delete a file, tolerating the brief window on Windows where a
+/// just-written, just-closed file is still locked (the OS or a virus
+/// scanner holding it open for a scan): a single fire-and-forget
+/// remove loses that race and leaves a finished download's state
+/// file behind, its error discarded. Bounded (~0.5 s worst case)
+/// and only a backstop — callers close their handles first and
+/// order their writes so the first attempt normally succeeds.
+fn remove_file_bounded(path: &Path) {
+    for attempt in 0..20 {
+        match std::fs::remove_file(path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(_) if attempt < 19 => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return,
+        }
     }
 }
 
@@ -1685,38 +1712,53 @@ fn start_impl(
             for h in handles {
                 let _ = h.join();
             }
-            // Settle the terminal status FIRST, from the atomics
-            // alone: the sync and the state save below can be slow
-            // (an 800 MB file on a busy disk) or can fail, and they
-            // must never delay — or, if this thread dies, prevent —
-            // the terminal state the rest of the app is waiting on
-            // (F-15: the entry sat non-terminal forever).
+            // Settle from the atomics alone. For the ERROR /
+            // CANCELLED / PAUSED outcomes the terminal status is
+            // published FIRST: the sync and the state save below can
+            // be slow (an 800 MB file on a busy disk) or can fail,
+            // and they must never delay — or, if this thread dies,
+            // prevent — the terminal state the rest of the app is
+            // waiting on (F-15: the entry sat non-terminal forever).
+            // The FINISHED outcome is the one exception, because it
+            // also DELETES the state file: publishing Finished before
+            // that removal lands lets an observer see "finished"
+            // while the state file is still on disk. On Linux the
+            // gap is invisible; on Windows, where flush + rename +
+            // delete is slower and a just-closed file can be briefly
+            // locked, the gap is wide enough to observe (a lib test
+            // asserting the file is gone right after Finished failed
+            // on windows-latest exactly this way). So the finished
+            // path finalizes its files first and publishes last —
+            // every call in it ignores its own errors, so the status
+            // cannot be wedged by them either.
             let finished = !s.failed.load(Ordering::Relaxed)
                 && s.done_count.load(Ordering::Relaxed) >= total_blocks;
-            if s.failed.load(Ordering::Relaxed) {
-                set_status(&s, Status::Error);
-            } else if finished {
+            if finished {
                 // byte-complete is Finished even if a cancel landed in
                 // the same instant — the file on disk IS the full file
                 for b in &s.block_state {
                     b.store(1, Ordering::Relaxed);
                 }
+                let _ = file.sync_all();
+                save_state(&s, true);
+                remove_file_bounded(&s.state_path);
                 set_status(&s, Status::Finished);
-            } else if s.control.cancelled.load(Ordering::Relaxed) {
-                set_status(&s, Status::Cancelled);
-            } else if s.control.paused.load(Ordering::Relaxed) {
-                set_status(&s, Status::Paused);
             } else {
-                set_status(&s, Status::Error);
-                let mut err = plock(&s.error);
-                if err.is_none() {
-                    *err = Some("download stopped before completion".to_string());
+                if s.failed.load(Ordering::Relaxed) {
+                    set_status(&s, Status::Error);
+                } else if s.control.cancelled.load(Ordering::Relaxed) {
+                    set_status(&s, Status::Cancelled);
+                } else if s.control.paused.load(Ordering::Relaxed) {
+                    set_status(&s, Status::Paused);
+                } else {
+                    set_status(&s, Status::Error);
+                    let mut err = plock(&s.error);
+                    if err.is_none() {
+                        *err = Some("download stopped before completion".to_string());
+                    }
                 }
-            }
-            let _ = file.sync_all();
-            save_state(&s, true);
-            if finished {
-                let _ = std::fs::remove_file(&s.state_path);
+                let _ = file.sync_all();
+                save_state(&s, true);
             }
             // the LAST write this download will ever make has
             // landed: removal paths waiting on is_settled may now
