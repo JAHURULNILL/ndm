@@ -33,7 +33,9 @@
 !ifndef OUTFILE
   !define OUTFILE "NDM_${VERSION}_x64-setup.exe"
 !endif
-!define ICON "${__FILEDIR__}\..\src-tauri\icons\icon.ico"
+!ifndef ICON
+  !define ICON "${__FILEDIR__}\..\src-tauri\icons\icon.ico"
+!endif
 !define APPNAME "Nill Download Manager"
 !define REGKEY "Software\Nill Download Manager"
 !define UNREGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\Nill Download Manager"
