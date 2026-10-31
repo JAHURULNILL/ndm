@@ -61,17 +61,21 @@ jobs:
       - name: Fetch bundled tools (Windows builds)
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force tools | Out-Null
+          New-Item -ItemType Directory -Force tools, dl | Out-Null
           Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile tools/yt-dlp.exe
-          Invoke-WebRequest https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip -OutFile /tmp/deno.zip
-          Expand-Archive /tmp/deno.zip -DestinationPath tools -Force
-          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile /tmp/ff.zip
-          Expand-Archive /tmp/ff.zip -DestinationPath /tmp/ff -Force
-          Copy-Item /tmp/ff/*/bin/ffmpeg.exe tools/ffmpeg.exe
+          Invoke-WebRequest https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip -OutFile dl/deno.zip
+          Expand-Archive dl/deno.zip -DestinationPath tools -Force
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile dl/ff.zip
+          Expand-Archive dl/ff.zip -DestinationPath dl/ff -Force
+          Copy-Item dl/ff/*/bin/ffmpeg.exe tools/ffmpeg.exe
       - name: Build
         run: |
           cargo build --release
           cargo build --release --manifest-path src-tauri/Cargo.toml
+      - name: Test on Windows
+        run: |
+          cargo test --release
+          cargo test --release --manifest-path src-tauri/Cargo.toml
       - name: Assemble portable ZIP
         shell: pwsh
         run: |
@@ -83,6 +87,35 @@ jobs:
           Copy-Item tools/yt-dlp.exe, tools/deno.exe, tools/ffmpeg.exe $dir/components/
           Copy-Item extension $dir/extension -Recurse
           Compress-Archive $dir "NDM_${v}_Windows_Portable.zip"
+      - name: Smoke — host handshake (gate) + app launch (report)
+        shell: pwsh
+        run: |
+          $dir = "NDM-Windows-Portable"
+          $msg = [System.Text.Encoding]::UTF8.GetBytes('{"type":"ping"}')
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = (Resolve-Path "$dir/ndm-host.exe").Path
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.UseShellExecute = $false
+          $hp = [System.Diagnostics.Process]::Start($psi)
+          $len = [BitConverter]::GetBytes([int]$msg.Length)
+          $hp.StandardInput.BaseStream.Write($len, 0, 4)
+          $hp.StandardInput.BaseStream.Write($msg, 0, $msg.Length)
+          $hp.StandardInput.BaseStream.Flush()
+          $hp.StandardInput.Close()
+          $buf = New-Object byte[] 4
+          $hp.StandardOutput.BaseStream.Read($buf, 0, 4) | Out-Null
+          $n = [BitConverter]::ToInt32($buf, 0)
+          $body = New-Object byte[] $n
+          $off = 0
+          while ($off -lt $n) { $r = $hp.StandardOutput.BaseStream.Read($body, $off, $n - $off); if ($r -le 0) { break }; $off += $r }
+          $reply = [System.Text.Encoding]::UTF8.GetString($body)
+          Write-Host "host reply: $reply"
+          if ($reply -notmatch '"pong"\s*:\s*true') { throw "host handshake failed" }
+          $hp.WaitForExit(5000) | Out-Null
+          $app = Start-Process (Resolve-Path "$dir/ndm-app.exe").Path -PassThru
+          Start-Sleep -Seconds 10
+          if ($app.HasExited) { Write-Warning "ndm-app.exe exited early, code $($app.ExitCode)" } else { Write-Host "ndm-app.exe alive after 10s"; Stop-Process -Id $app.Id -Force }
       - uses: actions/upload-artifact@v4
         with:
           name: ndm-windows
