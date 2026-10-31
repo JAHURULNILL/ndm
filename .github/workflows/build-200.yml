@@ -1,0 +1,278 @@
+# NDM release builds.
+#
+# Linux:   the .deb (Debian/Ubuntu family) and the portable tarball
+#          (any distro) — the same packaging scripts used locally.
+# Windows: a portable ZIP (ndm-app.exe + ndm-host.exe + components +
+#          extension) AND a per-user NSIS installer
+#          (NDM_<ver>_x64-setup.exe, built from scripts/installer.nsi
+#          over the same assembled tree, silent-install tested in
+#          the job). Both run on any Windows 10/11 PC that has the
+#          WebView2 runtime (preinstalled on Windows 11 and on
+#          updated Windows 10).
+#
+# Runs on version tags (v*) and on manual dispatch. NOTE: prepared
+# ahead of the first push — the first run validates the Windows job.
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev ffmpeg zip
+      - name: Fetch bundled tools (yt-dlp, deno)
+        run: bash scripts/fetch-tools.sh
+      - name: Fetch portable ffmpeg (BtbN build — the distro static
+          builds segfault on merges, this one is merge-verified)
+        run: |
+          curl -sL -o /tmp/ff.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          tar -xJf /tmp/ff.tar.xz -C /tmp
+          cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg tools/ffmpeg
+          chmod +x tools/ffmpeg
+      - name: Build
+        run: |
+          cargo build --release
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+      - name: Package (.deb + portable tarball)
+        run: |
+          bash scripts/package-deb.sh
+          bash scripts/package-portable.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ndm-linux
+          path: |
+            NDM_*_amd64.deb
+            NDM_*_Linux_Portable.tar.xz
+            ndm-extension-*.zip
+      - name: Attach Linux assets to their GitHub release (dispatch runs only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          v=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          gh release upload "v$v" NDM_*_amd64.deb NDM_*_Linux_Portable.tar.xz ndm-extension-*.zip --clobber --repo "$GITHUB_REPOSITORY"
+
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch bundled tools (Windows builds)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force tools, dl | Out-Null
+          Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile tools/yt-dlp.exe
+          Invoke-WebRequest https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip -OutFile dl/deno.zip
+          Expand-Archive dl/deno.zip -DestinationPath tools -Force
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile dl/ff.zip
+          Expand-Archive dl/ff.zip -DestinationPath dl/ff -Force
+          Copy-Item dl/ff/*/bin/ffmpeg.exe tools/ffmpeg.exe
+      - name: Build
+        run: |
+          cargo build --release
+          cargo build --release --manifest-path src-tauri/Cargo.toml
+      # Two separate steps on purpose: in one shared pwsh block the
+      # block's exit code is the LAST command's, so a failing lib
+      # suite was masked by the passing app suite (build #14 shipped
+      # green with a red lib test). Each suite must fail its own step.
+      - name: Test lib on Windows
+        run: cargo test --release
+      - name: Test app on Windows
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
+      - name: Assemble portable ZIP
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $dir = "NDM-Windows-Portable"
+          New-Item -ItemType Directory -Force $dir/components | Out-Null
+          Copy-Item src-tauri/target/release/ndm-app.exe $dir/
+          Copy-Item target/release/ndm-host.exe $dir/
+          Copy-Item tools/yt-dlp.exe, tools/deno.exe, tools/ffmpeg.exe $dir/components/
+          Copy-Item extension $dir/extension -Recurse
+          Compress-Archive $dir "NDM_${v}_Windows_Portable.zip"
+      - name: Smoke — host handshake (gate) + app launch (report)
+        shell: pwsh
+        run: |
+          $dir = "NDM-Windows-Portable"
+          $msg = [System.Text.Encoding]::UTF8.GetBytes('{"type":"ping"}')
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = (Resolve-Path "$dir/ndm-host.exe").Path
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.UseShellExecute = $false
+          $hp = [System.Diagnostics.Process]::Start($psi)
+          $len = [BitConverter]::GetBytes([int]$msg.Length)
+          $hp.StandardInput.BaseStream.Write($len, 0, 4)
+          $hp.StandardInput.BaseStream.Write($msg, 0, $msg.Length)
+          $hp.StandardInput.BaseStream.Flush()
+          $hp.StandardInput.Close()
+          $buf = New-Object byte[] 4
+          $hp.StandardOutput.BaseStream.Read($buf, 0, 4) | Out-Null
+          $n = [BitConverter]::ToInt32($buf, 0)
+          $body = New-Object byte[] $n
+          $off = 0
+          while ($off -lt $n) { $r = $hp.StandardOutput.BaseStream.Read($body, $off, $n - $off); if ($r -le 0) { break }; $off += $r }
+          $reply = [System.Text.Encoding]::UTF8.GetString($body)
+          Write-Host "host reply: $reply"
+          if ($reply -notmatch '"pong"\s*:\s*true') { throw "host handshake failed" }
+          $hp.WaitForExit(5000) | Out-Null
+          $app = Start-Process (Resolve-Path "$dir/ndm-app.exe").Path -PassThru
+          Start-Sleep -Seconds 10
+          if ($app.HasExited) { Write-Warning "ndm-app.exe exited early, code $($app.ExitCode)" } else { Write-Host "ndm-app.exe alive after 10s"; Stop-Process -Id $app.Id -Force }
+      - name: Build installer (NSIS)
+        shell: pwsh
+        run: |
+          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) {
+            choco install nsis -y --no-progress
+            $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          }
+          if (-not (Test-Path $makensis)) { throw "makensis not found" }
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          & $makensis "/DVERSION=$v" "/DSRCROOT=$PWD\NDM-Windows-Portable" "/DOUTFILE=$PWD\NDM_${v}_x64-setup.exe" scripts\installer.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "NDM_${v}_x64-setup.exe")) { throw "installer exe was not produced" }
+          Write-Host "installer built: NDM_${v}_x64-setup.exe"
+      # NSIS setups detach: the launcher process exits while the
+      # real installer works in a child process, so -Wait alone can
+      # return before a single file is copied. Poll for the full
+      # layout instead — that is the actual completion signal.
+      - name: Silent-install test — layout + installed app launch
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $setup = (Resolve-Path "NDM_${v}_x64-setup.exe").Path
+          $installDir = "$env:LOCALAPPDATA\Programs\Nill Download Manager"
+          Start-Process $setup -ArgumentList "/S" -PassThru | Out-Null
+          $want = @(
+            "ndm-app.exe", "ndm-host.exe", "installed.flag", "uninstall.exe",
+            "components\yt-dlp.exe", "components\deno.exe", "components\ffmpeg.exe",
+            "extension\manifest.json", "extension\background.js"
+          )
+          $deadline = (Get-Date).AddSeconds(180)
+          $missing = $want
+          while ((Get-Date) -lt $deadline) {
+            $missing = $want | Where-Object { -not (Test-Path (Join-Path $installDir $_)) }
+            if (-not $missing) { break }
+            Start-Sleep -Seconds 2
+          }
+          if ($missing) { throw "install layout incomplete, missing: $($missing -join ', ')" }
+          Write-Host "install layout complete in $installDir"
+          if ((Get-Content "$installDir\installed.flag" -Raw) -notmatch [regex]::Escape($v)) { throw "installed.flag does not carry version $v" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Nill Download Manager\Nill Download Manager.lnk")) { throw "Start Menu shortcut missing" }
+          if (-not (Test-Path "$env:USERPROFILE\Desktop\Nill Download Manager.lnk")) { throw "desktop shortcut missing" }
+          $arp = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Nill Download Manager" -ErrorAction Stop
+          if ($arp.DisplayVersion -ne $v) { throw "Add/Remove Programs DisplayVersion is '$($arp.DisplayVersion)', expected '$v'" }
+          Write-Host "shortcuts + uninstall entry (v$v) verified"
+          $app = Start-Process "$installDir\ndm-app.exe" -PassThru
+          Start-Sleep -Seconds 10
+          if ($app.HasExited) { throw "installed ndm-app.exe exited early, code $($app.ExitCode)" }
+          Write-Host "installed ndm-app.exe alive after 10s"
+          Stop-Process -Id $app.Id -Force
+          Start-Sleep -Seconds 2
+      # The installed launch above must have made the app register
+      # its native-messaging host (its own first-run mechanism):
+      # HKCU keys for Chrome + Firefox pointing at manifest files
+      # under %APPDATA%\com.ndm.downloadmanager\.
+      - name: Extension registration check
+        shell: pwsh
+        run: |
+          $manifestDir = "$env:APPDATA\com.ndm.downloadmanager"
+          foreach ($f in @("com.ndm.host.chrome.json", "com.ndm.host.firefox.json")) {
+            if (-not (Test-Path (Join-Path $manifestDir $f))) { throw "host manifest missing: $f" }
+          }
+          foreach ($kv in @(
+            @{ Key = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.ndm.host"; Manifest = "com.ndm.host.chrome.json" },
+            @{ Key = "HKCU:\Software\Mozilla\NativeMessagingHosts\com.ndm.host"; Manifest = "com.ndm.host.firefox.json" }
+          )) {
+            if (-not (Test-Path $kv.Key)) { throw "registry key missing: $($kv.Key)" }
+            $target = (Get-Item $kv.Key).GetValue("")
+            $expected = Join-Path $manifestDir $kv.Manifest
+            if ($target -ne $expected) { throw "$($kv.Key) points at '$target', expected '$expected'" }
+            Write-Host "registered: $($kv.Key) -> $target"
+          }
+          Write-Host "extension registration verified (Chrome + Firefox)"
+      - name: Create GUI fixture file
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force gui-fixture | Out-Null
+          $bytes = New-Object byte[] (2 * 1024 * 1024)
+          (New-Object System.Random).NextBytes($bytes)
+          [System.IO.File]::WriteAllBytes("$PWD\gui-fixture\ndm-gui-fixture.bin", $bytes)
+          Write-Host "fixture: gui-fixture\ndm-gui-fixture.bin ($($bytes.Length) bytes)"
+      # Report-only by design (continue-on-error): if WebView2
+      # refuses the CDP debugging port in this session the script
+      # exits 2 and prints GUI UNVERIFIED — an honest gap in GUI
+      # coverage, not a fake pass and not a red job. Real GUI
+      # assertion failures (exit 1) are surfaced the same way in
+      # the log; the install + registration gates above stay hard.
+      - name: GUI smoke — drive the installed app via CDP (report-only)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          # child pwsh process on purpose: the script ends with
+          # `exit <code>`, which would kill THIS step's shell if it
+          # were invoked with & in-process — as a child, the code
+          # lands in $LASTEXITCODE where it belongs
+          & pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\gui-smoke.ps1 `
+            -AppExe "$env:LOCALAPPDATA\Programs\Nill Download Manager\ndm-app.exe" `
+            -FixtureDir "$PWD\gui-fixture" `
+            -FixtureFile "ndm-gui-fixture.bin" `
+            -DownloadDir "$env:USERPROFILE\Downloads" `
+            -ShotsDir "$PWD\gui-shots"
+          $code = $LASTEXITCODE
+          if ($code -eq 2) { Write-Host "::warning::GUI UNVERIFIED on Windows — CDP endpoint never appeared; the GUI layer remains unverified (see GUI-SMOKE lines above)" }
+          elseif ($code -ne 0) { Write-Host "::warning::GUI smoke FAILED with exit code $code (see GUI-SMOKE lines above)" }
+          else { Write-Host "GUI smoke passed (see GUI-SMOKE lines above)" }
+          exit $code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ndm-gui-shots
+          path: gui-shots/
+          if-no-files-found: ignore
+      - name: Uninstall (report-only)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $installDir = "$env:LOCALAPPDATA\Programs\Nill Download Manager"
+          Get-Process ndm-app -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (Test-Path "$installDir\uninstall.exe") {
+            Start-Process "$installDir\uninstall.exe" -ArgumentList "/S" -PassThru | Out-Null
+            $deadline = (Get-Date).AddSeconds(60)
+            while ((Get-Date) -lt $deadline -and (Test-Path "$installDir\ndm-app.exe")) { Start-Sleep -Seconds 2 }
+            if (Test-Path "$installDir\ndm-app.exe") { Write-Warning "uninstall did not remove the app exe within 60s" }
+            else { Write-Host "uninstall removed the installed copy" }
+          } else {
+            Write-Warning "uninstall.exe not present — nothing to uninstall"
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ndm-windows
+          path: |
+            NDM_*_Windows_Portable.zip
+            NDM_*_x64-setup.exe
+      - name: Attach Windows assets to their GitHub release (dispatch runs only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $zip = (Get-ChildItem "NDM_${v}_Windows_Portable.zip").Name
+          $setup = (Get-ChildItem "NDM_${v}_x64-setup.exe").Name
+          gh release upload "v$v" $zip $setup --clobber --repo $env:GITHUB_REPOSITORY
