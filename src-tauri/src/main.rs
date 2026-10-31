@@ -1096,6 +1096,15 @@ fn load_settings(state: &AppState) {
 }
 
 fn save_settings(state: &AppState) {
+    // Fire-and-forget callers (background threads) still get a
+    // logged failure (F-4); the Options path uses
+    // save_settings_result and surfaces the error to the user.
+    if let Err(e) = save_settings_result(state) {
+        eprintln!("[ndm] could not save settings: {e}");
+    }
+}
+
+fn save_settings_result(state: &AppState) -> Result<(), String> {
     // Unlike persist (serialized by save_lock), this writer had NO
     // lock: the UI's set_settings and the 12 s install-count thread
     // write the same shared .tmp path concurrently, and one side can
@@ -1105,16 +1114,19 @@ fn save_settings(state: &AppState) {
     let _guard = SETTINGS_SAVE_LOCK.lock().unwrap();
     let path = state.settings_file.lock().unwrap().clone();
     if path.as_os_str().is_empty() {
-        return;
+        return Ok(());
     }
     let settings = current_settings(state);
     let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = create_private(&tmp) {
-        use std::io::Write;
-        if serde_json::to_writer(&mut f, &settings).is_ok() && f.flush().is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
-    }
+    let mut f = create_private(&tmp).map_err(|e| format!("cannot write the settings file: {e}"))?;
+    use std::io::Write;
+    serde_json::to_writer(&mut f, &settings)
+        .map_err(|e| format!("cannot write the settings file: {e}"))?;
+    f.flush()
+        .map_err(|e| format!("cannot write the settings file: {e}"))?;
+    drop(f);
+    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write the settings file: {e}"))?;
+    Ok(())
 }
 
 /// Progress restored from disk for an entry that has no live engine handle.
@@ -1635,11 +1647,22 @@ fn persist(state: &AppState) {
         })
         .collect();
     let tmp = path.with_extension("json.tmp");
-    if let Ok(mut f) = create_private(&tmp) {
+    // F-4: a failed journal write used to vanish silently — the
+    // list then quietly reverted on the next launch and nobody
+    // could tell why. The write stays best-effort (persist runs
+    // on hot paths and must never panic or block on a dialog),
+    // but a failure is always logged.
+    let written = (|| -> std::io::Result<()> {
+        let mut f = create_private(&tmp)?;
         use std::io::Write;
-        if serde_json::to_writer(&mut f, &saved).is_ok() && f.flush().is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        serde_json::to_writer(&mut f, &saved)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        eprintln!("[ndm] could not save the download list to {}: {e}", path.display());
     }
 }
 
@@ -1653,12 +1676,30 @@ fn update_sample(entry: &Entry) {
     let now = Instant::now();
     let dt = now.duration_since(s.0).as_secs_f64();
     if dt >= 0.2 {
-        let inst = (p.done_bytes.saturating_sub(s.1)) as f64 / dt;
-        s.2 = if s.2 == 0.0 { inst } else { 0.5 * s.2 + 0.5 * inst };
-        if p.done_bytes != s.1 || p.status != ndm::Status::Downloading {
+        if p.done_bytes != s.1 {
+            // bytes moved inside the window: fold the window's
+            // instantaneous rate into the EMA and re-anchor BOTH
+            // marks at the movement
+            let inst = (p.done_bytes - s.1) as f64 / dt;
+            s.2 = if s.2 == 0.0 { inst } else { 0.5 * s.2 + 0.5 * inst };
+            s.0 = now;
+            s.1 = p.done_bytes;
+        } else if p.status != ndm::Status::Downloading {
             s.0 = now;
         }
-        s.1 = p.done_bytes;
+        // W193-1: a tick where NO byte arrived used to fold a
+        // synthetic inst=0 into the EMA while leaving s.0 anchored
+        // at the last movement — so the next real window was
+        // measured over a too-long span and halved, then halved
+        // again, and the displayed rate (and the time-left derived
+        // from it) oscillated at half the true speed on any
+        // connection that delivers in bursts slower than the emit
+        // cadence (a single throttled connection proved 16 KB/s
+        // shown against 262 KB/s real). A silent tick now changes
+        // nothing: the window stays anchored at the last movement,
+        // so the next movement is measured over the true elapsed
+        // span. The payload's own 3-second no-movement gate still
+        // decays a genuinely stalled transfer's rate to 0.
     }
 }
 
@@ -1750,6 +1791,42 @@ fn resolve_video_file(entry: &Entry) -> PathBuf {
         }
     }
     entry.out_path.clone()
+}
+
+/// The file an entry's download occupies on disk: a file entry's
+/// output path itself; a video entry's resolved final file inside
+/// its folder. Used wherever two entries' files must be compared
+/// (the shared-path guards of W193-2/W193-5).
+fn entry_file_path(entry: &Entry) -> PathBuf {
+    if entry.kind == "video" {
+        resolve_video_file(entry)
+    } else {
+        entry.out_path.clone()
+    }
+}
+
+/// W193-5: does a FINISHED entry other than `self_id` own `path`
+/// as its file? A finished download's file is complete user data;
+/// another entry starting into that path would corrupt it (the
+/// engine truncates/resumes into its target without asking whose
+/// it is). Returns the owning entry's id.
+fn finished_path_owner(state: &AppState, path: &Path, self_id: &str) -> Option<String> {
+    let entries: Vec<Arc<Entry>> = state
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    entries
+        .iter()
+        .find(|e| {
+            e.id != self_id
+                && !e.removed.load(Ordering::Relaxed)
+                && entry_file_path(e) == path
+                && entry_is_finished(e)
+        })
+        .map(|e| e.id.clone())
 }
 
 /// IDM's Sounds options, lite: play the desktop sound theme's event
@@ -1985,12 +2062,23 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
     // an entry the user PAUSED is unfinished work, not "done":
     // powering down (or closing) over it would strand a download
     // they fully intend to resume tomorrow
-    let any_paused = {
+    let paused_count = {
         let entries: Vec<Arc<Entry>> =
             state.entries.lock().unwrap().values().cloned().collect();
-        entries.iter().any(|e| payload_of(e).status == "paused")
+        entries
+            .iter()
+            .filter(|e| payload_of(e).status == "paused")
+            .count()
     };
-    if any_paused {
+    if paused_count > 0 {
+        // W193-12: the veto used to be invisible — the app simply
+        // stayed open and the user had no way to learn that a
+        // paused download was the reason. Say so, once per finish
+        // that lands on the veto.
+        let _ = app.emit(
+            "exit_vetoed",
+            serde_json::json!({ "paused": paused_count }),
+        );
         return;
     }
     if count_active(state) > 0 {
@@ -2478,6 +2566,90 @@ fn unique_out_path(state: &AppState, dir: &Path, name: &str) -> (String, PathBuf
     (candidate, p)
 }
 
+/// W193-5, the write-time half of the finished-file guard: if a
+/// stub's target file is owned by a FINISHED entry, the stub is
+/// rebuilt under a unique sibling name ("name (1)", IDM-style)
+/// BEFORE anything writes a byte. Add-time uniquification cannot
+/// cover every path to this state — a journal restored from disk
+/// may hold two entries for one path (hand-edited, or written by
+/// an older version), and a path can change hands while an entry
+/// sits unparsed — so the check repeats at the last moment before
+/// a start, on the start paths themselves. Live entries are never
+/// rehomed (their file is their own, mid-flight). Returns the
+/// entry to start: the same stub, or its replacement, already
+/// installed in the map and persisted.
+fn rehome_if_finished_conflict(
+    app: &AppHandle,
+    state: &AppState,
+    stub: &Arc<Entry>,
+) -> Arc<Entry> {
+    if stub.download.is_some() || stub.video.is_some() {
+        return stub.clone();
+    }
+    let target = entry_file_path(stub);
+    if finished_path_owner(state, &target, &stub.id).is_none() {
+        return stub.clone();
+    }
+    let (name, out_path) = if stub.kind == "video" {
+        let n = unique_video_name(state, &stub.out_path, &stub.name, stub.audio);
+        (n, stub.out_path.clone())
+    } else {
+        let dir = stub
+            .out_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| stub.out_path.clone());
+        unique_out_path(state, &dir, &stub.name)
+    };
+    if name == stub.name && out_path == stub.out_path {
+        return stub.clone();
+    }
+    let fresh = Arc::new(Entry {
+        id: stub.id.clone(),
+        name,
+        url: stub.url.clone(),
+        out_path,
+        category: stub.category.clone(),
+        added: stub.added.clone(),
+        last_try: Mutex::new(stub.last_try.lock().unwrap().clone()),
+        download: None,
+        video: None,
+        kind: stub.kind.clone(),
+        selector: stub.selector.clone(),
+        cookies: stub.cookies.clone(),
+        referer: stub.referer.clone(),
+        audio: stub.audio,
+        restored: Mutex::new(stub.restored.lock().unwrap().clone()),
+        queued: AtomicBool::new(stub.queued.load(Ordering::Relaxed)),
+        sample: Mutex::new((Instant::now(), 0, 0.0)),
+        emitting: AtomicBool::new(false),
+        starting: AtomicBool::new(false),
+        slot_preclaimed: AtomicBool::new(stub.slot_preclaimed.load(Ordering::Relaxed)),
+        removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
+        pause_requested: AtomicBool::new(stub.pause_requested.load(Ordering::SeqCst)),
+        completion: Mutex::new(stub.completion.lock().unwrap().clone()),
+        queue: Mutex::new(entry_queue(stub)),
+        login: stub.login.clone(),
+        password: stub.password.clone(),
+        description: Mutex::new(stub.description.lock().unwrap().clone()),
+        speed_limit: Mutex::new(*stub.speed_limit.lock().unwrap()),
+    });
+    {
+        let mut map = state.entries.lock().unwrap();
+        let still_current = map
+            .get(&stub.id)
+            .map(|e| Arc::ptr_eq(e, stub))
+            .unwrap_or(false);
+        if !still_current || stub.removed.load(Ordering::SeqCst) {
+            return stub.clone();
+        }
+        map.insert(fresh.id.clone(), fresh.clone());
+    }
+    let _ = app.emit("progress", payload_of(&fresh));
+    persist(state);
+    fresh
+}
+
 /// Register a not-yet-started HTTP download in the list; returns its stub.
 /// `category` overrides the extension-based category (the Site Grabber
 /// passes "Grabber" so its downloads land in Grabber projects).
@@ -2604,6 +2776,7 @@ fn release_entry_id(state: &AppState, id: &str) {
         .compare_exchange(n, n - 1, Ordering::Relaxed, Ordering::Relaxed);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_http_stub(
     state: &AppState,
     url: &str,
@@ -2615,6 +2788,7 @@ fn register_http_stub(
     queue: &str,
     login: &str,
     password: &str,
+    dir_explicit: bool,
 ) -> Result<Arc<Entry>, String> {
     // a name the browser suggested (Content-Disposition) wins over the
     // URL tail, stripped of any path parts a hostile page could smuggle
@@ -2622,6 +2796,10 @@ fn register_http_stub(
         .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).trim().to_string())
         .filter(|n| !n.is_empty() && n != "." && n != "..")
         .unwrap_or_else(|| file_name_for(url));
+    // F-6: a browser- or user-supplied name skips file_name_of's
+    // cap — apply the same 255-byte limit here so an over-long
+    // suggestion fails nowhere downstream with a raw OS error
+    let base_name = ndm::cap_file_name(&base_name);
     // a saved Site Login for this address applies automatically when
     // the caller supplied no credentials of its own — centrally, here,
     // so EVERY registration path (dialog, silent browser catch,
@@ -2644,8 +2822,16 @@ fn register_http_stub(
         .map(|c| c.to_string())
         .unwrap_or_else(|| category_for_with(&base_name, &current_settings(state)));
     // category routing (IDM-style): the category's own folder applies
-    // when the caller asked for the ordinary default folder
-    let dir = route_category_dir(state, &category, resolve_dir(dir));
+    // when the caller asked for the ordinary default folder. An
+    // EXPLICIT folder (the Add dialog's field, which already shows
+    // the routed folder — W193-3) always wins verbatim: routing must
+    // never silently move a download away from the folder the user
+    // was shown and confirmed.
+    let dir = if dir_explicit {
+        resolve_dir(dir)
+    } else {
+        route_category_dir(state, &category, resolve_dir(dir))
+    };
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
     let (name, out_path) = unique_out_path(state, &dir, &base_name);
     let id = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
@@ -2794,6 +2980,13 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
     if let Some(r) = entry.restored.lock().unwrap().as_mut() {
         r.error.clear();
     }
+    // W193-5: the last moment before a start — if a finished
+    // entry owns this stub's target file, the stub moves to a
+    // unique sibling name first (see rehome_if_finished_conflict)
+    let entry = {
+        let state = app.state::<AppState>();
+        rehome_if_finished_conflict(app, &state, &entry)
+    };
     if entry.download.is_some() {
         let state = app.state::<AppState>();
         if let Some(stub) = demote_terminal_live(&state, &entry) {
@@ -3388,18 +3581,42 @@ fn pump_queue(app: &AppHandle) {
     }
 }
 
-/// Start every queued entry of one queue (or of all queues when
-/// `queue` is None), regardless of the simultaneous cap.
+/// Start the queued entries of one queue (or of all queues when
+/// `queue` is None) — up to each queue's simultaneous cap
+/// (W193-9: "Start All" used to claim EVERY queued entry at once,
+/// so 4 queued downloads ran under a cap of 2; the entries past
+/// the cap stay queued and the pump promotes them as slots free,
+/// exactly as if they had been added one by one). A cap of 0
+/// means "no cap" in the queue settings, as in the pump.
 fn start_all_queued(app: &AppHandle, queue: Option<&str>) {
     let state = app.state::<AppState>();
+    // the download quota is a hard limit for start-all paths too:
+    // a queue window opening (or a Start Queue Now) must not
+    // override an exhausted quota — the pump enforces it per
+    // queue, this path has to check it itself
+    if quota_blocks(&state) {
+        return;
+    }
+    let s = current_settings(&state);
     let order = state.order.lock().unwrap().clone();
+    // running total per queue, seeded with what is already active
+    let mut active: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for id in order {
         if let Some(e) = state.get(&id) {
-            if queue.is_some_and(|q| entry_queue(&e) != q) {
+            let q = entry_queue(&e);
+            if queue.is_some_and(|want| q != want) {
+                continue;
+            }
+            let cap = effective_cap(&s, &q);
+            let running = active
+                .entry(q.clone())
+                .or_insert_with(|| count_active_for(&state, &q));
+            if cap > 0 && *running >= cap {
                 continue;
             }
             if claim_queued(&e) {
                 start_entry(app, e);
+                *running += 1;
             }
         }
     }
@@ -3491,7 +3708,13 @@ fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) 
     ndm::set_global_connections(s.max_connections);
     apply_proxy_to_engine(&s);
     *state.settings.lock().unwrap() = s.clone();
-    save_settings(&state);
+    // F-4: a failed write must reach the user — Options used to
+    // close as if saved while the settings file silently kept the
+    // old values. The in-memory settings stay applied for this
+    // session; the error says plainly that they were not saved.
+    save_settings_result(&state).map_err(|e| {
+        format!("{e} — the new settings apply until NDM closes, but they were not saved")
+    })?;
     // an entry whose queue was deleted falls back to the Main queue
     {
         let names: Vec<String> = s.queues.iter().map(|q| q.name.clone()).collect();
@@ -3603,6 +3826,100 @@ fn basket_add(app: AppHandle, state: State<'_, AppState>, url: String) -> Result
     Ok(())
 }
 
+/// Offer a dropped link in the main window's Add URL dialog —
+/// the shared landing for every drop source (W193-4).
+fn offer_dropped_url(app: &AppHandle, url: &str) {
+    let state = app.state::<AppState>();
+    let payload = serde_json::json!({
+        "url": url,
+        "title": "",
+        "pageUrl": "",
+        "cookies": "",
+        "source": "drop",
+    });
+    state.pending_files.lock().unwrap().push(payload.clone());
+    raise_main_window(app);
+    let _ = app.emit("incoming_file", payload);
+}
+
+/// Pull the URL out of a dropped shortcut file: `.url` and
+/// `.desktop` carry a `URL=` line; a `.webloc` plist carries the
+/// address in its first <string> element.
+fn extract_shortcut_url(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("URL=") {
+            let u = rest.trim().trim_matches('"');
+            if u.starts_with("http://") || u.starts_with("https://") {
+                return Some(u.to_string());
+            }
+        }
+    }
+    if let Some(start) = text.find("<string>http") {
+        let rest = &text[start + "<string>".len()..];
+        if let Some(end) = rest.find("</string>") {
+            let u = rest[..end].trim();
+            if u.starts_with("http://") || u.starts_with("https://") {
+                return Some(u.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// One path from a native drag-drop (W193-4): a link (handed over
+/// as a path string on some platforms, or inside a shortcut file)
+/// is offered as a download; anything else is a local file, which
+/// a download manager cannot fetch — the window that received the
+/// drop says so instead of swallowing the gesture.
+fn handle_dropped_path(app: &AppHandle, path: &Path, on_basket: bool) {
+    let s = path.to_string_lossy().to_string();
+    if s.starts_with("http://") || s.starts_with("https://") {
+        offer_dropped_url(app, &s);
+        if on_basket {
+            let _ = app.emit("basket_note", serde_json::json!({ "text": "Sent to NDM ✓" }));
+        }
+        return;
+    }
+    let ext = path
+        .extension()
+        .map(|x| x.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(ext.as_str(), "url" | "webloc" | "desktop") {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Some(u) = extract_shortcut_url(&text) {
+                offer_dropped_url(app, &u);
+                if on_basket {
+                    let _ = app
+                        .emit("basket_note", serde_json::json!({ "text": "Sent to NDM ✓" }));
+                }
+                return;
+            }
+        }
+    }
+    if on_basket {
+        let _ = app.emit(
+            "basket_note",
+            serde_json::json!({ "text": "That was not a web link" }),
+        );
+    } else {
+        let _ = app.emit(
+            "drop_file_ignored",
+            serde_json::json!({
+                "name": path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            }),
+        );
+    }
+}
+
+/// Native drag-drop (W193-4) is dispatched from the builder's
+/// on_window_event (Tauri 2 delivers drops as WindowEvent::DragDrop
+/// — file paths and shortcut files from OS drags, XDND on Linux /
+/// OLE on Windows, which the webview's HTML5 drop events never see
+/// under Tauri's native handling). The basket keeps its HTML5
+/// handler too, for the text/uri-list drags some sources deliver
+/// that way.
+
 /// Show or hide the drop-basket window (View menu / basket's own
 /// close button).
 #[tauri::command]
@@ -3680,6 +3997,48 @@ fn scheduler_stop_now(app: AppHandle, state: State<'_, AppState>, queue: Option<
     pause_all(&app, false, Some(&q));
 }
 
+/// The Downloads menu's "Start All": every unfinished entry in
+/// every queue is offered to the pump, which enforces each
+/// queue's simultaneous cap and the download quota (W193-9: the
+/// old UI path resumed every entry individually, so the cap was
+/// bypassed completely — 4 downloads ran under a cap of 2).
+/// Entries past the cap stay queued and are promoted as slots
+/// free. Returns how many entries were offered.
+#[tauri::command]
+fn start_all(app: AppHandle, state: State<'_, AppState>) -> usize {
+    if state.update_required.load(Ordering::SeqCst) {
+        return 0;
+    }
+    let s = current_settings(&state);
+    // Start All is the user commanding every queue to run NOW:
+    // schedule windows are overridden, as with Start Queue Now
+    for cfg in &s.queues {
+        state.sched_override.lock().unwrap().insert(cfg.name.clone());
+    }
+    let order = state.order.lock().unwrap().clone();
+    let mut offered = 0;
+    for id in &order {
+        let Some(e) = state.get(id) else { continue };
+        let status = payload_of(&e).status;
+        if matches!(status.as_str(), "finished" | "downloading" | "cancelled") {
+            continue;
+        }
+        // errored entries are offered too (the old Start All
+        // resumed them as well): the pump/start path demotes a
+        // dead handle and retries from the on-disk state, and a
+        // pending automatic-retry registration for the same id
+        // finds a non-error status when it fires and stands down
+        e.pause_requested.store(false, Ordering::SeqCst);
+        if !e.queued.swap(true, Ordering::Relaxed) {
+            offered += 1;
+            let _ = app.emit("progress", payload_of(&e));
+        }
+    }
+    pump_queue(&app);
+    persist(&state);
+    offered
+}
+
 /// Serializes "cap check + slot reservation" across every direct
 /// start path: two starts landing together must not both pass the
 /// simultaneous-cap check before either has claimed its slot.
@@ -3702,6 +4061,7 @@ async fn add_download(
     password: Option<String>,
     description: Option<String>,
     total: Option<u64>,
+    dir_explicit: Option<bool>,
 ) -> Result<String, String> {
     if state.update_required.load(Ordering::SeqCst) {
         return Err("NDM needs its latest update before it can download. Please install the update first.".to_string());
@@ -3744,6 +4104,7 @@ async fn add_download(
         queue.as_deref().unwrap_or(&main_queue_name()),
         login.as_deref().unwrap_or(""),
         password.as_deref().unwrap_or(""),
+        dir_explicit.unwrap_or(false),
     )?;
     if let Some(d) = &description {
         *stub.description.lock().unwrap() = d.chars().take(500).collect();
@@ -3980,6 +4341,9 @@ async fn resume_download(
         Some(stub) => stub,
         None => entry,
     };
+    // W193-5: a stub about to (re)start must not write into a
+    // finished entry's file — rehome first (no-op for live entries)
+    let entry = rehome_if_finished_conflict(&app, &state, &entry);
     if let Some(dl) = &entry.download {
         dl.control.resume();
         stamp_last_try(&entry);
@@ -4161,19 +4525,33 @@ fn remove_download(
         }
         // IDM's delete confirmation offers "also delete the file":
         // only then does the downloaded data itself go (the plain
-        // list removal above always keeps it). The finished half of
-        // that decision is the BACKEND's, taken from the entry's
-        // live truth — never from a status the caller cached: a
-        // batch delete keyed on the UI's stale "Paused" silently
-        // kept a finished 800 MB file the user had explicitly asked
-        // to delete (F-21). An unfinished entry's partial stays,
-        // exactly like a plain removal.
-        if delete_file.unwrap_or(false) && was_finished {
-            if entry.kind == "video" {
-                let f = resolve_video_file(&entry);
-                let _ = std::fs::remove_file(&f);
-            } else {
-                let _ = std::fs::remove_file(&entry.out_path);
+        // list removal above always keeps it). W193-2: the choice
+        // applies to the entry's file WHATEVER its status — the
+        // old rule silently kept the file of any entry that was
+        // not finished, so deleting an ACTIVE download with the
+        // box ticked stopped it, dropped the row, and left the
+        // partial on disk anyway. The engines have settled by
+        // now, so removing the file cannot race a writer. One
+        // guard (W193-5): if ANOTHER live entry points at the
+        // same file, the file stays — it is that entry's data too.
+        if delete_file.unwrap_or(false) {
+            let target = entry_file_path(&entry);
+            // snapshot first, file paths computed unlocked (the
+            // same discipline as the duplicate finders)
+            let others: Vec<Arc<Entry>> = state
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
+            let shared = others.iter().any(|e| {
+                e.id != entry.id
+                    && !e.removed.load(Ordering::Relaxed)
+                    && entry_file_path(e) == target
+            });
+            if !shared {
+                let _ = std::fs::remove_file(&target);
             }
         }
         // the emit loop is stopped and the entry is leaving: its
@@ -4364,6 +4742,39 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Windows install flavour: an installer-made copy carries an
+/// `installed.flag` file beside the executable (the installer
+/// writes it — a fixed contract); its absence means a portable
+/// copy that updates itself by swapping its own files.
+#[cfg(windows)]
+fn windows_is_installer_flavour() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("installed.flag").is_file()))
+        .unwrap_or(false)
+}
+
+/// Is there a package THIS copy of the app can actually install
+/// from the feed? A mandatory update may only arm when the answer
+/// is yes — arming it against a feed that carries no usable asset
+/// for the platform/flavour would strand the user behind a block
+/// with nothing installable (the pre-2.0 Windows dead end, and
+/// the same rule the spec sets for every platform asset).
+fn usable_update_asset(info: &ndm::updater::ReleaseInfo) -> bool {
+    #[cfg(windows)]
+    {
+        if windows_is_installer_flavour() {
+            !info.win_setup_url.is_empty()
+        } else {
+            !info.win_url.is_empty()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        !info.deb_url.is_empty()
+    }
+}
+
 fn do_check_update(app: &AppHandle) -> serde_json::Value {
     let state = app.state::<AppState>();
     let info = match ndm::updater::fetch_release() {
@@ -4376,14 +4787,8 @@ fn do_check_update(app: &AppHandle) -> serde_json::Value {
     }
     let mandatory = !info.min_supported.is_empty()
         && ndm::updater::version_cmp(current, &info.min_supported)
-            == std::cmp::Ordering::Less;
-    // The one-click installer is a Linux package flow (.deb via
-    // pkexec/apt): the manifest carries no Windows package, so on
-    // Windows an update is only ever REPORTED — never latched as
-    // mandatory (the block would strand the user with nothing
-    // installable) and never stashed for install_update. A
-    // Windows user updates by taking the new portable build.
-    let mandatory = mandatory && !cfg!(target_os = "windows");
+            == std::cmp::Ordering::Less
+        && usable_update_asset(&info);
     if mandatory {
         state.update_required.store(true, Ordering::SeqCst);
     }
@@ -4393,14 +4798,7 @@ fn do_check_update(app: &AppHandle) -> serde_json::Value {
         "notes": info.notes,
         "mandatory": mandatory,
     });
-    #[cfg(not(windows))]
-    {
-        *state.pending_update.lock().unwrap() = Some(info);
-    }
-    #[cfg(windows)]
-    {
-        let _ = &info;
-    }
+    *state.pending_update.lock().unwrap() = Some(info);
     let _ = app.emit("update_available", payload.clone());
     payload
 }
@@ -4418,24 +4816,44 @@ async fn check_update(app: AppHandle) -> Result<serde_json::Value, String> {
 /// desktop's software installer when pkexec/apt is unavailable.
 #[tauri::command]
 fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        // the install chain below is the Linux .deb flow (pkexec /
-        // pkcon / xdg-open); the manifest carries no Windows
-        // package. Fail honestly instead of downloading a .deb
-        // the machine cannot use.
-        let _ = (&app, &state);
-        return Err(
-            "Automatic install is not available on Windows yet — please download the new portable build from the NDM releases page and unpack it over the old one."
-                .to_string(),
-        );
-    }
     let info = state
         .pending_update
         .lock()
         .unwrap()
         .clone()
         .ok_or("no update is waiting to install")?;
+    #[cfg(windows)]
+    {
+        // Windows installs in-process (see run_windows_update):
+        // the user clicks once and never sees or touches a file —
+        // the package downloads with progress, and the app closes
+        // and reopens on the new version by itself.
+        if state.update_busy.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let app_t = app.clone();
+        let info_t = info.clone();
+        std::thread::spawn(move || {
+            // panic-isolated, like the Linux chain: update_busy
+            // must never stay latched by a panic
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_windows_update(&app_t, &info_t)
+            }))
+            .unwrap_or_else(|_| Err("the update failed unexpectedly".to_string()));
+            if let Err(e) = outcome {
+                // honest failure: the old version is intact and
+                // the mandatory latch (if any) stays armed, so
+                // the update stays retryable
+                let st = app_t.state::<AppState>();
+                st.update_busy.store(false, Ordering::SeqCst);
+                let _ = app_t.emit(
+                    "update_progress",
+                    serde_json::json!({ "phase": "error", "message": e }),
+                );
+            }
+        });
+        return Ok(());
+    }
     if info.deb_url.is_empty() {
         return Err("this update has no installable package".to_string());
     }
@@ -4522,6 +4940,224 @@ fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), Stri
         let _ = app.emit("update_progress", payload);
     });
     Ok(())
+}
+
+/// The Windows half of the one-click update (SPEC §B). Runs on a
+/// worker thread; progress rides the same `update_progress` events
+/// as the Linux flow. On success the app EXITS from here — the
+/// installer (installer flavour) or the detached helper (portable
+/// flavour) owns what happens next and relaunches the new build.
+/// Any error leaves the running version completely untouched.
+#[cfg(windows)]
+fn run_windows_update(
+    app: &AppHandle,
+    info: &ndm::updater::ReleaseInfo,
+) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("updates");
+    let installer = windows_is_installer_flavour();
+    let (url, sha, fname) = if installer {
+        (
+            info.win_setup_url.clone(),
+            info.win_setup_sha256.clone(),
+            "ndm-setup.exe",
+        )
+    } else {
+        (
+            info.win_url.clone(),
+            info.win_sha256.clone(),
+            "ndm-update.zip",
+        )
+    };
+    if url.is_empty() {
+        return Err(
+            "this update has no installable package for your copy of NDM".to_string(),
+        );
+    }
+    let dest = dir.join(fname);
+    let app2 = app.clone();
+    let cb = move |done: u64, total: u64| {
+        let _ = app2.emit(
+            "update_progress",
+            serde_json::json!({ "phase": "downloading", "downloaded": done, "total": total }),
+        );
+    };
+    ndm::updater::download_file(&url, &dest, &sha, &cb)?;
+    let _ = app.emit(
+        "update_progress",
+        serde_json::json!({ "phase": "installing",
+            "message": "Installing the update — NDM will close and reopen on the new version…" }),
+    );
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let install_dir = exe
+        .parent()
+        .ok_or("cannot locate the install folder")?
+        .to_path_buf();
+    if installer {
+        // silent install over the running copy; the app exits so
+        // the installer can replace its files, and the installer
+        // relaunches NDM when it is done (SPEC §C contract)
+        std::process::Command::new(&dest)
+            .arg("/S")
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("the installer could not be started: {e}"))?;
+        app.exit(0);
+        return Ok(());
+    }
+    // portable: stage the new tree beside the installation, then
+    // hand the swap to a detached copy of this binary (in temp —
+    // never a file the swap itself replaces) and exit
+    let staging = install_dir.join(".ndm-update-staging");
+    if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+    if let Err(e) = ndm::updater::extract_zip(&dest, &staging) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+    if !staging.join("ndm-app.exe").is_file() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err("the update package does not contain the NDM application".to_string());
+    }
+    let helper = std::env::temp_dir()
+        .join(format!("ndm-update-helper-{}.exe", std::process::id()));
+    std::fs::copy(&exe, &helper).map_err(|e| format!("cannot prepare the update: {e}"))?;
+    std::process::Command::new(&helper)
+        .arg("--apply-update")
+        .arg(&staging)
+        .arg(&install_dir)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("cannot start the update: {e}"))?;
+    app.exit(0);
+    Ok(())
+}
+
+/// The detached half of the portable Windows update: this process
+/// is a throwaway copy of the app binary (in temp) re-invoked with
+/// `--apply-update <staging> <install_dir>`. It waits for the real
+/// app to exit (its exe unlocks), swaps every staged file in
+/// (the old file is renamed to `<name>.old` first), relaunches
+/// the app, and exits. Any failure rolls the swap back — the old
+/// version stays whole. Runs before any Tauri state exists.
+#[cfg(windows)]
+fn apply_staged_update(staging: &Path, install_dir: &Path) -> ! {
+    fn collect(base: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    collect(base, &p, out);
+                } else if let Ok(rel) = p.strip_prefix(base) {
+                    out.push(rel.to_path_buf());
+                }
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(staging, staging, &mut files);
+    // the app exe goes first: renaming it is also the wait — a
+    // running executable is locked, so its rename only succeeds
+    // once the app has fully exited
+    files.sort_by_key(|rel| {
+        if rel.file_name().map(|n| n == "ndm-app.exe").unwrap_or(false) {
+            0
+        } else {
+            1
+        }
+    });
+    let mut swapped: Vec<(PathBuf, PathBuf)> = Vec::new(); // (target, .old)
+    let mut placed_new: Vec<PathBuf> = Vec::new(); // targets that did not exist before
+    let mut failed = files.is_empty();
+    if !failed {
+        'outer: for rel in &files {
+            let src = staging.join(rel);
+            let target = install_dir.join(rel);
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let old = PathBuf::from(format!("{}.old", target.to_string_lossy()));
+            if target.exists() {
+                // retry while locks drain (the exe above all)
+                let mut moved = false;
+                for _ in 0..480 {
+                    let _ = std::fs::remove_file(&old);
+                    if std::fs::rename(&target, &old).is_ok() {
+                        moved = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                if !moved {
+                    failed = true;
+                    break 'outer;
+                }
+                swapped.push((target.clone(), old));
+            }
+            if std::fs::rename(&src, &target).is_err() {
+                failed = true;
+                break 'outer;
+            }
+            if !swapped.iter().any(|(t, _)| t == &target) {
+                placed_new.push(target.clone());
+            }
+        }
+    }
+    if failed {
+        // roll back: remove any new file already placed and put
+        // every .old back, so the old version is whole again
+        for target in &placed_new {
+            let _ = std::fs::remove_file(target);
+        }
+        for (target, old) in swapped.iter().rev() {
+            let _ = std::fs::remove_file(target);
+            let _ = std::fs::rename(old, target);
+        }
+        std::process::exit(1);
+    }
+    let _ = std::fs::remove_dir_all(staging);
+    let _ = std::process::Command::new(install_dir.join("ndm-app.exe")).spawn();
+    std::process::exit(0);
+}
+
+/// Next-start cleanup after a portable swap (SPEC §B): the
+/// staging folder and the `.old` files the helper left behind.
+#[cfg(windows)]
+fn cleanup_update_leftovers() {
+    fn sweep(dir: &Path, depth: usize) {
+        if depth > 4 {
+            return;
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    sweep(&p, depth + 1);
+                } else if p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().ends_with(".old"))
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let staging = dir.join(".ndm-update-staging");
+            if staging.exists() {
+                let _ = std::fs::remove_dir_all(&staging);
+            }
+            sweep(dir, 0);
+        }
+    }
 }
 
 #[tauri::command]
@@ -4669,6 +5305,20 @@ async fn probe_file(
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|text| cookie_header_from_netscape(&text));
     let referer = referer.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+    // W193-13: the probe must authenticate exactly like the
+    // download will — a saved Site Login for this address applies
+    // when the caller supplied no credentials of its own (the
+    // download paths all do this via register_http_stub; the probe
+    // used to skip it, so a login-gated file probed as anonymous
+    // and showed no size while the download itself succeeded)
+    let (login, password) = if login.as_deref().unwrap_or("").is_empty() {
+        match site_login_for(&current_settings(&state), &url_trimmed) {
+            Some((l, p)) => (Some(l), Some(p)),
+            None => (login, password),
+        }
+    } else {
+        (login, password)
+    };
     let authorization = basic_auth_header(
         login.as_deref().unwrap_or(""),
         password.as_deref().unwrap_or(""),
@@ -4689,12 +5339,24 @@ async fn probe_file(
         .suggested_name
         .unwrap_or_else(|| file_name_for(&url_trimmed));
     let category = category_for_with(&suggested, &current_settings(&state));
+    // W193-3: report the folder the file will ACTUALLY land in
+    // (the category's routed folder when the target is the default
+    // folder), so the Add dialog can show the truth instead of the
+    // un-routed default it used to display while the file silently
+    // went elsewhere
+    let settings_now = current_settings(&state);
+    let effective_dir = route_category_dir(
+        &state,
+        &category,
+        resolve_dir(&settings_now.default_dir),
+    );
     Ok(serde_json::json!({
         "total": probe.total,
         "resumable": probe.range_ok,
         "unknown_size": probe.unknown_size,
         "suggested_name": suggested,
         "category": category,
+        "dir": effective_dir.to_string_lossy(),
     }))
 }
 
@@ -4723,14 +5385,31 @@ fn unique_video_name(state: &AppState, dir: &Path, raw_title: &str, audio: bool)
     // of a download-all pair vs its audio half) writes a different
     // filename and must not force a spurious "(1)" (R3-EXT-04).
     let taken = |cand: &str| -> bool {
-        video::stem_taken_on_disk(dir, cand, audio)
-            || state.entries.lock().unwrap().values().any(|e| {
+        if video::stem_taken_on_disk(dir, cand, audio) {
+            return true;
+        }
+        // the entries lock is scoped to this block on purpose:
+        // finished_path_owner below takes the same lock itself
+        let video_taken = {
+            state.entries.lock().unwrap().values().any(|e| {
                 e.kind == "video"
                     && e.audio == audio
                     && e.out_path == dir
                     && !e.removed.load(Ordering::Relaxed)
                     && (e.name == cand || video::safe_filename_stem(&e.name) == cand)
             })
+        };
+        if video_taken {
+            return true;
+        }
+        // W193-5, cross-kind: a FINISHED file entry whose file is
+        // exactly the path this video would land on (same folder,
+        // same name including a media extension) owns that path —
+        // the video must take a "(1)" name instead of overwriting
+        // a completed download at finalize time
+        ["mp4", "mkv", "webm", "mp3", "m4a"].iter().any(|ext| {
+            finished_path_owner(state, &dir.join(format!("{cand}.{ext}")), "").is_some()
+        }) || finished_path_owner(state, &dir.join(cand), "").is_some()
     };
     if !taken(&base_stem) {
         return base_stem;
@@ -4759,18 +5438,25 @@ fn do_add_video(
     duration_hint: f64,
     force: bool,
     queue: String,
+    dir_explicit: bool,
 ) -> Result<String, String> {
     if state.update_required.load(Ordering::SeqCst) {
         return Err("please install the required update before starting new downloads".to_string());
     }
     // category routing (IDM-style) happens BEFORE the duplicate
     // check, so a re-add compares against the folder the first add
-    // was actually routed to
-    let dir = route_category_dir(
-        state,
-        if audio { "Music" } else { "Video" },
-        resolve_dir(&dir),
-    );
+    // was actually routed to. An explicit folder from the video
+    // dialog (which shows the routed folder itself — W193-3) wins
+    // verbatim, exactly as on the file path.
+    let dir = if dir_explicit {
+        resolve_dir(&dir)
+    } else {
+        route_category_dir(
+            state,
+            if audio { "Music" } else { "Video" },
+            resolve_dir(&dir),
+        )
+    };
     let cookies_token = cookies
         .filter(|t| state.cookies_path(t).is_some())
         .unwrap_or_default();
@@ -4991,6 +5677,7 @@ async fn add_video(
     force: Option<bool>,
     queue: Option<String>,
     description: Option<String>,
+    dir_explicit: Option<bool>,
 ) -> Result<String, String> {
     let id = do_add_video(
         &app,
@@ -5006,6 +5693,7 @@ async fn add_video(
         duration.unwrap_or(0.0),
         force.unwrap_or(false),
         queue.unwrap_or_else(main_queue_name),
+        dir_explicit.unwrap_or(false),
     )?;
     if let Some(d) = &description {
         if let Some(e) = state.get(&id) {
@@ -5023,34 +5711,6 @@ struct GrabItemDto {
     kind: String,
     size: Option<u64>,
     label: String,
-}
-
-#[derive(Clone, Serialize)]
-struct GrabPageDto {
-    title: String,
-    items: Vec<GrabItemDto>,
-}
-
-#[tauri::command]
-async fn grab_page(state: State<'_, AppState>, url: String) -> Result<GrabPageDto, String> {
-    let settings = current_settings(&state);
-    let page = tauri::async_runtime::spawn_blocking(move || ndm::grab_page(&url))
-        .await
-        .map_err(|e| format!("internal join error: {e}"))??;
-    Ok(GrabPageDto {
-        title: page.title,
-        items: page
-            .items
-            .into_iter()
-            .map(|it| GrabItemDto {
-                kind: category_for_with(&it.name, &settings),
-                url: it.url,
-                name: it.name,
-                size: it.size,
-                label: it.label,
-            })
-            .collect(),
-    })
 }
 
 #[derive(Clone, Deserialize)]
@@ -6012,6 +6672,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             0.0,
             force,
             main_queue_name(),
+            false,
         ) {
             Ok(entry_id) => write_ack_and_result(
                 handle,
@@ -6102,6 +6763,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             &main_queue_name(),
             "",
             "",
+            false,
         ) {
             Ok(stub) => {
                 let entry_id = stub.id.clone();
@@ -6406,7 +7068,7 @@ fn register_native_hosts() {
    the magic, the newcomer runs unguarded rather than not at all.
    std-only — no new dependencies.
 
-   Two hardenings from the 1.9.2 audit ride on this design:
+   Two hardenings from the previous audit ride on this design:
    - C-MAJOR: the protocol is SERVED from the moment of bind, in
      main(), before Tauri starts. Serving used to begin only in
      setup() (seconds into a cold start): a newcomer in that
@@ -6576,6 +7238,20 @@ fn acquire_instance() -> Instance {
 }
 
 fn main() {
+    // Windows portable self-update hands the file swap to a copy
+    // of this binary in temp, re-invoked with --apply-update: it
+    // is not a second instance and must run BEFORE the guard and
+    // before any Tauri state exists (it never returns)
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() >= 4 && args[1] == "--apply-update" {
+            apply_staged_update(
+                std::path::Path::new(&args[2]),
+                std::path::Path::new(&args[3]),
+            );
+        }
+    }
     // single-instance guard FIRST: a second process must exit
     // before it builds any state — its persist() snapshots would
     // resurrect whatever the real window deletes (see above)
@@ -6623,8 +7299,27 @@ fn main() {
                     window.app_handle().exit(0);
                 }
             }
+            // W193-4: an OS-level drop on either window — files,
+            // shortcut files, or (on some platforms) the link
+            // itself — becomes a download offer in the main
+            // window; a plain local file gets an honest refusal
+            // on the window that received it
+            if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop {
+                paths, ..
+            }) = event
+            {
+                let on_basket = window.label() == "basket";
+                for p in paths {
+                    handle_dropped_path(window.app_handle(), p, on_basket);
+                }
+            }
         })
         .setup(|app| {
+            // a completed portable self-update leaves its staging
+            // folder and .old files beside the exe — sweep them
+            // now that the new build is the one running
+            #[cfg(windows)]
+            cleanup_update_leftovers();
             // the single-instance guard has been serving since
             // main() bound the port; setup only publishes the
             // AppHandle its raise path needs (and applies a raise
@@ -6668,11 +7363,37 @@ fn main() {
                         let _ = do_check_update(&handle);
                     }
                     if !current_settings(&st).install_counted {
-                        if ndm::updater::count_hit("installs-15") {
+                        // F-3: the counter bucket derives from the
+                        // running major version — a hardcoded series
+                        // string silently merged counts across
+                        // releases whenever a bump was forgotten
+                        let major = env!("CARGO_PKG_VERSION")
+                            .split('.')
+                            .next()
+                            .unwrap_or("0");
+                        let bucket = format!("installs-v{major}");
+                        if ndm::updater::count_hit(&bucket) {
                             let mut settings = st.settings.lock().unwrap();
                             settings.install_counted = true;
                             drop(settings);
                             save_settings(&st);
+                        }
+                    }
+                });
+            }
+            // periodic update re-check (SPEC §B): every 6 hours
+            // while the app runs, so a min_supported raise in the
+            // feed actually reaches users who never restart — the
+            // launch check alone left long-running copies unaware
+            // (and unblocked) indefinitely
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(6 * 3600));
+                        let st = handle.state::<AppState>();
+                        if current_settings(&st).auto_update {
+                            let _ = do_check_update(&handle);
                         }
                     }
                 });
@@ -6910,13 +7631,39 @@ fn main() {
                         // once per window
                         let blocked = quota_blocks(&state);
                         if blocked {
+                            // W193-11: enforcement is CONTINUOUS,
+                            // not a one-shot on the warned edge —
+                            // the old shape paused once per window,
+                            // so a download the user resumed by hand
+                            // (or one started after the edge) ran
+                            // straight through the limit for the
+                            // rest of the window. While the budget
+                            // is exhausted, anything downloading is
+                            // paused (re-queued, so the rollover
+                            // below restarts it), every tick.
                             let mut q = state.quota_state.lock().unwrap();
                             if !q.2 {
                                 q.2 = true;
                                 drop(q);
                                 save_quota(&state);
+                            }
+                            if count_active(&state) > 0 {
                                 pause_all(&handle, true, None);
-                                let _ = handle.emit("quota_exceeded", serde_json::json!({}));
+                            }
+                            if !was_blocked {
+                                // the notice edge is THIS thread's,
+                                // not the persisted warned flag: an
+                                // app restarted mid-window (warned
+                                // already true on disk) must still
+                                // show the banner once
+                                let s = current_settings(&state);
+                                let _ = handle.emit(
+                                    "quota_exceeded",
+                                    serde_json::json!({
+                                        "mb": s.quota_mb,
+                                        "hours": s.quota_hours,
+                                    }),
+                                );
                             }
                         }
                         if was_blocked && !blocked {
@@ -6924,6 +7671,7 @@ fn main() {
                             // the quota paused. Nothing else ever
                             // pumped here, so quota-paused downloads
                             // used to stall until an unrelated event.
+                            let _ = handle.emit("quota_cleared", serde_json::json!({}));
                             pump_queue(&handle);
                         }
                         was_blocked = blocked;
@@ -6966,7 +7714,6 @@ fn main() {
             probe_file,
             probe_video,
             add_video,
-            grab_page,
             grab_explore,
             get_settings,
             set_settings,
@@ -6977,6 +7724,7 @@ fn main() {
             basket_add,
             set_basket_visible,
             scheduler_start_now,
+            start_all,
             scheduler_stop_now,
             open_path,
             set_completion,

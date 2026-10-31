@@ -29,6 +29,16 @@ pub struct ReleaseInfo {
     pub deb_url: String,
     #[serde(default)]
     pub deb_sha256: String,
+    /// Windows portable build (a ZIP the app swaps in itself)
+    #[serde(default)]
+    pub win_url: String,
+    #[serde(default)]
+    pub win_sha256: String,
+    /// Windows installer (setup .exe, run silently)
+    #[serde(default)]
+    pub win_setup_url: String,
+    #[serde(default)]
+    pub win_setup_sha256: String,
 }
 
 fn parse_version(v: &str) -> Vec<u64> {
@@ -73,9 +83,13 @@ pub fn fetch_release() -> Result<ReleaseInfo, String> {
     serde_json::from_str(&body).map_err(|e| format!("update info was unreadable: {e}"))
 }
 
-/// Download `url` to `dest`, verifying the SHA-256 when one is given.
-/// Progress reports (downloaded, total). Used for the one-click
-/// update package; a hash mismatch deletes the file and errors.
+/// Download `url` to `dest`, verifying the SHA-256 against the
+/// feed's published hash. Progress reports (downloaded, total).
+/// Used for the one-click update package; a hash mismatch deletes
+/// the file and errors. An EMPTY expected hash is a broken feed,
+/// not a weaker check: the install is refused outright (F-7) —
+/// an update channel that cannot name its package's hash must
+/// never silently downgrade to a length comparison.
 pub fn download_file(
     url: &str,
     dest: &Path,
@@ -123,25 +137,66 @@ pub fn download_file(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    if !sha256_expected.is_empty() {
-        let digest = format!("{:x}", hasher.finalize());
-        if digest != sha256_expected.to_lowercase() {
-            let _ = std::fs::remove_file(&tmp);
-            return Err("the update failed its integrity check and was discarded".to_string());
-        }
-    } else if total > 0 && downloaded != total {
-        // no hash to verify against: the server's own Content-Length
-        // is the only integrity signal — a connection that closed
-        // mid-body must not be renamed into place as a "successful"
-        // download and fail later, inside the installer
+    if sha256_expected.is_empty() {
+        // F-7: no published hash — the feed is invalid for install
+        // purposes. Discard the bytes and refuse; never fall back
+        // to a Content-Length comparison as if it were integrity.
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!(
-            "the update download was truncated ({downloaded} of {total} bytes) and was discarded"
-        ));
+        return Err(
+            "the update feed carries no integrity hash for this package, so the update was refused"
+                .to_string(),
+        );
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    if digest != sha256_expected.to_lowercase() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("the update failed its integrity check and was discarded".to_string());
     }
     std::fs::rename(&tmp, dest).map_err(|e| format!("cannot install file: {e}"))?;
     on_progress(downloaded, total.max(downloaded));
     Ok(())
+}
+
+/// Extract a ZIP archive into `dest_dir`, returning the relative
+/// paths written. Used by the Windows portable self-update: the
+/// archive is the published portable tree, extracted to a staging
+/// folder beside the installation and swapped in by a detached
+/// helper. Entries with absolute paths or `..` components are
+/// refused — a hostile or corrupt archive must never write outside
+/// the staging folder.
+pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    let file = std::fs::File::open(zip_path)
+        .map_err(|e| format!("cannot read the update package: {e}"))?;
+    let mut arch = zip::ZipArchive::new(file)
+        .map_err(|e| format!("the update package is unreadable: {e}"))?;
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|e| format!("cannot create the update folder: {e}"))?;
+    let mut written = Vec::new();
+    for i in 0..arch.len() {
+        let mut entry = arch
+            .by_index(i)
+            .map_err(|e| format!("the update package is unreadable: {e}"))?;
+        let Some(rel) = entry.enclosed_name() else {
+            return Err("the update package contains an unsafe path and was discarded".to_string());
+        };
+        let rel = rel.to_path_buf();
+        let out = dest_dir.join(&rel);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out)
+                .map_err(|e| format!("cannot create folder: {e}"))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create folder: {e}"))?;
+        }
+        let mut w = std::fs::File::create(&out)
+            .map_err(|e| format!("cannot write file: {e}"))?;
+        std::io::copy(&mut entry, &mut w)
+            .map_err(|e| format!("cannot extract the update package: {e}"))?;
+        written.push(rel);
+    }
+    Ok(written)
 }
 
 /// Increment a shared counter (fire-and-forget, returns success).

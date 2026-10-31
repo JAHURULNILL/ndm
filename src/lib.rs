@@ -589,7 +589,9 @@ fn sanitize_suggested_name(raw: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let name = trimmed.to_string();
+    // F-6: a server-suggested name can be arbitrarily long; cap it
+    // like every other name source before it reaches the filesystem
+    let name = cap_file_name(trimmed);
     if cfg!(target_os = "windows") {
         // Windows reserves the DOS device names with ANY extension:
         // a download literally named "nul.mp3" or "CON" cannot be
@@ -602,7 +604,7 @@ fn sanitize_suggested_name(raw: &str) -> String {
             "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
         ];
         if RESERVED.contains(&stem.as_str()) {
-            return format!("_{name}");
+            return cap_file_name(&format!("_{name}"));
         }
     }
     name
@@ -2452,6 +2454,26 @@ pub fn query_file_name(url: &str) -> Option<String> {
     None
 }
 
+/// Cap a file name at the 255-byte filesystem limit, truncating the
+/// stem on a UTF-8 boundary and keeping the extension — the same
+/// treatment the video path gives its titles (F-6). A name already
+/// within the limit is returned untouched.
+pub fn cap_file_name(name: &str) -> String {
+    if name.len() <= 255 {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let budget = 255usize.saturating_sub(ext.len());
+    let mut end = stem.len().min(budget);
+    while end > 0 && !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &stem[..end], ext)
+}
+
 pub fn file_name_of(url: &str) -> String {
     let base = url.split(['?', '#']).next().unwrap_or(url);
     let raw = base.rsplit('/').next().unwrap_or("");
@@ -2472,11 +2494,17 @@ pub fn file_name_of(url: &str) -> String {
             }
         })
         .collect();
-    let name = cleaned.trim();
-    let name = if name.is_empty() || name == "." || name == ".." {
+    // F-5: a URL-derived name gets the SAME full treatment as a
+    // Content-Disposition name — control characters stripped, the
+    // remaining Windows-hostile characters (`:` `*` `?`) replaced,
+    // leading/trailing dots and spaces trimmed, DOS device names
+    // defused — not the weaker local cleanup above (which stays as
+    // a first pass for the extra shell metacharacters it covers).
+    let sanitized = sanitize_suggested_name(&cleaned);
+    let name = if sanitized.is_empty() {
         "index".to_string()
     } else {
-        name.to_string()
+        sanitized
     };
     // A bare handler path (/dl, /getfile, /) carries no usable
     // name — but the query string often carries the real one

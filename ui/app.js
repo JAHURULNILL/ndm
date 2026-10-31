@@ -1,6 +1,9 @@
 'use strict';
-/* NDM frontend — works against the Tauri backend via IPC, and falls back to a
-   self-contained demo simulation when opened in a plain browser. */
+/* NDM frontend — works against the Tauri backend via IPC. There is
+   deliberately NO fallback simulation (F-2): when the desktop
+   backend is absent the UI shows an honest not-connected state
+   instead of fabricated downloads, so a broken connection can
+   never masquerade as a working app. */
 
 const TAURI = typeof window !== 'undefined' && !!window.__TAURI__;
 let invoke = null, listen = null;
@@ -185,11 +188,14 @@ async function loadSettings() {
   $('vInDir').value = settings.default_dir || '~/Downloads';
 }
 
+/* Returns true when the settings were actually saved. F-4: a
+   failed write used to be swallowed here, so Options closed as
+   if saved while the file kept the old values — callers that
+   present the save as done (the Options dialog) must check. */
 async function saveSettings() {
-  if (TAURI) {
-    try { await invoke('set_settings', { settings }); }
-    catch (e) { console.error('set_settings failed', e); }
-  }
+  if (!TAURI) return true;
+  try { await invoke('set_settings', { settings }); return true; }
+  catch (e) { console.error('set_settings failed', e); return false; }
 }
 
 /* Last Try Date: the backend stamps every real attempt (fresh
@@ -316,6 +322,51 @@ function toggleQueues() {
   $('queueExpBox').textContent = queuesExpanded ? '−' : '+';
   queueListSig = ''; // the rebuild below keys on expansion too
   renderQueueFilters();
+}
+
+/* W193-6: the category tree is built from the SAME category set
+   the rest of the app knows — the built-ins, the user's own
+   categories (Options / the File dialog's "+"), and any category
+   a listed download actually carries. It used to be five static
+   rows in the markup, so a custom category could classify and
+   route downloads yet never appear in the tree or be filtered
+   by. ("General" has no tree node, IDM-style; "Grabber" has its
+   own node below.) */
+let catListSig = '';
+function renderCategoryFilters() {
+  const box = $('allChildren');
+  if (!box) return;
+  const builtin = ['Compressed', 'Documents', 'Music', 'Programs', 'Video'];
+  const extra = new Set();
+  for (const n of categoryNames()) {
+    if (!builtin.includes(n) && n !== 'General' && n !== 'Grabber') extra.add(n);
+  }
+  for (const d of items.values()) {
+    if (d.category && !builtin.includes(d.category)
+        && d.category !== 'General' && d.category !== 'Grabber') {
+      extra.add(d.category);
+    }
+  }
+  const names = [...builtin, ...[...extra].sort()];
+  const sig = JSON.stringify([names, currentCat]);
+  if (sig === catListSig) return;
+  catListSig = sig;
+  box.innerHTML = '';
+  for (const n of names) {
+    const row = document.createElement('div');
+    row.className = 'trow tchild' + (currentCat === n ? ' sel' : '');
+    row.dataset.cat = n;
+    const ic = document.createElement('span');
+    ic.className = 'ticon';
+    ic.innerHTML = TREE_ICONS[n] || ICON16.generic;
+    const lab = document.createElement('span');
+    lab.className = 'tlabel';
+    lab.textContent = n;
+    lab.title = n;
+    row.append(ic, lab);
+    row.addEventListener('click', () => selectTreeCat(n));
+    box.appendChild(row);
+  }
 }
 
 let queueListSig = '';
@@ -614,6 +665,10 @@ function cellHtml(colId, d, st, left) {
       // progress to report the bare 2-decimal percentage
       if (st === 'finished') return 'Complete';
       if (st === 'error') return 'Error';
+      // W193-10: a queued entry must SAY so — it used to fall into
+      // the percentage branch and sit at "0.00%", indistinguishable
+      // from a paused entry that simply had not started
+      if (st === 'queued') return 'Queued';
       if (d.total > 0) return pctOf(d).toFixed(2) + '%';
       return cap(st);
     case 'timeleft':
@@ -740,6 +795,7 @@ function render() {
     }
   }
   renderQueueFilters();
+  renderCategoryFilters();
   const list = visibleItems();
   /* selection repair: toolbar/menu actions act on the selection, so
      the selection must never point at a row the current filter
@@ -1033,6 +1089,33 @@ $('cfYes').onclick = () => settleConfirm(true);
 $('cfNo').onclick = $('cfModalClose').onclick = () => settleConfirm(false);
 $('cfmodal').addEventListener('click', e => { if (e.target === $('cfmodal')) settleConfirm(false); });
 
+/* The app's own styled text prompt (W193-17: the new-category
+   name used to come from a raw JS prompt() titled
+   "JavaScript - tauri://…"). Resolves the entered text, or null
+   on Cancel/×/backdrop/Escape. */
+let promptResolve = null;
+function showPrompt(title, msg) {
+  return new Promise(res => {
+    if (promptResolve) promptResolve(null); // never stack two asks
+    promptResolve = res;
+    $('pTitle').textContent = title || 'Name';
+    $('pMsg').textContent = msg || '';
+    $('pInput').value = '';
+    revealModal($('pmodal'));
+    $('pInput').focus();
+  });
+}
+function settlePrompt(v) {
+  $('pmodal').classList.add('hidden');
+  if (promptResolve) { const r = promptResolve; promptResolve = null; r(v); }
+}
+$('pOk').onclick = () => settlePrompt($('pInput').value);
+$('pCancel').onclick = $('pModalClose').onclick = () => settlePrompt(null);
+$('pmodal').addEventListener('click', e => { if (e.target === $('pmodal')) settlePrompt(null); });
+$('pInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); settlePrompt($('pInput').value); }
+});
+
 /* WebKit's default context menu (Back / Reload / Inspect Element)
    is browser chrome, not app UI — suppress it everywhere except
    the download rows, whose own handler builds the app menu. */
@@ -1059,6 +1142,10 @@ function select(id, openDetail) {
   if (id) selectedIds.add(id);
   if (openDetail) {
     revealModal(detailEl);
+    // W193-8: the Speed Limiter tab must show THIS download's
+    // limit the moment the dialog opens — sync explicitly here,
+    // not only on the next progress tick's renderDetail
+    syncLimiterPanel();
     requestAnimationFrame(() => renderDetail());
   }
   render();
@@ -1132,9 +1219,9 @@ function showCtxMenu(x, y, id) {
   head.textContent = d.name && d.name.length > 34 ? d.name.slice(0, 34) + '…' : (d.name || 'Download');
   ctxMenu.appendChild(head);
   const st = d.status;
-  add('Resume', () => actOnSelected(id => TAURI ? invoke('resume_download', { id }) : demoResume(id)),
+  add('Resume', () => actOnSelected(id => invoke('resume_download', { id })),
     st === 'downloading' || st === 'finished');
-  add('Pause', () => actOnSelected(id => TAURI ? invoke('pause_download', { id }) : demoPause(id)),
+  add('Pause', () => actOnSelected(id => invoke('pause_download', { id })),
     st !== 'downloading');
   add('Properties / Status…', () => select(id, true));
   const sep1 = document.createElement('div'); sep1.className = 'ctx-sep'; ctxMenu.appendChild(sep1);
@@ -1179,8 +1266,8 @@ async function actOnSelected(fn) {
   if (TAURI) { try { await fn(d.id); } catch (e) { console.error(e); toast(String(e)); } }
   else fn(d.id);
 }
-$('btnPause').onclick = () => actOnSelected(id => TAURI ? invoke('pause_download', { id }) : demoPause(id));
-$('btnResume').onclick = () => actOnSelected(id => TAURI ? invoke('resume_download', { id }) : demoResume(id));
+$('btnPause').onclick = () => actOnSelected(id => invoke('pause_download', { id }));
+$('btnResume').onclick = () => actOnSelected(id => invoke('resume_download', { id }));
 /* IDM's toolbar "Stop" IS its pause (there is no separate Pause
    button on the bar): same action as the hidden Pause button
    the detail dialog uses */
@@ -1208,15 +1295,16 @@ function openDeleteConfirm() {
   if (targets.length === 1) {
     const d = items.get(targets[0]);
     $('delName').textContent = 'Delete "' + (d.name || 'download') + '" from the list?';
-    $('delFileLbl').textContent = 'Also delete the downloaded file from the disk';
-    $('delFileChk').disabled = d.status !== 'finished';
+    $('delFileLbl').textContent = 'Also delete the file from the disk (including a partial download)';
   } else {
     $('delName').textContent = 'Delete ' + targets.length + ' downloads from the list?';
-    $('delFileLbl').textContent = 'Also delete the downloaded files from the disk';
-    // the disk-file checkbox applies to the finished entries of the
-    // batch; it stays disabled only when none of them is finished
-    $('delFileChk').disabled = !targets.some(id => items.get(id).status === 'finished');
+    $('delFileLbl').textContent = 'Also delete the files from the disk (including partial downloads)';
   }
+  // W193-2: the choice applies to every status — the checkbox used
+  // to be disabled (or silently ignored) for anything not finished,
+  // so deleting an active download with the box ticked left its
+  // partial file on disk anyway
+  $('delFileChk').disabled = false;
   $('delFileChk').checked = false;
   revealModal($('delmodal'));
   $('delConfirm').focus();
@@ -1237,12 +1325,12 @@ $('delConfirm').onclick = async () => {
   if (TAURI) {
     let failed = 0;
     for (const id of targets) {
-      const d = items.get(id);
       try {
         // the same remove the single delete uses (it stops an active
-        // download first); the disk-file choice only ever applied to
-        // finished entries, so it is honoured per entry that way
-        await invoke('remove_download', { id, deleteFile: delFile && d && d.status === 'finished' ? true : null });
+        // download first); the disk-file choice is passed as ticked
+        // for every entry — the backend deletes the file whatever
+        // the status, guarding only files another entry still owns
+        await invoke('remove_download', { id, deleteFile: delFile ? true : null });
       } catch (e) {
         console.error(e);
         if (targets.length === 1) { toast(String(e)); return; }
@@ -1301,7 +1389,6 @@ $('btnStopAll').onclick = async () => {
   for (const d of items.values()) {
     if (d.status !== 'downloading') continue;
     if (TAURI) { try { await invoke('pause_download', { id: d.id }); } catch (e) { /* keep going */ } }
-    else demoPause(d.id);
   }
   scheduleRender();
 };
@@ -1394,6 +1481,19 @@ const fileLinkQueue = [];
 let presentedFile = null; // { url, cookies, referer } while shown
 let fileCatTouched = false; // the user picked a category themselves —
                             // the probe must not override their choice
+/* W193-3: the folder the dialog SHOWS is the folder the file goes
+   to. While the user has not edited the folder field themselves,
+   it tracks the category routing (the backend reports the routed
+   folder with each probe; the Options table covers category
+   changes between probes). Once they type a folder, it is theirs
+   verbatim — and both dialogs submit dirExplicit so the backend
+   never re-routes what was shown. */
+let fileDirTouched = false;
+let videoDirTouched = false;
+function routedDirFor(cat) {
+  const dirs = settings.category_dirs || {};
+  return (cat && dirs[cat]) || settings.default_dir || '~/Downloads';
+}
 function queueFileLink(payload) {
   const url = payload && payload.url;
   if (!url) return;
@@ -1541,6 +1641,9 @@ async function runFileProbe() {
     const info = await invoke('probe_file', { url, cookies, referer, login, password });
     if (mySeq !== fileProbeSeq || $('inUrl').value.trim() !== url) return;
     fileProbeTotal = info.total > 0 ? info.total : 0;
+    // W193-3: show the folder the backend will actually use (its
+    // routed answer rides with the probe) until the user edits it
+    if (!fileDirTouched && info.dir) $('inDir').value = info.dir;
     $('fCat').textContent = info.category || 'General';
     // preselect what the probe detected in the Category dropdown,
     // unless the user already picked a category in this session
@@ -1563,7 +1666,11 @@ async function runFileProbe() {
 
 $('inUrl').addEventListener('input', () => {
   setFileError('');
-  fileProbeTotal = 0; // the address changed — the old probe is stale
+  // W193-14: the previous address's probe results (its size, its
+  // resume verdict, its category — including a failed probe's
+  // leftovers) clear the moment the address changes, not whenever
+  // the next probe happens to land
+  resetFileProbeUi();
   clearTimeout(fileProbeTimer);
   fileProbeTimer = setTimeout(runFileProbe, 350);
 });
@@ -1572,9 +1679,16 @@ $('inAuth').addEventListener('change', () => {
   clearTimeout(fileProbeTimer);
   fileProbeTimer = setTimeout(runFileProbe, 350);
 });
-if ($('inCat')) $('inCat').addEventListener('change', () => { fileCatTouched = true; });
+if ($('inCat')) $('inCat').addEventListener('change', () => {
+  fileCatTouched = true;
+  // a different category routes to a different folder: keep the
+  // shown folder truthful while it is still an automatic value
+  if (!fileDirTouched) $('inDir').value = routedDirFor($('inCat').value || $('fCat').textContent);
+});
+if ($('inDir')) $('inDir').addEventListener('input', () => { fileDirTouched = true; });
+if ($('vInDir')) $('vInDir').addEventListener('input', () => { videoDirTouched = true; });
 if ($('inCatAdd')) $('inCatAdd').onclick = async () => {
-  const name = (prompt('New category name:') || '').trim();
+  const name = ((await showPrompt('New category', 'Name for the new category:')) || '').trim();
   if (!name) return;
   const existing = categoryNames().find(c => c.toLowerCase() === name.toLowerCase());
   if (existing) {
@@ -1602,6 +1716,8 @@ function openFileDialog(payload) {
   fillQueueSelect($('inQueue'));
   fillCategorySelect($('inCat'), '');
   fileCatTouched = false;
+  fileDirTouched = false;
+  $('inDir').value = settings.default_dir || '~/Downloads';
   if ($('inRememberCat')) $('inRememberCat').checked = false;
   $('inAuth').checked = false;
   $('inAuthBox').classList.add('hidden');
@@ -1667,6 +1783,10 @@ async function submitAdd(later) {
     try {
       const args = {
         url, dir, later, category, name,
+        // the dialog's folder is the final word (W193-3): it
+        // already shows the routed folder, so the backend must
+        // not route it again behind the user's back
+        dirExplicit: true,
         cookies: session ? (session.cookies || null) : null,
         referer: session ? (session.referer || null) : null,
         queue: $('inQueue').value || null,
@@ -1695,11 +1815,12 @@ async function submitAdd(later) {
       try {
         await invoke('add_download', args);
       } catch (e) {
-        // IDM asks what to do about a duplicate link — so do we
-        if (String(e).startsWith('duplicate:') &&
-            confirm('This file is already in the download list.\nDownload it again as a new copy?')) {
-          await invoke('add_download', { ...args, force: true });
-        } else if (String(e).startsWith('duplicate:')) {
+        // IDM asks what to do about a duplicate link — so do we,
+        // with the app's own styled confirm (W193-17)
+        if (String(e).startsWith('duplicate:')) {
+          if (await showConfirm('This file is already in the download list.\nDownload it again as a new copy?', 'Download again')) {
+            await invoke('add_download', { ...args, force: true });
+          }
           // user chose to keep the existing entry — done, not an error
         } else {
           throw e;
@@ -1738,7 +1859,7 @@ async function submitAdd(later) {
   } else {
     $('inUrl').value = '';
     $('inName').value = '';
-    demoAdd(url, later);
+    toast('Downloads need the NDM desktop app — this page is not connected to it');
   }
   pumpFileLinks();
 }
@@ -1791,10 +1912,32 @@ function openVideoModal(url, cookies) {
   presentedVideoCookies = cookies || '';
   fillQueueSelect($('vInQueue'));
   if ($('vInDesc')) $('vInDesc').value = '';
+  // W193-7: reopening must never strand the dialog — a retained
+  // probe result from a previous visit comes back with its
+  // buttons ENABLED (they used to stay disabled forever, with
+  // the formats visible but unstartable), and a different (or
+  // new) address starts from a clean slate instead of showing
+  // the previous video's results as its own
+  const effUrl = url || $('vInUrl').value.trim();
+  const retained = !!(vInfo && effUrl && vInfo.url === effUrl);
+  if (!retained) {
+    vInfo = null;
+    $('vInfo').classList.add('hidden');
+    $('vOptions').innerHTML = '';
+    $('vStatus').textContent = '';
+    $('vStatus').classList.remove('error');
+  }
+  $('vStart').disabled = !retained;
+  if ($('vLater')) $('vLater').disabled = !retained;
+  if ($('vAll')) $('vAll').disabled = !retained;
+  // W193-3: the shown folder is the routed Video folder until
+  // the user edits it themselves
+  videoDirTouched = false;
+  $('vInDir').value = routedDirFor('Video');
   revealModal(vmodal);
   if (url) { $('vInUrl').value = url; }
   $('vInUrl').focus();
-  if (url && TAURI) fetchVideoInfo();
+  if (url && TAURI && !retained) fetchVideoInfo();
 }
 $('btnVideo').onclick = () => openVideoModal('');
 $('vModalClose').onclick = $('vCancel').onclick = () => closeVideoModal();
@@ -1838,7 +1981,8 @@ let componentsReady = false;
 let setupWanted = false; // a probe is waiting for the setup to finish
 let ffmpegNoteShown = false;
 async function gateComponents() {
-  // demo mode (plain browser): nothing to set up — let the demo flow run
+  // no backend (plain browser): nothing to set up — fetchVideoInfo
+  // will report the missing desktop app itself
   if (!TAURI) return true;
   if (componentsReady) return true;
   try {
@@ -1983,6 +2127,9 @@ async function fetchVideoInfo() {
       lab.addEventListener('change', () => {
         box.querySelectorAll('label').forEach(el => el.classList.remove('sel'));
         lab.classList.add('sel');
+        // an audio pick routes to the Music folder, a video pick
+        // to Video's — keep the shown folder truthful (W193-3)
+        if (!videoDirTouched) $('vInDir').value = routedDirFor(o.audio ? 'Music' : 'Video');
       });
       lab.addEventListener('dblclick', () => {
         const inp = lab.querySelector('input');
@@ -2036,6 +2183,7 @@ async function submitVideo(later) {
     const args = {
       url,
       dir,
+      dirExplicit: true, // the shown folder is final (W193-3)
       selector: opt.selector,
       audio: !!opt.audio,
       title: customTitle,
@@ -2051,11 +2199,13 @@ async function submitVideo(later) {
     try {
       await invoke('add_video', args);
     } catch (e) {
-      // IDM asks what to do about a duplicate link — so do we
-      if (String(e).startsWith('duplicate:') &&
-          confirm('This video quality is already in the download list.\nDownload it again as a new copy?')) {
-        await invoke('add_video', { ...args, force: true });
-      } else if (!String(e).startsWith('duplicate:')) {
+      // IDM asks what to do about a duplicate link — so do we,
+      // with the app's own styled confirm (W193-17)
+      if (String(e).startsWith('duplicate:')) {
+        if (await showConfirm('This video quality is already in the download list.\nDownload it again as a new copy?', 'Download again')) {
+          await invoke('add_video', { ...args, force: true });
+        }
+      } else {
         throw e;
       }
     }
@@ -2095,7 +2245,7 @@ if ($('vAll')) $('vAll').onclick = async () => {
   for (const opt of options) {
     try {
       await invoke('add_video', {
-        url, dir, selector: opt.selector, audio: !!opt.audio,
+        url, dir, dirExplicit: true, selector: opt.selector, audio: !!opt.audio,
         title: customTitle, cookies, later: false,
         total: Number(opt.size_bytes) || 0,
         duration: Number(vInfo.duration) || 0, queue,
@@ -2336,7 +2486,18 @@ $('oSave').onclick = async () => {
     quota_mb: Math.max(0, parseInt($('oQuotaMb').value, 10) || 0),
     quota_hours: Math.min(168, Math.max(1, parseInt($('oQuotaHours').value, 10) || 5)),
   };
-  await saveSettings();
+  // F-4: if the write failed, the dialog STAYS OPEN and says so —
+  // closing here used to present a failed save as a successful one
+  const saved = await saveSettings();
+  if (!saved) {
+    const st = $('oStatus');
+    if (st) {
+      st.textContent = 'These settings could not be saved to disk — they apply until NDM closes, but will be lost. Check that the app data folder is writable, then Save again.';
+      st.classList.remove('hidden');
+    }
+    return;
+  }
+  if ($('oStatus')) $('oStatus').classList.add('hidden');
   $('inDir').value = settings.default_dir;
   $('vInDir').value = settings.default_dir;
   omodal.classList.add('hidden');
@@ -2874,7 +3035,7 @@ async function fetchGrab() {
   const p = grabWizardState();
   if (!p.start_url) { showGrabStep(1); $('gUrl').focus(); return; }
   showGrabStep(5);
-  if (!TAURI) { demoGrab(); return; }
+  if (!TAURI) { setGrabStatus('Exploring needs the NDM desktop app — this page is not connected to it', true); return; }
   $('gFetch').disabled = true;
   setGrabStatus('Exploring…');
   try {
@@ -2986,35 +3147,7 @@ $('gDownload').onclick = async () => {
   gmodal.classList.add('hidden');
 };
 
-/* demo data so the grabber is fully previewable in a plain browser.
-   The wizard's own filters still apply — templates write their
-   extension lists into the Step 4 fields, so filtering by the
-   wizard state exercises the template wiring too */
-function demoGrab() {
-  const base = $('gUrl').value.trim().replace(/\/+$/, '');
-  const p = grabWizardState();
-  const all = [
-    { url: `${base}/brochure-2026.pdf`, name: 'brochure-2026.pdf', kind: 'Documents', size: 4821760, label: 'Company brochure (PDF)' },
-    { url: `${base}/theme-song.mp3`, name: 'theme-song.mp3', kind: 'Music', size: 8388608, label: '' },
-    { url: `${base}/assets-backup.zip`, name: 'assets-backup.zip', kind: 'Compressed', size: null, label: 'Full asset backup' },
-    { url: `${base}/promo-clip.mp4`, name: 'promo-clip.mp4', kind: 'Video', size: 157286400, label: 'Promo clip — 1080p' },
-  ];
-  grabItems = all.filter(it => {
-    const ext = (it.name.split('.').pop() || '').toLowerCase();
-    if (p.include_exts.length && !p.include_exts.includes(ext)) return false;
-    if (p.exclude_exts.includes(ext)) return false;
-    if (it.size != null) {
-      if (p.min_kb > 0 && it.size < p.min_kb * 1024) return false;
-      if (p.max_mb > 0 && it.size > p.max_mb * 1024 * 1024) return false;
-    }
-    return true;
-  });
-  grabUnchecked.clear();
-  grabKindsOff.clear();
-  renderGrabKinds();
-  renderGrabList();
-  setGrabStatus(`Explored 3 pages — found ${grabItems.length} files on "Demo Page"`);
-}
+
 
 
 /* ---------- detail tabs + completion options + speed limiter + open/refresh ---------- */
@@ -3026,8 +3159,12 @@ function syncLimiterPanel() {
   const bps = (d && d.speed_limit) || 0;
   if ($('dLimitOn')) $('dLimitOn').checked = bps > 0;
   if ($('dLimitVal')) {
+    // W193-8: show the entry's OWN limit at full fidelity — the
+    // old 1-decimal rounding rewrote 256 KB/s as "0.3" MB/s, and
+    // a stale panel could present the "2" placeholder as if it
+    // were the set value. Up to 3 decimals, trailing zeros cut.
     $('dLimitVal').value = bps > 0
-      ? (bps / (1024 * 1024)).toFixed(1).replace(/\.0$/, '')
+      ? String(parseFloat((bps / (1024 * 1024)).toFixed(3)))
       : '2';
   }
 }
@@ -3181,6 +3318,8 @@ document.addEventListener('keydown', e => {
   // the styled confirm must SETTLE (as a "no"), not just hide —
   // hiding it would leave the awaiting guard pending forever
   if (top.id === 'cfmodal') { settleConfirm(false); return; }
+  // same for the styled prompt: Escape is a cancel, settled as null
+  if (top.id === 'pmodal') { settlePrompt(null); return; }
   // the video and Add dialogs own cleanup — a captured browser
   // session must be discarded and the queue pumped — so Escape goes
   // through the same close path as their Cancel buttons
@@ -3194,6 +3333,25 @@ document.addEventListener('keydown', e => {
   // closing a dialog may un-block a queued completion dialog
   showNextComplete();
 });
+/* W193-4: dropping LINK TEXT (from a browser address bar or a
+   page) anywhere on the main window opens the Add URL dialog
+   with it, the way IDM's drop target does. OS-level file drops
+   are handled by the backend's native drag-drop path instead
+   (files, shortcuts); this one covers text the page itself
+   carries. */
+window.addEventListener('dragover', e => { e.preventDefault(); });
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  if (!e.dataTransfer) return;
+  const uriList = e.dataTransfer.getData('text/uri-list') || '';
+  const plain = e.dataTransfer.getData('text/plain') || '';
+  const candidate = (uriList.split(/\r?\n/).find(l => l && !l.startsWith('#'))
+    || plain.split(/\r?\n/)[0] || '').trim();
+  if (/^https?:\/\//i.test(candidate)) {
+    openFileDialog({ url: candidate, source: 'drop', cookies: null, referer: null, name: null });
+  }
+});
+
 $('inUrl').addEventListener('keydown', e => { if (e.key === 'Enter') submitAdd(false); });
 $('vInUrl').addEventListener('keydown', e => { if (e.key === 'Enter') fetchVideoInfo(); });
 $('rUrl').addEventListener('keydown', e => { if (e.key === 'Enter') $('rSave').click(); });
@@ -3224,8 +3382,35 @@ async function initTauri() {
     const pending = await invoke('take_pending_videos');
     for (const p of pending || []) queueVideoLink(p.url || '', p.cookies || '');
   } catch (e) { console.error('take_pending_videos failed', e); }
-  await listen('quota_exceeded', () => {
-    toast(`Download limit reached (${settings.quota_mb} MB per ${settings.quota_hours} h). Downloads are paused until the next period.`);
+  await listen('quota_exceeded', e => {
+    // W193-11: a persistent banner, not just a toast — the toast
+    // used to be the only trace, and a completion dialog opening
+    // over it made the limit's action completely invisible
+    const p = e.payload || {};
+    const mb = p.mb || settings.quota_mb;
+    const hours = p.hours || settings.quota_hours;
+    const b = $('quotaBanner');
+    if (b) {
+      b.textContent = `Download limit reached (${mb} MB per ${hours} h) — downloads are paused until the next period. You can raise or remove the limit in Options → Connection.`;
+      b.classList.remove('hidden');
+    }
+    toast(`Download limit reached (${mb} MB per ${hours} h). Downloads are paused until the next period.`);
+  });
+  await listen('quota_cleared', () => {
+    const b = $('quotaBanner');
+    if (b) b.classList.add('hidden');
+  });
+  // W193-12: "Exit when done" was vetoed by paused downloads —
+  // say why the app is staying open
+  await listen('exit_vetoed', e => {
+    const n = (e.payload || {}).paused || 0;
+    toast(`"Exit when done" is on, but ${n} paused download${n === 1 ? ' is' : 's are'} unfinished — NDM stays open.`, 'info');
+  });
+  // W193-4: a plain local file dropped on the main window cannot
+  // be downloaded — say so instead of ignoring the gesture
+  await listen('drop_file_ignored', e => {
+    const name = (e.payload || {}).name || 'That file';
+    toast(`"${name}" is a local file — NDM downloads from links. Drop or paste a link instead.`, 'info');
   });
   await listen('download_complete', async e => {
     const p = e.payload || {};
@@ -3399,73 +3584,6 @@ if ($('cOpenFolder')) $('cOpenFolder').onclick = () => closeComplete('folder');
 if ($('cClose')) $('cClose').onclick = () => closeComplete(null);
 if ($('cModalClose')) $('cModalClose').onclick = () => closeComplete(null);
 
-/* ---------- demo mode (plain browser, no Tauri) ---------- */
-const DEMO_BLOCK_BYTES = 4 * 1024 * 1024;
-let demoSeq = 0;
-
-function categorize(name) {
-  const ext = (name.split('.').pop() || '').toLowerCase();
-  if (['zip', 'rar', '7z', 'tar', 'gz'].includes(ext)) return 'Compressed';
-  if (['mp4', 'mkv', 'avi', 'webm', 'mov'].includes(ext)) return 'Video';
-  if (['mp3', 'flac', 'wav', 'ogg'].includes(ext)) return 'Music';
-  if (['pdf', 'doc', 'docx', 'txt', 'xlsx', 'pptx'].includes(ext)) return 'Documents';
-  return 'Programs';
-}
-function makeBlocks(n) { return new Array(n).fill('0'); }
-function blocksString(d) {
-  const done = Math.floor((d.done_bytes / d.total) * d._blocks.length);
-  return d._blocks.map((_, i) => {
-    if (i < done) return '1';
-    if (d.status === 'downloading' && i >= done && i < done + d.conns) return '2';
-    return '0';
-  }).join('');
-}
-function demoItem(name, url, total, status, doneRatio) {
-  const nBlocks = Math.max(16, Math.min(512, Math.round(total / DEMO_BLOCK_BYTES)));
-  const d = {
-    id: 'demo-' + (++demoSeq), name, url, total,
-    done_bytes: Math.floor(total * doneRatio), speed_bps: 0,
-    conns: 4 + Math.floor(Math.random() * 9), status,
-    category: categorize(name), added: 'Today',
-    resume_capability: 'Yes (Range supported)',
-    _blocks: makeBlocks(nBlocks),
-  };
-  d.blocks = blocksString(d);
-  return d;
-}
-function demoSeed() {
-  const a = demoItem('Horizon_Documentary_Ep01.mp4',
-    'https://videos.example.org/docs/Horizon_Documentary_Ep01.mp4', 1_894_256_640, 'downloading', 0.14);
-  const b = demoItem('Annual_Report_2026.pdf',
-    'https://files.example.com/reports/Annual_Report_2026.pdf', 24_517_632, 'finished', 1);
-  items.set(a.id, a); items.set(b.id, b);
-  selectedId = a.id;
-  setInterval(demoTick, 450);
-  render();
-}
-function demoTick() {
-  for (const d of items.values()) {
-    if (d.status !== 'downloading') { d.speed_bps = 0; continue; }
-    const base = d.total / 55; // ~25 s to finish at full speed
-    d.speed_bps = Math.max(0, Math.round(base * (0.65 + Math.random() * 0.7)));
-    d.done_bytes = Math.min(d.total, d.done_bytes + d.speed_bps * 0.45);
-    if (d.done_bytes >= d.total) { d.status = 'finished'; d.speed_bps = 0; }
-    d.blocks = blocksString(d);
-  }
-  scheduleRender();
-}
-function demoAdd(url, later) {
-  let name = 'download.bin';
-  try { name = decodeURIComponent(new URL(url).pathname.split('/').pop() || name); } catch (e) { /* keep default */ }
-  const total = 180_000_000 + Math.floor(Math.random() * 900_000_000);
-  const d = demoItem(name, url, total, later ? 'paused' : 'downloading', 0);
-  items.set(d.id, d);
-  selectedId = d.id;
-  render();
-}
-function demoPause(id) { const d = items.get(id); if (d && d.status === 'downloading') { d.status = 'paused'; d.speed_bps = 0; d.blocks = blocksString(d); } scheduleRender(); }
-function demoResume(id) { const d = items.get(id); if (d && (d.status === 'paused' || d.status === 'queued')) d.status = 'downloading'; scheduleRender(); }
-
 /* ---------- boot ---------- */
 setInterval(() => {
   pulse++;
@@ -3487,18 +3605,41 @@ function closeMenus() {
   document.querySelectorAll('.menu-drop').forEach(d => d.classList.add('hidden'));
   document.querySelectorAll('.menu-btn').forEach(b => b.classList.remove('open'));
 }
+/* W193-18: the View menu's state rows show what is currently on —
+   a checkmark on Dark Theme / Sidebar / Drop Basket, and on the
+   active sort. They used to render identically in both states,
+   so the menu could not report its own toggles. */
+function refreshMenuChecks() {
+  const view = $('menu-view');
+  if (!view) return;
+  const state = {
+    theme: document.documentElement.dataset.theme === 'dark',
+    sidebar: !document.body.classList.contains('no-side'),
+    basket: typeof basketShown !== 'undefined' && basketShown,
+    'sort-name': sortKey === 'name',
+    'sort-date': sortKey === 'date',
+    'sort-size': sortKey === 'size',
+    'sort-status': sortKey === 'status',
+  };
+  for (const btn of view.querySelectorAll('button[data-act]')) {
+    const slot = btn.querySelector('.mcheck');
+    if (!slot) continue;
+    slot.textContent = state[btn.dataset.act] ? '✓' : '';
+  }
+}
 for (const btn of document.querySelectorAll('.menu-btn')) {
   const drop = $('menu-' + btn.dataset.menu);
   btn.addEventListener('click', e => {
     e.stopPropagation();
     const wasHidden = drop.classList.contains('hidden');
     closeMenus();
-    if (wasHidden) { drop.classList.remove('hidden'); btn.classList.add('open'); }
+    if (wasHidden) { refreshMenuChecks(); drop.classList.remove('hidden'); btn.classList.add('open'); }
   });
   btn.addEventListener('mouseenter', () => {
     const anyOpen = [...document.querySelectorAll('.menu-drop')].some(d => !d.classList.contains('hidden'));
     if (anyOpen && drop.classList.contains('hidden')) {
       closeMenus();
+      refreshMenuChecks();
       drop.classList.remove('hidden');
       btn.classList.add('open');
     }
@@ -3509,23 +3650,23 @@ document.addEventListener('click', e => {
 });
 
 async function startAllDownloads() {
-  let n = 0;
-  for (const d of items.values()) {
-    if (d.status === 'paused' || d.status === 'error' || d.status === 'queued') {
-      // these used to call a null invoke() in the browser demo and
-      // report "Nothing to start" while demo items sat paused
-      if (TAURI) { try { await invoke('resume_download', { id: d.id }); n++; } catch (e) { /* keep going */ } }
-      else { demoResume(d.id); n++; }
-    }
-  }
-  toast(n ? `Started ${n} download${n > 1 ? 's' : ''}` : 'Nothing to start', 'info');
+  // W193-9: Start All goes through the backend's start_all, which
+  // offers every unfinished entry to the queue pump — the pump
+  // enforces each queue's simultaneous cap and the download
+  // quota, so entries past the cap wait their turn instead of
+  // all running at once (the old per-entry Resume loop bypassed
+  // the cap entirely)
+  if (!TAURI) { toast('Downloads need the NDM desktop app'); return; }
+  try {
+    const n = await invoke('start_all');
+    toast(n ? `Started ${n} download${n > 1 ? 's' : ''}` : 'Nothing to start', 'info');
+  } catch (e) { toast('Could not start downloads: ' + e); }
 }
 async function pauseAllDownloads() {
   let n = 0;
   for (const d of items.values()) {
     if (d.status === 'downloading') {
       if (TAURI) { try { await invoke('pause_download', { id: d.id }); n++; } catch (e) { /* keep going */ } }
-      else { demoPause(d.id); n++; }
     }
   }
   toast(n ? `Paused ${n} download${n > 1 ? 's' : ''}` : 'Nothing is downloading', 'info');
@@ -3590,7 +3731,11 @@ function onUpdateProgress(p) {
       : `Downloading the update — ${mb(p.downloaded)} MB`;
     if (p.total) $('uBar').style.width = Math.min(100, (p.downloaded / p.total) * 100) + '%';
   } else if (p.phase === 'installing') {
-    $('uBarText').textContent = 'Installing — your password may be asked by the system…';
+    // the backend narrates its own install (the Windows setup /
+    // portable swap says "NDM will close and reopen…") — fall
+    // back to the Linux pkexec wording when it sent none
+    $('uBarText').textContent = p.message
+      || 'Installing — your password may be asked by the system…';
     $('uBar').style.width = '100%';
   } else if (p.phase === 'installed') {
     updateInstalling = false;
@@ -3643,8 +3788,18 @@ function openBatch() {
 $('bModalClose').onclick = $('bCancel').onclick = () => bmodal.classList.add('hidden');
 bmodal.addEventListener('click', e => { if (e.target === bmodal) bmodal.classList.add('hidden'); });
 $('bAdd').onclick = async () => {
-  const urls = $('bUrls').value.split(/\r?\n/).map(x => x.trim()).filter(x => x.startsWith('http'));
-  if (!urls.length) { $('bStatus').textContent = 'No valid links found — one http(s) link per line.'; return; }
+  // W193-15: EVERY pasted line counts in the report — lines that
+  // are not links used to be filtered out before counting, so
+  // "Added 1 of 2" silently hid a third, garbage line
+  const rawLines = $('bUrls').value.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const urls = rawLines.filter(x => x.startsWith('http'));
+  const invalid = rawLines.filter(x => !x.startsWith('http'));
+  if (!rawLines.length) { $('bStatus').textContent = 'Paste the links first — one http(s) link per line.'; return; }
+  if (!urls.length) {
+    $('bStatus').textContent = `No valid links found — ${invalid.length} line${invalid.length === 1 ? ' is' : 's are'} not a link. One http(s) link per line.`;
+    $('bStatus').classList.add('error');
+    return;
+  }
   if (!TAURI) { $('bStatus').textContent = 'Batch downloads need the NDM desktop app'; return; }
   const dir = $('bDir').value.trim() || settings.default_dir;
   $('bAdd').disabled = true;
@@ -3662,7 +3817,7 @@ $('bAdd').onclick = async () => {
     }
   }
   $('bAdd').disabled = false;
-  if (!failed.length) {
+  if (!failed.length && !invalid.length) {
     $('bUrls').value = '';
     $('bStatus').textContent = '';
     $('bStatus').classList.remove('error');
@@ -3673,16 +3828,18 @@ $('bAdd').onclick = async () => {
   // partial (or total) failure: keep the dialog open and name
   // every failed URL with its reason — a bare "Added 1 of 3"
   // count used to be the only trace of the failures (N-07).
-  // The URLs that DID add leave the textarea, so what remains
+  // The lines that DID add leave the textarea, so what remains
   // is exactly what still needs attention — and a retry cannot
-  // duplicate the successes.
+  // duplicate the successes. Non-link lines stay too, counted.
   const failedUrls = new Set(failed.map(f => f.url));
-  $('bUrls').value = urls.filter(u => failedUrls.has(u)).join('\n');
+  $('bUrls').value = rawLines.filter(u => failedUrls.has(u) || !u.startsWith('http')).join('\n');
   const shown = failed.slice(0, 12);
   $('bStatus').textContent =
-    `Added ${ok} of ${urls.length} — ${failed.length} failed:\n`
-    + shown.map(f => `• ${f.url} — ${f.reason}`).join('\n')
-    + (failed.length > shown.length ? `\n…and ${failed.length - shown.length} more` : '');
+    `Added ${ok} of ${rawLines.length} lines`
+    + (failed.length ? ` — ${failed.length} failed:\n`
+      + shown.map(f => `• ${f.url} — ${f.reason}`).join('\n')
+      + (failed.length > shown.length ? `\n…and ${failed.length - shown.length} more` : '') : '')
+    + (invalid.length ? `\n${invalid.length} line${invalid.length === 1 ? ' is' : 's are'} not a link and could not be added.` : '');
   $('bStatus').classList.add('error');
 };
 
@@ -3808,4 +3965,10 @@ document.addEventListener('keydown', e => {
 
 applyColumns();
 applyToolbar();
-if (TAURI) initTauri(); else { loadSettings(); demoSeed(); }
+if (TAURI) initTauri(); else {
+  // F-2: no backend — an honest empty state, never fabricated
+  // downloads. The list stays blank and a single message says why.
+  loadSettings();
+  render();
+  toast('Not connected to the NDM desktop app — this preview cannot download anything');
+}

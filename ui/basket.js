@@ -19,6 +19,21 @@ document.getElementById('close').addEventListener('click', () => {
   if (invoke) invoke('set_basket_visible', { visible: false }).catch(() => {});
 });
 
+/* W193-19: a right-click on the basket used to open the raw
+   WebKitGTK context menu (Reload / Inspect Element…) — the main
+   window suppresses its own, and the basket now does too */
+document.addEventListener('contextmenu', e => e.preventDefault());
+
+/* W193-4: the backend answers an OS-level file drop on the basket
+   with a basket_note — "Sent to NDM ✓" for a link or shortcut,
+   or the reason a plain file cannot be taken. (HTML5 drops of
+   link text are answered inline by the drop handler below.) */
+try {
+  window.__TAURI__.event.listen('basket_note', e => {
+    note((e.payload && e.payload.text) || '');
+  });
+} catch (e) { /* not in Tauri */ }
+
 for (const ev of ['dragenter', 'dragover']) {
   window.addEventListener(ev, e => {
     e.preventDefault();

@@ -400,6 +400,10 @@ body {
 .menu-drop > button { display: flex; justify-content: space-between; align-items: center; gap: 18px; background: none; border: none; font: inherit; font-size: 11px; text-align: left; padding: 5px 9px; border-radius: 4px; cursor: pointer; color: inherit; white-space: nowrap; transition: background .15s ease; }
 .menu-drop > button:hover { background: var(--hover, rgba(90, 140, 200, .16)); }
 .menu-drop .mkey { opacity: .55; font-size: 11px; }
+/* W193-18: state rows carry a checkmark; the slot is always
+   reserved so labels never shift when the mark appears */
+.menu-drop .mcheck { width: 14px; flex: 0 0 14px; text-align: center; font-size: 11px; }
+.menu-drop > button:has(> .mcheck) { justify-content: flex-start; gap: 4px; }
 .menu-sep { height: 1px; background: var(--line-soft, #dde3e8); margin: 5px 4px; }
 body.no-side .sidebar { display: none; }
 .ta { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px; border: 1px solid var(--line, #ccd4dc); border-radius: 2px; background: var(--input-bg, #fff); color: inherit; resize: vertical; }
@@ -591,6 +595,13 @@ body.no-side .sidebar { display: none; }
 /* informational messages (up-to-date, export done, counts) are not
    errors — they get a neutral banner, in both themes */
 .flash.info { background: var(--panel2); color: var(--text); border-color: var(--line); }
+/* W193-11: persistent download-limit banner above the list */
+.quota-banner {
+  margin: 8px 12px 0; padding: 8px 12px; border-radius: 6px;
+  background: #fdf3e0; color: #7a5410; border: 1px solid #ecd9a8;
+  font-size: 13px;
+}
+[data-theme="dark"] .quota-banner { background: #3a2f1a; color: #eec987; border-color: #6b5626; }
 .comp-note { margin: 4px 0 8px; color: var(--text); }
 .comp-note.dim { color: var(--dim); font-size: 12px; }
 /* one flex row per option: the radio/checkbox is vertically centred

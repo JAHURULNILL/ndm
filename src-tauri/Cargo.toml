@@ -1,6 +1,6 @@
 [package]
 name = "ndm-app"
-version = "1.9.2"
+version = "2.0.0"
 edition = "2021"
 description = "NDM — IDM-class download manager (Tauri shell over the ndm engine)"
 license = "MIT OR Apache-2.0"

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nill Download Manager 1.9.2</title>
+<title>Nill Download Manager 2.0.0</title>
 <script>
   // apply the saved theme before first paint (default: light)
   try {
@@ -68,14 +68,14 @@
   <div class="menu">
     <button class="menu-btn" data-menu="view">View</button>
     <div class="menu-drop hidden" id="menu-view">
-      <button data-act="theme">Dark Theme</button>
-      <button data-act="sidebar">Categories Sidebar</button>
-      <button data-act="basket">Drop Basket</button>
+      <button data-act="theme"><span class="mcheck"></span>Dark Theme</button>
+      <button data-act="sidebar"><span class="mcheck"></span>Categories Sidebar</button>
+      <button data-act="basket"><span class="mcheck"></span>Drop Basket</button>
       <div class="menu-sep"></div>
-      <button data-act="sort-name">Sort by Name</button>
-      <button data-act="sort-date">Sort by Date Added</button>
-      <button data-act="sort-size">Sort by Size</button>
-      <button data-act="sort-status">Sort by Status</button>
+      <button data-act="sort-name"><span class="mcheck"></span>Sort by Name</button>
+      <button data-act="sort-date"><span class="mcheck"></span>Sort by Date Added</button>
+      <button data-act="sort-size"><span class="mcheck"></span>Sort by Size</button>
+      <button data-act="sort-status"><span class="mcheck"></span>Sort by Status</button>
       <div class="menu-sep"></div>
       <button data-act="columns">Columns…</button>
       <button data-act="toolbar">Customize Toolbar…</button>
@@ -156,6 +156,10 @@
   </aside>
 
   <section class="content">
+    <!-- W193-11: the download-limit notice is a persistent banner,
+         not a transient toast — it stays until the quota window
+         rolls over (quota_cleared) or the limit is turned off -->
+    <div id="quotaBanner" class="quota-banner hidden"></div>
     <div class="grid-wrap">
     <table class="grid">
       <colgroup id="colGroup"></colgroup>
@@ -439,6 +443,7 @@
     <div class="opt-row"><span>Programs types</span><textarea id="oCatExtPrograms" class="cat-types" rows="2" spellcheck="false"></textarea></div>
     <div class="opt-row"><span>General folder</span><input id="oCatGeneral" type="text" placeholder="~/Downloads" spellcheck="false"></div>
     </div>
+    <div id="oStatus" class="v-status error hidden" style="margin-top:10px"></div>
     <div class="modal-btns">
       <button id="oSave" class="tool primary">Save</button>
       <button id="oCancel" class="tool">Cancel</button>
@@ -749,6 +754,18 @@
     <div class="modal-btns">
       <button id="cfYes" class="tool primary">Confirm</button>
       <button id="cfNo" class="tool">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="pmodal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head"><span id="pTitle">Name</span> <span id="pModalClose">×</span></div>
+    <div class="opt-note" id="pMsg" style="white-space:pre-line"></div>
+    <input id="pInput" type="text" spellcheck="false" style="width:100%;margin-top:8px">
+    <div class="modal-btns">
+      <button id="pOk" class="tool primary">OK</button>
+      <button id="pCancel" class="tool">Cancel</button>
     </div>
   </div>
 </div>

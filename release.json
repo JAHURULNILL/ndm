@@ -1,7 +1,11 @@
 {
- "deb_sha256": "304c968c78b3fa26761b7be0713b716e744a587fb16faad3dbcc285c9c299479",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.9.2/NDM_1.9.2_amd64.deb",
+ "deb_sha256": "841ad5546a2569ef17649f59c611d6488c0b0fd1e5d34a8e9d4490cbed154f9a",
+ "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.0/NDM_2.0.0_amd64.deb",
  "min_supported": "1.0.0",
- "notes": "Nill Download Manager 1.9.2 \u2014 the main window is rebuilt in Internet Download Manager's classic layout (toolbar, categories tree and columns) with a polished one-colour finish, and the browser flyout is now a full IDM-style download dialog: the video thumbnail and per-quality file sizes are back, with labelled Status, File size, Downloaded, Transfer rate and Time left rows, an expandable connections detail view, a Resume capability line, and a working per-file Speed Limiter tab. Downloads also start faster (stream resolution is cached and warmed ahead of the click), a file deleted from the list no longer returns after a restart (the app now runs as a single instance), every file carries a Last Try Date, and a resumed download shows live progress again. Every change was verified in live use and a full audit of the app and extension.",
- "version": "1.9.2"
+ "notes": "Nill Download Manager 2.0.0 \u2014 a ground-up audit release: the whole app and the browser extension were used end-to-end and read line by line, and what the audit found is fixed here. A path collision that could overwrite an existing file is closed, so a download can no longer lose data; drag and drop onto the main window and the Drop Basket works; transfer rate and time-left figures are the true measured values; downloads are routed into categories truthfully and your own custom categories appear in the categories tree. On Windows, NDM now updates itself from inside the app \u2014 one click on Update downloads, verifies and installs the new version and relaunches it, and an update can be marked required so older copies cannot keep downloading until they update \u2014 and there is a proper Windows installer (per-user, no administrator rights needed) alongside the portable build, plus a matching update check on Linux. Every fix was verified in live use.",
+ "version": "2.0.0",
+ "win_setup_sha256": "",
+ "win_setup_url": "",
+ "win_sha256": "",
+ "win_url": ""
 }
