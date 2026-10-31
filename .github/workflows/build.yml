@@ -72,10 +72,14 @@ jobs:
         run: |
           cargo build --release
           cargo build --release --manifest-path src-tauri/Cargo.toml
-      - name: Test on Windows
-        run: |
-          cargo test --release
-          cargo test --release --manifest-path src-tauri/Cargo.toml
+      # Two separate steps on purpose: in one shared pwsh block the
+      # block's exit code is the LAST command's, so a failing lib
+      # suite was masked by the passing app suite (build #14 shipped
+      # green with a red lib test). Each suite must fail its own step.
+      - name: Test lib on Windows
+        run: cargo test --release
+      - name: Test app on Windows
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
       - name: Assemble portable ZIP
         shell: pwsh
         run: |
