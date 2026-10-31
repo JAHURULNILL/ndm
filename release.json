@@ -1,11 +1,11 @@
 {
- "deb_sha256": "841ad5546a2569ef17649f59c611d6488c0b0fd1e5d34a8e9d4490cbed154f9a",
+ "deb_sha256": "e1a012a07e7674b8af5187a7dd4115b85c09568add3094807dec192980b407ad",
  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.0/NDM_2.0.0_amd64.deb",
  "min_supported": "1.0.0",
  "notes": "Nill Download Manager 2.0.0 \u2014 a ground-up audit release: the whole app and the browser extension were used end-to-end and read line by line, and what the audit found is fixed here. A path collision that could overwrite an existing file is closed, so a download can no longer lose data; drag and drop onto the main window and the Drop Basket works; transfer rate and time-left figures are the true measured values; downloads are routed into categories truthfully and your own custom categories appear in the categories tree. On Windows, NDM now updates itself from inside the app \u2014 one click on Update downloads, verifies and installs the new version and relaunches it, and an update can be marked required so older copies cannot keep downloading until they update \u2014 and there is a proper Windows installer (per-user, no administrator rights needed) alongside the portable build, plus a matching update check on Linux. Every fix was verified in live use.",
  "version": "2.0.0",
- "win_setup_sha256": "",
- "win_setup_url": "",
- "win_sha256": "",
- "win_url": ""
+ "win_setup_sha256": "16a3b6ac508094468dde15f8aec3853c808fa421bbab7d13860bb14125263bf5",
+ "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.0/NDM_2.0.0_x64-setup.exe",
+ "win_sha256": "4f5549f2965adc4ad399e72f3ed3389a4fe88fdaee3802952965184158f25ddc",
+ "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.0/NDM_2.0.0_Windows_Portable.zip"
 }
