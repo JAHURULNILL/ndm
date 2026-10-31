@@ -11,7 +11,15 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::Path;
 
+/// The manifest travels WITH each release as an asset, fetched via
+/// GitHub's always-latest download route — plain github.com, which
+/// is reachable on networks where the raw host below times out
+/// (seen live: a user's ISP blackholing raw.githubusercontent.com
+/// while github.com itself worked fine, which silently killed every
+/// update check). The repo copy stays as a fallback mirror.
 pub const MANIFEST_URL: &str =
+    "https://github.com/JAHURULNILL/ndm/releases/latest/download/release.json";
+pub const MANIFEST_URL_FALLBACK: &str =
     "https://raw.githubusercontent.com/JAHURULNILL/ndm/main/release.json";
 const COUNT_BASE: &str = "https://abacus.jasoncameron.dev";
 const COUNT_NS: &str = "ndm-nill";
@@ -67,20 +75,34 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 
 pub fn fetch_release() -> Result<ReleaseInfo, String> {
     // The env override exists for local update-flow tests; a release
-    // build must only ever trust the pinned manifest address.
-    let url = if cfg!(debug_assertions) {
-        std::env::var("NDM_UPDATE_URL").unwrap_or_else(|_| MANIFEST_URL.to_string())
-    } else {
-        MANIFEST_URL.to_string()
-    };
+    // build must only ever trust the pinned manifest addresses.
+    let mut urls: Vec<String> = Vec::new();
+    if cfg!(debug_assertions) {
+        if let Ok(u) = std::env::var("NDM_UPDATE_URL") {
+            urls.push(u);
+        }
+    }
+    urls.push(MANIFEST_URL.to_string());
+    urls.push(MANIFEST_URL_FALLBACK.to_string());
+    // Try each route in turn: one unreachable host must not silently
+    // kill the update check when the other route works.
     let agent = crate::build_agent();
-    let body = agent
-        .get(&url)
-        .call()
-        .map_err(|e| format!("update check failed: {e}"))?
-        .into_string()
-        .map_err(|e| format!("update check failed: {e}"))?;
-    serde_json::from_str(&body).map_err(|e| format!("update info was unreadable: {e}"))
+    let mut last_err = String::new();
+    for url in &urls {
+        let fetched = agent
+            .get(url)
+            .call()
+            .map_err(|e| format!("update check failed: {e}"))
+            .and_then(|r| r.into_string().map_err(|e| format!("update check failed: {e}")));
+        match fetched {
+            Ok(body) => match serde_json::from_str(&body) {
+                Ok(info) => return Ok(info),
+                Err(e) => last_err = format!("update info was unreadable: {e}"),
+            },
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
 }
 
 /// Download `url` to `dest`, verifying the SHA-256 against the

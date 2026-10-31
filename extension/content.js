@@ -3281,6 +3281,16 @@
         box-shadow: 0 10px 32px rgba(10, 25, 45, .28);
         font-size: 13px; line-height: 1.45;
       }
+      /* The progress view IS IDM's download dialog, so while it
+         is on board the card takes the dialog's own width:
+         526 px, pixel-measured from the reference screenshots
+         (ndm-research/idm-dialog-ref 01/02 — the dialog fills
+         01's frame edge to edge; 02's bar + panel corroborate).
+         At the flyout's 348 px the same elements rendered at
+         two-thirds of the dialog's scale and read cramped. The
+         list view has no IDM original and keeps 348 px; the
+         100vw cap below still protects small viewports. */
+      .ndm-fly:has(.ndm-fly-prog) { width: 526px; }
       .ndm-fly-head {
         display: flex; align-items: center; justify-content: space-between;
         padding: 7px 8px 7px 12px;
@@ -3386,14 +3396,21 @@
       .ndm-fly-prog {
         padding: 9px 12px 11px;
         font-family: Tahoma, "Segoe UI", sans-serif;
-        font-size: 11.5px; color: #000;
+        font-size: 11px; color: #000;
       }
+      /* IDM's text block sits deeper than its bar: labels at
+         ≈26 px from the dialog's edge, the value column at
+         ≈129 px (pixel-measured, refs 01/02), while the bar and
+         button row keep the ≈12 px container inset. The status
+         pane carries that extra indent; with the 104 px label
+         column below, values land on the dialog's 129 px. */
+      .ndm-fly-pane-status { padding-left: 12px; }
       .ndm-fly-purl {
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         margin-bottom: 6px;
       }
       .ndm-fly-prow { display: flex; line-height: 1.55; }
-      .ndm-fly-plab { flex: 0 0 108px; white-space: nowrap; }
+      .ndm-fly-plab { flex: 0 0 104px; white-space: nowrap; }
       .ndm-fly-pval {
         flex: 1; min-width: 0;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -3413,7 +3430,7 @@
         background: #e4e4e4; border: 1px solid #7f7f7f; border-bottom: none;
         border-radius: 0; box-shadow: none; cursor: pointer;
         padding: 3px 12px; margin-bottom: -1px;
-        font: 400 11.5px Tahoma, "Segoe UI", sans-serif; color: #000;
+        font: 400 11px Tahoma, "Segoe UI", sans-serif; color: #000;
       }
       .ndm-fly-tab-on { background: #fff; }
       /* The Speed Limiter pane (reference 04): the live speed
@@ -3428,13 +3445,13 @@
         width: 62px; height: 21px; padding: 0 4px;
         border: 1px solid #7f7f7f; border-radius: 0;
         background: #fff; color: #000;
-        font: 400 11.5px Tahoma, "Segoe UI", sans-serif;
+        font: 400 11px Tahoma, "Segoe UI", sans-serif;
       }
       .ndm-fly-lval:disabled { background: #f0f0f0; color: #838383; }
       .ndm-fly-lunit {
         height: 23px; border: 1px solid #7f7f7f; border-radius: 0;
         background: #fff; color: #000;
-        font: 400 11.5px Tahoma, "Segoe UI", sans-serif;
+        font: 400 11px Tahoma, "Segoe UI", sans-serif;
       }
       .ndm-fly-lunit:disabled { color: #838383; }
       .ndm-fly-lnote { color: #b00020; margin-top: 5px; min-height: 13px; }
@@ -3447,10 +3464,10 @@
         background: #00b050;
         transition: width .3s ease;
       }
-      .ndm-fly-btns { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+      .ndm-fly-btns { display: flex; align-items: center; gap: 8px; margin-top: 10px; padding-left: 10px; }
       .ndm-fly-btnsp { flex: 1; }
       .ndm-pbtn {
-        height: 23px; min-width: 86px; padding: 0 10px;
+        height: 23px; min-width: 90px; padding: 0 10px;
         background: #f0f0f0; border: 1px solid #7f7f7f; border-radius: 0;
         color: #000; font: 400 11px Tahoma, "Segoe UI", sans-serif;
         cursor: pointer; white-space: nowrap; box-shadow: none;

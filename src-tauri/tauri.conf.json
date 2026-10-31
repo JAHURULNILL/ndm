@@ -12,7 +12,7 @@
         "label": "main",
         "minHeight": 540,
         "minWidth": 860,
-        "title": "Nill Download Manager 2.0.0",
+        "title": "Nill Download Manager 2.0.1",
         "visible": false,
         "width": 1120
       },
@@ -58,5 +58,5 @@
   },
   "identifier": "com.ndm.downloadmanager",
   "productName": "NDM",
-  "version": "2.0.0"
+  "version": "2.0.1"
 }
