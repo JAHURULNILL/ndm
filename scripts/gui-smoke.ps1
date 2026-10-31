@@ -39,7 +39,7 @@ param(
   [string]$DownloadDir = "$env:USERPROFILE\Downloads",
   [string]$ShotsDir = "$PSScriptRoot\..\gui-shots",
   [int]$Port = 9222,
-  [int]$CdpTimeoutSec = 45,
+  [int]$CdpTimeoutSec = 90,
   [int]$DownloadTimeoutSec = 120,
   [string]$ExpectTitle = "Nill Download Manager"
 )
@@ -157,9 +157,21 @@ try {
   }
   if (-not (Test-CdpUp)) {
     # a leftover instance without debugging would swallow the new
-    # launch via the single-instance handover — clear it first
+    # launch via the single-instance handover — clear it first, and
+    # WAIT until it is really gone: a dying process still holds the
+    # single-instance listener and the WebView2 profile lock, and a
+    # fresh launch into that profile silently loses the debug port
     Get-Process ndm-app -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$Port"
+    $goneDeadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $goneDeadline -and (Get-Process ndm-app -ErrorAction SilentlyContinue)) {
+      Start-Sleep -Milliseconds 500
+    }
+    # a dedicated, empty WebView2 profile for this smoke: no stale
+    # locks or state from the instances the earlier steps launched
+    $wvProfile = Join-Path $env:TEMP "ndm-gui-smoke-wv2"
+    if (Test-Path $wvProfile) { Remove-Item $wvProfile -Recurse -Force -ErrorAction SilentlyContinue }
+    $env:WEBVIEW2_USER_DATA_FOLDER = $wvProfile
+    $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = "--remote-debugging-port=$Port --remote-allow-origins=*"
     $script:appProc = Start-Process $AppExe -PassThru
     Log "launched app (pid $($script:appProc.Id)) with CDP port $Port"
   } else {
