@@ -1,11 +1,11 @@
 {
- "deb_sha256": "2e3ae276f3778f7e466eae97af8b7c5bb6146993a28c3163ba05a9e48d83badb",
+ "deb_sha256": "1332f8a38008d8605e7215069f0f45109a72cc5366a5950c7259b56f50c3dcb0",
  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.1/NDM_2.0.1_amd64.deb",
  "min_supported": "1.0.0",
  "notes": "Nill Download Manager 2.0.1 \u2014 two fixes from real-world use. The update check now fetches its feed from github.com itself, with the previous address kept as a fallback, so update popups and Check for Update keep working on networks where that address times out. And the browser download card now opens at the same measured size as IDM's download dialog \u2014 full-width rows, proper buttons \u2014 on Windows and Linux alike.",
  "version": "2.0.1",
- "win_setup_sha256": "",
- "win_setup_url": "",
- "win_sha256": "",
- "win_url": ""
+ "win_setup_sha256": "0d226d8a50bf3e632eb53dd7429296027e6ffb74024fa6e1cb8ed65330316930",
+ "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.1/NDM_2.0.1_x64-setup.exe",
+ "win_sha256": "586399c9056b8329d2314e2c89c3c4f4b1b5608d5ba4cd006670b7b6b54f7c45",
+ "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.1/NDM_2.0.1_Windows_Portable.zip"
 }
