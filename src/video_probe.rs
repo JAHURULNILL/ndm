@@ -772,6 +772,22 @@ pub fn clean_probe_title(title: &str, id: &str) -> String {
     }
 }
 
+/// Build a Command for a bundled console tool. On Windows the
+/// desktop app is a GUI-subsystem process with no console of its
+/// own, so a console child would allocate a flashing console
+/// window unless created with CREATE_NO_WINDOW; elsewhere this
+/// is a plain Command::new.
+fn tool_cmd<S: AsRef<std::ffi::OsStr>>(prog: S) -> Command {
+    #[allow(unused_mut)] // mut is only exercised by the Windows branch
+    let mut c = Command::new(prog);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
 pub fn probe(
     url: &str,
     components_dir: &Path,
@@ -779,7 +795,7 @@ pub fn probe(
 ) -> Result<VideoInfo, String> {
     let ytdlp = find_tool("yt-dlp", components_dir)
         .ok_or("yt-dlp not found — the video component is not installed yet")?;
-    let mut cmd = Command::new(&ytdlp);
+    let mut cmd = tool_cmd(&ytdlp);
     cmd.args(base_args_for_url(url, components_dir, cookies))
         .args(["-J", "--", url])
         .stdout(Stdio::piped())

@@ -1666,7 +1666,11 @@ fn update_sample(entry: &Entry) {
 fn open_target(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut cmd = {
+        use std::os::windows::process::CommandExt;
         let mut c = std::process::Command::new("cmd");
+        // the app has no console of its own (GUI subsystem): keep
+        // the helper cmd from flashing one of its own
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         c.args(["/C", "start", ""]);
         c.arg(path);
         c
@@ -4373,6 +4377,13 @@ fn do_check_update(app: &AppHandle) -> serde_json::Value {
     let mandatory = !info.min_supported.is_empty()
         && ndm::updater::version_cmp(current, &info.min_supported)
             == std::cmp::Ordering::Less;
+    // The one-click installer is a Linux package flow (.deb via
+    // pkexec/apt): the manifest carries no Windows package, so on
+    // Windows an update is only ever REPORTED — never latched as
+    // mandatory (the block would strand the user with nothing
+    // installable) and never stashed for install_update. A
+    // Windows user updates by taking the new portable build.
+    let mandatory = mandatory && !cfg!(target_os = "windows");
     if mandatory {
         state.update_required.store(true, Ordering::SeqCst);
     }
@@ -4382,7 +4393,14 @@ fn do_check_update(app: &AppHandle) -> serde_json::Value {
         "notes": info.notes,
         "mandatory": mandatory,
     });
-    *state.pending_update.lock().unwrap() = Some(info);
+    #[cfg(not(windows))]
+    {
+        *state.pending_update.lock().unwrap() = Some(info);
+    }
+    #[cfg(windows)]
+    {
+        let _ = &info;
+    }
     let _ = app.emit("update_available", payload.clone());
     payload
 }
@@ -4400,6 +4418,18 @@ async fn check_update(app: AppHandle) -> Result<serde_json::Value, String> {
 /// desktop's software installer when pkexec/apt is unavailable.
 #[tauri::command]
 fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        // the install chain below is the Linux .deb flow (pkexec /
+        // pkcon / xdg-open); the manifest carries no Windows
+        // package. Fail honestly instead of downloading a .deb
+        // the machine cannot use.
+        let _ = (&app, &state);
+        return Err(
+            "Automatic install is not available on Windows yet — please download the new portable build from the NDM releases page and unpack it over the old one."
+                .to_string(),
+        );
+    }
     let info = state
         .pending_update
         .lock()
@@ -6197,16 +6227,100 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
 fn native_host_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
+    // the binary carries the .exe suffix on Windows (the portable
+    // ZIP ships ndm-host.exe next to ndm-app.exe); the search
+    // shapes are the same, only the leaf name differs
+    let leaf = if cfg!(target_os = "windows") {
+        "ndm-host.exe"
+    } else {
+        "ndm-host"
+    };
     for cand in [
-        dir.join("ndm-host"),
-        dir.join("../../../target/release/ndm-host"),
-        dir.join("../lib/ndm/ndm-host"),
+        dir.join(leaf),
+        dir.join(format!("../../../target/release/{leaf}")),
+        dir.join(format!("../lib/ndm/{leaf}")),
     ] {
         if cand.is_file() {
             return Some(cand.canonicalize().unwrap_or(cand));
         }
     }
     None
+}
+
+/// The native-messaging manifest bodies, built with serde_json
+/// (not string interpolation) on every platform: a host path
+/// containing a quote or backslash must not corrupt the manifest.
+fn chrome_host_manifest(host: &str) -> String {
+    serde_json::json!({
+        "name": "com.ndm.host",
+        "description": "Nill Download Manager native messaging host",
+        "path": host,
+        "type": "stdio",
+        "allowed_origins": ["chrome-extension://njjmngpfmblaghapeenfdfkahhdocbic/"],
+    })
+    .to_string()
+}
+
+fn firefox_host_manifest(host: &str) -> String {
+    serde_json::json!({
+        "name": "com.ndm.host",
+        "description": "Nill Download Manager native messaging host",
+        "path": host,
+        "type": "stdio",
+        "allowed_extensions": ["ndm@nill.download"],
+    })
+    .to_string()
+}
+
+/// Windows browsers never read manifest folders out of the user
+/// profile: each one looks the host name up under its own HKCU
+/// `NativeMessagingHosts` registry key, whose default value is
+/// the path of the manifest JSON. Write the manifests into the
+/// app-data dir (beside the queue the host and the app already
+/// share) and point every known browser's key at them with the
+/// stock `reg` tool. Best effort, exactly like the Linux path:
+/// every failure is ignored and the next launch retries.
+#[cfg(windows)]
+fn register_native_hosts_windows(host: &Path) {
+    use std::os::windows::process::CommandExt;
+    let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) else {
+        return;
+    };
+    let dir = appdata.join("com.ndm.downloadmanager");
+    let host = host.to_string_lossy();
+    let chrome_path = dir.join("com.ndm.host.chrome.json");
+    let firefox_path = dir.join("com.ndm.host.firefox.json");
+    write_if_changed(&chrome_path, &chrome_host_manifest(&host));
+    write_if_changed(&firefox_path, &firefox_host_manifest(&host));
+    let chrome_s = chrome_path.to_string_lossy().into_owned();
+    let firefox_s = firefox_path.to_string_lossy().into_owned();
+    for (key, manifest) in [
+        (
+            r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.ndm.host",
+            &chrome_s,
+        ),
+        (
+            r"HKCU\Software\Chromium\NativeMessagingHosts\com.ndm.host",
+            &chrome_s,
+        ),
+        (
+            r"HKCU\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.ndm.host",
+            &chrome_s,
+        ),
+        (
+            r"HKCU\Software\Microsoft\Edge\NativeMessagingHosts\com.ndm.host",
+            &chrome_s,
+        ),
+        (
+            r"HKCU\Software\Mozilla\NativeMessagingHosts\com.ndm.host",
+            &firefox_s,
+        ),
+    ] {
+        let _ = std::process::Command::new("reg")
+            .args(["add", key, "/ve", "/t", "REG_SZ", "/d", manifest, "/f"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status();
+    }
 }
 
 fn write_if_changed(path: &Path, body: &str) {
@@ -6227,22 +6341,21 @@ fn write_if_changed(path: &Path, body: &str) {
 /// the ndm-setup-browser command remains as a manual fallback.
 fn register_native_hosts() {
     let Some(host) = native_host_path() else { return };
+    #[cfg(windows)]
+    {
+        // Windows registration is registry-based and needs no
+        // HOME (a GUI process there usually has none): its own
+        // path entirely
+        register_native_hosts_windows(&host);
+        return;
+    }
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else { return };
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| home.join(".config"));
     let host = host.to_string_lossy();
-    // built with serde_json, not string interpolation: a path
-    // containing a quote or backslash must not corrupt the manifest
-    let chrome = serde_json::json!({
-        "name": "com.ndm.host",
-        "description": "Nill Download Manager native messaging host",
-        "path": host,
-        "type": "stdio",
-        "allowed_origins": ["chrome-extension://njjmngpfmblaghapeenfdfkahhdocbic/"],
-    })
-    .to_string();
+    let chrome = chrome_host_manifest(&host);
     // create the NativeMessagingHosts directories unconditionally
     // (F-EXT-06): writing only into config dirs that already exist
     // silently skipped every browser the user had not launched yet —
@@ -6260,14 +6373,7 @@ fn register_native_hosts() {
         );
     }
     let moz = home.join(".mozilla");
-    let firefox = serde_json::json!({
-        "name": "com.ndm.host",
-        "description": "Nill Download Manager native messaging host",
-        "path": host,
-        "type": "stdio",
-        "allowed_extensions": ["ndm@nill.download"],
-    })
-    .to_string();
+    let firefox = firefox_host_manifest(&host);
     write_if_changed(
         &moz.join("native-messaging-hosts").join("com.ndm.host.json"),
         &firefox,

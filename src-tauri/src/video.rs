@@ -15,6 +15,22 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
+/// Build a Command for a bundled console tool (yt-dlp/ffmpeg).
+/// On Windows the app is a GUI-subsystem process with no console
+/// of its own, so a console child would allocate a flashing
+/// console window unless created with CREATE_NO_WINDOW;
+/// elsewhere this is a plain Command::new.
+fn tool_cmd<S: AsRef<std::ffi::OsStr>>(prog: S) -> Command {
+    #[allow(unused_mut)] // mut is only exercised by the Windows branch
+    let mut c = Command::new(prog);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
 /// Parse `ffmpeg -hide_banner -i <file>` stderr to check `(has_video, has_audio)`.
 pub fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
     let mut video = false;
@@ -36,7 +52,7 @@ pub fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
 /// verify which stream types (`(has_video, has_audio)`) are actually present.
 pub fn probe_streams(path: &Path, components_dir: &Path) -> Option<(bool, bool)> {
     let ffmpeg = find_tool("ffmpeg", components_dir)?;
-    let out = Command::new(ffmpeg)
+    let out = tool_cmd(ffmpeg)
         .args(["-hide_banner", "-i"])
         .arg(path)
         .stdin(Stdio::null())
@@ -113,7 +129,7 @@ fn duration_in_ffmpeg_info(text: &str) -> Option<f64> {
 /// Run `ffmpeg -i` over a file and read its container duration.
 fn probe_duration_secs(path: &Path, components_dir: &Path) -> Option<f64> {
     let ffmpeg = find_tool("ffmpeg", components_dir)?;
-    let out = Command::new(ffmpeg)
+    let out = tool_cmd(ffmpeg)
         .args(["-hide_banner", "-i"])
         .arg(path)
         .stdin(Stdio::null())
@@ -222,7 +238,7 @@ pub fn media_payload_estimate(text: &str) -> Option<u64> {
 /// payload (see `media_payload_estimate`).
 fn estimate_media_payload(path: &Path, components_dir: &Path) -> Option<u64> {
     let ffmpeg = find_tool("ffmpeg", components_dir)?;
-    let out = Command::new(ffmpeg)
+    let out = tool_cmd(ffmpeg)
         .args(["-hide_banner", "-i"])
         .arg(path)
         .stdin(Stdio::null())
@@ -814,7 +830,7 @@ fn resolve_streams_core(
     args.push("--".into());
     args.push(url.to_string());
 
-    let out = Command::new(ytdlp)
+    let out = tool_cmd(ytdlp)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1490,7 +1506,7 @@ impl VideoJob {
         }
         ff_args.push(final_path.display().to_string());
 
-        let merge_ok = Command::new(ffmpeg)
+        let merge_ok = tool_cmd(ffmpeg)
             .args(&ff_args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1778,7 +1794,7 @@ impl VideoJob {
         args.push(audio_tmpl.display().to_string());
         args.push("--".into());
         args.push(pair_url.clone());
-        let fetched = Command::new(&ytdlp)
+        let fetched = tool_cmd(&ytdlp)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1811,7 +1827,7 @@ impl VideoJob {
 
         // 2. Mux video + audio into a temp file and verify it.
         let mux_path = self.dir.join(format!(".{stem}.ndm_mux.mp4"));
-        let mux_ok = Command::new(&ffmpeg)
+        let mux_ok = tool_cmd(&ffmpeg)
             .args([
                 "-y",
                 "-loglevel",
@@ -2092,7 +2108,7 @@ impl VideoJob {
             // would then skip that file as "pre-existing" and report
             // a finished download as an error
             let before = dir_snapshot(&job.dir);
-            let Ok(mut child) = Command::new(&ytdlp)
+            let Ok(mut child) = tool_cmd(&ytdlp)
                 .args(&args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

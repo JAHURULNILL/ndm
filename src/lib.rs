@@ -560,10 +560,25 @@ fn sanitize_suggested_name(raw: &str) -> String {
         .collect();
     let trimmed = cleaned.trim().trim_matches('.');
     if trimmed.is_empty() {
-        String::new()
-    } else {
-        trimmed.to_string()
+        return String::new();
     }
+    let name = trimmed.to_string();
+    if cfg!(target_os = "windows") {
+        // Windows reserves the DOS device names with ANY extension:
+        // a download literally named "nul.mp3" or "CON" cannot be
+        // created there at all. Defuse it with a leading underscore.
+        // (cfg! keeps every other platform's names byte-identical.)
+        let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+        const RESERVED: [&str; 22] = [
+            "CON", "PRN", "AUX", "NUL", //
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", //
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if RESERVED.contains(&stem.as_str()) {
+            return format!("_{name}");
+        }
+    }
+    name
 }
 
 pub(crate) const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
