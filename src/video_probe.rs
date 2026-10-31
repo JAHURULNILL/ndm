@@ -748,6 +748,30 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
     options
 }
 
+/// W-8: yt-dlp's html5 extractor enumerates a page's media
+/// elements and titles them after the page title plus the element
+/// number — "Walk Test Movie 2026 (1)" for the FIRST video on the
+/// page (id "video-1") — and the app used to show and save that
+/// enumeration verbatim, so every first-time Add Video name
+/// carried a spurious "(1)" that looks like a duplicate marker.
+/// Strip exactly that suffix: a trailing " (N)" whose N equals
+/// the number in an html5-style id ("video-N"). Any other title —
+/// including a genuine " (1)" the uploader actually wrote, whose
+/// entry id will not match — passes through untouched.
+pub fn clean_probe_title(title: &str, id: &str) -> String {
+    let Some(n) = id
+        .strip_prefix("video-")
+        .and_then(|rest| rest.parse::<u64>().ok())
+    else {
+        return title.to_string();
+    };
+    let suffix = format!(" ({n})");
+    match title.strip_suffix(&suffix) {
+        Some(base) if !base.trim().is_empty() => base.to_string(),
+        _ => title.to_string(),
+    }
+}
+
 pub fn probe(
     url: &str,
     components_dir: &Path,
@@ -826,7 +850,10 @@ pub fn probe(
     }
     let v: serde_json::Value =
         serde_json::from_slice(&stdout).map_err(|e| format!("bad yt-dlp output: {e}"))?;
-    let title = v["title"].as_str().unwrap_or("Video").to_string();
+    let title = clean_probe_title(
+        v["title"].as_str().unwrap_or("Video"),
+        v["id"].as_str().unwrap_or(""),
+    );
     let duration_f64 = v["duration"]
         .as_f64()
         .or_else(|| v["duration"].as_u64().map(|u| u as f64))
@@ -1203,6 +1230,27 @@ mod tests {
         assert!(!cookie_file_has_real_session(&f));
         assert!(!cookie_file_usable_for_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ", &f));
         let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn probe_title_strips_only_the_html5_enumeration_suffix() {
+        // W-8: the html5 extractor's enumeration for the page's
+        // first media element is not part of the title
+        assert_eq!(
+            clean_probe_title("Walk Test Movie 2026 (1)", "video-1"),
+            "Walk Test Movie 2026"
+        );
+        assert_eq!(clean_probe_title("Second Clip (2)", "video-2"), "Second Clip");
+        // a real title's own parenthetical survives: the id is not
+        // the html5 enumeration, or the numbers do not agree
+        assert_eq!(
+            clean_probe_title("Movie (1)", "dQw4w9WgXcQ"),
+            "Movie (1)"
+        );
+        assert_eq!(clean_probe_title("Movie (2)", "video-1"), "Movie (2)");
+        assert_eq!(clean_probe_title("Plain Title", "video-1"), "Plain Title");
+        // the suffix alone is never a title
+        assert_eq!(clean_probe_title(" (1)", "video-1"), " (1)");
     }
 }
 

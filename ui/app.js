@@ -32,18 +32,62 @@ let pulse = 0;                 // animation phase for active blocks
 
 /* ---------- formatting ---------- */
 const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+/* W-6: ONE size format on every app surface — always 2 decimals
+   (raw bytes excepted). The old rule (0 decimals once the value
+   reached 100) made neighbouring dialogs disagree about the same
+   quantity: the list's "200.00 MB" vs the File Info dialog's
+   "200 MB" vs the completion dialog's "200 MB (… bytes)". */
 function fmtSize(b) {
   if (!b && b !== 0) return '—';
   let i = 0, v = b;
   while (v >= 1024 && i < UNITS.length - 1) { v /= 1024; i++; }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 2)} ${UNITS[i]}`;
+  return `${v.toFixed(i === 0 ? 0 : 2)} ${UNITS[i]}`;
 }
 const fmtRate = b => (b > 0 ? fmtSize(b) + '/s' : '—');
-function fmtLeft(sec) {
-  if (!isFinite(sec) || sec == null) return '—';
+/* ---------- IDM list formats (SPEC-MAIN §5.4) ----------
+   The main LIST's formats: size and rate always carry exactly
+   2 decimals, the rate unit is "/sec", time-left is humanised
+   ("57 min 5 sec", "1 hour(s) 18 min"), and dates read
+   "Dec 30 17:51:09 2020". Sizes are shared with the dialogs
+   (fmtSize above is the same 2-decimal shape — W-6 unified
+   them after the walkthrough caught the same quantity rendered
+   two ways); only the rate unit ("/sec" vs "/s") and the list's
+   own date shape stay list-specific. */
+function fmtListSize(b) {
+  if (b == null) return '—';
+  let i = 0, v = b;
+  while (v >= 1024 && i < UNITS.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(2)} ${UNITS[i]}`;
+}
+function fmtListRate(bps) {
+  if (!(bps > 0)) return '';
+  if (bps < 1024) return `${(bps / 1024).toFixed(2)} KB/sec`;
+  return fmtListSize(bps) + '/sec';
+}
+function fmtListLeft(sec) {
+  if (sec == null || !isFinite(sec)) return '';
   sec = Math.max(0, Math.round(sec));
-  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
-  return h ? `${h}h ${m}m` : m ? `${m}m ${s}s` : `${s}s`;
+  if (sec < 60) return `${sec} sec`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return `${m} min ${s} sec`;
+  return `${Math.floor(m / 60)} hour(s) ${m % 60} min`;
+}
+const IDM_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+/* backend `added`/`last_try` strings arrive as
+   "YYYY-MM-DD HH:MM:SS" (W-4: `added` used to stop at the
+   minute, so a never-started entry's Last Try Date — which
+   falls back to `added` — showed no seconds while a started
+   entry's did); UI-stamped times carry real seconds too. The
+   IDM rendering shows seconds when the source has them, so
+   pre-W-4 journal strings still render as recorded. */
+function fmtIdmDate(str) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/.exec(str || '');
+  if (!m) return str || '';
+  return `${IDM_MONTHS[+m[2] - 1]} ${m[3]} ${m[4]}:${m[5]}${m[6] ? ':' + m[6] : ''} ${m[1]}`;
+}
+function stampNow() {
+  const t = new Date(), p = n => String(n).padStart(2, '0');
+  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
 }
 const pctOf = d => (d.total > 0 ? Math.min(100, (100 * d.done_bytes) / d.total) : 0);
 const KNOWN_STATUS = ['downloading', 'paused', 'queued', 'finished', 'error', 'cancelled'];
@@ -127,19 +171,10 @@ function fillCategorySelect(sel, selected) {
   sel.value = selected && names.includes(selected) ? selected : '';
 }
 
-/* the Q column: the queue's 1-based number, IDM-style */
-function queueShort(qname) {
-  const names = (settings.queues || []).map(q => q.name);
-  const i = names.indexOf(qname || 'Main download queue');
-  return i >= 0 ? String(i + 1) : '1';
-}
-
-function syncLimiterLabel() {
-  const bps = settings.speed_limit_bps || 0;
-  $('limiterLabel').innerHTML = bps > 0
-    ? `Speed Limiter: <b>${fmtSize(bps)}/s</b>`
-    : 'Speed Limiter: <b>OFF</b>';
-}
+/* (there is no bottom status bar in IDM's main window, so the
+   old syncLimiterLabel/sideStatus/totalSpeed readouts are gone;
+   the speed limit itself still lives in Options and shows in
+   the Download Status dialog's Speed Limiter tab) */
 
 async function loadSettings() {
   if (TAURI) {
@@ -148,7 +183,6 @@ async function loadSettings() {
   }
   $('inDir').value = settings.default_dir || '~/Downloads';
   $('vInDir').value = settings.default_dir || '~/Downloads';
-  syncLimiterLabel();
 }
 
 async function saveSettings() {
@@ -156,8 +190,78 @@ async function saveSettings() {
     try { await invoke('set_settings', { settings }); }
     catch (e) { console.error('set_settings failed', e); }
   }
-  syncLimiterLabel();
 }
+
+/* Last Try Date: the backend stamps every real attempt (fresh
+   start, resume, retry) and carries it in the payload as
+   `last_try`, persisted in the journal alongside `added` — that
+   value wins whenever the entry has one. The UI-side stamps below
+   remain only for entries that have never carried the field
+   (journals written before the field existed, not yet re-tried
+   since): the list stamps the moment THIS ui sees an entry
+   (re)enter 'downloading' — which is exactly a try — and persists
+   the stamps by id. An entry with neither falls back to its Date
+   Added (its first try). */
+let lastTryById = {};
+try { lastTryById = JSON.parse(localStorage.getItem('ndm-lasttry-v1') || '{}') || {}; } catch (e) { lastTryById = {}; }
+function noteLastTry(id) {
+  lastTryById[id] = stampNow();
+  try { localStorage.setItem('ndm-lasttry-v1', JSON.stringify(lastTryById)); } catch (e) { /* private mode */ }
+}
+
+/* ---------- 16×16 icons (tree nodes + list name cells) ----------
+   Small classic-style drawings in IDM's palette, shared by the
+   static tree rows, the dynamic queue rows and the per-file
+   name-cell icon. */
+const ICON16 = {
+  folder: '<svg viewBox="0 0 16 16"><path d="M1 4a1 1 0 0 1 1-1h4l1.2 1.7H14a1 1 0 0 1 1 1V12a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1z" fill="#f2b33d" stroke="#b57e14" stroke-width=".7"/></svg>',
+  compressed: '<svg viewBox="0 0 16 16"><rect x="1.8" y="2.8" width="12.4" height="10.4" fill="#deac5f" stroke="#96682a" stroke-width=".8"/><path d="M1.8 5.8h12.4M6.2 2.8v3h3.6v-3" fill="none" stroke="#96682a" stroke-width=".9"/><path d="M8 5.8v7.4" stroke="#96682a" stroke-width="1.4" stroke-dasharray="1.8 1.4"/></svg>',
+  documents: '<svg viewBox="0 0 16 16"><path d="M4 1.5h5.5L12.5 4.5v10H4z" fill="#fff" stroke="#52769c" stroke-width=".8"/><path d="M9.5 1.5v3h3" fill="none" stroke="#52769c" stroke-width=".8"/><path d="M5.8 7.5h4.4M5.8 9.8h4.4M5.8 12.1h4.4" stroke="#6e9ccb" stroke-width="1"/></svg>',
+  music: '<svg viewBox="0 0 16 16"><path d="M6.2 12.6V4.2l6.8-1.6v8.2" fill="none" stroke="#6a5fb0" stroke-width="1.3"/><ellipse cx="4.5" cy="12.6" rx="2" ry="1.6" fill="#6a5fb0"/><ellipse cx="11.3" cy="10.8" rx="2" ry="1.6" fill="#6a5fb0"/></svg>',
+  programs: '<svg viewBox="0 0 16 16"><rect x="1.8" y="2.4" width="12.4" height="11.2" fill="#d8e7f8" stroke="#2456a6" stroke-width=".9"/><path d="M1.8 5.6h12.4M6.4 5.6v8" stroke="#2456a6" stroke-width=".9"/><circle cx="3.4" cy="4" r=".8" fill="#d2493b"/><circle cx="5.4" cy="4" r=".8" fill="#f2b33d"/></svg>',
+  video: '<svg viewBox="0 0 16 16"><rect x="1.4" y="2.8" width="13.2" height="10.4" fill="#39424d"/><path d="M4.6 2.8v10.4M11.4 2.8v10.4" stroke="#d3dbe2" stroke-width="1.1"/><path d="M6.8 5.8l3.6 2.2-3.6 2.2z" fill="#fff"/></svg>',
+  image: '<svg viewBox="0 0 16 16"><rect x="1.6" y="2.6" width="12.8" height="10.8" fill="#e9f4e2" stroke="#4a7a3a" stroke-width=".8"/><circle cx="5.4" cy="6" r="1.3" fill="#f2b33d"/><path d="M2.4 12.4l3.6-3.4 2.4 2.2 2.8-2.8 2.4 2.4" fill="none" stroke="#4a7a3a" stroke-width="1.1"/></svg>',
+  generic: '<svg viewBox="0 0 16 16"><path d="M4 1.5h5.5L12.5 4.5v10H4z" fill="#eff2f6" stroke="#8494a7" stroke-width=".8"/><path d="M9.5 1.5v3h3" fill="none" stroke="#8494a7" stroke-width=".8"/></svg>',
+  unfinished: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.6" fill="#e8f6ec" stroke="#2e9e4f" stroke-width=".9"/><path d="M8 4.4v6.2m0 0L5.3 7.9M8 10.6l2.7-2.7" stroke="#2e9e4f" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  finished: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.8" fill="#2e9e4f"/><path d="M5 8.4l2.1 2.1 4-4.5" stroke="#fff" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+  globe: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.4" fill="#cfe2f5" stroke="#2456a6" stroke-width=".9"/><ellipse cx="8" cy="8" rx="3" ry="6.4" fill="none" stroke="#2456a6" stroke-width=".7"/><path d="M1.8 5.6h12.4M1.8 10.4h12.4" stroke="#2456a6" stroke-width=".7" fill="none"/></svg>',
+};
+const TREE_ICONS = {
+  'All Downloads': ICON16.folder,
+  Compressed: ICON16.compressed,
+  Documents: ICON16.documents,
+  Music: ICON16.music,
+  Programs: ICON16.programs,
+  Video: ICON16.video,
+  Unfinished: ICON16.unfinished,
+  Finished: ICON16.finished,
+  Grabber: ICON16.globe,
+  queues: ICON16.folder,
+  queue: ICON16.folder,
+};
+/* the name cell's per-file-type icon: by extension first (the
+   file itself knows best), the entry's category after that */
+function fileIconSvg(d) {
+  const name = (d.name || '').toLowerCase();
+  const ext = name.includes('.') ? name.split('.').pop() : '';
+  if (['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico'].includes(ext)) return ICON16.image;
+  if (['mp4', 'mkv', 'webm', 'avi', 'mov', 'flv', 'wmv', 'm4v', 'ts'].includes(ext)) return ICON16.video;
+  if (['mp3', 'm4a', 'm4b', 'flac', 'wav', 'ogg', 'opus', 'aac', 'wma'].includes(ext)) return ICON16.music;
+  if (['zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst', 'tgz', 'iso', 'img', 'dmg'].includes(ext)) return ICON16.compressed;
+  if (['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'md', 'csv', 'rtf', 'epub'].includes(ext)) return ICON16.documents;
+  if (['exe', 'msi', 'deb', 'rpm', 'pkg', 'appimage', 'apk', 'bin', 'run', 'jar', 'msix'].includes(ext)) return ICON16.programs;
+  switch (d.category) {
+    case 'Video': return ICON16.video;
+    case 'Music': return ICON16.music;
+    case 'Documents': return ICON16.documents;
+    case 'Compressed': return ICON16.compressed;
+    case 'Programs': return ICON16.programs;
+    default: return ICON16.generic;
+  }
+}
+/* the Q cell's content while an entry is queue work: IDM's
+   small green circular-arrows icon — never a number */
+const Q_ICON = '<svg viewBox="0 0 16 16" width="13" height="13"><path d="M13.4 8A5.4 5.4 0 1 1 8 2.6c1.6 0 3 .65 4 1.7" fill="none" stroke="#2e9e4f" stroke-width="1.7" stroke-linecap="round"/><path d="M13 1.2l-.4 3.6-3.4-1z" fill="#2e9e4f"/></svg>';
 
 /* ---------- rendering ---------- */
 let sortKey = 'date'; // View menu + header clicks: name | date | size | status
@@ -185,31 +289,60 @@ function visibleItems() {
   return by ? [...out].sort((a, b) => by(a, b) * sortDir) : out;
 }
 
+/* ---------- the categories tree ----------
+   One tree (IDM): static category rows in the markup, queue
+   rows built here under the Queues node. Selection is the
+   label-width highlight on the active row. */
+let allExpanded = true;
+let queuesExpanded = false;
+function refreshTreeSelection() {
+  document.querySelectorAll('#catTree .trow').forEach(r => {
+    r.classList.toggle('sel', !!r.dataset.cat && r.dataset.cat === currentCat);
+  });
+}
+function selectTreeCat(cat) {
+  currentCat = cat;
+  refreshTreeSelection();
+  render();
+}
+function toggleAllCats() {
+  allExpanded = !allExpanded;
+  $('allChildren').classList.toggle('hidden', !allExpanded);
+  $('allExpBox').textContent = allExpanded ? '−' : '+';
+}
+function toggleQueues() {
+  queuesExpanded = !queuesExpanded;
+  $('queueChildren').classList.toggle('hidden', !queuesExpanded);
+  $('queueExpBox').textContent = queuesExpanded ? '−' : '+';
+  queueListSig = ''; // the rebuild below keys on expansion too
+  renderQueueFilters();
+}
+
 let queueListSig = '';
 function renderQueueFilters() {
-  const ul = $('queueList');
-  if (!ul) return;
-  const counts = {};
-  for (const d of items.values()) counts[d.queue || 'Main download queue'] = (counts[d.queue || 'Main download queue'] || 0) + 1;
+  const box = $('queueChildren');
+  if (!box) return;
   const names = (settings.queues || []).map(q => q.name);
   // JSON encoding: queue names containing '|' or ',' used to be
   // able to forge a collision and freeze the sidebar
-  const sig = JSON.stringify([names, names.map(n => counts[n] || 0), currentCat]);
+  const sig = JSON.stringify([names, currentCat, queuesExpanded]);
   if (sig === queueListSig) return;
   queueListSig = sig;
-  ul.innerHTML = '';
+  box.innerHTML = '';
   for (const n of names) {
-    const li = document.createElement('li');
-    li.textContent = `▸ ${n} (${counts[n] || 0})`;
-    if (currentCat === 'queue:' + n) li.classList.add('active');
-    li.onclick = () => {
-      document.querySelectorAll('#catList li').forEach(x => x.classList.remove('active'));
-      document.querySelectorAll('#queueList li').forEach(x => x.classList.remove('active'));
-      li.classList.add('active');
-      currentCat = 'queue:' + n;
-      render();
-    };
-    ul.appendChild(li);
+    const row = document.createElement('div');
+    row.className = 'trow tchild' + (currentCat === 'queue:' + n ? ' sel' : '');
+    row.dataset.cat = 'queue:' + n;
+    const ic = document.createElement('span');
+    ic.className = 'ticon';
+    ic.innerHTML = TREE_ICONS.queue;
+    const lab = document.createElement('span');
+    lab.className = 'tlabel';
+    lab.textContent = n;
+    lab.title = n; // W-5: the full queue name is always reachable
+    row.append(ic, lab);
+    row.addEventListener('click', () => selectTreeCat('queue:' + n));
+    box.appendChild(row);
   }
 }
 
@@ -219,16 +352,23 @@ function renderQueueFilters() {
    localStorage like the theme. The header and every row are built
    from this one definition, so the picker can never disagree with
    the list. */
+/* IDM 6.x's default column set and order (SPEC-MAIN §5.1):
+   File Name, Q, Size, Status, Time left, Transfer rate,
+   Last Try Date, Description — with Date Added and Save To
+   available but off. There is no Category column in IDM's set.
+   The storage key moved to v2 with this reskin: a layout saved
+   by the pre-IDM list (Q in 6th place, no Last Try Date) would
+   otherwise silently override the new defaults forever. */
 const COLUMN_DEFS = [
   { id: 'name', label: 'File Name', defW: 0 },
-  { id: 'size', label: 'Size', defW: 90 },
-  { id: 'status', label: 'Status', defW: 175 },
-  { id: 'timeleft', label: 'Time Left', defW: 80 },
-  { id: 'rate', label: 'Transfer Rate', defW: 105 },
-  { id: 'q', label: 'Q', defW: 36 },
+  { id: 'q', label: 'Q', defW: 30 },
+  { id: 'size', label: 'Size', defW: 84 },
+  { id: 'status', label: 'Status', defW: 92 },
+  { id: 'timeleft', label: 'Time left', defW: 96 },
+  { id: 'rate', label: 'Transfer rate', defW: 96 },
+  { id: 'lasttry', label: 'Last Try Date', defW: 138 },
   { id: 'desc', label: 'Description', defW: 150 },
-  { id: 'added', label: 'Date Added', defW: 135 },
-  { id: 'category', label: 'Category', defW: 100, defOff: true },
+  { id: 'added', label: 'Date Added', defW: 138, defOff: true },
   { id: 'saveto', label: 'Save To', defW: 240, defOff: true },
 ];
 function defaultColumnCfg() {
@@ -236,7 +376,7 @@ function defaultColumnCfg() {
 }
 function loadColumnCfg() {
   try {
-    const raw = JSON.parse(localStorage.getItem('ndm-columns-v1') || 'null');
+    const raw = JSON.parse(localStorage.getItem('ndm-columns-v2') || 'null');
     if (!Array.isArray(raw)) return defaultColumnCfg();
     const out = [];
     for (const r of raw) {
@@ -256,7 +396,7 @@ function loadColumnCfg() {
 }
 let columnCfg = loadColumnCfg();
 function saveColumnCfg() {
-  try { localStorage.setItem('ndm-columns-v1', JSON.stringify(columnCfg)); } catch (e) { /* private mode */ }
+  try { localStorage.setItem('ndm-columns-v2', JSON.stringify(columnCfg)); } catch (e) { /* private mode */ }
 }
 function visibleColumns() { return columnCfg.filter(c => c.visible); }
 
@@ -292,7 +432,9 @@ function applyColumns() {
   lastStructSig = '__columns_changed__'; // force one structural rebuild
 }
 
-/* paint the ▲/▼ marker on the header that owns the current sort */
+/* paint the sort marker on the header that owns the current
+   sort: a small GREEN arrow glyph beside the label (IDM),
+   not a text ▲/▼ in the label's own colour */
 function updateSortIndicators() {
   const hr = $('headRow');
   if (!hr) return;
@@ -302,23 +444,28 @@ function updateSortIndicators() {
     if (!c) return;
     const def = COLUMN_DEFS.find(d => d.id === c.id) || {};
     const arrow = SORT_FOR_COL[c.id] && SORT_FOR_COL[c.id] === sortKey
-      ? (sortDir > 0 ? ' ▲' : ' ▼') : '';
-    th.textContent = (def.label || c.id) + arrow;
+      ? `<span class="sort-arrow">${sortDir > 0 ? '▲' : '▼'}</span>` : '';
+    th.innerHTML = escapeHtml(def.label || c.id) + arrow;
   });
 }
 
 /* ---------- toolbar customization (IDM's toolbar "Customize…") ---------- */
+/* IDM 6.x's toolbar set and order (SPEC-MAIN §3). Add Video,
+   Pause and Status are not on IDM's bar — their hidden buttons
+   stay in the DOM for the menus/dialogs/shortcuts that drive
+   them, and are not listed here. */
 const TOOLBAR_DEFS = [
   { id: 'btnAdd', label: 'Add URL' },
-  { id: 'btnVideo', label: 'Add Video' },
-  { id: 'btnGrabber', label: 'Site Grabber' },
   { id: 'btnResume', label: 'Resume' },
-  { id: 'btnPause', label: 'Pause' },
+  { id: 'btnStop', label: 'Stop' },
   { id: 'btnStopAll', label: 'Stop All' },
   { id: 'btnDelete', label: 'Delete' },
-  { id: 'btnStatus', label: 'Status' },
-  { id: 'btnScheduler', label: 'Scheduler' },
+  { id: 'btnDelDone', label: 'Delete Completed' },
   { id: 'btnOptions', label: 'Options' },
+  { id: 'btnScheduler', label: 'Scheduler' },
+  { id: 'btnStartQueue', label: 'Start Queue' },
+  { id: 'btnStopQueue', label: 'Stop Queue' },
+  { id: 'btnGrabber', label: 'Grabber' },
 ];
 function loadToolbarCfg() {
   try {
@@ -334,7 +481,10 @@ function saveToolbarCfg() {
 function applyToolbar() {
   for (const d of TOOLBAR_DEFS) {
     const el = $(d.id);
-    if (el) el.style.display = toolbarCfg.hidden.includes(d.id) ? 'none' : '';
+    if (!el) continue;
+    // the split buttons hide as one unit (main half + ▼ half)
+    const target = el.closest('.tool-split') || el;
+    target.style.display = toolbarCfg.hidden.includes(d.id) ? 'none' : '';
   }
   const tb = document.querySelector('.toolbar');
   if (tb) tb.classList.toggle('tb-small', toolbarCfg.size === 'small');
@@ -447,23 +597,35 @@ let lastStructSig = '';
 function cellHtml(colId, d, st, left) {
   switch (colId) {
     case 'name':
-      return `${escapeHtml(d.name)}${d.status === 'downloading' && d.total === 0 ? '<div class="pbar ind"></div>' : `<div class="pbar"><i data-pct="${pctOf(d).toFixed(1)}"></i></div>`}`;
-    case 'size':
-      return d.total > 0 || st === 'finished' ? fmtSize(d.total) : 'Unknown';
-    case 'status':
-      return `${cap(st)}${st !== 'finished' && d.total > 0 ? ' ' + pctOf(d).toFixed(0) + '%' : ''}${st === 'error' && d.error ? ' — ' + escapeHtml(d.error.length > 60 ? d.error.slice(0, 60) + '…' : d.error) : ''}`;
-    case 'timeleft':
-      return st === 'finished' ? '—' : fmtLeft(left);
-    case 'rate':
-      return st === 'downloading' ? fmtRate(d.speed_bps) : '—';
+      // the file's own 16×16 type icon before the name (IDM);
+      // single-line rows — there is NO in-row progress bar,
+      // progress is the Status cell's percentage text
+      return `<span class="ficon">${fileIconSvg(d)}</span>${escapeHtml(d.name)}`;
     case 'q':
-      return escapeHtml(queueShort(d.queue));
+      // IDM: the small green queue icon while the entry is a
+      // queue's work, blank otherwise — never a number or name
+      return (st === 'downloading' || st === 'paused' || st === 'queued') ? Q_ICON : '';
+    case 'size':
+      return d.total > 0 || st === 'finished' ? fmtListSize(d.total) : 'Unknown';
+    case 'status':
+      // IDM's vocabulary, always plain black: "Complete" when
+      // done, "Error" alone when failed (the message lives in
+      // the tooltip and the status dialog), and while there is
+      // progress to report the bare 2-decimal percentage
+      if (st === 'finished') return 'Complete';
+      if (st === 'error') return 'Error';
+      if (d.total > 0) return pctOf(d).toFixed(2) + '%';
+      return cap(st);
+    case 'timeleft':
+      return left != null ? fmtListLeft(left) : '';
+    case 'rate':
+      return st === 'downloading' ? fmtListRate(d.speed_bps) : '';
+    case 'lasttry':
+      return fmtIdmDate(d.last_try || lastTryById[d.id] || d.added || '');
     case 'desc':
       return d.description ? escapeHtml(d.description) : '';
     case 'added':
-      return escapeHtml(d.added || '');
-    case 'category':
-      return escapeHtml(d.category || '');
+      return fmtIdmDate(d.added || '');
     case 'saveto':
       return escapeHtml(d.save_to || '');
     default:
@@ -487,21 +649,18 @@ function updateRowCells(tr, d) {
       td._h = html;
     }
     if (colId === 'status') {
-      const cls = 'st-' + st;
-      if (td.className !== cls) td.className = cls;
+      // no state classes: status text is plain black in every
+      // state (IDM); the error MESSAGE rides the tooltip
       const title = st === 'error' && d.error ? d.error : '';
       if (td.title !== title) td.title = title;
     }
     if (colId === 'q') {
+      if (td.className !== 'qcell') td.className = 'qcell';
       const t = d.queue || 'Main download queue';
       if (td.title !== t) td.title = t;
     }
     if (colId === 'name' && td.className !== 'name') td.className = 'name';
   }
-  // the row fill goes through the DOM, never the innerHTML string:
-  // this WebKit drops percentage widths written into inline styles
-  const fill = tr.querySelector('.pbar i');
-  if (fill) fill.style.width = fill.dataset.pct + '%';
   const sel = selectedIds.has(d.id) || d.id === selectedId;
   if (tr.classList.contains('selected') !== sel) tr.classList.toggle('selected', sel);
 }
@@ -567,6 +726,9 @@ function render() {
   for (const d of items.values()) {
     const prev = prevStatusById.get(d.id);
     prevStatusById.set(d.id, d.status);
+    // a (re)entry into 'downloading' is a try — stamp it for
+    // the Last Try Date column (first sight counts too)
+    if (d.status === 'downloading' && prev !== 'downloading') noteLastTry(d.id);
     if (d.status !== 'finished') { completeAnnounced.delete(d.id); continue; }
     if (prev && prev !== 'finished' && !completeAnnounced.has(d.id)) {
       completeAnnounced.add(d.id);
@@ -616,39 +778,24 @@ function render() {
       if (tr) updateRowCells(tr, d);
     }
   }
+  // IDM's empty list is a blank white list — no placeholder
+  // text in any filter (the element stays only as a toggle)
   const em = $('emptyMsg');
-  em.style.display = list.length ? 'none' : 'block';
-  if (!list.length) {
-    // the empty text must reflect WHY the list is empty: with a
-    // category/queue filter active, "No downloads yet" is a lie
-    em.textContent = currentCat === 'All Downloads'
-      ? 'No downloads yet — click “Add URL” to start one.'
-      : currentCat.startsWith('queue:')
-        ? 'No downloads in this queue.'
-        : currentCat === 'Finished'
-          ? 'No finished downloads.'
-          : currentCat === 'Unfinished'
-            ? 'No unfinished downloads.'
-            : 'No downloads in this category.';
-  }
-
-  const all = [...items.values()];
-  const dlAll = all.filter(d => d.status === 'downloading');
-  // the counts describe the VIEW: with a category/queue filter
-  // active the bar used to keep quoting the unfiltered totals
-  // (N-06). Total speed stays global — it is a live system stat,
-  // not a property of the filtered rows.
-  const dl = list.filter(d => d.status === 'downloading');
-  $('sideStatus').textContent = `${list.length} files (${dl.length} downloading)`;
-  $('totalSpeed').textContent = 'Total speed: ' + fmtRate(dlAll.reduce((a, d) => a + d.speed_bps, 0)).replace('—', '0 B/s');
+  em.style.display = 'none';
+  em.textContent = '';
 
   const cur = items.get(selectedId);
   const curFinished = cur && cur.status === 'finished';
   const curDownloading = cur && cur.status === 'downloading';
   const curCanResume = cur && !curFinished && !curDownloading;
-  if ($('btnPause')) $('btnPause').disabled = !curDownloading;
+  // IDM's greyscale treatment is driven by these disabled flags:
+  // Resume/Stop/Delete light up only when they can act, Delete
+  // Completed only when a completed entry exists
+  if ($('btnStop')) $('btnStop').disabled = !curDownloading;
+  if ($('btnStopAll')) $('btnStopAll').disabled = ![...items.values()].some(d => d.status === 'downloading');
   if ($('btnResume')) $('btnResume').disabled = !curCanResume;
   if ($('btnDelete')) $('btnDelete').disabled = !cur && selectedIds.size === 0;
+  if ($('btnDelDone')) $('btnDelDone').disabled = ![...items.values()].some(d => d.status === 'finished');
 
   if (!detailEl.classList.contains('hidden')) {
     renderDetail();
@@ -719,7 +866,7 @@ function renderDetail() {
     : `${fmtSize(d.done_bytes)} (size unknown)`;
   $('dRate').textContent = d.status === 'downloading' ? fmtRate(d.speed_bps) : '—';
   $('dLeft').textContent = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
-    ? fmtLeft((d.total - d.done_bytes) / d.speed_bps) : '—';
+    ? fmtListLeft((d.total - d.done_bytes) / d.speed_bps) : '—';
   $('dResume').textContent = d.resume_capability || '—';
   if ($('dSaveTo')) $('dSaveTo').textContent = d.save_to || '—';
   if ($('dReferer')) $('dReferer').textContent = d.referer || '—';
@@ -787,19 +934,18 @@ function drawSegMap(blocks, status) {
   }
 }
 
-/* ---------- theme (light by default, choice persists) ---------- */
-function syncThemeButton() {
-  const dark = document.documentElement.dataset.theme === 'dark';
-  $('themeToggle').textContent = dark ? '☀️ Light' : '🌙 Dark';
-}
-$('themeToggle').onclick = () => {
+/* ---------- theme (light by default, choice persists) ----------
+   The in-page title-bar toggle is gone with the title bar
+   (IDM has neither); the choice lives where it already lived
+   besides — the View menu's "Dark Theme" item. (The old
+   syncThemeButton/themeToggle wiring went with the button:
+   C-6 — it looked up an element that no longer exists.) */
+function toggleTheme() {
   const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = next;
   try { localStorage.setItem('ndm-theme', next); } catch (e) { /* private mode */ }
-  syncThemeButton();
   if (!detailEl.classList.contains('hidden')) renderDetail();
-};
-syncThemeButton();
+}
 
 /* transient message line under the toolbar. The default style is
    the pink error banner; kind 'info' renders the SAME line in a
@@ -1035,6 +1181,11 @@ async function actOnSelected(fn) {
 }
 $('btnPause').onclick = () => actOnSelected(id => TAURI ? invoke('pause_download', { id }) : demoPause(id));
 $('btnResume').onclick = () => actOnSelected(id => TAURI ? invoke('resume_download', { id }) : demoResume(id));
+/* IDM's toolbar "Stop" IS its pause (there is no separate Pause
+   button on the bar): same action as the hidden Pause button
+   the detail dialog uses */
+$('btnStop').onclick = $('btnPause').onclick;
+$('btnDelDone').onclick = () => deleteCompleted();
 /* Delete asks first (IDM does) — removing the wrong row used to be
    one stray Delete keystroke away, with no way back. The dialog
    also offers deleting the file itself, not just the list entry.
@@ -1155,15 +1306,77 @@ $('btnStopAll').onclick = async () => {
   scheduleRender();
 };
 
-document.querySelectorAll('#catList li').forEach(li => {
-  li.onclick = () => {
-    document.querySelectorAll('#catList li').forEach(x => x.classList.remove('active'));
-    document.querySelectorAll('#queueList li').forEach(x => x.classList.remove('active'));
-    li.classList.add('active');
-    currentCat = li.dataset.cat;
-    render();
-  };
+/* Start/Stop Queue split buttons (IDM): the main half acts on
+   the picked queue — the first queue until the ▼ half's picker
+   chooses another — using the scheduler's own start/stop
+   commands, the same ones the Scheduler dialog's buttons use */
+let queuePick = 'Main download queue';
+function pickQueueName() {
+  const names = (settings.queues || []).map(q => q.name);
+  return names.includes(queuePick) ? queuePick : (names[0] || 'Main download queue');
+}
+async function startQueueNow(name) {
+  if (TAURI) {
+    try { await invoke('scheduler_start_now', { queue: name }); }
+    catch (e) { toast('Could not start the queue: ' + e); return; }
+  }
+  toast(`Queue "${name}" started`, 'info');
+}
+async function stopQueueNow(name) {
+  if (TAURI) {
+    try { await invoke('scheduler_stop_now', { queue: name }); }
+    catch (e) { toast('Could not stop the queue: ' + e); return; }
+  }
+  toast(`Queue "${name}" stopped`, 'info');
+}
+function closeQueueDrops() {
+  document.querySelectorAll('.queue-drop').forEach(d => d.classList.add('hidden'));
+}
+function fillQueueDrop(drop, fn) {
+  drop.innerHTML = '';
+  const names = (settings.queues || []).map(q => q.name);
+  const list = names.length ? names : ['Main download queue'];
+  for (const n of list) {
+    const b = document.createElement('button');
+    b.textContent = n;
+    if (n === pickQueueName()) b.classList.add('cur');
+    b.addEventListener('click', () => { queuePick = n; drop.classList.add('hidden'); fn(n); });
+    drop.appendChild(b);
+  }
+}
+$('btnStartQueue').onclick = () => startQueueNow(pickQueueName());
+$('btnStopQueue').onclick = () => stopQueueNow(pickQueueName());
+$('btnStartQueueMenu').onclick = () => {
+  const d = $('startQueueDrop');
+  const was = d.classList.contains('hidden');
+  closeQueueDrops();
+  if (was) { fillQueueDrop(d, startQueueNow); d.classList.remove('hidden'); }
+};
+$('btnStopQueueMenu').onclick = () => {
+  const d = $('stopQueueDrop');
+  const was = d.classList.contains('hidden');
+  closeQueueDrops();
+  if (was) { fillQueueDrop(d, stopQueueNow); d.classList.remove('hidden'); }
+};
+document.addEventListener('click', e => { if (!e.target.closest('.tool-split')) closeQueueDrops(); });
+
+/* tree wiring: static rows select their filter; the [+]/[−]
+   boxes only expand/collapse; the Queues row only expands
+   (its children are the selectable queue rows) */
+document.querySelectorAll('#catTree .trow[data-cat]').forEach(row => {
+  row.addEventListener('click', () => selectTreeCat(row.dataset.cat));
 });
+/* decorate the static tree rows with their node icons */
+document.querySelectorAll('#catTree .trow').forEach(row => {
+  const ic = row.querySelector('.ticon');
+  if (!ic || ic.innerHTML) return;
+  ic.innerHTML = row.id === 'queuesRow' ? TREE_ICONS.queues : (TREE_ICONS[row.dataset.cat] || TREE_ICONS.queue);
+});
+$('allExpBox').addEventListener('click', e => { e.stopPropagation(); toggleAllCats(); });
+$('queueExpBox').addEventListener('click', e => { e.stopPropagation(); toggleQueues(); });
+$('queuesRow').addEventListener('click', () => toggleQueues());
+$('sideClose').addEventListener('click', () => document.body.classList.add('no-side'));
+refreshTreeSelection();
 
 /* ---------- Add URL modal ---------- */
 const modal = $('modal');
@@ -1829,6 +2042,9 @@ async function submitVideo(later) {
       cookies,
       later: !!later,
       total: Number(opt.size_bytes) || 0,
+      // the probed duration rides along so the finish line can
+      // cross-check the delivered file against it (W-2)
+      duration: Number(vInfo.duration) || 0,
       queue: $('vInQueue').value || null,
       description: ($('vInDesc') && $('vInDesc').value.trim()) || null,
     };
@@ -1881,7 +2097,8 @@ if ($('vAll')) $('vAll').onclick = async () => {
       await invoke('add_video', {
         url, dir, selector: opt.selector, audio: !!opt.audio,
         title: customTitle, cookies, later: false,
-        total: Number(opt.size_bytes) || 0, queue,
+        total: Number(opt.size_bytes) || 0,
+        duration: Number(vInfo.duration) || 0, queue,
       });
       sent++;
     } catch (e) {
@@ -2276,9 +2493,7 @@ $('schedDelete').onclick = async () => {
   // fall back to All Downloads instead of an empty phantom filter
   if (currentCat === 'queue:' + gone) {
     currentCat = 'All Downloads';
-    document.querySelectorAll('#queueList li').forEach(x => x.classList.remove('active'));
-    document.querySelectorAll('#catList li').forEach(x =>
-      x.classList.toggle('active', x.dataset.cat === 'All Downloads'));
+    refreshTreeSelection();
   }
   // entries the backend moved to Main need their local queue updated
   for (const d of items.values()) {
@@ -2933,7 +3148,16 @@ document.addEventListener('keydown', e => {
     // selection Delete then confirms once for the whole batch
     const active = document.activeElement;
     if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
-    if (document.querySelector('.modal:not(.hidden)')) return;
+    // W-3: the completion dialog is the one modal that appears
+    // UNINVITED while the user works the list. Swallowing Ctrl+A
+    // behind it left the selection at the anchor row, so the
+    // Delete that followed (after closing the dialog) removed
+    // just that one entry while the user believed all were
+    // marked. Selecting is inert state — every destructive path
+    // still confirms — so the notification dialog does not block
+    // it; real work dialogs (Options, Add, confirms) still do.
+    const openModal = document.querySelector('.modal:not(.hidden)');
+    if (openModal && openModal.id !== 'cmodal') return;
     e.preventDefault();
     const list = visibleItems();
     selectedIds.clear();
@@ -3540,7 +3764,7 @@ const menuActions = {
   grabber: () => $('btnGrabber').click(),
   scheduler: () => $('btnScheduler').click(),
   options: openOptions,
-  theme: () => $('themeToggle').click(),
+  theme: () => toggleTheme(),
   sidebar: () => document.body.classList.toggle('no-side'),
   basket: async () => {
     if (!TAURI) { toast('The drop basket needs the NDM desktop app'); return; }

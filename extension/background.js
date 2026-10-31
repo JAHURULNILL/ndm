@@ -472,11 +472,14 @@ function sendToNdm(message) {
 }
 
 /* Pause or discard one existing entry (the browser dialog's Later /
-   Cancel now that downloads start while the dialog is open). */
-function sendControl(type, entry) {
+   Cancel now that downloads start while the dialog is open).
+   `extra` merges additional fields into the native message — the
+   Speed Limiter control carries its limit_bps this way. */
+function sendControl(type, entry, extra) {
+  const msg = Object.assign({ type, entry }, extra || {});
   const attempt = new Promise(resolve => {
     try {
-      chrome.runtime.sendNativeMessage(HOST_NAME, { type, entry }, response => {
+      chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
         if (chrome.runtime.lastError) {
           const text = chrome.runtime.lastError.message || '';
           const missing = /not found|No such native/i.test(text);
@@ -867,6 +870,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.action === 'ndm-set-speed-limit') {
+    // The progress card's Speed Limiter tab: a number is the new
+    // per-entry limit in bytes/sec; null clears it. Anything else
+    // collapses to a clear rather than reaching the app malformed.
+    const raw = message.limit_bps;
+    const limit_bps =
+      raw == null
+        ? null
+        : Number.isFinite(Number(raw)) && Number(raw) > 0
+          ? Math.floor(Number(raw))
+          : null;
+    sendControl('set_speed_limit', String(message.entry || ''), {
+      limit_bps,
+    }).then(r => sendResponse(r));
+    return true;
+  }
+
   if (message.action === 'ndm-entry-progress') {
     sendNativeFull({ type: 'progress', id: String(message.id || '') })
       .then(r => sendResponse(r || { ok: false }))
@@ -939,6 +959,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         disabled = !!(v.ndmTabOff && tabId != null && v.ndmTabOff[tabId]);
       } catch (e) {}
       sendResponse({ disabled, tabId });
+    })();
+    return true;
+  }
+
+  if (message.action === 'ndm-warm') {
+    // The flyout just showed this video's qualities: ask the app to
+    // resolve those selectors in the background so the click that
+    // follows starts instantly from its resolution cache instead of
+    // paying a full yt-dlp run first. Fire-and-forget — nothing is
+    // downloaded and no entry is created.
+    const pageUrl = message.pageUrl || (sender.tab && sender.tab.url) || '';
+    const targetUrl = message.url || pageUrl;
+    (async () => {
+      await settingsReady;
+      const items = (Array.isArray(message.items) ? message.items : [])
+        .filter((i) => i && i.selector)
+        .slice(0, 6)
+        .map((i) => ({ selector: String(i.selector), audio: !!i.audio }));
+      if (!/^https?:\/\//.test(targetUrl) || !items.length) {
+        sendResponse({ ok: false });
+        return;
+      }
+      const cookies = await captureCookies(targetUrl, pageUrl);
+      const res = await sendToNdm({ type: 'warm', url: targetUrl, pageUrl, cookies, items });
+      sendResponse(res);
     })();
     return true;
   }

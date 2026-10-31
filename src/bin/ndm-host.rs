@@ -11,6 +11,11 @@
 //                         and ensures `ndm-app` is running.
 // - `type: "pause_entry" / "cancel_entry" / "resume_entry"`
 //                      -> controls one existing entry via the queue
+// - `type: "set_speed_limit"`
+//                      -> sets/clears one entry's own speed limit
+//                         (`limit_bps`, bytes/sec; null = no limit)
+//                         via the queue — the progress card's
+//                         Speed Limiter tab
 // - `type: "progress"` -> reads the app's per-entry progress file
 //                         (progress/<id>.json) for the panel's live card
 
@@ -164,10 +169,12 @@ fn handle(message: &Value) -> Value {
         Some("probe") => handle_probe(message),
         Some("probe_file") => handle_probe_file(message),
         Some("show_app") => handle_show_app(),
+        Some("warm") => handle_warm(message),
         Some("download") => handle_download(message),
         Some("pause_entry") => handle_entry_control(message, "pause_entry"),
         Some("cancel_entry") => handle_entry_control(message, "cancel_entry"),
         Some("resume_entry") => handle_entry_control(message, "resume_entry"),
+        Some("set_speed_limit") => handle_set_speed_limit(message),
         Some("progress") => handle_progress(message),
         Some(other) => json!({ "ok": false, "error": format!("unknown type: {other}") }),
         None => json!({ "ok": false, "error": "missing type" }),
@@ -399,6 +406,61 @@ fn wait_for_ack_and_result(id: &str, timeout_secs: u64, queued_on_timeout: bool)
     })
 }
 
+/// Queue background stream resolutions for a video page the flyout
+/// is currently showing, so the quality click that follows starts
+/// from the app's resolution cache instead of paying a full yt-dlp
+/// resolve first. Fire-and-forget by design: the lines carry no id
+/// (the app writes no ack/result for them), no entry is created,
+/// and the reply only confirms the lines were queued.
+///
+/// m-3: warming is purely opportunistic — it exists to make a
+/// click that is seconds away faster. It must never START the
+/// desktop app: merely opening the flyout on a video page used to
+/// launch ndm-app (hidden) on machines where the user had never
+/// opened it. When the app is not already running, nothing is
+/// queued (a warm line drained at some later launch would be
+/// stale anyway) and the reply reports zero.
+fn handle_warm(message: &Value) -> Value {
+    let url = message.get("url").and_then(Value::as_str).unwrap_or("");
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return json!({ "ok": false, "error": "url must be a non-empty http(s) URL" });
+    }
+    if !app_is_running() {
+        return json!({ "ok": true, "queued": 0 });
+    }
+    let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
+    let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
+    let Some(items) = message.get("items").and_then(Value::as_array) else {
+        return json!({ "ok": false, "error": "items must be an array" });
+    };
+    let mut queued = 0usize;
+    for item in items.iter().take(6) {
+        let selector = item
+            .get("selector")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(512)
+            .collect::<String>();
+        if selector.is_empty() || selector.contains(['\r', '\n']) {
+            continue;
+        }
+        let audio = item.get("audio").and_then(Value::as_bool).unwrap_or(false);
+        let obj = json!({
+            "kind": "warm",
+            "url": url,
+            "selector": selector,
+            "audio": audio,
+        });
+        if append_to_queue(obj, cookies).is_ok() {
+            queued += 1;
+        }
+    }
+    // no ensure_app_running here (m-3): the gate above already
+    // established the app is running and will drain the queue
+    json!({ "ok": true, "queued": queued })
+}
+
 fn handle_download(message: &Value) -> Value {
     let kind = message.get("kind").and_then(Value::as_str).unwrap_or("");
     if kind != "video" && kind != "file" && kind != "video_direct" && kind != "file_direct" && kind != "grab" {
@@ -533,13 +595,51 @@ fn handle_entry_control(message: &Value, kind: &str) -> Value {
     }
 }
 
-/// Launch `ndm-app` detached if it is not already running.
-/// When `background` is true, passes `--background` so `ndm-app` starts
-/// hidden in the background without stealing focus from the user's browser.
+/// The largest limit the bridge will forward: 1 TB/sec is beyond
+/// any real link, so anything above it is a malformed request,
+/// not a preference.
+const MAX_LIMIT_BPS: u64 = 1_000_000_000_000;
+
+/// Set or clear one existing entry's own speed limit — the
+/// progress card's Speed Limiter tab. Same queue plumbing as the
+/// other entry controls, plus the `limit_bps` value carried
+/// through verbatim (a JSON number in bytes/sec; null clears the
+/// limit). The app runs the very command its own per-file
+/// Speed Limiter uses, so the change applies to the live
+/// engine/job immediately — this bridge adds no logic of its own.
+fn handle_set_speed_limit(message: &Value) -> Value {
+    let entry = message.get("entry").and_then(Value::as_str).unwrap_or("");
+    if !valid_entry_id(entry) {
+        return json!({ "ok": false, "error": "invalid entry id" });
+    }
+    let limit = match message.get("limit_bps") {
+        None | Some(Value::Null) => Value::Null,
+        Some(v) => match v.as_u64() {
+            Some(n) if n <= MAX_LIMIT_BPS => json!(n),
+            _ => return json!({ "ok": false, "error": "invalid limit_bps" }),
+        },
+    };
+    let id = new_entry_id();
+    let obj = json!({ "id": id, "kind": "set_speed_limit", "entry": entry, "limit_bps": limit });
+    match append_to_queue(obj, "") {
+        Ok(()) => {
+            ensure_app_running(true);
+            wait_for_ack_and_result(&id, 15, false)
+        }
+        Err(e) => {
+            eprintln!("ndm-host: cannot write queue: {e}");
+            json!({ "ok": false, "error": "cannot write queue file" })
+        }
+    }
+}
+
+/// Is an `ndm-app` process alive on this machine? The warm path
+/// (m-3) uses it to stay purely opportunistic — never the reason
+/// the app starts — and ensure_app_running uses it to avoid
+/// spawning a twin.
 #[cfg(unix)]
-fn ensure_app_running(background: bool) {
-    use std::os::unix::process::CommandExt;
-    let running = std::fs::read_dir("/proc")
+fn app_is_running() -> bool {
+    std::fs::read_dir("/proc")
         .map(|rd| {
             rd.flatten().any(|e| {
                 if !e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit()) {
@@ -559,8 +659,25 @@ fn ensure_app_running(background: bool) {
                 !zombie
             })
         })
-        .unwrap_or(false);
-    if running {
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn app_is_running() -> bool {
+    // no cheap process scan on this platform: report "running" so
+    // warm keeps its previous reach — queued lines are only ever
+    // drained by a live app, and the app's own single-instance
+    // guard absorbs a redundant spawn
+    true
+}
+
+/// Launch `ndm-app` detached if it is not already running.
+/// When `background` is true, passes `--background` so `ndm-app` starts
+/// hidden in the background without stealing focus from the user's browser.
+#[cfg(unix)]
+fn ensure_app_running(background: bool) {
+    use std::os::unix::process::CommandExt;
+    if app_is_running() {
         return;
     }
     let mut candidates: Vec<PathBuf> = Vec::new();

@@ -30,6 +30,9 @@ struct ProgressPayload {
     blocks: String,
     category: String,
     added: String,
+    /// when the last download attempt began ("%Y-%m-%d %H:%M:%S",
+    /// "" = never tried) — IDM's Last Try Date
+    last_try: String,
     resume_capability: String,
     completion: String,
     error: String,
@@ -59,6 +62,11 @@ struct SavedEntry {
     category: String,
     #[serde(default)]
     added: String,
+    /// when the last download attempt began, "%Y-%m-%d %H:%M:%S"
+    /// local time ("" = never tried); journals written before this
+    /// field existed carry no key and load as ""
+    #[serde(default)]
+    last_try: String,
     #[serde(default)]
     total: u64,
     #[serde(default)]
@@ -903,10 +911,6 @@ fn window_open(start: &str, stop: &str, now: &str) -> bool {
     }
 }
 
-fn in_window(s: &Settings, now: &str) -> bool {
-    window_open(&s.sched_start, &s.sched_stop, now)
-}
-
 /// The config of one queue by name (the Main queue's config when the
 /// name is unknown — an entry must never fall out of the system).
 fn queue_cfg(s: &Settings, name: &str) -> QueueCfg {
@@ -1131,6 +1135,10 @@ struct Entry {
     out_path: PathBuf,
     category: String,
     added: String,
+    /// when the last download attempt began (IDM's Last Try Date),
+    /// "%Y-%m-%d %H:%M:%S" local time, "" = never tried; stamped by
+    /// stamp_last_try wherever an attempt actually begins
+    last_try: Mutex<String>,
     download: Option<Arc<ndm::Download>>,
     video: Option<Arc<video::VideoJob>>,
     kind: String,
@@ -1344,6 +1352,23 @@ fn synth_blocks(total: u64, done: u64, downloading: bool) -> String {
     s
 }
 
+/// The current local time WITH seconds — the storage format for
+/// `last_try` (IDM's Last Try Date shows seconds; `added` predates
+/// that need and keeps its minute-only format).
+fn now_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// Record that a download attempt begins now. Every real attempt —
+/// fresh start, resume, automatic retry, queue-pump start — funnels
+/// through one of the stamped call sites (start_engine for the HTTP
+/// engine, the live-handle resume branches, the video job starts),
+/// so the stamp is the last time NDM actually tried to download
+/// this file, which is exactly IDM's meaning for the column.
+fn stamp_last_try(entry: &Entry) {
+    *entry.last_try.lock().unwrap() = now_stamp();
+}
+
 fn payload_of(entry: &Entry) -> ProgressPayload {
     if let Some(job) = &entry.video {
         let p = job.progress.lock().unwrap().clone();
@@ -1408,6 +1433,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             status: p.status.clone(),
             category: entry.category.clone(),
             added: entry.added.clone(),
+            last_try: entry.last_try.lock().unwrap().clone(),
             resume_capability: "Yes (yt-dlp resume)".to_string(),
             completion: entry.completion.lock().unwrap().clone(),
             error: p.error.clone().unwrap_or_default(),
@@ -1496,6 +1522,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         blocks,
         category: entry.category.clone(),
         added: entry.added.clone(),
+        last_try: entry.last_try.lock().unwrap().clone(),
         resume_capability: if resumable {
             "Yes (Range supported)".to_string()
         } else {
@@ -1584,6 +1611,7 @@ fn persist(state: &AppState) {
                 out_path: e.out_path.to_string_lossy().to_string(),
                 category: e.category.clone(),
                 added: e.added.clone(),
+                last_try: p.last_try.clone(),
                 total: p.total,
                 done_bytes: p.done_bytes,
                 status: if e.queued.load(Ordering::Relaxed) {
@@ -2157,6 +2185,32 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                     break;
                 }
                 "paused" | "queued" => {
+                    // W-1: a resume that landed just before this loop
+                    // (re)started can still read as "paused" on the
+                    // first tick — the HTTP engine flips its reported
+                    // status on its own 200 ms tracker tick, not
+                    // synchronously with resume(). Acting on that
+                    // stale read ended the entry's only reporting
+                    // loop while the download itself ran on
+                    // unreported (frozen UI row AND frozen progress
+                    // mirror). Confirm the parked state with a
+                    // second read after a short wait; only a state
+                    // that is STILL parked ends the loop.
+                    std::thread::sleep(Duration::from_millis(350));
+                    if entry.removed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    update_sample(&entry);
+                    let confirm = payload_of(&entry);
+                    if confirm.status != status {
+                        // the entry moved on (a resume landed):
+                        // publish the fresh payload and keep
+                        // following it instead of dying here
+                        write_progress_file(&app, &confirm);
+                        last_progress_write = Some(Instant::now());
+                        let _ = app.emit("progress", confirm);
+                        continue;
+                    }
                     let state = app.state::<AppState>();
                     persist(&state);
                     pump_queue(&app);
@@ -2196,6 +2250,7 @@ fn swap_live(
         out_path: stub.out_path.clone(),
         category: stub.category.clone(),
         added: stub.added.clone(),
+        last_try: Mutex::new(stub.last_try.lock().unwrap().clone()),
         download: Some(dl),
         video: None,
         kind: "http".to_string(),
@@ -2274,6 +2329,11 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
     if stub.starting.swap(true, Ordering::SeqCst) && !preclaimed {
         return Err("the download is already starting".to_string());
     }
+    // the attempt begins now, probe included: a probe that fails is
+    // still a try, so the stamp lands before it, not after success.
+    // swap_live carries it onto the live entry; a failed start keeps
+    // it on the stub beside the error it records.
+    stamp_last_try(stub);
     let dl = match tauri::async_runtime::spawn_blocking(move || {
         ndm::start_with_auth(&url, &out_path, max_conn, ndm::DEFAULT_BLOCK, auth)
     })
@@ -2591,7 +2651,8 @@ fn register_http_stub(
         url: url.to_string(),
         out_path,
         category,
-        added: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+        added: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        last_try: Mutex::new(String::new()),
         download: None,
         video: None,
         kind: "http".to_string(),
@@ -2667,6 +2728,7 @@ fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<Entr
         out_path: entry.out_path.clone(),
         category: entry.category.clone(),
         added: entry.added.clone(),
+        last_try: Mutex::new(entry.last_try.lock().unwrap().clone()),
         download: None,
         video: None,
         kind: entry.kind.clone(),
@@ -2737,6 +2799,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
     }
     if let Some(dl) = &entry.download {
         dl.control.resume();
+        stamp_last_try(&entry);
         // the emit loop died when it observed the pause — without a
         // fresh one this download would report no progress and fire
         // NONE of the finish side-effects (no persist-at-finish, no
@@ -2773,8 +2836,15 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
     if let Some(job) = &entry.video {
         let state = app.state::<AppState>();
         job.set_limit(*entry.speed_limit.lock().unwrap());
+        // m-8: the stamp lands BEFORE the attempt, as on the HTTP
+        // paths — a resume that fails to spawn was still a try, and
+        // stamping only inside the Ok arm left Last Try Date stale
+        // on exactly the failures the user most needs to see timed
+        stamp_last_try(&entry);
         match job.resume(&state.components()) {
-            Ok(()) => spawn_emit_loop(app.clone(), entry),
+            Ok(()) => {
+                spawn_emit_loop(app.clone(), entry)
+            }
             Err(e) => {
                 // the last silent start path: a missing yt-dlp here
                 // used to leave the entry sitting on "paused" forever
@@ -2797,6 +2867,10 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
         if entry.starting.swap(true, Ordering::SeqCst) {
             return;
         }
+        // as in start_engine, the stamp lands before the start runs:
+        // a job that fails to spawn was still a try, and the live
+        // entry built below clones the stamp off this one
+        stamp_last_try(&entry);
         let state = app.state::<AppState>();
         match video::VideoJob::start(
             &entry.url,
@@ -2808,6 +2882,17 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
             &entry.login,
             &entry.password,
             &state.components(),
+            // a restarted stub keeps the size it was added with as
+            // its finish-line expectation; the probed duration was
+            // never persisted, so that half of the check sits out
+            entry
+                .restored
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r.total)
+                .unwrap_or(0),
+            0.0,
         ) {
             Ok(job) => {
             job.set_limit(*entry.speed_limit.lock().unwrap());
@@ -2825,6 +2910,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 out_path: entry.out_path.clone(),
                 category: entry.category.clone(),
                 added: entry.added.clone(),
+                last_try: Mutex::new(entry.last_try.lock().unwrap().clone()),
                 download: None,
                 video: Some(job),
                 kind: "video".to_string(),
@@ -3892,6 +3978,7 @@ async fn resume_download(
     };
     if let Some(dl) = &entry.download {
         dl.control.resume();
+        stamp_last_try(&entry);
         let _ = app.emit("progress", payload_of(&entry));
         // same emit-loop revival as start_entry: a resumed HTTP
         // download must keep reporting and must finish properly
@@ -3902,6 +3989,9 @@ async fn resume_download(
         // with the same arguments and yt-dlp continues its .part files
         if let Some(job) = &entry.video {
             job.set_limit(*entry.speed_limit.lock().unwrap());
+            // m-8: stamp before the attempt — the `?` below used to
+            // return on a failed resume before the stamp ever ran
+            stamp_last_try(&entry);
             job.resume(&state.components())?;
             spawn_emit_loop(app, entry);
         } else {
@@ -3913,6 +4003,9 @@ async fn resume_download(
             if entry.starting.swap(true, Ordering::SeqCst) {
                 return Ok(());
             }
+            // stamped before the start runs, as in start_engine:
+            // a failed spawn was still a try
+            stamp_last_try(&entry);
             let job = match video::VideoJob::start(
                 &entry.url,
                 &entry.out_path,
@@ -3923,6 +4016,14 @@ async fn resume_download(
                 &entry.login,
                 &entry.password,
                 &state.components(),
+                entry
+                    .restored
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|r| r.total)
+                    .unwrap_or(0),
+                0.0,
             ) {
                 Ok(j) => j,
                 Err(e) => {
@@ -3938,6 +4039,7 @@ async fn resume_download(
                 out_path: entry.out_path.clone(),
                 category: entry.category.clone(),
                 added: entry.added.clone(),
+                last_try: Mutex::new(entry.last_try.lock().unwrap().clone()),
                 download: None,
                 video: Some(job),
                 kind: "video".to_string(),
@@ -4468,6 +4570,7 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         out_path: entry.out_path.clone(),
         category: entry.category.clone(),
         added: entry.added.clone(),
+        last_try: Mutex::new(entry.last_try.lock().unwrap().clone()),
         download: None,
         video: None,
         kind: entry.kind.clone(),
@@ -4623,6 +4726,7 @@ fn do_add_video(
     cookies: Option<String>,
     later: bool,
     total_hint: u64,
+    duration_hint: f64,
     force: bool,
     queue: String,
 ) -> Result<String, String> {
@@ -4720,7 +4824,8 @@ fn do_add_video(
             url,
             out_path: dir,
             category,
-            added: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+            added: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            last_try: Mutex::new(String::new()),
             download: None,
             video: None,
             kind: "video".to_string(),
@@ -4770,6 +4875,8 @@ fn do_add_video(
         &login,
         &password,
         &state.components(),
+        total_hint,
+        duration_hint,
     ) {
         Ok(job) => job,
         Err(e) => {
@@ -4797,7 +4904,10 @@ fn do_add_video(
         url,
         out_path: dir,
         category,
-        added: chrono::Local::now().format("%Y-%m-%d %H:%M").to_string(),
+        added: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        // the job above is already running: this add IS the entry's
+        // first try, stamped at its birth
+        last_try: Mutex::new(now_stamp()),
         download: None,
         video: Some(job),
         kind: "video".to_string(),
@@ -4847,6 +4957,7 @@ async fn add_video(
     cookies: Option<String>,
     later: Option<bool>,
     total: Option<u64>,
+    duration: Option<f64>,
     force: Option<bool>,
     queue: Option<String>,
     description: Option<String>,
@@ -4862,6 +4973,7 @@ async fn add_video(
         cookies,
         later.unwrap_or(false),
         total.unwrap_or(0),
+        duration.unwrap_or(0.0),
         force.unwrap_or(false),
         queue.unwrap_or_else(main_queue_name),
     )?;
@@ -5106,6 +5218,7 @@ fn restore_saved(state: &AppState) {
                 out_path,
                 category: s.category.clone(),
                 added: s.added.clone(),
+                last_try: Mutex::new(s.last_try.clone()),
                 download: None,
                 video: None,
                 kind: "video".to_string(),
@@ -5209,6 +5322,7 @@ fn restore_saved(state: &AppState) {
             out_path,
             category: s.category.clone(),
             added: s.added.clone(),
+            last_try: Mutex::new(s.last_try.clone()),
             download: None,
             video: None,
             kind: "http".to_string(),
@@ -5239,6 +5353,12 @@ fn restore_saved(state: &AppState) {
     }
     state.seq.store(max_seq + 1, Ordering::Relaxed);
 }
+
+/// Warm resolves currently in flight (m-5): keys of
+/// url + selector + audio + cookie-content hash. Bounded so a
+/// re-rendering flyout cannot fan out unbounded yt-dlp processes.
+static WARM_INFLIGHT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+const WARM_MAX_INFLIGHT: usize = 4;
 
 /// Process the browser extension's incoming queue file. A leftover
 /// `incoming.processing` from a crashed run is drained first, so queued
@@ -5323,6 +5443,11 @@ fn write_ack_and_result(handle: &AppHandle, ack_id: Option<&str>, result: serde_
 /// visible outside the app). Only the fields the card renders are
 /// written; eta_secs is derived here because the payload itself
 /// carries no ETA (0 = unknown, which the card renders as absent).
+/// The IDM details fields (resume_capability / conns /
+/// conns_detail / blocks) ride along additively: the host returns
+/// this file verbatim, and readers that predate them simply ignore
+/// the extra keys — the original six fields keep their exact
+/// names, types and derivations.
 fn write_progress_file(handle: &AppHandle, payload: &ProgressPayload) {
     let Some(id) = sanitize_ack_id(&payload.id) else {
         return;
@@ -5344,6 +5469,23 @@ fn write_progress_file(handle: &AppHandle, payload: &ProgressPayload) {
         "rate_bps": payload.speed_bps,
         "eta_secs": eta_secs,
         "error": payload.error,
+        // IDM "Download status" details: the Resume capability row
+        // (the payload's own string, e.g. "Yes (Range supported)")
+        // and the expandable per-connection section — active
+        // connection count, cumulative bytes per connection this
+        // session (empty for video jobs, which have no engine
+        // connections to report), and the block map the segment
+        // chart is drawn from ('0' pending, '1' done, '2' active).
+        "resume_capability": payload.resume_capability,
+        "conns": payload.conns,
+        "conns_detail": payload.conns_detail,
+        "blocks": payload.blocks,
+        // The entry's own speed limit (bytes/sec, 0 = none): the
+        // progress card's Speed Limiter tab pre-fills its controls
+        // from this, the same way the details fields above ride
+        // along. Purely additive — older cards ignore the key, and
+        // a card meeting an older app (no key) never shows the tab.
+        "speed_limit": payload.speed_limit,
     });
     let _ = std::fs::write(dir.join(format!("{id}.json")), body.to_string());
 }
@@ -5642,10 +5784,14 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
         write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
         return;
     }
-    if kind == "pause_entry" || kind == "cancel_entry" || kind == "resume_entry" {
+    if kind == "pause_entry"
+        || kind == "cancel_entry"
+        || kind == "resume_entry"
+        || kind == "set_speed_limit"
+    {
         // the browser dialog's Later / Cancel for a download that
         // started while the dialog was open, and the panel progress
-        // card's Pause / Resume / Cancel
+        // card's Pause / Resume / Cancel / Speed Limiter
         let entry_id = v["entry"].as_str().unwrap_or("");
         let state = handle.state::<AppState>();
         let result = match state.get(entry_id) {
@@ -5656,6 +5802,18 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
                 } else if kind == "cancel_entry" {
                     discard_entry(handle, &state, &entry);
                     serde_json::json!({ "ok": true })
+                } else if kind == "set_speed_limit" {
+                    // The progress card's Speed Limiter tab: the
+                    // SAME command the app's own per-file limiter
+                    // runs — entry field, live engine/job handles,
+                    // persist, progress emit — no second path to
+                    // drift. limit_bps null/absent clears the
+                    // limit (0 = none).
+                    let limit = v["limit_bps"].as_u64().unwrap_or(0);
+                    match set_entry_limit(handle.clone(), state, entry_id.to_string(), limit) {
+                        Ok(()) => serde_json::json!({ "ok": true }),
+                        Err(e) => serde_json::json!({ "ok": false, "error": e }),
+                    }
                 } else {
                     // the SAME resume the app's own Resume button
                     // runs — no second implementation to drift. This
@@ -5712,6 +5870,81 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             }
         }
     }
+    if kind == "warm" {
+        // The flyout is showing this video's qualities; resolve the
+        // requested selectors in the background NOW so the click
+        // that follows starts from the resolution cache instead of
+        // paying a full yt-dlp run first (the measured click-to-byte
+        // bottleneck). Fire-and-forget: no entry is created, nothing
+        // is shown anywhere, and a warm line whose selector is empty
+        // or whose resolution fails simply leaves the cache cold.
+        //
+        // m-5: the fan-out is bounded and deduplicated — a flyout
+        // that re-renders (or several tabs on the same video) used
+        // to spawn one yt-dlp resolve per line per display, all for
+        // the same cache key. At most WARM_MAX_INFLIGHT resolves
+        // run at once, and a key already in flight is not started
+        // twice (the in-flight one populates the same cache entry).
+        //
+        // m-4: a warm line that carried cookies minted a token file
+        // above that NO entry will ever own — it is dropped when
+        // the warm completes (or immediately, when the warm is
+        // skipped), instead of orphaning one file per flyout open.
+        let selector = v["selector"].as_str().unwrap_or("").to_string();
+        let state = handle.state::<AppState>();
+        if selector.is_empty() {
+            drop_cookies_token(&state, &token);
+            write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
+            return;
+        }
+        let audio = v["audio"].as_bool().unwrap_or(false);
+        let cookie_sig = {
+            let text = v["cookies"].as_str().unwrap_or("");
+            let mut h: u64 = 0xcbf29ce484222325;
+            for b in text.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        };
+        let warm_key = format!("{url}\n{selector}\n{}\n{cookie_sig}", audio as u8);
+        let admitted = {
+            let mut set = WARM_INFLIGHT.lock().unwrap();
+            if set.iter().any(|k| k == &warm_key) || set.len() >= WARM_MAX_INFLIGHT {
+                false
+            } else {
+                set.push(warm_key.clone());
+                true
+            }
+        };
+        if !admitted {
+            drop_cookies_token(&state, &token);
+            write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
+            return;
+        }
+        let components = state.components();
+        let cookies_path = state.cookies_path(&token);
+        let warm_url = url.to_string();
+        let warm_handle = handle.clone();
+        std::thread::spawn(move || {
+            video::warm_resolution(
+                &warm_url,
+                &selector,
+                audio,
+                cookies_path,
+                "",
+                "",
+                &components,
+            );
+            WARM_INFLIGHT.lock().unwrap().retain(|k| k != &warm_key);
+            if !token.is_empty() {
+                let st = warm_handle.state::<AppState>();
+                drop_cookies_token(&st, &token);
+            }
+        });
+        write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
+        return;
+    }
     if kind == "video_direct" {
         // Run silently in the background — NEVER steal focus from the browser!
         let state = handle.state::<AppState>();
@@ -5746,6 +5979,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             cookies_opt,
             later,
             total_hint,
+            0.0,
             force,
             main_queue_name(),
         ) {
@@ -6040,7 +6274,208 @@ fn register_native_hosts() {
     );
 }
 
+/* ---------- single-instance guard ----------
+   downloads.json has exactly one writer discipline: the running
+   app's in-memory list, snapshotted by persist() — including the
+   5-second periodic snapshot. A SECOND process on the same profile
+   holds its own copy of the list and re-persists it on the same
+   cadence, so a delete performed in one window is silently undone
+   by the other process within seconds, forever (the user's
+   "deleted downloads keep coming back after a restart": the
+   resurrected journal is what the next launch reads). Nothing
+   guarded against a twin: a launcher double-click, a native-host
+   spawn race, or an updater restart could each start one.
+
+   The guard is a loopback TCP listener on a port derived from the
+   app-data dir (the same path computation ndm-host uses to find
+   the incoming queue), so it is stable per profile — other users
+   and other profiles never collide. Whoever binds it is the
+   primary. A newcomer that cannot bind watches the port for a
+   short grace window: an updater restart's old process exits
+   inside it and frees the port (the newcomer then takes over as
+   primary); a primary still holding AND answering the magic ping
+   at the end of the window is a genuine twin — the newcomer asks
+   it to raise its window and exits before building any state of
+   its own. If the port is held by something that never answers
+   the magic, the newcomer runs unguarded rather than not at all.
+   std-only — no new dependencies.
+
+   Two hardenings from the 1.9.2 audit ride on this design:
+   - C-MAJOR: the protocol is SERVED from the moment of bind, in
+     main(), before Tauri starts. Serving used to begin only in
+     setup() (seconds into a cold start): a newcomer in that
+     window connected into the backlog, never got a reply, and
+     concluded "not NDM" — the guard failed open exactly during
+     primary startup. A "raise" that arrives before the window
+     exists is queued and applied in setup().
+   - m-1: after handing a raise to a live primary, the newcomer
+     watches the port for a bounded window before exiting. An
+     updater handover looks identical to a twin launch for its
+     first moments (old process still answering, then exits to
+     swap binaries): if the holder disappears inside the window,
+     the newcomer binds and takes over as primary instead of
+     leaving the user with no NDM at all. */
+static INSTANCE_HANDLE: Mutex<Option<AppHandle>> = Mutex::new(None);
+static INSTANCE_RAISE_PENDING: AtomicBool = AtomicBool::new(false);
+
+enum Instance {
+    Primary,
+    Secondary,
+}
+
+/// Bind the guard port; on success start serving the ping/raise
+/// protocol IMMEDIATELY (see C-MAJOR above) and report true.
+fn bind_and_serve_instance(port: u16) -> bool {
+    let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+        return false;
+    };
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 64];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..n]);
+                let line = line.trim();
+                if line == "ping" || line == "raise" {
+                    let _ = s.write_all(b"ndm-here\n");
+                    if line == "raise" {
+                        match INSTANCE_HANDLE.lock().unwrap().clone() {
+                            Some(h) => raise_main_window(&h),
+                            // the window does not exist yet (the
+                            // primary is still starting): queue the
+                            // raise for setup() to apply
+                            None => INSTANCE_RAISE_PENDING
+                                .store(true, Ordering::SeqCst),
+                        }
+                    }
+                }
+            });
+        }
+    });
+    true
+}
+
+/// Called from setup(): publish the AppHandle the guard's raise
+/// path needs, and apply any raise that arrived while the primary
+/// was still starting.
+fn register_instance_handle(app: &AppHandle) {
+    *INSTANCE_HANDLE.lock().unwrap() = Some(app.clone());
+    if INSTANCE_RAISE_PENDING.swap(false, Ordering::SeqCst) {
+        raise_main_window(app);
+    }
+}
+
+fn instance_port() -> u16 {
+    let dir = {
+        #[cfg(windows)]
+        let base = std::env::var_os("APPDATA").map(PathBuf::from);
+        #[cfg(not(windows))]
+        let base = match std::env::var_os("XDG_DATA_HOME") {
+            Some(x) if !x.is_empty() => Some(PathBuf::from(x)),
+            _ => std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".local").join("share")),
+        };
+        base.map(|b| b.join("com.ndm.downloadmanager"))
+            .unwrap_or_else(|| PathBuf::from("com.ndm.downloadmanager"))
+    };
+    // m-2: hash the CANONICAL path when it can be resolved, so two
+    // launches that reach the same profile through different
+    // environment spellings (a symlinked HOME, an XDG_DATA_HOME
+    // that names the same directory through another route) still
+    // derive the same port and see each other. The directory may
+    // not exist yet on a first-ever launch (setup creates it
+    // later); the raw path is then hashed, as before.
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in dir.to_string_lossy().as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    41000 + (h % 12000) as u16
+}
+
+fn instance_ping(port: u16, verb: &str) -> bool {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
+    else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+    if s.write_all(format!("{verb}\n").as_bytes()).is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 32];
+    let n = s.read(&mut buf).unwrap_or(0);
+    buf[..n].starts_with(b"ndm-here")
+}
+
+fn acquire_instance() -> Instance {
+    let port = instance_port();
+    if bind_and_serve_instance(port) {
+        return Instance::Primary;
+    }
+    // the port is held: an updater restart's old process may free
+    // it inside this grace window (then WE are the primary), and a
+    // holder answering the magic at the end of it is a live primary
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut primary_alive = false;
+    loop {
+        if instance_ping(port, "ping") {
+            primary_alive = true;
+        }
+        if bind_and_serve_instance(port) {
+            return Instance::Primary;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !primary_alive {
+        // the port is held by something that is not NDM (or by
+        // nothing reachable): run unguarded rather than not at all
+        return Instance::Primary;
+    }
+    // a live primary holds the port: hand the user to it — unless
+    // this process was started hidden by the native host, where
+    // raising the window would steal focus for a spawn race the
+    // user never saw
+    if !std::env::args().any(|a| a == "--background") {
+        let _ = instance_ping(port, "raise");
+    }
+    // m-1: the updater handover is indistinguishable from a twin
+    // launch right now — the old process answered us, and is about
+    // to exit so the new binary can take its place. Exiting
+    // unconditionally here left NO NDM running when that was the
+    // case. Watch the port for a bounded window: if the holder
+    // disappears, bind and take over; a primary still holding it
+    // at the end was a genuine twin launch, and only then do we
+    // exit as a secondary.
+    let watch_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if bind_and_serve_instance(port) {
+            return Instance::Primary;
+        }
+        if Instant::now() >= watch_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    Instance::Secondary
+}
+
 fn main() {
+    // single-instance guard FIRST: a second process must exit
+    // before it builds any state — its persist() snapshots would
+    // resurrect whatever the real window deletes (see above)
+    if matches!(acquire_instance(), Instance::Secondary) {
+        return;
+    }
     tauri::Builder::default()
         .manage(AppState {
             entries: Mutex::new(HashMap::new()),
@@ -6084,6 +6519,11 @@ fn main() {
             }
         })
         .setup(|app| {
+            // the single-instance guard has been serving since
+            // main() bound the port; setup only publishes the
+            // AppHandle its raise path needs (and applies a raise
+            // queued during startup)
+            register_instance_handle(app.handle());
             if let Some(w) = app.get_webview_window("main") {
                 if std::env::args().any(|a| a == "--background") {
                     let _ = w.hide();
@@ -6658,6 +7098,7 @@ mod tests {
             out_path: dir.join("test.iso"),
             category: "Programs".to_string(),
             added: "2026-10-29 12:00".to_string(),
+            last_try: Mutex::new("2026-10-29 12:00:34".to_string()),
             download: None,
             video: None,
             kind: "http".to_string(),
@@ -6698,6 +7139,120 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn state_with_data_file(data_file: PathBuf) -> AppState {
+        AppState {
+            entries: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
+            seq: AtomicU64::new(1),
+            data_file: Mutex::new(data_file),
+            components_dir: Mutex::new(PathBuf::new()),
+            cookies_dir: Mutex::new(PathBuf::new()),
+            save_lock: Mutex::new(()),
+            settings: Mutex::new(Settings::default()),
+            settings_file: Mutex::new(PathBuf::new()),
+            sched_override: Mutex::new(std::collections::HashSet::new()),
+            quota_state: Mutex::new((0, 0, false)),
+            quota_removed: Mutex::new(0),
+            quota_file: Mutex::new(PathBuf::new()),
+            pending_videos: Mutex::new(Vec::new()),
+            pending_files: Mutex::new(Vec::new()),
+            pending_grabs: Mutex::new(Vec::new()),
+            components_busy: AtomicBool::new(false),
+            pending_update: Mutex::new(None),
+            update_required: AtomicBool::new(false),
+            update_busy: AtomicBool::new(false),
+            retries: Mutex::new(HashMap::new()),
+            had_active: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn stamp_last_try_writes_seconds_format() {
+        let entry = restored_entry("f.bin", "http", 1000, PathBuf::from("/tmp/f.bin"));
+        assert_eq!(*entry.last_try.lock().unwrap(), "");
+        stamp_last_try(&entry);
+        let s = entry.last_try.lock().unwrap().clone();
+        // "%Y-%m-%d %H:%M:%S" — the shape the UI's fmtIdmDate parses
+        assert_eq!(s.len(), 19, "stamp: {s}");
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], " ");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+    }
+
+    #[test]
+    fn last_try_survives_the_journal_round_trip() {
+        // IDM's Last Try Date is a real backend field: stamped on an
+        // entry, written to downloads.json by persist, and restored
+        // onto the entry (and its payload) by restore_saved.
+        let dir = std::env::temp_dir().join(format!("ndm-lasttry-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+
+        let state = state_with_data_file(data_file.clone());
+        let entry = restored_entry("f.bin", "http", 1000, dir.join("f.bin"));
+        *entry.last_try.lock().unwrap() = "2026-10-30 21:44:07".to_string();
+        let entry = Arc::new(entry);
+        state
+            .entries
+            .lock()
+            .unwrap()
+            .insert("dl-1".to_string(), entry);
+        state.order.lock().unwrap().push("dl-1".to_string());
+        persist(&state);
+
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(
+            text.contains("\"last_try\":\"2026-10-30 21:44:07\""),
+            "journal: {text}"
+        );
+
+        // restore into a fresh state: the field comes back on the
+        // entry and in the payload the UI renders the column from
+        let state2 = state_with_data_file(data_file.clone());
+        restore_saved(&state2);
+        let restored = state2.get("dl-1").expect("entry restored");
+        assert_eq!(*restored.last_try.lock().unwrap(), "2026-10-30 21:44:07");
+        assert_eq!(payload_of(&restored).last_try, "2026-10-30 21:44:07");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn journal_without_last_try_still_loads() {
+        // journals written before the field existed carry no
+        // last_try key: the serde default makes them load as "",
+        // the entry restores cleanly with an empty stamp, and the
+        // column simply falls back until the next attempt
+        let old: SavedEntry = serde_json::from_str(
+            r#"{"id":"dl-7","name":"old.bin","url":"https://example.com/old.bin",
+                "out_path":"/tmp/old.bin","added":"2026-10-01 09:15",
+                "status":"paused","kind":"http"}"#,
+        )
+        .expect("old-format entry parses");
+        assert_eq!(old.last_try, "");
+
+        let dir = std::env::temp_dir().join(format!("ndm-lasttry-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        std::fs::write(
+            &data_file,
+            r#"[{"id":"dl-7","name":"old.bin","url":"https://example.com/old.bin",
+                 "out_path":"/tmp/old.bin","added":"2026-10-01 09:15","total":10,
+                 "done_bytes":4,"status":"paused","kind":"http"}]"#,
+        )
+        .unwrap();
+        let state = state_with_data_file(data_file);
+        restore_saved(&state);
+        let restored = state.get("dl-7").expect("old entry restored");
+        assert_eq!(*restored.last_try.lock().unwrap(), "");
+        assert_eq!(payload_of(&restored).last_try, "");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn restored_entry(name: &str, kind: &str, total: u64, out_path: PathBuf) -> Entry {
         Entry {
             id: "dl-1".to_string(),
@@ -6706,6 +7261,7 @@ mod tests {
             out_path,
             category: "General".to_string(),
             added: "2026-10-30 12:00".to_string(),
+            last_try: Mutex::new(String::new()),
             download: None,
             video: None,
             kind: kind.to_string(),

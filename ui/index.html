@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nill Download Manager</title>
+<title>Nill Download Manager 1.9.2</title>
 <script>
   // apply the saved theme before first paint (default: light)
   try {
@@ -15,7 +15,7 @@
      black default for a beat before styles.css arrives — the theme
      script above has already set data-theme, so paint THAT theme's
      background immediately */
-  html { background: #eceff2; }
+  html { background: #e9edf2; }
   html[data-theme="dark"] { background: #232629; }
   body { background: inherit; }
 </style>
@@ -23,14 +23,21 @@
 </head>
 <body>
 
-<header class="titlebar">
-  <div class="app-title"><span class="logo">⬇</span> Nill Download Manager</div>
-  <div class="title-right">
-    <button id="themeToggle" class="theme-toggle" title="Switch theme">🌙 Dark</button>
-  </div>
-</header>
-
+<!-- IDM 6.x layout: no in-page title bar — the OS title bar (name +
+     version, tauri.conf) sits directly above the menu bar. The theme
+     choice lives in the View menu ("Dark Theme"), as before. -->
 <nav class="menubar" id="menubar">
+  <div class="menu">
+    <button class="menu-btn" data-menu="tasks">Tasks</button>
+    <div class="menu-drop hidden" id="menu-tasks">
+      <button data-act="batch">Add Batch Download…</button>
+      <button data-act="import">Import Downloads…</button>
+      <button data-act="export">Export Downloads</button>
+      <div class="menu-sep"></div>
+      <button data-act="grabber">Grabber</button>
+      <button data-act="scheduler">Scheduler</button>
+    </div>
+  </div>
   <div class="menu">
     <button class="menu-btn" data-menu="file">File</button>
     <div class="menu-drop hidden" id="menu-file">
@@ -53,7 +60,7 @@
       <button data-act="del">Delete Selected</button>
       <button data-act="deldone">Delete All Completed</button>
       <div class="menu-sep"></div>
-      <button data-act="grabber">Site Grabber</button>
+      <button data-act="grabber">Grabber</button>
       <button data-act="scheduler">Scheduler</button>
       <button data-act="options">Options</button>
     </div>
@@ -87,39 +94,65 @@
   </div>
 </nav>
 
-<div class="toolbar">
-  <button id="btnAdd" class="tool primary">＋ Add URL</button>
-  <button id="btnVideo" class="tool">🎬 Add Video</button>
-  <button id="btnGrabber" class="tool">🕸 Site Grabber</button>
-  <button id="btnResume" class="tool">▶ Resume</button>
-  <button id="btnPause" class="tool">⏸ Pause</button>
-  <button id="btnStopAll" class="tool">⏹ Stop All</button>
-  <button id="btnDelete" class="tool">🗑 Delete</button>
-  <button id="btnStatus" class="tool" title="Show Download Status &amp; Details (or double-click / right-click a row)">📊 Status</button>
+<!-- IDM 6.x toolbar: 32×32 icon ABOVE its label, IDM's exact set
+     and order, one separator after Stop All, Start/Stop Queue as
+     split buttons with queue-picker dropdowns. -->
+<div class="toolbar" id="toolbar">
+  <button id="btnAdd" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><path d="M3 10a2 2 0 0 1 2-2h5l2.2 3H27a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="#f2b33d" stroke="#b57e14"/><path d="M20.5 13v8.2m0 0L17 17.7m3.5 3.5l3.5-3.5" stroke="#2456a6" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="tlabel">Add URL</span></button>
+  <button id="btnResume" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><path d="M10 3h9l5 5v21H10z" fill="#fff" stroke="#46586e"/><path d="M19 3v5h5" fill="none" stroke="#46586e"/><path d="M21.5 13.5a6 6 0 1 1-1.8 7" fill="none" stroke="#2e9e4f" stroke-width="2.6" stroke-linecap="round"/><path d="M22.6 9.8l-.7 4.2-4-1.4z" fill="#2e9e4f"/></svg></span><span class="tlabel">Resume</span></button>
+  <button id="btnStop" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><path d="M11 4h10l7 7v10l-7 7H11l-7-7V11z" fill="#d2493b" stroke="#9e3226"/><rect x="12" y="12" width="8" height="8" fill="#fff"/></svg></span><span class="tlabel">Stop</span></button>
+  <button id="btnStopAll" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><path d="M13 2.5h8.5L27 8v8.5l-5.5 5.5H13L7.5 16.5V8z" fill="#e3e9f0" stroke="#9e3226"/><path d="M11 9h10l7 7v10l-7 7H11l-7-7V16z" fill="#d2493b" stroke="#9e3226" transform="translate(-1.5 1.5) scale(0.94)"/><rect x="12" y="13" width="8" height="8" fill="#fff"/></svg></span><span class="tlabel">Stop All</span></button>
   <span class="tool-sep"></span>
-  <button id="btnScheduler" class="tool">🗓 Scheduler</button>
-  <button id="btnOptions" class="tool">⚙ Options</button>
+  <button id="btnDelete" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><path d="M8 8h16l-1.6 19a2 2 0 0 1-2 1.8H11.6a2 2 0 0 1-2-1.8z" fill="#d9e1ea" stroke="#46586e"/><path d="M5 8h22M13 8V5.5A1.5 1.5 0 0 1 14.5 4h3A1.5 1.5 0 0 1 19 5.5V8" fill="none" stroke="#46586e" stroke-width="1.8"/><path d="M12.5 13v10M16 13v10M19.5 13v10" stroke="#46586e" stroke-width="1.4"/></svg></span><span class="tlabel">Delete</span></button>
+  <button id="btnDelDone" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><path d="M8 9h16l-1.6 18a2 2 0 0 1-2 1.8H11.6a2 2 0 0 1-2-1.8z" fill="#2f66b8" stroke="#1e4e96"/><path d="M5 9h22M13 9V6.5A1.5 1.5 0 0 1 14.5 5h3A1.5 1.5 0 0 1 19 6.5V9" fill="none" stroke="#1e4e96" stroke-width="1.8"/><path d="M11 19.5l3.4 3.4L21 15.5" fill="none" stroke="#8fe3a8" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="tlabel">Delete Completed</span></button>
+  <button id="btnOptions" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><defs><g id="gr"><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1"/><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1" transform="rotate(45)"/><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1" transform="rotate(90)"/><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1" transform="rotate(135)"/><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1" transform="rotate(180)"/><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1" transform="rotate(225)"/><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1" transform="rotate(270)"/><rect x="-1.7" y="-11.5" width="3.4" height="5.4" rx="1" transform="rotate(315)"/><circle r="7.4"/><circle r="3.2" fill="#edf1f6"/></g></defs><use href="#gr" transform="translate(12.5 12.5)" fill="#316ac5"/><use href="#gr" transform="translate(22 22) scale(0.6)" fill="#7c8da6"/></svg></span><span class="tlabel">Options</span></button>
+  <button id="btnScheduler" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><circle cx="8" cy="6.5" r="3" fill="#f2b33d" stroke="#b57e14"/><circle cx="24" cy="6.5" r="3" fill="#f2b33d" stroke="#b57e14"/><path d="M9.5 8.5L12 12M22.5 8.5L20 12" stroke="#2456a6" stroke-width="2"/><circle cx="16" cy="18" r="10.5" fill="#fff" stroke="#2456a6" stroke-width="2.4"/><path d="M16 12.5V18l4 2.4" fill="none" stroke="#46586e" stroke-width="2" stroke-linecap="round"/><path d="M11 27l-1.6 3M21 27l1.6 3" stroke="#2456a6" stroke-width="2" stroke-linecap="round"/></svg></span><span class="tlabel">Scheduler</span></button>
+  <div class="tool-split" id="wrapStartQueue">
+    <button id="btnStartQueue" class="tool split-main"><span class="tic"><svg viewBox="0 0 32 32"><path d="M8 3h13l5 5v21H8z" fill="#fff" stroke="#46586e"/><path d="M21 3v5h5" fill="none" stroke="#46586e"/><path d="M13.5 11.5l9 5.5-9 5.5z" fill="#2e9e4f" stroke="#1f7a3a"/></svg></span><span class="tlabel">Start Queue</span></button>
+    <button id="btnStartQueueMenu" class="tool split-arrow" title="Choose a queue">▼</button>
+    <div class="queue-drop hidden" id="startQueueDrop"></div>
+  </div>
+  <div class="tool-split" id="wrapStopQueue">
+    <button id="btnStopQueue" class="tool split-main"><span class="tic"><svg viewBox="0 0 32 32"><path d="M8 3h13l5 5v21H8z" fill="#fff" stroke="#46586e"/><path d="M21 3v5h5" fill="none" stroke="#46586e"/><rect x="12.5" y="12" width="9" height="9" fill="#d2493b" stroke="#9e3226"/></svg></span><span class="tlabel">Stop Queue</span></button>
+    <button id="btnStopQueueMenu" class="tool split-arrow" title="Choose a queue">▼</button>
+    <div class="queue-drop hidden" id="stopQueueDrop"></div>
+  </div>
+  <button id="btnGrabber" class="tool"><span class="tic"><svg viewBox="0 0 32 32"><circle cx="16" cy="16" r="11.5" fill="#cfe2f5" stroke="#2456a6" stroke-width="1.8"/><ellipse cx="16" cy="16" rx="5.5" ry="11.5" fill="none" stroke="#2456a6" stroke-width="1.3"/><path d="M4.7 12h22.6M4.7 20h22.6" stroke="#2456a6" stroke-width="1.3" fill="none"/><path d="M22 22.5a7.5 7.5 0 0 1 4 3.5" fill="none" stroke="#2e9e4f" stroke-width="2.2" stroke-linecap="round"/><path d="M27.4 22.4l-.6 4-3.4-2z" fill="#2e9e4f"/></svg></span><span class="tlabel">Grabber</span></button>
 </div>
+<!-- actions IDM keeps in menus and dialogs rather than on the
+     bar (Add Video, Pause for the detail dialog, Status) stay in
+     the DOM, hidden: menus, shortcuts and the detail dialog
+     drive them by id -->
+<button id="btnVideo" class="tool" hidden></button>
+<button id="btnPause" class="tool" hidden></button>
+<button id="btnStatus" class="tool" hidden></button>
 
 <div id="flashMsg" class="flash hidden"></div>
 
 <main class="layout">
-  <aside class="sidebar">
-    <div class="side-head">CATEGORIES</div>
-    <ul id="catList">
-      <li data-cat="All Downloads" class="active">◎ All Downloads</li>
-      <li data-cat="Compressed">🗜 Compressed</li>
-      <li data-cat="Documents">📄 Documents</li>
-      <li data-cat="Music">🎵 Music</li>
-      <li data-cat="Programs">⚙ Programs</li>
-      <li data-cat="Video">🎬 Video</li>
-      <li data-cat="General">📁 General</li>
-      <li data-cat="Unfinished">▸ Unfinished</li>
-      <li data-cat="Finished">✓ Finished</li>
-      <li data-cat="Grabber">↗ Grabber projects</li>
-    </ul>
-    <div class="side-head">QUEUES</div>
-    <ul id="queueList"></ul>
+  <aside class="sidebar" id="sidebar">
+    <div class="side-head"><span>Categories</span><button id="sideClose" class="side-close" title="Close the Categories pane">×</button></div>
+    <!-- IDM's single Win32-style tree: dotted connectors, [+]/[−]
+         boxes, per-node icons; the five file-type categories nest
+         under All Downloads (no "General" node in the tree), the
+         queues nest under their own Queues node. Node icons are
+         injected by app.js (TREE_ICONS) so static and dynamic
+         rows share one drawing. -->
+    <div class="tree" id="catTree">
+      <div class="trow" data-cat="All Downloads"><span class="tbox" id="allExpBox">−</span><span class="ticon"></span><span class="tlabel">All Downloads</span></div>
+      <div class="tchildren" id="allChildren">
+        <div class="trow tchild" data-cat="Compressed"><span class="ticon"></span><span class="tlabel">Compressed</span></div>
+        <div class="trow tchild" data-cat="Documents"><span class="ticon"></span><span class="tlabel">Documents</span></div>
+        <div class="trow tchild" data-cat="Music"><span class="ticon"></span><span class="tlabel">Music</span></div>
+        <div class="trow tchild" data-cat="Programs"><span class="ticon"></span><span class="tlabel">Programs</span></div>
+        <div class="trow tchild" data-cat="Video"><span class="ticon"></span><span class="tlabel">Video</span></div>
+      </div>
+      <div class="trow" data-cat="Unfinished"><span class="tbox ph"></span><span class="ticon"></span><span class="tlabel">Unfinished</span></div>
+      <div class="trow" data-cat="Finished"><span class="tbox ph"></span><span class="ticon"></span><span class="tlabel">Finished</span></div>
+      <div class="trow" data-cat="Grabber"><span class="tbox ph"></span><span class="ticon"></span><span class="tlabel">Grabber projects</span></div>
+      <div class="trow" id="queuesRow"><span class="tbox" id="queueExpBox">+</span><span class="ticon"></span><span class="tlabel">Queues</span></div>
+      <div class="tchildren hidden" id="queueChildren"></div>
+    </div>
   </aside>
 
   <section class="content">
@@ -132,21 +165,13 @@
       <tbody id="rows"></tbody>
     </table>
     </div>
-    <div id="emptyMsg" class="empty">No downloads yet — click “Add URL” to start one.</div>
+    <!-- IDM shows a blank white list when it is empty — no
+         placeholder text, and no bottom status bar: the list
+         runs to the window's bottom edge. The element stays in
+         the DOM (hidden) because render() toggles it. -->
+    <div id="emptyMsg" class="empty hidden"></div>
   </section>
 </main>
-
-<!-- IDM-style bottom status bar: file counts left, live totals
-     right (the same elements the header used to carry — ids and
-     the JS that fills them are unchanged) -->
-<footer class="statusbar">
-  <div id="sideStatus" class="side-status">0 files (0 downloading)</div>
-  <div class="title-stats">
-    <span id="totalSpeed">Total speed: 0 B/s</span>
-    <span class="sep">|</span>
-    <span id="limiterLabel">Speed Limiter: <b>OFF</b></span>
-  </div>
-</footer>
 
 <div id="detail" class="modal hidden">
   <div class="modal-card detail-modal">

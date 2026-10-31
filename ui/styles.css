@@ -1,142 +1,261 @@
 /* NDM — light theme by default, dark theme via [data-theme="dark"].
    All colors flow through variables so the toggle is a single attribute flip. */
 * { box-sizing: border-box; margin: 0; padding: 0; }
-/* IDM hubuhu reskin: the light theme is IDM's classic desktop
-   look — plain white/grey surfaces, flat standard controls, the
-   Windows highlight blue for selection, Tahoma-class font, tight
-   spacing. No gradients, no glass, no heavy rounding/shadows. */
+/* IDM hubuhu STRUCTURE (menubar, icon-over-label toolbar, tree,
+   8-column listview) with a DESIGNER FINISH on top: one colour
+   story — a deepened IDM-blue family over blue-tinted neutrals —
+   carried by three token layers (primitives → semantics →
+   component values below). Depth comes from hairline gradients
+   and soft shadows only: no glass, no blur, nothing that costs
+   the WebKitGTK renderer a frame. */
 :root {
-  --bg: #f0f0f0; --panel: #ffffff; --panel2: #f0f0f0; --line: #c6c6c6;
-  --text: #111111; --dim: #5a5a5a; --blue: #316ac5; --blue2: #316ac5;
+  /* primitives — the blue family + tinted slate neutrals */
+  --blue-700: #1e4e96; --blue-600: #2f66b8; --blue-500: #3574c8; --blue-400: #5b8bd4;
+  --blue-100: #dce9f7; --blue-50: #eef4fb;
+  --ink-900: #1d2a38; --ink-500: #5c6b7e; --ink-400: #8494a7;
+  --n-25: #f7f9fb; --n-50: #f2f5f8; --n-100: #e8ecf1; --n-200: #dfe5ec; --n-300: #c3cedb;
+  /* semantics */
+  --bg: #e8ecf1; --panel: #ffffff; --panel2: var(--n-50); --line: var(--n-300);
+  --line-soft: var(--n-200); --rail: var(--n-25);
+  --text: var(--ink-900); --dim: var(--ink-500); --blue: var(--blue-600); --blue2: var(--blue-500);
   --green: #2e7d4f; --yellow: #9c7200;
-  --title-bg: #f0f0f0; --hover: #e5f1fb; --th-bg: #f7f7f7;
-  --row-line: #e4e4e4; --row-hover: #eef5fc; --sel: #316ac5; --sel-hover: #2a5dab;
-  --track: #e0e0e0; --seg-bg: #f4f4f4; --input-bg: #ffffff;
+  --title-bg: #edf1f5; --hover: #e1ecf9; --th-bg: #edf1f6;
+  --row-line: #e5eaf0; --row-hover: var(--blue-50); --sel: var(--blue-600); --sel-hover: #2a5ca8;
+  --track: var(--n-200); --seg-bg: #f4f6f9; --input-bg: #ffffff;
   --bar-text: #ffffff; --bar-shadow: none;
-  --seg-done: #316ac5; --seg-active: #f5c542; --seg-active2: #c79a1d; --seg-pending: #d4d4d4;
-  --modal-shadow: 0 2px 10px rgba(0,0,0,.28);
+  --seg-done: var(--blue-500); --seg-active: #f2b33d; --seg-active2: #c79a1d; --seg-pending: #d3dae2;
+  /* component finish tokens */
+  --chrome-hi: #fcfdfe; --chrome-lo: #e7ecf2; --chrome-shine: rgba(255,255,255,.7);
+  --th-hi: #fdfdff; --th-lo: #e6ecf3;
+  --sel-hi: #3873c6; --sel-lo: #2a5ca8;
+  --btn-hi: #ffffff; --btn-lo: #edf1f5; --hover-line: #a9c6e8;
+  --ring: rgba(47,102,184,.35);
+  --menu-shadow: 0 10px 28px rgba(23,42,66,.16), 0 2px 6px rgba(23,42,66,.10);
+  --modal-shadow: 0 18px 44px rgba(23,42,66,.22), 0 3px 10px rgba(23,42,66,.12);
 }
 [data-theme="dark"] {
-  --bg: #232629; --panel: #2b2f33; --panel2: #31363b; --line: #3d4247;
-  --text: #e8eaed; --dim: #9aa3ab; --blue: #2f7fd1; --blue2: #4a9be8;
+  --bg: #21262d; --panel: #272c34; --panel2: #2e353f; --line: #424c59;
+  --line-soft: #333b45; --rail: #242a31;
+  --text: #e9edf2; --dim: #9fabb9; --blue: #3f8fe0; --blue2: #55a0ea;
   --green: #43b581; --yellow: #f5c542;
-  --title-bg: #1d1f22; --hover: #3c4249; --th-bg: #26292c;
-  --row-line: #2e3236; --row-hover: #2d3136; --sel: #274b73; --sel-hover: #2c5482;
-  --track: #1c1e20; --seg-bg: #1a1c1e; --input-bg: #1c1e20;
+  --title-bg: #1b1f24; --hover: #37424e; --th-bg: #232930;
+  --row-line: #2e353e; --row-hover: #2b333c; --sel: #2a5486; --sel-hover: #2f5c94;
+  --track: #1b1f24; --seg-bg: #191d21; --input-bg: #1b1f24;
   --bar-text: #ffffff; --bar-shadow: 0 1px 2px rgba(0,0,0,.6);
-  --seg-done: #3f9de0; --seg-active: #f5c542; --seg-active2: #a97e14; --seg-pending: #3a3f44;
-  --modal-shadow: 0 2px 10px rgba(0,0,0,.5);
+  --seg-done: #4a93e0; --seg-active: #f5c542; --seg-active2: #a97e14; --seg-pending: #3a3f44;
+  --chrome-hi: #2e353f; --chrome-lo: #232930; --chrome-shine: rgba(255,255,255,.05);
+  --th-hi: #2c333c; --th-lo: #22272e;
+  --sel-hi: #35679e; --sel-lo: #2a5486;
+  --btn-hi: #39424d; --btn-lo: #2c333b; --hover-line: var(--line);
+  --ring: rgba(85,160,234,.4);
+  --menu-shadow: 0 10px 28px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.4);
+  --modal-shadow: 0 18px 44px rgba(0,0,0,.55), 0 3px 10px rgba(0,0,0,.4);
 }
 html, body { height: 100%; }
 body {
   font-family: Tahoma, "Segoe UI", -apple-system, Roboto, "Noto Sans", Ubuntu, sans-serif;
-  background: var(--bg); color: var(--text); font-size: 12.5px;
+  background: var(--bg); color: var(--text); font-size: 11px;
   display: flex; flex-direction: column; overflow: hidden;
 }
 
-/* title bar + menu */
-.titlebar {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 7px 12px; background: var(--title-bg); border-bottom: 1px solid var(--line);
-}
-.app-title { font-weight: 600; font-size: 13.5px; letter-spacing: .2px; }
-.logo { color: var(--blue2); font-weight: 700; margin-right: 4px; }
-.title-right { display: flex; align-items: center; gap: 10px; }
-.title-stats { color: var(--dim); font-size: 12px; }
-.title-stats .sep { margin: 0 8px; opacity: .5; }
-.title-stats b { color: var(--text); }
-.theme-toggle {
-  background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-  border-radius: 2px; padding: 4px 11px; font-size: 12px; cursor: pointer;
-  transition: background .15s;
-}
-.theme-toggle:hover { background: var(--hover); }
+/* No in-page title bar (IDM 6.x): the OS title bar carries the
+   app name + version, and the menu bar is the client area's
+   first row. There is likewise NO bottom status bar — the file
+   list fills the window to its bottom edge. */
 
-/* toolbar */
+/* toolbar — IDM 6.x large buttons: a 32×32 icon CENTRED ABOVE
+   its 11px label, bar ≈ 64px tall, buttons flat on the bar
+   until hovered. Generic .tool below still serves the dialogs. */
 .toolbar {
-  display: flex; gap: 6px; align-items: center; padding: 8px 10px;
-  background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap;
+  display: flex; gap: 2px; align-items: stretch; padding: 3px 6px;
+  background: linear-gradient(to bottom, var(--chrome-hi), var(--chrome-lo));
+  border-bottom: 1px solid var(--line); flex-wrap: nowrap;
+  box-shadow: inset 0 1px 0 var(--chrome-shine), 0 1px 3px rgba(23,42,66,.05);
+  /* NO overflow clipping here: the split buttons' queue-picker
+     dropdowns hang below the bar and must paint over the list */
 }
+.toolbar .tool {
+  display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  gap: 3px; min-width: 60px; flex: none; padding: 4px 5px 3px;
+  background: transparent; border: 1px solid transparent; border-radius: 6px;
+  font-size: 11px; color: var(--text); cursor: pointer;
+  transition: background .18s ease, border-color .18s ease, box-shadow .18s ease;
+}
+.toolbar .tool .tic { display: block; width: 32px; height: 32px; flex: none; }
+.toolbar .tool .tic svg { display: block; width: 32px; height: 32px; }
+/* W-5: buttons size to their labels (IDM does the same) — the old
+   fixed 60px box ellipsized "Scheduler…", "Start Q…", "Delete …"
+   even with empty bar space to the right */
+.toolbar .tool .tlabel {
+  white-space: nowrap; line-height: 13px; letter-spacing: .01em;
+}
+.toolbar .tool:hover:not(:disabled) {
+  background: linear-gradient(to bottom, #ffffff, var(--hover));
+  border-color: var(--hover-line); box-shadow: 0 1px 2px rgba(23,42,66,.08);
+}
+[data-theme="dark"] .toolbar .tool:hover:not(:disabled) {
+  background: linear-gradient(to bottom, var(--btn-hi), var(--hover)); border-color: var(--line);
+}
+.toolbar .tool:active:not(:disabled) {
+  background: var(--hover); box-shadow: inset 0 1px 3px rgba(23,42,66,.14);
+}
+/* IDM's disabled treatment: the ICON goes greyscale and the
+   LABEL goes grey — the button itself is not faded */
+.toolbar .tool:disabled { opacity: 1; color: #808080; cursor: default; }
+.toolbar .tool:disabled .tic { filter: grayscale(1); }
+[data-theme="dark"] .toolbar .tool:disabled { color: #6f777e; }
+/* Start/Stop Queue split buttons: main half + narrow ▼ half */
+.tool-split { position: relative; display: flex; align-items: stretch; flex: none; }
+.toolbar .tool.split-arrow {
+  width: 13px; padding: 0 0 7px; font-size: 7px; color: var(--text);
+  align-items: center; justify-content: flex-end;
+}
+.queue-drop {
+  position: absolute; top: calc(100% + 2px); right: 0; min-width: 200px; z-index: 45;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  box-shadow: var(--menu-shadow); padding: 5px;
+  display: flex; flex-direction: column;
+}
+.queue-drop > button {
+  background: none; border: none; font: inherit; font-size: 11px; text-align: left;
+  padding: 5px 9px; border-radius: 4px; cursor: pointer; color: inherit; white-space: nowrap;
+  transition: background .15s ease;
+}
+.queue-drop > button:hover { background: var(--hover); }
+.queue-drop > button.cur { font-weight: 700; }
 .tool {
-  background: var(--panel2); color: var(--text); border: 1px solid var(--line);
-  border-radius: 2px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
-  transition: background .15s, transform .05s;
+  background: linear-gradient(to bottom, var(--btn-hi), var(--btn-lo));
+  color: var(--text); border: 1px solid var(--line);
+  border-radius: 4px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+  transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, transform .05s;
 }
-.tool:hover:not(:disabled) { background: var(--hover); }
+.tool:hover:not(:disabled) {
+  background: linear-gradient(to bottom, var(--btn-hi), var(--hover));
+  border-color: var(--hover-line); box-shadow: 0 1px 2px rgba(23,42,66,.08);
+}
 .tool:active:not(:disabled) { transform: translateY(1px); }
 .tool:disabled { opacity: .45; cursor: default; }
-/* the primary button is IDM's DEFAULT button: standard grey,
-   emphasised by its border and weight — not a coloured fill */
-.tool.primary { background: #e7e7e7; border-color: #7a7a7a; color: var(--text); font-weight: 600; }
-[data-theme="dark"] .tool.primary { background: #3c4249; border-color: #7d848c; }
-.tool.primary:hover { background: var(--hover); }
-.tool-sep { width: 1px; height: 22px; background: var(--line); margin: 0 4px; }
-/* IDM's toolbar buttons sit flat on the bar until hovered */
-.toolbar .tool { background: transparent; border-color: transparent; }
-.toolbar .tool.primary { background: transparent; border-color: transparent; color: var(--text); }
-.toolbar .tool:hover:not(:disabled) { background: var(--hover); border-color: #b9d7f2; }
-[data-theme="dark"] .toolbar .tool:hover:not(:disabled) { border-color: var(--line); }
+/* the primary button is the ONE accent moment in a dialog: the
+   deepened IDM blue as a soft vertical gradient, white label */
+.tool.primary {
+  background: linear-gradient(to bottom, #3a77c9, #2a5ca8);
+  border-color: var(--blue-700); color: #ffffff; font-weight: 600;
+  box-shadow: 0 1px 2px rgba(23,42,66,.18), inset 0 1px 0 rgba(255,255,255,.18);
+}
+.tool.primary:hover:not(:disabled) {
+  background: linear-gradient(to bottom, #4482d2, #2f66b8); border-color: var(--blue-700);
+}
+.tool-sep {
+  width: 1px; align-self: stretch; margin: 2px 4px; flex: none;
+  background: linear-gradient(to bottom, transparent, var(--line) 22%, var(--line) 78%, transparent);
+}
 
 /* layout */
 .layout { flex: 1; display: flex; min-height: 0; }
 .sidebar {
-  width: 188px; background: var(--panel); border-right: 1px solid var(--line);
+  width: 170px; flex: none; background: var(--rail); border-right: 1px solid var(--line);
   display: flex; flex-direction: column;
 }
+/* "Categories" in normal case on the rail face, × close at the
+   pane's right edge (IDM); the finish is weight + tracking only */
 .side-head {
-  display: flex; justify-content: space-between; padding: 8px 10px;
-  font-size: 11px; letter-spacing: 1px; color: var(--dim); border-bottom: 1px solid var(--line);
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 4px 4px 4px 8px; font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  color: var(--text); background: transparent;
 }
-.sidebar ul { list-style: none; padding: 6px; flex: 1; overflow-y: auto; }
-.sidebar li {
-  padding: 5px 9px; border-radius: 2px; cursor: pointer; color: var(--dim);
-  transition: background .15s, color .15s; white-space: nowrap;
+.side-close {
+  background: none; border: none; font: inherit; font-size: 12px; line-height: 1;
+  padding: 1px 4px; cursor: pointer; color: var(--dim); border-radius: 3px;
+  transition: background .15s ease, color .15s ease;
 }
-.sidebar li:hover { background: var(--panel2); color: var(--text); }
-.sidebar li.active { background: var(--blue); color: #fff; }
-.side-status { padding: 7px 10px; border-top: 1px solid var(--line); color: var(--dim); font-size: 11.5px; }
-/* the bottom status bar (IDM's main window ends in one): file
-   counts on the left, live totals on the right */
-.statusbar {
-  display: flex; justify-content: space-between; align-items: center; gap: 16px;
-  padding: 4px 10px; background: var(--panel2); border-top: 1px solid var(--line);
-  color: var(--dim); font-size: 12px;
+.side-close:hover { background: var(--hover); color: var(--text); }
+/* the categories tree — classic Win32 treeview: dotted connector
+   lines, small [+]/[−] boxes, ≈19px indent, 16×16 node icons,
+   ≈19px rows, selection behind the node's TEXT only */
+/* W-5: horizontal scroll stays available (classic treeviews do
+   the same) so an over-long queue name can be scrolled into view
+   instead of being cut off at the pane edge for good */
+.tree { flex: 1; overflow-y: auto; overflow-x: auto; padding: 2px 0 6px 4px; background: transparent; }
+.trow {
+  display: flex; align-items: center; height: 19px; padding-right: 4px;
+  cursor: pointer; white-space: nowrap; color: var(--text);
 }
-.statusbar .side-status { padding: 0; border-top: none; font-size: 12px; }
-.statusbar .title-stats { color: var(--dim); }
+.tbox {
+  flex: none; width: 9px; height: 9px; margin: 0 3px 0 1px; padding: 0;
+  border: 1px solid #93a3b5; background: var(--panel); color: #5c6b7e;
+  font-size: 8px; line-height: 1; cursor: pointer; border-radius: 2px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.tbox.ph { visibility: hidden; }
+.ticon { flex: none; width: 16px; height: 16px; margin-right: 4px; display: inline-flex; }
+.ticon svg { width: 16px; height: 16px; display: block; }
+.tlabel {
+  /* W-5: never shrink — a long queue name makes its ROW wider
+     than the pane and the tree's horizontal scroll (plus the
+     label's title tooltip) keeps the full name reachable,
+     instead of an ellipsis inside a too-narrow flex slot */
+  flex: none;
+  padding: 0 3px; border-radius: 3px;
+  transition: background .15s ease;
+}
+.trow:not(.sel):hover > .tlabel { background: var(--row-hover); }
+.trow.sel > .tlabel { background: linear-gradient(to bottom, var(--sel-hi), var(--sel-lo)); color: #fff; }
+.tchildren { margin-left: 9px; padding-left: 10px; border-left: 1px dotted #b7c7d9; }
+.tchildren .trow { position: relative; }
+.tchildren .trow::before {
+  content: ''; position: absolute; left: -11px; top: 50%; width: 9px;
+  border-top: 1px dotted #b7c7d9;
+}
 
 .content { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); }
 .grid-wrap { flex: 1; min-height: 0; overflow-y: auto; overflow-x: auto; }
 .grid thead th { position: sticky; top: 0; z-index: 1; }
-.grid { width: 100%; border-collapse: collapse; }
+.grid { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+/* classic raised listview header: token gradient, regular-weight
+   labels with a breath of tracking, hairline column separators;
+   the sorted column carries a small GREEN arrow glyph (IDM),
+   not a text ▲/▼ */
 .grid th {
-  text-align: left; font-weight: 600; color: var(--text); font-size: 12px;
-  padding: 5px 8px; border-bottom: 1px solid var(--line); background: var(--th-bg);
+  text-align: left; font-weight: 400; color: var(--text); font-size: 11px;
+  letter-spacing: .02em; padding: 3px 8px;
+  border-bottom: 1px solid var(--line); border-right: 1px solid var(--line-soft);
+  background: linear-gradient(to bottom, var(--th-hi), var(--th-lo));
+  box-shadow: inset 0 1px 0 var(--chrome-shine);
 }
-.grid td { padding: 5px 8px; border-bottom: 1px solid var(--row-line); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.grid th .sort-arrow { color: #2e9e4f; font-size: 8px; margin-left: 3px; }
+/* light gridlines in BOTH directions; ≈19px single-line rows.
+   The finish adds a whisper-quiet hover tint — anatomy and
+   density stay the classic listview's */
+.grid td {
+  padding: 2px 8px; line-height: 15px; font-size: 11px;
+  border-bottom: 1px solid var(--row-line); border-right: 1px solid var(--row-line);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 /* no max-width cap on the name column: the Columns dialog owns its
    width (a 340px CSS cap made the picker disagree with the list) */
-.grid tbody tr { cursor: pointer; transition: background .12s; }
+/* the file's own 16×16 type icon at the left of the name cell */
+.grid td.name .ficon { display: inline-flex; width: 16px; height: 16px; vertical-align: -3px; margin-right: 5px; }
+.grid td.name .ficon svg { width: 16px; height: 16px; display: block; }
+.grid td.qcell { text-align: center; }
+.grid tbody tr { cursor: default; }
 .grid tbody tr:hover { background: var(--row-hover); }
-.grid tbody tr.selected { background: var(--sel); }
-.grid tbody tr.selected:hover { background: var(--sel-hover); }
+.grid tbody tr.selected { background: linear-gradient(to bottom, var(--sel-hi), var(--sel-lo)); }
 /* IDM's selection is the solid highlight blue with WHITE text —
    including the status cell, whose state colour would otherwise
    fight the background */
 .grid tbody tr.selected td { color: #fff; }
-/* row progress bar: the fill child's width is set via the DOM after
-   render (see app.js) — inline-style percentages do not survive
-   this WebKit's parsing inside the list's innerHTML */
+/* progress bar used by DIALOGS (video setup, updater). The file
+   LIST has no in-row progress bar at all (IDM carries list
+   progress as Status-cell text), so nothing in the grid uses
+   this. The fill child's width is set via the DOM after render
+   (see app.js) — inline-style percentages do not survive this
+   WebKit's parsing inside innerHTML */
 .pbar { height: 5px; border-radius: 2px; margin-top: 4px; width: 150px; background: var(--track); overflow: hidden; }
 .pbar i { display: block; height: 100%; background: var(--blue2); border-radius: 2px; }
-.pbar.ind { background: linear-gradient(90deg, var(--track) 0%, var(--blue2) 50%, var(--track) 100%);
-  background-size: 200% 100%; animation: indslide3 1.1s linear infinite; }
-@keyframes indslide3 { from { background-position: 100% 0; } to { background-position: -100% 0; } }
 .bar #dBarFill.ind { width: 35%; animation: indslide2 1s ease-in-out infinite alternate; }
 @keyframes indslide2 { from { margin-left: 0; } to { margin-left: 65%; } }
-.st-downloading { color: var(--blue2); } .st-finished { color: var(--green); }
-.st-paused { color: var(--yellow); } .st-error { color: #d84a3a; } .st-queued { color: var(--dim); }
-.st-cancelled { color: var(--dim); }
+/* (status text in the list is plain black in every state — IDM
+   does not colour-code it — so there are no .st-* classes) */
 .empty { padding: 26px; text-align: center; color: var(--dim); }
 
 /* detail modal (IDM Download Status floating window) */
@@ -172,10 +291,15 @@ body {
 #segMap { width: 100%; height: 86px; background: var(--seg-bg); border: 1px solid var(--line); border-radius: 2px; }
 .detail-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
 .detail-btns button {
-  background: var(--panel); color: var(--text); border: 1px solid var(--line);
-  border-radius: 2px; padding: 5px 14px; cursor: pointer; transition: background .15s;
+  background: linear-gradient(to bottom, var(--btn-hi), var(--btn-lo));
+  color: var(--text); border: 1px solid var(--line);
+  border-radius: 4px; padding: 5px 14px; cursor: pointer;
+  transition: background .18s ease, border-color .18s ease;
 }
-.detail-btns button:hover:not(:disabled) { background: var(--hover); }
+.detail-btns button:hover:not(:disabled) {
+  background: linear-gradient(to bottom, var(--btn-hi), var(--hover));
+  border-color: var(--hover-line);
+}
 .detail-btns button:disabled { opacity: .45; cursor: default; }
 
 /* modal */
@@ -193,8 +317,8 @@ body {
      With auto margins the card centres when it fits and aligns to
      the top — fully scrollable — when it does not. */
   margin: auto;
-  width: 430px; background: var(--panel); border: 1px solid #8a8a8a;
-  border-radius: 3px; padding: 16px; box-shadow: var(--modal-shadow);
+  width: 430px; background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 16px; box-shadow: var(--modal-shadow);
   /* at the minimum window height a tall card (grabber, options) must
      scroll internally — centred overflow off both ends is a trap.
      The 60px pairs with the overlay's 48px top padding below. */
@@ -223,16 +347,19 @@ body {
    titles) is title text and keeps the title look. */
 .modal-head {
   font-weight: 600; font-size: 13px; display: flex; justify-content: space-between;
-  align-items: center; background: var(--panel2); border-bottom: 1px solid var(--line);
+  align-items: center; letter-spacing: .01em;
+  background: linear-gradient(to bottom, var(--chrome-hi), var(--chrome-lo));
+  border-bottom: 1px solid var(--line); border-radius: 7px 7px 0 0;
   margin: -16px -16px 12px; padding: 8px 12px;
 }
 .modal-head > span:last-child { cursor: pointer; color: var(--dim); font-size: 15px; line-height: 1; padding: 0 2px; }
 .modal-card label { display: block; color: var(--dim); margin-bottom: 11px; font-size: 12px; }
 .modal-card input {
-  width: 100%; margin-top: 4px; padding: 6px 8px; border-radius: 2px;
+  width: 100%; margin-top: 4px; padding: 6px 8px; border-radius: 4px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
 }
-.modal-card input:focus { border-color: var(--blue2); }
+.modal-card input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--ring); }
 /* radios and checkboxes are NOT text fields: the generic rule above
    gave them width:100%, padding and a top margin, so the circle
    rendered stretched/offset from its label and the click target no
@@ -244,24 +371,36 @@ body {
 .modal-card input.invalid { border-color: #d84a3a; }
 .cat-row { display: flex; gap: 6px; margin-top: 4px; }
 .cat-row select {
-  flex: 1; min-width: 0; padding: 6px 8px; border-radius: 2px;
+  flex: 1; min-width: 0; padding: 6px 8px; border-radius: 4px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
 }
-.cat-row select:focus { border-color: var(--blue2); }
+.cat-row select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--ring); }
 .cat-row button { flex: 0 0 auto; }
 .modal-btns { display: flex; gap: 6px; justify-content: flex-end; margin-top: 4px; }
 .modal-btns.left { justify-content: flex-start; align-items: center; margin-bottom: 10px; }
 .modal-card.wide { width: 520px; }
 /* ---------- menu bar ---------- */
-.menubar { display: flex; gap: 2px; padding: 3px 8px; background: var(--panel, #f4f6f8); border-bottom: 1px solid var(--line, #dde3e8); position: relative; z-index: 40; }
+.menubar {
+  display: flex; gap: 2px; padding: 2px 6px; position: relative; z-index: 40;
+  /* the menubar and toolbar are ONE chrome piece: same gradient,
+     no divider between them — the toolbar's bottom hairline is
+     the only line above the data */
+  background: linear-gradient(to bottom, var(--chrome-hi), var(--chrome-lo));
+  box-shadow: inset 0 1px 0 var(--chrome-shine);
+}
 .menu { position: relative; }
-.menu-btn { background: none; border: none; font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 2px; cursor: pointer; color: inherit; }
+.menu-btn {
+  background: none; border: none; font: inherit; font-size: 11px; padding: 3px 9px;
+  border-radius: 4px; cursor: pointer; color: inherit; letter-spacing: .01em;
+  transition: background .15s ease;
+}
 .menu-btn:hover, .menu-btn.open { background: var(--hover, rgba(90, 140, 200, .16)); }
-.menu-drop { position: absolute; top: calc(100% + 2px); left: 0; min-width: 264px; background: var(--panel, #fff); border: 1px solid var(--line, #dde3e8); border-radius: 3px; box-shadow: 0 4px 14px rgba(0, 0, 0, .18); padding: 4px; display: flex; flex-direction: column; }
-.menu-drop > button { display: flex; justify-content: space-between; align-items: center; gap: 18px; background: none; border: none; font: inherit; font-size: 13px; text-align: left; padding: 6px 10px; border-radius: 2px; cursor: pointer; color: inherit; white-space: nowrap; }
+.menu-drop { position: absolute; top: calc(100% + 2px); left: 0; min-width: 264px; background: var(--panel, #fff); border: 1px solid var(--line, #dde3e8); border-radius: 6px; box-shadow: var(--menu-shadow); padding: 5px; display: flex; flex-direction: column; }
+.menu-drop > button { display: flex; justify-content: space-between; align-items: center; gap: 18px; background: none; border: none; font: inherit; font-size: 11px; text-align: left; padding: 5px 9px; border-radius: 4px; cursor: pointer; color: inherit; white-space: nowrap; transition: background .15s ease; }
 .menu-drop > button:hover { background: var(--hover, rgba(90, 140, 200, .16)); }
-.menu-drop .mkey { opacity: .55; font-size: 12px; }
-.menu-sep { height: 1px; background: var(--line, #dde3e8); margin: 5px 4px; }
+.menu-drop .mkey { opacity: .55; font-size: 11px; }
+.menu-sep { height: 1px; background: var(--line-soft, #dde3e8); margin: 5px 4px; }
 body.no-side .sidebar { display: none; }
 .ta { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px; border: 1px solid var(--line, #ccd4dc); border-radius: 2px; background: var(--input-bg, #fff); color: inherit; resize: vertical; }
 .shortcuts div { display: flex; gap: 14px; padding: 5px 2px; font-size: 13.5px; }
@@ -359,19 +498,21 @@ body.no-side .sidebar { display: none; }
 .opt-row > span { flex: 0 0 168px; }
 .opt-row .opt-unit { flex: 0 0 auto; }
 .opt-row input, .opt-row select {
-  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 2px;
+  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 4px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
+  transition: border-color .15s ease, box-shadow .15s ease;
 }
-.opt-row input:focus, .opt-row select:focus { border-color: var(--blue2); }
+.opt-row input:focus, .opt-row select:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--ring); }
 /* fields gated off by their mode (Options proxy modes, N-01)
    read as inert, the way a disabled control does in IDM */
 .opt-row input:disabled, .opt-row select:disabled { opacity: .5; }
 .opt-row textarea {
-  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 2px;
+  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 4px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text);
   font: inherit; font-size: 13px; outline: none; resize: vertical;
+  transition: border-color .15s ease, box-shadow .15s ease;
 }
-.opt-row textarea:focus { border-color: var(--blue2); }
+.opt-row textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--ring); }
 /* a row whose label is a whole sentence (Scheduler power action):
    stack label over control so the dropdown gets the full card width
    and its value is never truncated */
@@ -442,7 +583,7 @@ body.no-side .sidebar { display: none; }
 
 /* audit additions: transient message + completion options */
 .flash {
-  margin: 8px 12px 0; padding: 8px 12px; border-radius: 2px;
+  margin: 8px 12px 0; padding: 8px 12px; border-radius: 6px;
   background: #fdecec; color: #a12622; border: 1px solid #f3c2c0;
   font-size: 13px;
 }
@@ -464,15 +605,16 @@ body.no-side .sidebar { display: none; }
 
 /* row right-click context menu (IDM-style) */
 .ctx-menu {
-  position: fixed; z-index: 90; min-width: 210px; padding: 4px;
+  position: fixed; z-index: 90; min-width: 210px; padding: 5px;
   background: var(--panel, #ffffff); color: inherit;
-  border: 1px solid var(--line, #ccd4db); border-radius: 3px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, .2);
+  border: 1px solid var(--line, #ccd4db); border-radius: 6px;
+  box-shadow: var(--menu-shadow);
 }
 .ctx-menu button {
   display: block; width: 100%; text-align: left; background: none;
   border: none; padding: 6px 10px; font: inherit; font-size: 13px;
-  cursor: pointer; border-radius: 2px; color: inherit;
+  cursor: pointer; border-radius: 4px; color: inherit;
+  transition: background .15s ease;
 }
 .ctx-menu button:hover:not(:disabled) { background: rgba(49, 106, 197, .14); }
 .ctx-menu button:disabled { opacity: .45; cursor: default; }
@@ -531,7 +673,8 @@ body.no-side .sidebar { display: none; }
 .col-row .col-name { flex: 1; }
 .col-row input[type="number"] { width: 70px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 2px; }
 .col-row input[type="checkbox"] { width: auto; margin: 0; }
-.toolbar.tb-small .tool { padding: 4px 8px; font-size: 12px; }
+.toolbar.tb-small .tool { min-width: 50px; font-size: 10px; }
+.toolbar.tb-small .tool .tic, .toolbar.tb-small .tool .tic svg { width: 22px; height: 22px; }
 .modal-btns.left { justify-content: flex-start; }
 
 /* the Options card is a fixed frame (N-02): title bar, tab strip
@@ -542,3 +685,41 @@ body.no-side .sidebar { display: none; }
 #omodal .modal-card { display: flex; flex-direction: column; overflow: hidden; }
 #omodal .opt-panel { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 #omodal .modal-head, #omodal .opt-tabs, #omodal .modal-btns { flex: none; }
+
+/* ---------- designer finish: global touches ----------
+   Keyboard focus is always visible (accent ring, offset so it
+   never eats the control's own border); text fields keep their
+   softer box-shadow ring instead of an outline. */
+:focus-visible:not(input):not(select):not(textarea) {
+  outline: 2px solid var(--blue); outline-offset: 1px;
+}
+/* thin, tinted scrollbars that belong to the colour story
+   instead of the renderer's default grey blocks */
+.grid-wrap::-webkit-scrollbar, .tree::-webkit-scrollbar,
+.modal-card::-webkit-scrollbar, .opt-panel::-webkit-scrollbar,
+.v-options::-webkit-scrollbar, .grab-list::-webkit-scrollbar,
+.col-list::-webkit-scrollbar, .s-files::-webkit-scrollbar,
+.detail-body::-webkit-scrollbar {
+  width: 10px; height: 10px;
+}
+.grid-wrap::-webkit-scrollbar-track, .tree::-webkit-scrollbar-track,
+.modal-card::-webkit-scrollbar-track, .opt-panel::-webkit-scrollbar-track,
+.v-options::-webkit-scrollbar-track, .grab-list::-webkit-scrollbar-track,
+.col-list::-webkit-scrollbar-track, .s-files::-webkit-scrollbar-track,
+.detail-body::-webkit-scrollbar-track { background: transparent; }
+.grid-wrap::-webkit-scrollbar-thumb, .tree::-webkit-scrollbar-thumb,
+.modal-card::-webkit-scrollbar-thumb, .opt-panel::-webkit-scrollbar-thumb,
+.v-options::-webkit-scrollbar-thumb, .grab-list::-webkit-scrollbar-thumb,
+.col-list::-webkit-scrollbar-thumb, .s-files::-webkit-scrollbar-thumb,
+.detail-body::-webkit-scrollbar-thumb {
+  background: var(--line); border: 2px solid var(--panel); border-radius: 6px;
+}
+.grid-wrap::-webkit-scrollbar-thumb:hover, .tree::-webkit-scrollbar-thumb:hover,
+.modal-card::-webkit-scrollbar-thumb:hover, .opt-panel::-webkit-scrollbar-thumb:hover,
+.v-options::-webkit-scrollbar-thumb:hover, .grab-list::-webkit-scrollbar-thumb:hover,
+.col-list::-webkit-scrollbar-thumb:hover, .s-files::-webkit-scrollbar-thumb:hover,
+.detail-body::-webkit-scrollbar-thumb:hover { background: var(--ink-400, #a9b8c8); }
+body { -webkit-font-smoothing: antialiased; }
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}

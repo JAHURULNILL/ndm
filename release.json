@@ -1,7 +1,7 @@
 {
- "deb_sha256": "b29566e3226cca2b56e73c9a6328ddf59b7e92338c8ba069d3278ffac590bc75",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.9.1/NDM_1.9.1_amd64.deb",
+ "deb_sha256": "304c968c78b3fa26761b7be0713b716e744a587fb16faad3dbcc285c9c299479",
+ "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v1.9.2/NDM_1.9.2_amd64.deb",
  "min_supported": "1.0.0",
- "notes": "Nill Download Manager 1.9.1 — a fixes release from a full audit of the app and the browser extension, every fix re-verified in live use. The Scheduler now starts Download Later files placed in a scheduled queue (before, they never started at all) and no longer pauses a download immediately after a schedule edit. Direct audio files are labelled with their real format, e.g. Audio Only (M4A). Deleting, cancelling and pause-resume no longer leave journal or partial files behind, and an errored download is recognised by the duplicate check so Retry resumes the same entry. The app also carries its full name from this release: Nill Download Manager.",
- "version": "1.9.1"
+ "notes": "Nill Download Manager 1.9.2 \u2014 the main window is rebuilt in Internet Download Manager's classic layout (toolbar, categories tree and columns) with a polished one-colour finish, and the browser flyout is now a full IDM-style download dialog: the video thumbnail and per-quality file sizes are back, with labelled Status, File size, Downloaded, Transfer rate and Time left rows, an expandable connections detail view, a Resume capability line, and a working per-file Speed Limiter tab. Downloads also start faster (stream resolution is cached and warmed ahead of the click), a file deleted from the list no longer returns after a restart (the app now runs as a single instance), every file carries a Last Try Date, and a resumed download shows live progress again. Every change was verified in live use and a full audit of the app and extension.",
+ "version": "1.9.2"
 }

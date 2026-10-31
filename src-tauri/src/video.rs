@@ -90,6 +90,81 @@ fn drastic_shrink(
     }
 }
 
+/// The container duration in `ffmpeg -i` text ("Duration:
+/// HH:MM:SS.xx, ..."), in seconds. None when unreported.
+fn duration_in_ffmpeg_info(text: &str) -> Option<f64> {
+    for line in text.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix("Duration: ") {
+            let token = rest.split(',').next()?.trim();
+            if token == "N/A" {
+                return None;
+            }
+            let mut parts = token.split(':');
+            let h: f64 = parts.next()?.parse().ok()?;
+            let m: f64 = parts.next()?.parse().ok()?;
+            let s: f64 = parts.next()?.parse().ok()?;
+            return Some(h * 3600.0 + m * 60.0 + s);
+        }
+    }
+    None
+}
+
+/// Run `ffmpeg -i` over a file and read its container duration.
+fn probe_duration_secs(path: &Path, components_dir: &Path) -> Option<f64> {
+    let ffmpeg = find_tool("ffmpeg", components_dir)?;
+    let out = Command::new(ffmpeg)
+        .args(["-hide_banner", "-i"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    duration_in_ffmpeg_info(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// W-2 finish-line contradiction check. `drastic_shrink` judges a
+/// merge against the RESOLVED streams; this judges the produced
+/// file against what the user was SHOWN and picked at add time —
+/// the chosen option's probed size and the page video's probed
+/// duration (0 = unknown, that half of the check then sits out).
+/// A plain contradiction — the delivered file runs half the
+/// expected length or less (or twice it), or lands under a quarter
+/// of the expected size — means a different stream than the one
+/// probed was delivered (the walkthrough's silent-substitution
+/// case), and the entry must say so instead of presenting a clean
+/// success. Deliberately NOT judged: the raw downloaded byte count
+/// (a padded container legitimately remuxes down to its media —
+/// R3-EXT-01), and the size half never applies to audio jobs,
+/// whose transcodes legitimately change size (only their duration
+/// is checked).
+fn contradiction_verdict(
+    expect_size: u64,
+    expect_duration: f64,
+    produced_size: u64,
+    produced_duration: Option<f64>,
+    audio: bool,
+) -> Option<String> {
+    if expect_duration >= 1.0 {
+        if let Some(d) = produced_duration {
+            if d >= 0.5 && (d < expect_duration * 0.5 || d > expect_duration * 2.0) {
+                return Some(format!(
+                    "the downloaded file runs about {}s but the page's video is about {}s — the wrong stream may have been delivered; please retry",
+                    d.round() as u64,
+                    expect_duration.round() as u64
+                ));
+            }
+        }
+    }
+    if !audio && expect_size > 0 && produced_size > 0 && produced_size.saturating_mul(4) < expect_size {
+        return Some(format!(
+            "the downloaded file is {produced_size} bytes but the quality you picked was about {expect_size} bytes — the wrong stream may have been delivered; please retry"
+        ));
+    }
+    None
+}
+
 /// Estimate a media file's true media payload in bytes from its
 /// `ffmpeg -i` text: the container duration × the sum of its
 /// streams' OWN bitrates. Per-stream bitrates describe the media
@@ -529,6 +604,14 @@ pub struct VideoJob {
     /// output file, kept on disk and recorded here, which the next
     /// resume finalizes instead of re-downloading everything
     merged_final: Mutex<Option<PathBuf>>,
+    /// what the user was shown and chose at add time: the picked
+    /// option's probed size in bytes and the page video's probed
+    /// duration in seconds (0 = unknown). The finish line
+    /// cross-checks the produced file against them (W-2): a
+    /// delivery that plainly contradicts the probed expectation is
+    /// surfaced as an error, never presented as a clean success.
+    expect_size: u64,
+    expect_duration: f64,
 }
 
 #[derive(Clone)]
@@ -540,7 +623,446 @@ struct DirectStream {
     referer: Option<String>,
 }
 
+/// A completed stream resolution: everything a job start needs to
+/// skip the yt-dlp resolve run. Stream URLs are signed and perishable,
+/// so resolutions are cached only briefly (see RESOLUTION_TTL) and the
+/// cache key covers every input that can change the result — the full
+/// page URL, the effective selector, the audio flag, the site login,
+/// a hash of its password (m-6: the login NAME alone used to key it,
+/// so a corrected password kept being served the resolution the wrong
+/// one produced), the proxy, and a hash of the cookie file's BYTES
+/// (a re-login or a refreshed session changes the bytes, so it can
+/// never be served a resolution made under the old cookies). A cached
+/// resolution can therefore only be wrong if the STREAM URL itself
+/// died inside the TTL window — and that case is already handled: the
+/// engine's start or stream error path falls back to the yt-dlp
+/// download, which re-resolves independently. A stale hit can cost
+/// one fast failed engine attempt, never a wrong file.
+#[derive(Clone)]
+struct Resolution {
+    title: String,
+    streams: Vec<DirectStream>,
+    expect_audio: bool,
+    expected_media: Option<u64>,
+    pair_audio_url: Option<String>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ResolutionKey {
+    url: String,
+    sel: String,
+    audio: bool,
+    login: String,
+    password_sig: u64,
+    cookies_sig: u64,
+    proxy: String,
+}
+
+/// FNV-1a over the password's bytes — the cache key must change when
+/// the password does, without ever holding the password itself. The
+/// empty password hashes to the same sentinel family as a missing
+/// cookie file: 0, which no real password's hash is remapped to.
+fn password_signature(password: &str) -> u64 {
+    if password.is_empty() {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in password.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// How long a resolution stays reusable. Signed CDN URLs live for
+/// hours; ten minutes is deliberately far inside that, while still
+/// covering the flows that re-resolve today: pause-killed yt-dlp
+/// jobs, error retries, restored entries after an app restart, a
+/// repeat add of the same quality, and a click that follows a
+/// flyout-open warm resolve (see warm_resolution).
+const RESOLUTION_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const RESOLUTION_CACHE_CAP: usize = 64;
+
+static RESOLUTION_CACHE: Mutex<Vec<(ResolutionKey, Instant, Resolution)>> =
+    Mutex::new(Vec::new());
+
+/// Content signature of the cookie file a resolution was made with:
+/// FNV-1a over its bytes. No file and an unreadable file get distinct
+/// sentinels so neither can alias a real (or empty) file's hash.
+fn cookies_signature(cookies: Option<&Path>) -> u64 {
+    let Some(p) = cookies else { return 0 };
+    let Ok(bytes) = std::fs::read(p) else {
+        return u64::MAX;
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn resolution_cache_get(key: &ResolutionKey, now: Instant) -> Option<Resolution> {
+    let mut cache = RESOLUTION_CACHE.lock().unwrap();
+    cache.retain(|(_, at, _)| now.duration_since(*at) < RESOLUTION_TTL);
+    cache
+        .iter()
+        .find(|(k, _, _)| k == key)
+        .map(|(_, _, r)| r.clone())
+}
+
+fn resolution_cache_store(key: ResolutionKey, res: Resolution, now: Instant) {
+    let mut cache = RESOLUTION_CACHE.lock().unwrap();
+    cache.retain(|(k, at, _)| k != &key && now.duration_since(*at) < RESOLUTION_TTL);
+    cache.push((key, now, res));
+    while cache.len() > RESOLUTION_CACHE_CAP {
+        cache.remove(0);
+    }
+}
+
+/// The full outcome of one yt-dlp resolve run. `resolved` is None
+/// when the selection is not eligible for the parallel engine (the
+/// caller then takes the yt-dlp download path) — the learned fields
+/// are still meaningful in that case and the job wrapper applies
+/// them exactly as the inline code did before this split.
+struct ResolutionProbe {
+    expect_audio: bool,
+    pair_audio_url: Option<String>,
+    expected_media: Option<u64>,
+    resolved: Option<(String, Vec<DirectStream>)>,
+}
+
+/// True when a yt-dlp format is a playlist (HLS/DASH) rather than
+/// a directly downloadable media file.
+fn format_is_playlist(f: &serde_json::Value) -> bool {
+    let proto = f["protocol"].as_str().unwrap_or("");
+    if proto.contains("m3u8") || proto.contains("dash") {
+        return true;
+    }
+    let u = f["url"].as_str().unwrap_or("").to_ascii_lowercase();
+    u.contains(".m3u8") || u.contains(".mpd")
+}
+
+/// The best DIRECT media format in a probe's full format list —
+/// the page's own `<video>` file, as opposed to a playlist variant
+/// a script or a CDN ladder offered alongside it. None when the
+/// list holds no direct video file. Ranking follows the app's
+/// usual preference: avc-in-mp4 first, then height, then bitrate.
+fn best_direct_format<'a>(v: &'a serde_json::Value) -> Option<&'a serde_json::Value> {
+    let formats = v["formats"].as_array()?;
+    let mut best: Option<(&serde_json::Value, (u8, u64, u64))> = None;
+    for f in formats {
+        if format_is_playlist(f) {
+            continue;
+        }
+        let proto = f["protocol"].as_str().unwrap_or("");
+        if proto != "http" && proto != "https" {
+            continue;
+        }
+        let u = f["url"].as_str().unwrap_or("");
+        if !u.starts_with("http://") && !u.starts_with("https://") {
+            continue;
+        }
+        let ext = f["ext"].as_str().unwrap_or("");
+        if !matches!(ext, "mp4" | "webm" | "mkv" | "mov") {
+            continue;
+        }
+        // an entry that DECLARES itself audio-only is not the
+        // page's video; undeclared codecs (generic pages) pass
+        let vc = f["vcodec"].as_str().unwrap_or("");
+        if vc == "none" {
+            continue;
+        }
+        if f["format_id"].as_str().unwrap_or("").contains("storyboard") {
+            continue;
+        }
+        let avc_mp4 = u8::from(ext == "mp4" && vc.starts_with("avc"));
+        let height = f["height"].as_u64().unwrap_or(0);
+        let tbr = f["tbr"].as_f64().unwrap_or(0.0) as u64;
+        let rank = (avc_mp4, height, tbr);
+        if best.map(|(_, r)| rank > r).unwrap_or(true) {
+            best = Some((f, rank));
+        }
+    }
+    best.map(|(f, _)| f)
+}
+
+/// One yt-dlp `-j -f <sel>` run against `url`, parsed into a
+/// ResolutionProbe. Free-standing (no job) so the flyout's warm
+/// resolve can populate the cache before any job exists.
+#[allow(clippy::too_many_arguments)]
+fn resolve_streams_core(
+    url: &str,
+    sel: &str,
+    audio: bool,
+    cookies: Option<&Path>,
+    login: &str,
+    password: &str,
+    ytdlp: &Path,
+    components_dir: &Path,
+) -> Option<ResolutionProbe> {
+    let mut args = base_args_for_url(url, components_dir, cookies);
+    if !login.is_empty() {
+        args.push("--username".into());
+        args.push(login.to_string());
+        args.push("--password".into());
+        args.push(password.to_string());
+    }
+    args.push("-j".into());
+    args.push("-f".into());
+    args.push(sel.to_string());
+    args.push("--".into());
+    args.push(url.to_string());
+
+    let out = Command::new(ytdlp)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))?
+        .to_string();
+    let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+    let resolved_title = v["title"].as_str().unwrap_or("").to_string();
+    let mut formats: Vec<&serde_json::Value> = match v["requested_formats"].as_array() {
+        Some(arr) if !arr.is_empty() => arr.iter().collect(),
+        _ => vec![&v],
+    };
+    // W-2: a page's own direct media source outranks an indirect
+    // variant. When the app's best-quality selection resolved to
+    // playlist streams only — the shape a page gets when a script
+    // planted an HLS/DASH variant next to a plain <video> element —
+    // while the probe's full format list holds a direct media file
+    // for the same content, the direct file is what the user means
+    // by "this video": resolve THAT for the engine instead of
+    // letting the yt-dlp fallback fetch the variant. Explicit
+    // per-quality selectors keep yt-dlp's own choice — the user
+    // picked that variant deliberately.
+    if !audio && sel == ndm::video_probe::best_selector() {
+        let selection_is_playlist =
+            !formats.is_empty() && formats.iter().all(|f| format_is_playlist(f));
+        if selection_is_playlist {
+            if let Some(direct) = best_direct_format(&v) {
+                formats = vec![direct];
+            }
+        }
+    }
+    // Learn what this download SHOULD contain before any early
+    // return below can lose the information: whether the chosen
+    // formats carry sound, and — for HLS sources whose sound is a
+    // separate rendition in the master playlist — where it lives.
+    let any_audio = formats.iter().any(|f| {
+        let ac = f["acodec"].as_str().unwrap_or("none");
+        !ac.is_empty() && ac != "none"
+    });
+    let mut pair_audio_url: Option<String> = None;
+    if !any_audio && !audio {
+        let clean_url = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let is_hls = clean_url.ends_with(".m3u8")
+            || formats
+                .iter()
+                .any(|f| f["protocol"].as_str().unwrap_or("").contains("m3u8"));
+        if is_hls {
+            let hdr = &formats[0]["http_headers"];
+            let cookie = hdr["Cookie"]
+                .as_str()
+                .or_else(|| hdr["cookie"].as_str())
+                .unwrap_or("")
+                .to_string();
+            let referer = hdr["Referer"]
+                .as_str()
+                .or_else(|| hdr["referer"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(u) = ndm::video_probe::fetch_hls_default_audio(url, &referer, &cookie) {
+                pair_audio_url = Some(u);
+            }
+        }
+    }
+    if formats.is_empty() || formats.len() > 2 {
+        return Some(ResolutionProbe {
+            expect_audio: any_audio,
+            pair_audio_url,
+            expected_media: None,
+            resolved: None,
+        });
+    }
+    // Learn the selected streams' combined media payload for
+    // the finish-line guard (see the field's note): recorded
+    // only when every selected format reported a bitrate.
+    // (Recorded before the stream checks below on purpose: if
+    // this resolution is rejected, the yt-dlp fallback still
+    // downloads this same selection, so the estimate stands.)
+    let expected_media =
+        formats_media_bytes(v["duration"].as_f64().unwrap_or(0.0), &formats);
+    let mut streams = Vec::new();
+    let mut saw_vcodec = false;
+    let mut any_video = false;
+    for f in formats {
+        let proto = f["protocol"].as_str().unwrap_or("");
+        if proto != "https" && proto != "http" {
+            return Some(ResolutionProbe {
+                expect_audio: any_audio,
+                pair_audio_url,
+                expected_media,
+                resolved: None,
+            });
+        }
+        let u = f["url"].as_str().unwrap_or("");
+        if !u.starts_with("http://") && !u.starts_with("https://") {
+            return Some(ResolutionProbe {
+                expect_audio: any_audio,
+                pair_audio_url,
+                expected_media,
+                resolved: None,
+            });
+        }
+        let lower = u.to_ascii_lowercase();
+        if lower.contains(".m3u8") || lower.contains(".mpd") {
+            return Some(ResolutionProbe {
+                expect_audio: any_audio,
+                pair_audio_url,
+                expected_media,
+                resolved: None,
+            });
+        }
+        // The extension comes from the network: keep it a plain
+        // short token before it is ever used inside a file path.
+        let raw_ext = f["ext"].as_str().unwrap_or("mp4");
+        let cleaned: String = raw_ext
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .take(5)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let ext = if cleaned.len() < 2 {
+            "mp4".to_string()
+        } else {
+            cleaned
+        };
+        let has_audio = {
+            let ac = f["acodec"].as_str().unwrap_or("none");
+            !ac.is_empty() && ac != "none"
+        };
+        {
+            let vc = f["vcodec"].as_str().unwrap_or("");
+            if !vc.is_empty() {
+                saw_vcodec = true;
+                if vc != "none" {
+                    any_video = true;
+                }
+            }
+        }
+        let headers = &f["http_headers"];
+        let cookie = headers["Cookie"]
+            .as_str()
+            .or_else(|| headers["cookie"].as_str())
+            .map(|s| s.to_string());
+        let referer = headers["Referer"]
+            .as_str()
+            .or_else(|| headers["referer"].as_str())
+            .map(|s| s.to_string());
+        streams.push(DirectStream {
+            url: u.to_string(),
+            ext,
+            has_audio,
+            cookie,
+            referer,
+        });
+    }
+    if !audio && saw_vcodec && !any_video {
+        // Defensive guard: the selector resolved to an
+        // audio-only set for a VIDEO job (every format declares
+        // vcodec "none"). The parallel engine would download
+        // the whole set and only fail at the finish line
+        // ("no playable video stream") — refuse here instead,
+        // so the caller falls back to yt-dlp, which re-resolves
+        // independently. Formats that declare no codec info at
+        // all (saw_vcodec == false) keep the old behaviour.
+        return Some(ResolutionProbe {
+            expect_audio: any_audio,
+            pair_audio_url,
+            expected_media,
+            resolved: None,
+        });
+    }
+    Some(ResolutionProbe {
+        expect_audio: any_audio,
+        pair_audio_url,
+        expected_media,
+        resolved: Some((resolved_title, streams)),
+    })
+}
+
+/// Resolve a page URL + selector in the background and cache the
+/// result, so the download click that follows (seconds later, once
+/// the user picks a quality in the flyout) starts without paying a
+/// second yt-dlp run. Called on a dedicated thread by the incoming
+/// queue drain for {"kind":"warm"} lines; a no-op when a fresh
+/// resolution for the same key already exists.
+pub fn warm_resolution(
+    url: &str,
+    sel: &str,
+    audio: bool,
+    cookies: Option<PathBuf>,
+    login: &str,
+    password: &str,
+    components_dir: &Path,
+) {
+    let key = ResolutionKey {
+        url: url.to_string(),
+        sel: sel.to_string(),
+        audio,
+        login: login.to_string(),
+        password_sig: password_signature(password),
+        cookies_sig: cookies_signature(cookies.as_deref()),
+        proxy: ndm::global_proxy(),
+    };
+    if resolution_cache_get(&key, Instant::now()).is_some() {
+        return;
+    }
+    let Some(ytdlp) = find_tool("yt-dlp", components_dir) else {
+        return;
+    };
+    let Some(probe) = resolve_streams_core(
+        url,
+        sel,
+        audio,
+        cookies.as_deref(),
+        login,
+        password,
+        &ytdlp,
+        components_dir,
+    ) else {
+        return;
+    };
+    if let Some((title, streams)) = probe.resolved {
+        resolution_cache_store(
+            key,
+            Resolution {
+                title,
+                streams,
+                expect_audio: probe.expect_audio,
+                expected_media: probe.expected_media,
+                pair_audio_url: probe.pair_audio_url,
+            },
+            Instant::now(),
+        );
+    }
+}
+
 impl VideoJob {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         url: &str,
         dir: &Path,
@@ -551,6 +1073,8 @@ impl VideoJob {
         login: &str,
         password: &str,
         components_dir: &Path,
+        expect_size: u64,
+        expect_duration: f64,
     ) -> Result<Arc<VideoJob>, String> {
         let initial_stem = {
             let s = safe_filename_stem(title);
@@ -589,6 +1113,8 @@ impl VideoJob {
             login: login.to_string(),
             password: password.to_string(),
             merged_final: Mutex::new(None),
+            expect_size,
+            expect_duration,
         });
         job.spawn(components_dir)?;
         Ok(job)
@@ -613,6 +1139,20 @@ impl VideoJob {
         unique
     }
 
+    /// The cache key for this job's resolution under `sel`: every
+    /// input that can change which streams yt-dlp would pick.
+    fn resolution_key(&self, sel: &str) -> ResolutionKey {
+        ResolutionKey {
+            url: self.url.clone(),
+            sel: sel.to_string(),
+            audio: self.audio,
+            login: self.login.clone(),
+            password_sig: password_signature(&self.password),
+            cookies_sig: cookies_signature(self.cookies.as_deref()),
+            proxy: ndm::global_proxy(),
+        }
+    }
+
     /// Resolve direct HTTP(S) stream URLs via yt-dlp JSON so we can download
     /// them over NDM's 32-connection parallel Rust engine instead of yt-dlp's
     /// single-threaded Python HTTP loop.
@@ -622,168 +1162,30 @@ impl VideoJob {
         components_dir: &Path,
         sel: &str,
     ) -> Option<(String, Vec<DirectStream>)> {
-        let mut args = base_args_for_url(&self.url, components_dir, self.cookies.as_deref());
-        if !self.login.is_empty() {
-            args.push("--username".into());
-            args.push(self.login.clone());
-            args.push("--password".into());
-            args.push(self.password.clone());
-        }
-        args.push("-j".into());
-        args.push("-f".into());
-        args.push(sel.to_string());
-        args.push("--".into());
-        args.push(self.url.clone());
-
-        let out = Command::new(ytdlp)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let line = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find(|l| l.trim_start().starts_with('{'))?
-            .to_string();
-        let v: serde_json::Value = serde_json::from_str(&line).ok()?;
-        let resolved_title = v["title"].as_str().unwrap_or("").to_string();
-        let formats: Vec<&serde_json::Value> = match v["requested_formats"].as_array() {
-            Some(arr) if !arr.is_empty() => arr.iter().collect(),
-            _ => vec![&v],
-        };
-        // Learn what this download SHOULD contain before any early
-        // return below can lose the information: whether the chosen
-        // formats carry sound, and — for HLS sources whose sound is a
-        // separate rendition in the master playlist — where it lives.
-        {
-            let any_audio = formats.iter().any(|f| {
-                let ac = f["acodec"].as_str().unwrap_or("none");
-                !ac.is_empty() && ac != "none"
-            });
-            *self.expect_audio.lock().unwrap() = any_audio;
-            if !any_audio && !self.audio {
-                let clean_url = self
-                    .url
-                    .split(['?', '#'])
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                let is_hls = clean_url.ends_with(".m3u8")
-                    || formats
-                        .iter()
-                        .any(|f| f["protocol"].as_str().unwrap_or("").contains("m3u8"));
-                if is_hls {
-                    let hdr = &formats[0]["http_headers"];
-                    let cookie = hdr["Cookie"]
-                        .as_str()
-                        .or_else(|| hdr["cookie"].as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let referer = hdr["Referer"]
-                        .as_str()
-                        .or_else(|| hdr["referer"].as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if let Some(u) = ndm::video_probe::fetch_hls_default_audio(
-                        &self.url,
-                        &referer,
-                        &cookie,
-                    ) {
-                        *self.pair_audio_url.lock().unwrap() = Some(u);
-                    }
-                }
-            }
-        }
-        if formats.is_empty() || formats.len() > 2 {
-            return None;
-        }
-        // Learn the selected streams' combined media payload for
-        // the finish-line guard (see the field's note): recorded
-        // only when every selected format reported a bitrate.
-        // (Recorded before the stream checks below on purpose: if
-        // this resolution is rejected, the yt-dlp fallback still
-        // downloads this same selection, so the estimate stands.)
-        if let Some(bytes) =
-            formats_media_bytes(v["duration"].as_f64().unwrap_or(0.0), &formats)
-        {
-            *self.expected_media.lock().unwrap() = Some(bytes);
-        }
-        let mut streams = Vec::new();
-        let mut saw_vcodec = false;
-        let mut any_video = false;
-        for f in formats {
-            let proto = f["protocol"].as_str().unwrap_or("");
-            if proto != "https" && proto != "http" {
-                return None;
-            }
-            let u = f["url"].as_str().unwrap_or("");
-            if !u.starts_with("http://") && !u.starts_with("https://") {
-                return None;
-            }
-            let lower = u.to_ascii_lowercase();
-            if lower.contains(".m3u8") || lower.contains(".mpd") {
-                return None;
-            }
-            // The extension comes from the network: keep it a plain
-            // short token before it is ever used inside a file path.
-            let raw_ext = f["ext"].as_str().unwrap_or("mp4");
-            let cleaned: String = raw_ext
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric())
-                .take(5)
-                .collect::<String>()
-                .to_ascii_lowercase();
-            let ext = if cleaned.len() < 2 {
-                "mp4".to_string()
-            } else {
-                cleaned
-            };
-            let has_audio = {
-                let ac = f["acodec"].as_str().unwrap_or("none");
-                !ac.is_empty() && ac != "none"
-            };
-            {
-                let vc = f["vcodec"].as_str().unwrap_or("");
-                if !vc.is_empty() {
-                    saw_vcodec = true;
-                    if vc != "none" {
-                        any_video = true;
-                    }
-                }
-            }
-            let headers = &f["http_headers"];
-            let cookie = headers["Cookie"]
-                .as_str()
-                .or_else(|| headers["cookie"].as_str())
-                .map(|s| s.to_string());
-            let referer = headers["Referer"]
-                .as_str()
-                .or_else(|| headers["referer"].as_str())
-                .map(|s| s.to_string());
-            streams.push(DirectStream {
-                url: u.to_string(),
-                ext,
-                has_audio,
-                cookie,
-                referer,
-            });
-        }
-        if !self.audio && saw_vcodec && !any_video {
-            // Defensive guard: the selector resolved to an
-            // audio-only set for a VIDEO job (every format declares
-            // vcodec "none"). The parallel engine would download
-            // the whole set and only fail at the finish line
-            // ("no playable video stream") — refuse here instead,
-            // so the caller falls back to yt-dlp, which re-resolves
-            // independently. Formats that declare no codec info at
-            // all (saw_vcodec == false) keep the old behaviour.
-            return None;
-        }
-        Some((resolved_title, streams))
+        let probe = resolve_streams_core(
+            &self.url,
+            sel,
+            self.audio,
+            self.cookies.as_deref(),
+            &self.login,
+            &self.password,
+            ytdlp,
+            components_dir,
+        )?;
+        // The learned fields are applied even when the selection
+        // turns out ineligible for the engine: the yt-dlp fallback
+        // downloads this same selection, so its guards still need
+        // them. They are applied UNCONDITIONALLY (m-7): this probe
+        // describes THIS selection, so a field it does not report
+        // must CLEAR the value a previous selection left behind —
+        // the old conditional writes let a fresh probe inherit the
+        // earlier selector's pair_audio_url / expected_media, and
+        // the cache store in run_parallel_engine then persisted
+        // those stale fields under the new selection's key.
+        *self.expect_audio.lock().unwrap() = probe.expect_audio;
+        *self.pair_audio_url.lock().unwrap() = probe.pair_audio_url.clone();
+        *self.expected_media.lock().unwrap() = probe.expected_media;
+        probe.resolved
     }
 
     fn run_parallel_engine(
@@ -794,10 +1196,40 @@ impl VideoJob {
         sel: &str,
         my_gen: u64,
     ) -> bool {
-        let Some((resolved_title, streams)) =
-            self.resolve_direct_streams(ytdlp, components_dir, sel)
-        else {
-            return false;
+        // A fresh cached resolution for this exact URL + selector +
+        // cookie set (left by an earlier start of the same selection
+        // or by the flyout's warm resolve) skips the yt-dlp run
+        // entirely — that run is the whole click-to-first-byte wait.
+        // A miss resolves live and leaves its result behind.
+        let res_key = self.resolution_key(sel);
+        let (resolved_title, streams) = match resolution_cache_get(&res_key, Instant::now()) {
+            Some(res) => {
+                // a cache hit defines this selection's learned
+                // state completely (m-7): assign, never merge with
+                // whatever a previous selection left on the job
+                *self.expect_audio.lock().unwrap() = res.expect_audio;
+                *self.expected_media.lock().unwrap() = res.expected_media;
+                *self.pair_audio_url.lock().unwrap() = res.pair_audio_url.clone();
+                (res.title, res.streams)
+            }
+            None => {
+                let Some(fresh) = self.resolve_direct_streams(ytdlp, components_dir, sel)
+                else {
+                    return false;
+                };
+                resolution_cache_store(
+                    res_key,
+                    Resolution {
+                        title: fresh.0.clone(),
+                        streams: fresh.1.clone(),
+                        expect_audio: *self.expect_audio.lock().unwrap(),
+                        expected_media: *self.expected_media.lock().unwrap(),
+                        pair_audio_url: self.pair_audio_url.lock().unwrap().clone(),
+                    },
+                    Instant::now(),
+                );
+                fresh
+            }
         };
         // The resolved streams are the ground truth for what the
         // merged file must contain (the finish-line guard reads this).
@@ -1178,9 +1610,18 @@ impl VideoJob {
                     } else {
                         None
                     };
-                    let finished_now = shrink.is_none();
+                    // W-2: a merge that passes the media-payload
+                    // guard can still contradict what the user was
+                    // shown at add time (a different stream than
+                    // the one probed) — that is an error too, never
+                    // a clean success
+                    let verdict = match shrink {
+                        Some(msg) => Some(msg),
+                        None => self.finish_contradiction(&verified, flen, components_dir),
+                    };
+                    let finished_now = verdict.is_none();
                     let mut p = self.progress.lock().unwrap();
-                    if let Some(msg) = shrink {
+                    if let Some(msg) = verdict {
                         // keep the true downloaded total; a
                         // drastically smaller deliverable is a
                         // visible error, not a silent success
@@ -1224,6 +1665,33 @@ impl VideoJob {
         } else {
             false
         }
+    }
+
+    /// The W-2 contradiction check for one produced file: compares
+    /// it against this job's add-time expectations (see
+    /// `contradiction_verdict`). Skips itself entirely when nothing
+    /// was probed at add time.
+    fn finish_contradiction(
+        &self,
+        produced: &Path,
+        produced_len: u64,
+        components_dir: &Path,
+    ) -> Option<String> {
+        if self.expect_size == 0 && self.expect_duration <= 0.0 {
+            return None;
+        }
+        let produced_duration = if self.expect_duration > 0.0 {
+            probe_duration_secs(produced, components_dir)
+        } else {
+            None
+        };
+        contradiction_verdict(
+            self.expect_size,
+            self.expect_duration,
+            produced_len,
+            produced_duration,
+            self.audio,
+        )
     }
 
     /// The silent-video guard. A video download is only "finished" when
@@ -1495,8 +1963,14 @@ impl VideoJob {
                             } else {
                                 None
                             };
+                            // W-2: same add-time contradiction
+                            // check as the fresh-merge finalize
+                            let verdict = match shrink {
+                                Some(msg) => Some(msg),
+                                None => job.finish_contradiction(&verified, flen, &comp_dir),
+                            };
                             let mut p = job.progress.lock().unwrap();
-                            if let Some(msg) = shrink {
+                            if let Some(msg) = verdict {
                                 p.status = "error".to_string();
                                 p.error = Some(msg);
                                 p.speed_bps = 0.0;
@@ -1766,7 +2240,18 @@ impl VideoJob {
                     .or_else(|| find_final_file(&job.dir, &before, job.audio, &stem_hint));
                 match found {
                     Some(fp) => match job.ensure_audio(&fp, &comp_dir) {
-                        Ok(verified) => Outcome::Finished(verified),
+                        Ok(verified) => {
+                            // W-2: the produced file must also
+                            // match what was probed at add time —
+                            // a plain contradiction is reported
+                            // through the guard-error outcome, not
+                            // presented as a clean finish
+                            let flen = verified.metadata().map(|m| m.len()).unwrap_or(0);
+                            match job.finish_contradiction(&verified, flen, &comp_dir) {
+                                Some(msg) => Outcome::GuardError(verified, msg),
+                                None => Outcome::Finished(verified),
+                            }
+                        }
                         Err(msg) => Outcome::GuardError(fp, msg),
                     },
                     None => Outcome::MergeMissing,
@@ -2007,6 +2492,111 @@ impl VideoJob {
 mod tests {
     use super::*;
 
+    fn test_key(url: &str, sel: &str) -> ResolutionKey {
+        ResolutionKey {
+            url: url.to_string(),
+            sel: sel.to_string(),
+            audio: false,
+            login: String::new(),
+            password_sig: 0,
+            cookies_sig: 0,
+            proxy: String::new(),
+        }
+    }
+
+    fn test_resolution() -> Resolution {
+        Resolution {
+            title: "t".to_string(),
+            streams: vec![DirectStream {
+                url: "https://cdn.example/v.mp4".to_string(),
+                ext: "mp4".to_string(),
+                has_audio: true,
+                cookie: None,
+                referer: None,
+            }],
+            expect_audio: true,
+            expected_media: Some(1234),
+            pair_audio_url: None,
+        }
+    }
+
+    #[test]
+    fn resolution_cache_hit_miss_and_key_strictness() {
+        // unique URLs per test: the cache is process-global and
+        // cargo runs tests on parallel threads
+        let now = Instant::now();
+        let key = test_key("https://example.com/watch?v=cache1", "bv*+ba");
+        assert!(resolution_cache_get(&key, now).is_none());
+        resolution_cache_store(key, test_resolution(), now);
+        let hit = resolution_cache_get(
+            &test_key("https://example.com/watch?v=cache1", "bv*+ba"),
+            now,
+        )
+        .expect("same key must hit");
+        assert_eq!(hit.streams.len(), 1);
+        assert_eq!(hit.expected_media, Some(1234));
+        // any key component differing must miss: another video, another
+        // selector, the audio variant, another login, other cookies
+        assert!(
+            resolution_cache_get(&test_key("https://example.com/watch?v=other", "bv*+ba"), now)
+                .is_none()
+        );
+        assert!(
+            resolution_cache_get(&test_key("https://example.com/watch?v=cache1", "bv*[height<=720]+ba"), now)
+                .is_none()
+        );
+        let mut audio_key = test_key("https://example.com/watch?v=cache1", "bv*+ba");
+        audio_key.audio = true;
+        assert!(resolution_cache_get(&audio_key, now).is_none());
+        let mut login_key = test_key("https://example.com/watch?v=cache1", "bv*+ba");
+        login_key.login = "someone".to_string();
+        assert!(resolution_cache_get(&login_key, now).is_none());
+        let mut cookie_key = test_key("https://example.com/watch?v=cache1", "bv*+ba");
+        cookie_key.cookies_sig = 42;
+        assert!(resolution_cache_get(&cookie_key, now).is_none());
+    }
+
+    #[test]
+    fn resolution_cache_expires_after_ttl() {
+        let key = test_key("https://example.com/watch?v=cache2", "bv*+ba");
+        let stored_at = Instant::now();
+        resolution_cache_store(key, test_resolution(), stored_at);
+        assert!(
+            resolution_cache_get(
+                &test_key("https://example.com/watch?v=cache2", "bv*+ba"),
+                stored_at
+            )
+            .is_some(),
+            "a fresh entry must be served"
+        );
+        assert!(
+            resolution_cache_get(
+                &test_key("https://example.com/watch?v=cache2", "bv*+ba"),
+                stored_at + RESOLUTION_TTL + std::time::Duration::from_secs(1)
+            )
+            .is_none(),
+            "an entry older than the TTL must never be served"
+        );
+    }
+
+    #[test]
+    fn cookies_signature_distinguishes_content() {
+        let dir = std::env::temp_dir().join(format!("ndm-cksig-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        std::fs::write(&a, b"session=one").unwrap();
+        std::fs::write(&b, b"session=two").unwrap();
+        assert_eq!(cookies_signature(Some(&a)), cookies_signature(Some(&a)));
+        assert_ne!(cookies_signature(Some(&a)), cookies_signature(Some(&b)));
+        assert_ne!(cookies_signature(None), cookies_signature(Some(&a)));
+        assert_ne!(
+            cookies_signature(Some(&dir.join("missing.txt"))),
+            cookies_signature(Some(&a))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn finish_sweep_removes_both_engines_temps_only() {
         // R4 side observation: a job paused on yt-dlp and finished
@@ -2219,6 +2809,85 @@ At least one output file must be specified";
         std::fs::write(dir.join("clip.mkv"), b"v").unwrap();
         assert_eq!(unique_stem_on_disk(&dir, "clip", false), "clip (1)");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn contradiction_verdict_flags_plain_mismatches_only() {
+        // the walkthrough's shape: the page's video runs ~40 min,
+        // the delivered file runs 6 s — a plain contradiction
+        assert!(contradiction_verdict(0, 2400.0, 2_342_828, Some(6.0), false).is_some());
+        // same story told by size alone: picked ~100 MB, got 2.3 MB
+        assert!(contradiction_verdict(100_663_296, 0.0, 2_342_828, None, false).is_some());
+        // a delivery that matches the probe passes clean
+        assert!(contradiction_verdict(100_000_000, 2400.0, 98_000_000, Some(2395.0), false).is_none());
+        // nothing probed → nothing to contradict (the padded-
+        // container fixture: option size unknown, duration unknown)
+        assert!(contradiction_verdict(0, 0.0, 2_342_828, Some(6.0), false).is_none());
+        // an unprobeable produced duration never fabricates a verdict
+        assert!(contradiction_verdict(0, 2400.0, 2_342_828, None, false).is_none());
+        // remux/transcode slack is not a contradiction: 60% of the
+        // expected size and 95% of the duration are both fine
+        assert!(contradiction_verdict(100_000_000, 2400.0, 60_000_000, Some(2280.0), false).is_none());
+        // audio jobs: size is never judged (transcodes shrink
+        // legitimately), duration still is
+        assert!(contradiction_verdict(100_000_000, 2400.0, 3_000_000, Some(2390.0), true).is_none());
+        assert!(contradiction_verdict(0, 2400.0, 3_000_000, Some(6.0), true).is_some());
+    }
+
+    #[test]
+    fn direct_format_wins_over_playlist_variants() {
+        // the W-2 fixture's shape: a direct <video> file plus a
+        // script-planted HLS ladder in one probe
+        let v = serde_json::json!({
+            "formats": [
+                {"format_id": "hls-720", "ext": "mp4", "protocol": "m3u8_native",
+                 "url": "http://cdn.example/hls/v720/pl.m3u8", "height": 720, "vcodec": "avc1"},
+                {"format_id": "0", "ext": "mp4", "protocol": "http",
+                 "url": "http://cdn.example/media/big.mp4", "vcodec": null, "acodec": null},
+                {"format_id": "hls-360", "ext": "mp4", "protocol": "m3u8_native",
+                 "url": "http://cdn.example/hls/v360/pl.m3u8", "height": 360, "vcodec": "avc1"}
+            ]
+        });
+        let direct = best_direct_format(&v).expect("a direct format exists");
+        assert_eq!(direct["url"].as_str(), Some("http://cdn.example/media/big.mp4"));
+        assert!(format_is_playlist(&v["formats"][0]));
+        assert!(!format_is_playlist(&v["formats"][1]));
+        // a list with only playlists yields no direct candidate
+        let v2 = serde_json::json!({
+            "formats": [
+                {"format_id": "hls-720", "ext": "mp4", "protocol": "m3u8_native",
+                 "url": "http://cdn.example/hls/v720/pl.m3u8", "height": 720, "vcodec": "avc1"}
+            ]
+        });
+        assert!(best_direct_format(&v2).is_none());
+        // an audio-only direct entry is not the page's video
+        let v3 = serde_json::json!({
+            "formats": [
+                {"format_id": "a1", "ext": "mp4", "protocol": "https",
+                 "url": "https://cdn.example/audio.m4a", "vcodec": "none", "acodec": "aac"}
+            ]
+        });
+        assert!(best_direct_format(&v3).is_none());
+    }
+
+    #[test]
+    fn password_signature_separates_passwords() {
+        // m-6: the resolution cache key must change when the
+        // password does, and stay stable when it doesn't
+        assert_eq!(password_signature(""), 0);
+        assert_eq!(password_signature("hunter2"), password_signature("hunter2"));
+        assert_ne!(password_signature("hunter2"), password_signature("hunter3"));
+        assert_ne!(password_signature("hunter2"), password_signature(""));
+    }
+
+    #[test]
+    fn duration_parses_from_ffmpeg_info() {
+        let text = "  Duration: 00:00:06.01, start: 0.000000, bitrate: 134217 kb/s\n";
+        assert_eq!(duration_in_ffmpeg_info(text), Some(6.01));
+        let text2 = "Duration: 01:02:03.50, start: 0.000000";
+        assert_eq!(duration_in_ffmpeg_info(text2), Some(3723.5));
+        assert_eq!(duration_in_ffmpeg_info("Duration: N/A"), None);
+        assert_eq!(duration_in_ffmpeg_info("no duration here"), None);
     }
 }
 

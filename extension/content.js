@@ -280,6 +280,40 @@
     return `${v.toFixed(i >= 2 ? 1 : 0)} ${units[i]}`;
   }
 
+  /* IDM's own number formats (progress dialog): sizes always
+     carry 3 decimals with the unit picked by magnitude, the
+     rate is "<v> KB/sec" under 1 MB/s and "<v> MB/sec" above,
+     and the time left reads "57 min 5 sec" / "1 hour(s) 18 min"
+     / "0 sec". Used only by the flyout's progress view, which
+     mirrors IDM's dialog element for element. */
+  function fmtIdmSize(n) {
+    const b = Number(n) || 0;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = b / 1024;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+      v /= 1024;
+      i++;
+    }
+    return `${v.toFixed(3)} ${units[i]}`;
+  }
+
+  function fmtIdmRate(bps) {
+    const r = Number(bps) || 0;
+    if (r >= 1024 * 1024) return `${(r / 1048576).toFixed(3)} MB/sec`;
+    return `${(r / 1024).toFixed(3)} KB/sec`;
+  }
+
+  function fmtIdmEta(secs) {
+    const s = Math.max(0, Math.round(Number(secs) || 0));
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const r = s % 60;
+    if (h > 0) return `${h} hour(s) ${m} min`;
+    if (m > 0) return `${m} min ${r} sec`;
+    return `${r} sec`;
+  }
+
   function cleanPageTitle() {
     return (document.title || 'video')
       .replace(/^\(\d+\)\s*/, '')
@@ -616,14 +650,17 @@
 
     /* ── IDM panel behaviour ────────────────────────────────────
        A compact flyout anchored at the player — NOT a centered
-       dialog. Header row "Download all" + one plain-text row per
-       quality ("1. <title>, MP4 file, quality 1080p"). NOTHING is
+       dialog. Header row "Download all", a media header (video
+       thumbnail, title, duration line), then one row per quality
+       ("1. <title>, MP4 file, quality 1080p • size"). NOTHING is
        sent to NDM until the user clicks a row (that format) or
        "Download all" (every format). After a click, THIS card
-       becomes the progress view — IDM's progress dialog in
-       miniature: "<percent>% — <filename>", a bar, downloaded /
-       total · speed · time left, Pause / Cancel. Closing the
-       card (×, Esc, outside click) NEVER touches the download. */
+       becomes the progress view — IDM's download dialog itself:
+       "<percent>% <filename>" in the header, the URL line and
+       the Status / File size / Downloaded / Transfer rate /
+       Time left rows, the green bar, Pause / Cancel. Closing
+       the card (×, Esc, outside click) NEVER touches the
+       download. */
     const backdrop = document.createElement('div');
     backdrop.className = 'ndm-fly-backdrop';
     for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'dblclick']) {
@@ -680,9 +717,9 @@
     const titleEl = card.querySelector('.ndm-fly-title');
 
     /* The card header is the "Download all" button in list view
-       and the entry's "<percent>% — <filename>" title in the
-       progress views, like IDM's progress-dialog title bar
-       (F-EXT-05). */
+       and the entry's "<percent>% <filename>" title in the
+       progress views — IDM's progress-dialog title bar verbatim
+       ("94% mult.flv": percent, one space, file name, F-EXT-05). */
     function showFlyTitle(text) {
       btnAll.style.display = 'none';
       titleEl.style.display = '';
@@ -695,12 +732,16 @@
     }
 
     let probedTitle = fallbackTitle;
+    let probedThumb = '';
+    let probedDuration = 0;
+    let probedUploader = '';
     let qualities = [];
     let rendered = false;
     let closed = false;
     let startBusy = false;
     let probeSettled = false; // rows (or the failure fallback) are on screen
     let wantAll = false;      // "Download all" clicked while still probing
+    let warmSentFor = '';     // target URL the warm resolve was fired for
 
     // Used only when probing produced no format list at all (the
     // same two automatic choices the old dialog fell back to).
@@ -897,13 +938,6 @@
       return '';
     }
 
-    function fmtEta(secs) {
-      const s = Math.max(0, Math.round(Number(secs) || 0));
-      if (s < 60) return `${s}s left`;
-      if (s < 3600) return `${Math.round(s / 60)} min left`;
-      return `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min left`;
-    }
-
     /* ── Sending ────────────────────────────────────────────────
        The ONLY two send sites of this panel: a row click (one
        format) and "Download all" (every format). No send happens
@@ -1039,14 +1073,18 @@
         'The download stopped with an error in NDM.';
       bodyEl.innerHTML = `
         <div class="ndm-fly-prog">
-          <div class="ndm-fly-prog-head">Download failed</div>
-          <div class="ndm-fly-stats">${escapeHtml(msg)}</div>
+          <div class="ndm-fly-purl"></div>
+          <div class="ndm-fly-prow"><span class="ndm-fly-plab">Status</span><span class="ndm-fly-pval">Error</span></div>
+          <div class="ndm-fly-pmsg">${escapeHtml(msg)}</div>
           <div class="ndm-fly-btns">
-            <button class="ndm-btn ndm-btn-primary ndm-fly-retry" type="button">Retry</button>
-            <button class="ndm-btn ndm-btn-secondary ndm-fly-showe" type="button">Show in NDM</button>
+            <button class="ndm-pbtn ndm-pbtn-def ndm-fly-retry" type="button">Retry</button>
+            <button class="ndm-pbtn ndm-fly-showe" type="button">Show in NDM</button>
           </div>
         </div>
       `;
+      const urlElE = bodyEl.querySelector('.ndm-fly-purl');
+      urlElE.textContent = targetUrl;
+      urlElE.title = targetUrl;
       bodyEl.querySelector('.ndm-fly-showe').addEventListener('click', () => {
         chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
       });
@@ -1114,13 +1152,31 @@
     }
 
     /* ── Progress view ──────────────────────────────────────────
-       Polls the entry every 1 s through the background
-       ({action:'ndm-entry-progress', id} → the host's
-       {type:'progress', id}). Expected reply:
-       {ok:true, status, done_bytes, total, rate_bps, eta_secs}.
-       ANY non-ok answer (a background/host without the channel)
-       degrades the card to a static "Downloading in NDM…" state —
-       never invented numbers. */
+       IDM's download dialog, element for element (SPEC:
+       ndm-research/idm-dialog-ref/SPEC.md): the card header is
+       the title bar "<percent>% <filename>"; the body is the
+       "Download status" panel — URL line, then Status / File
+       size / Downloaded / Transfer rate / Time left / Resume
+       capability rows in IDM's own number formats — over the
+       classic green bar, with IDM's details toggle and "Show
+       in NDM" on the left and Pause↔Resume and Cancel on the
+       right; the toggle expands the per-connection chart +
+       table (SPEC §1.7). The tab strip carries exactly the two
+       tabs this card can drive for real — Download status and
+       Speed Limiter (the limiter tab drives the app's own
+       per-entry set-limit command); IDM's remaining tabs are
+       per-file controls with no honest flyout equivalent, so
+       they stay unrendered rather than decorative. The poll carries
+       the mirror's fields — {status, done_bytes, total,
+       rate_bps, eta_secs, error} plus {resume_capability,
+       conns, conns_detail, blocks} from an app new enough to
+       mirror them (an older app's silence just hides the row
+       and the toggle). Polls the entry every 1 s through the
+       background ({action:'ndm-entry-progress', id} → the
+       host's {type:'progress', id}). ANY non-ok answer (a
+       background/host without the channel) degrades the card
+       to a static "Downloading in NDM…" state — never
+       invented numbers. */
     async function pollOnce(id) {
       try {
         const r = await chrome.runtime.sendMessage({
@@ -1137,26 +1193,351 @@
       stopPoll();
       btnAll.disabled = true;
       showFlyTitle(entry.name);
+
+      /* ── IDM details section (SPEC §1.7) ────────────────────
+         Behind the button row's left-slot toggle: the centred
+         caption, the segment chart drawn from the poll's block
+         map, and the N. / Downloaded / Info table from its
+         per-connection bytes. Everything renders from the
+         mirror's real fields only; a card talking to an older
+         app (which mirrors neither field) never shows the
+         toggle. The helpers live here because the live view and
+         the settled Complete view share them — the panel keeps
+         its details across the finish line, toggle state and
+         all. */
+      let detailsOpen = false;
+
+      /* IDM's Resume capability value is a bare Yes/No; the
+         app's payload carries the same answer with its reason
+         attached ("Yes (Range supported)") — the row shows
+         IDM's word for the app's answer. */
+      function idmResumeWord(raw) {
+        const s = String(raw || '').trim();
+        if (/^yes\b/i.test(s)) return 'Yes';
+        if (/^no\b/i.test(s)) return 'No';
+        return s;
+      }
+
+      function detailsHtml() {
+        return `
+          <div class="ndm-fly-details" style="display:none">
+            <div class="ndm-fly-dcap">Start positions and download progress by connections</div>
+            <div class="ndm-fly-dchart" style="display:none"></div>
+            <div class="ndm-fly-dtwrap" style="display:none">
+              <table class="ndm-fly-dtable">
+                <thead><tr><th class="ndm-dc-n">N.</th><th class="ndm-dc-d">Downloaded</th><th class="ndm-dc-i">Info</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        `;
+      }
+
+      function wireDetails(root) {
+        const els = {
+          toggle: root.querySelector('.ndm-fly-dtoggle'),
+          wrap: root.querySelector('.ndm-fly-details'),
+          chart: root.querySelector('.ndm-fly-dchart'),
+          twrap: root.querySelector('.ndm-fly-dtwrap'),
+          tbody: root.querySelector('.ndm-fly-dtable tbody'),
+          chartKey: null,
+        };
+        if (els.toggle) {
+          els.toggle.addEventListener('click', () => {
+            detailsOpen = !detailsOpen;
+            paintDetails(els);
+          });
+        }
+        return els;
+      }
+
+      /* IDM's per-connection Info vocabulary, from the poll's
+         own numbers only: a connection inside the live count
+         that has bytes is receiving; inside the count without
+         bytes it has not started receiving; anything else (a
+         finished session's history, a paused entry) states
+         nothing. The row filter is the app dialog's own: a row
+         exists once its connection has bytes, or while it is
+         one of the live connections. */
+      function detailsRows() {
+        if (!last) return [];
+        const det = Array.isArray(last.conns_detail) ? last.conns_detail : [];
+        const conns = Number(last.conns) || 0;
+        const live = String(last.status || '') === 'downloading';
+        const rows = [];
+        det.forEach((b, i) => {
+          const bytes = Number(b) || 0;
+          if (!(bytes > 0 || (live && i < conns))) return;
+          rows.push({
+            n: i + 1,
+            bytes,
+            info:
+              live && i < conns
+                ? bytes > 0
+                  ? 'Receiving data...'
+                  : 'Connecting...'
+                : '',
+          });
+        });
+        return rows;
+      }
+
+      function paintDetails(els) {
+        if (!els || !els.toggle || !els.wrap) return;
+        if (!last) {
+          els.toggle.style.display = 'none';
+          els.wrap.style.display = 'none';
+          return;
+        }
+        const blocks = typeof last.blocks === 'string' ? last.blocks : '';
+        const rows = detailsRows();
+        const has = blocks.length > 0 || rows.length > 0;
+        els.toggle.style.display = has ? '' : 'none';
+        const open = has && detailsOpen;
+        els.wrap.style.display = open ? '' : 'none';
+        els.toggle.textContent = open ? '<< Hide details' : 'Show details >>';
+        if (!open) return;
+        if (blocks.length > 0) {
+          els.chart.style.display = '';
+          if (els.chartKey !== blocks) {
+            els.chartKey = blocks;
+            els.chart.innerHTML = blocks
+              .split('')
+              .map(c => `<i class="${c === '1' ? 'b1' : c === '2' ? 'b2' : 'b0'}"></i>`)
+              .join('');
+          }
+        } else {
+          els.chart.style.display = 'none';
+        }
+        if (rows.length > 0) {
+          els.twrap.style.display = '';
+          els.tbody.innerHTML = rows
+            .map(
+              r =>
+                `<tr><td class="ndm-dc-n">${r.n}</td><td class="ndm-dc-d">${fmtIdmSize(r.bytes)}</td><td class="ndm-dc-i">${r.info}</td></tr>`
+            )
+            .join('');
+        } else {
+          els.twrap.style.display = 'none';
+        }
+      }
+
       bodyEl.innerHTML = `
         <div class="ndm-fly-prog">
-          <div class="ndm-fly-prog-head">Downloading in NDM…</div>
-          <div class="ndm-fly-bar"><div class="ndm-fly-bar-fill"></div></div>
-          <div class="ndm-fly-stats">Progress is shown in the NDM app.</div>
-          <div class="ndm-fly-btns">
-            <button class="ndm-btn ndm-btn-secondary ndm-fly-pause" type="button">Pause</button>
-            <button class="ndm-btn ndm-btn-primary ndm-fly-resume" type="button" style="display:none">Resume</button>
-            <button class="ndm-btn ndm-btn-secondary ndm-fly-cancel" type="button">Cancel</button>
-            <button class="ndm-btn ndm-btn-secondary ndm-fly-show" type="button" style="display:none">Show in NDM</button>
+          <div class="ndm-fly-tabs" style="display:none">
+            <button class="ndm-fly-tab ndm-fly-tab-status ndm-fly-tab-on" type="button">Download status</button>
+            <button class="ndm-fly-tab ndm-fly-tab-limit" type="button">Speed Limiter</button>
           </div>
+          <div class="ndm-fly-pane ndm-fly-pane-status">
+          <div class="ndm-fly-purl"></div>
+          <div class="ndm-fly-prow"><span class="ndm-fly-plab">Status</span><span class="ndm-fly-pval ndm-fly-pstatusv">Downloading in NDM…</span></div>
+          <div class="ndm-fly-prow ndm-fly-rfsize" style="display:none"><span class="ndm-fly-plab">File size</span><span class="ndm-fly-pval ndm-fly-pfsize"></span></div>
+          <div class="ndm-fly-prow ndm-fly-rdown" style="display:none"><span class="ndm-fly-plab">Downloaded</span><span class="ndm-fly-pval ndm-fly-pdown"></span></div>
+          <div class="ndm-fly-prow ndm-fly-rrate" style="display:none"><span class="ndm-fly-plab">Transfer rate</span><span class="ndm-fly-pval ndm-fly-prate"></span></div>
+          <div class="ndm-fly-prow ndm-fly-rtime" style="display:none"><span class="ndm-fly-plab">Time left</span><span class="ndm-fly-pval ndm-fly-ptime"></span></div>
+          <div class="ndm-fly-prow ndm-fly-rresume" style="display:none"><span class="ndm-fly-plab">Resume capability</span><span class="ndm-fly-pval ndm-fly-presume"></span></div>
+          </div>
+          <div class="ndm-fly-pane ndm-fly-pane-limit" style="display:none">
+            <div class="ndm-fly-prow"><span class="ndm-fly-plab">Current speed</span><span class="ndm-fly-pval ndm-fly-lcur"></span></div>
+            <label class="ndm-fly-lrow ndm-fly-luserow"><input type="checkbox" class="ndm-fly-luse"> Use Speed Limiter</label>
+            <div class="ndm-fly-lrow">
+              <span>Maximum download speed:</span>
+              <input type="text" class="ndm-fly-lval" inputmode="decimal" autocomplete="off" spellcheck="false" disabled>
+              <select class="ndm-fly-lunit" disabled>
+                <option value="1024">KB/sec</option>
+                <option value="1048576">MB/sec</option>
+              </select>
+            </div>
+            <div class="ndm-fly-lnote"></div>
+          </div>
+          <div class="ndm-fly-bar"><div class="ndm-fly-bar-fill"></div></div>
+          <div class="ndm-fly-btns">
+            <button class="ndm-pbtn ndm-fly-dtoggle" type="button" style="display:none">Show details &gt;&gt;</button>
+            <button class="ndm-pbtn ndm-fly-show" type="button" style="display:none">Show in NDM</button>
+            <span class="ndm-fly-btnsp"></span>
+            <button class="ndm-pbtn ndm-fly-pause" type="button">Pause</button>
+            <button class="ndm-pbtn ndm-fly-resume" type="button" style="display:none">Resume</button>
+            <button class="ndm-pbtn ndm-fly-cancel" type="button">Cancel</button>
+          </div>
+          ${detailsHtml()}
         </div>
       `;
-      const headEl = bodyEl.querySelector('.ndm-fly-prog-head');
+      const urlEl = bodyEl.querySelector('.ndm-fly-purl');
+      urlEl.textContent = targetUrl;
+      urlEl.title = targetUrl;
+      const statusEl = bodyEl.querySelector('.ndm-fly-pstatusv');
+      const fsizeEl = bodyEl.querySelector('.ndm-fly-pfsize');
+      const downEl = bodyEl.querySelector('.ndm-fly-pdown');
+      const rateEl = bodyEl.querySelector('.ndm-fly-prate');
+      const timeEl = bodyEl.querySelector('.ndm-fly-ptime');
+      const resumeEl = bodyEl.querySelector('.ndm-fly-presume');
+      const rowsEl = {
+        fsize: bodyEl.querySelector('.ndm-fly-rfsize'),
+        down: bodyEl.querySelector('.ndm-fly-rdown'),
+        rate: bodyEl.querySelector('.ndm-fly-rrate'),
+        time: bodyEl.querySelector('.ndm-fly-rtime'),
+        resume: bodyEl.querySelector('.ndm-fly-rresume'),
+      };
+      const progEls = wireDetails(bodyEl);
       const fillEl = bodyEl.querySelector('.ndm-fly-bar-fill');
-      const statsEl = bodyEl.querySelector('.ndm-fly-stats');
       const btnPause = bodyEl.querySelector('.ndm-fly-pause');
       const btnResume = bodyEl.querySelector('.ndm-fly-resume');
       const btnCancel = bodyEl.querySelector('.ndm-fly-cancel');
       const btnShow = bodyEl.querySelector('.ndm-fly-show');
+      /* ── IDM tab strip (SPEC §1.2) ─────────────────────────
+         "Download status" | "Speed Limiter" above the panel
+         body; the bar, the button row and the details section
+         sit below both panes, exactly as in IDM's dialog, so
+         switching tabs never disturbs the poll or the download.
+         The strip appears only once the progress mirror has
+         reported the entry's speed_limit — a card talking to an
+         older app (which mirrors no such field) keeps the
+         single-panel view it has always had. */
+      const tabsEl = bodyEl.querySelector('.ndm-fly-tabs');
+      const tabBtnStatus = bodyEl.querySelector('.ndm-fly-tab-status');
+      const tabBtnLimit = bodyEl.querySelector('.ndm-fly-tab-limit');
+      const paneStatus = bodyEl.querySelector('.ndm-fly-pane-status');
+      const paneLimit = bodyEl.querySelector('.ndm-fly-pane-limit');
+      const lUse = bodyEl.querySelector('.ndm-fly-luse');
+      const lVal = bodyEl.querySelector('.ndm-fly-lval');
+      const lUnit = bodyEl.querySelector('.ndm-fly-lunit');
+      const lCur = bodyEl.querySelector('.ndm-fly-lcur');
+      const lNote = bodyEl.querySelector('.ndm-fly-lnote');
+      let activeTab = 'status';
+      let limitFocus = false;
+      let prevUnit = 1024;
+      let limitBusy = false;
+      // m-10: the exact bytes/sec the display was last synced
+      // from. The field shows only 2 decimals, so re-applying an
+      // untouched panel would otherwise SEND the rounded readback
+      // (1,048,575 B/s → "1024" KB/sec → 1,048,576 B/s).
+      let limExactBps = 0;
+
+      function switchTab(name) {
+        activeTab = name;
+        tabBtnStatus.classList.toggle('ndm-fly-tab-on', name === 'status');
+        tabBtnLimit.classList.toggle('ndm-fly-tab-on', name === 'limit');
+        paneStatus.style.display = name === 'status' ? '' : 'none';
+        paneLimit.style.display = name === 'limit' ? '' : 'none';
+      }
+      tabBtnStatus.addEventListener('click', () => switchTab('status'));
+      tabBtnLimit.addEventListener('click', () => switchTab('limit'));
+      paneLimit.addEventListener('focusin', () => {
+        limitFocus = true;
+      });
+      paneLimit.addEventListener('focusout', () => {
+        limitFocus = false;
+      });
+
+      function fmtLimVal(x) {
+        return String(Math.round(x * 100) / 100);
+      }
+
+      /* Send the panel's current limiter state to the app
+         through the bridge (background → host → the app's own
+         set_entry_limit: entry field + live engine/job handles
+         + persist). Unchecked = clear (null). A rejection is
+         reported in the panel, never silently swallowed — and
+         the next poll re-syncs the controls from the mirror, so
+         the panel always settles on the app's truth. */
+      async function applyLimiter() {
+        if (!entry.id || limitBusy) return;
+        let bps = null;
+        if (lUse.checked) {
+          const v = parseFloat(String(lVal.value).replace(',', '.'));
+          const mult = Number(lUnit.value) || 1024;
+          if (!isFinite(v) || v <= 0) {
+            lNote.textContent = 'Enter a maximum speed above zero.';
+            return;
+          }
+          bps = Math.max(1024, Math.round(v * mult));
+          // m-10: a readback within half the display quantum
+          // (0.005 of the current unit) of the synced value is
+          // the untouched panel, not an edit — send the exact
+          // synced bytes/sec. A deliberate edit larger than the
+          // quantum still goes through as typed.
+          if (limExactBps > 0 && Math.abs(bps - limExactBps) <= mult / 200 + 1) {
+            bps = limExactBps;
+          }
+        }
+        if (bps !== null) limExactBps = bps;
+        limitBusy = true;
+        try {
+          const r = await chrome.runtime.sendMessage({
+            action: 'ndm-set-speed-limit',
+            entry: entry.id,
+            limit_bps: bps,
+          });
+          lNote.textContent =
+            r && r.ok ? '' : (r && r.error) || 'NDM rejected the speed limit.';
+        } catch (e) {
+          lNote.textContent = 'Could not reach the NDM app.';
+        }
+        limitBusy = false;
+        tick();
+      }
+      lUse.addEventListener('change', () => {
+        const on = lUse.checked;
+        lVal.disabled = !on;
+        lUnit.disabled = !on;
+        if (on && !(parseFloat(String(lVal.value).replace(',', '.')) > 0)) {
+          lVal.value = '500';
+          lUnit.value = '1024';
+          prevUnit = 1024;
+        }
+        applyLimiter();
+      });
+      lVal.addEventListener('change', () => {
+        if (lUse.checked) applyLimiter();
+      });
+      lUnit.addEventListener('change', () => {
+        // Keep the effective limit constant across the unit
+        // switch (re-express the same bytes/sec in the new unit),
+        // then apply it like any other edit.
+        const newMult = Number(lUnit.value) || 1024;
+        const v = parseFloat(String(lVal.value).replace(',', '.'));
+        if (isFinite(v) && v > 0) {
+          lVal.value = fmtLimVal((v * prevUnit) / newMult);
+        }
+        prevUnit = newMult;
+        if (lUse.checked) applyLimiter();
+      });
+
+      /* Reflect the mirror's truth in the limiter panel: the
+         strip's existence, the live rate on the tab's own speed
+         line (IDM shows it there), and the controls' pre-fill
+         from the entry's current limit. While the user is
+         editing inside the panel the poll must not fight them —
+         their change events apply, and sync resumes on blur. */
+      function syncLimiter() {
+        const has = !!last && typeof last.speed_limit === 'number';
+        tabsEl.style.display = has ? '' : 'none';
+        if (!has) {
+          if (activeTab !== 'status') switchTab('status');
+          return;
+        }
+        lCur.textContent = fmtIdmRate(last.rate_bps);
+        if (limitFocus) return;
+        const lim = Number(last.speed_limit) || 0;
+        limExactBps = lim;
+        lUse.checked = lim > 0;
+        lVal.disabled = lim <= 0;
+        lUnit.disabled = lim <= 0;
+        if (lim > 0) {
+          const mb = lim >= 1048576;
+          prevUnit = mb ? 1048576 : 1024;
+          lUnit.value = String(prevUnit);
+          lVal.value = fmtLimVal(lim / prevUnit);
+        } else if (!lVal.value) {
+          lVal.value = '500';
+        }
+      }
+      /* IDM renders the live Status value as blue underlined
+         link-style text; settled states (Paused, Cancelled, the
+         no-data fallback) read as plain dialog text. */
+      function setStatusLive(on) {
+        statusEl.classList.toggle('ndm-fly-pstatus', !!on);
+      }
 
       let last = null;       // last good progress reply
       let uiPaused = false;  // Pause pressed here (poll may lag/never answer)
@@ -1174,16 +1555,30 @@
 
       function render() {
         if (!last && !uiPaused) {
-          headEl.textContent = 'Downloading in NDM…';
-          statsEl.textContent = 'Progress is shown in the NDM app.';
+          statusEl.textContent = 'Downloading in NDM…';
+          setStatusLive(false);
+          rowsEl.fsize.style.display = 'none';
+          rowsEl.down.style.display = 'none';
+          rowsEl.rate.style.display = 'none';
+          rowsEl.time.style.display = 'none';
+          rowsEl.resume.style.display = 'none';
+          paintDetails(progEls);
+          syncLimiter();
           btnPause.style.display = '';
           btnResume.style.display = 'none';
           btnShow.style.display = 'none';
           return;
         }
         if (!last && uiPaused) {
-          headEl.textContent = 'Paused';
-          statsEl.textContent = 'Paused in NDM.';
+          statusEl.textContent = 'Paused';
+          setStatusLive(false);
+          rowsEl.fsize.style.display = 'none';
+          rowsEl.down.style.display = 'none';
+          rowsEl.rate.style.display = 'none';
+          rowsEl.time.style.display = 'none';
+          rowsEl.resume.style.display = 'none';
+          paintDetails(progEls);
+          syncLimiter();
           btnPause.style.display = 'none';
           btnResume.style.display = '';
           btnShow.style.display = '';
@@ -1199,28 +1594,51 @@
         // nothing left to pause or cancel — those buttons must
         // not stay live in this window.
         const finalizing = st !== 'paused' && total > 0 && done >= total;
-        // The "% — filename" line belongs to the card's title bar
-        // only (IDM's progress-dialog title); the body head is a
-        // plain state word. Printing the same line in both places
-        // was pure duplication.
-        showFlyTitle(pct != null ? `${pct}% — ${entry.name}` : entry.name);
-        headEl.textContent =
-          st === 'paused' ? 'Paused' : finalizing ? 'Finishing…' : 'Downloading…';
+        // The "<percent>% <filename>" line belongs to the card's
+        // title bar only (IDM's progress-dialog title); the body
+        // carries the labelled status rows instead. Printing the
+        // same line in both places was pure duplication.
+        showFlyTitle(pct != null ? `${pct}% ${entry.name}` : entry.name);
+        statusEl.textContent =
+          st === 'paused'
+            ? 'Paused'
+            : finalizing
+              ? 'Finishing...'
+              : st === 'queued'
+                ? 'Queued'
+                : 'Receiving data...';
+        setStatusLive(st !== 'paused');
         fillEl.style.width = pct != null ? pct + '%' : '0%';
-        const parts = [];
-        if (total > 0) parts.push(`${fmtBytes(done)} / ${fmtBytes(total)}`);
-        else if (done > 0) parts.push(fmtBytes(done));
-        if (st === 'paused') {
-          parts.push('Paused');
-        } else if (finalizing) {
-          parts.push('Finishing…');
-        } else {
-          if (Number(last.rate_bps) > 0) {
-            parts.push(`${fmtBytes(last.rate_bps)}/s`);
-          }
-          if (Number(last.eta_secs) > 0) parts.push(fmtEta(last.eta_secs));
+        // File size / Downloaded (SPEC §1.3): a row appears only
+        // when its number is actually known — never invented.
+        rowsEl.fsize.style.display = total > 0 ? '' : 'none';
+        if (total > 0) fsizeEl.textContent = fmtIdmSize(total);
+        rowsEl.down.style.display = total > 0 || done > 0 ? '' : 'none';
+        if (total > 0) {
+          downEl.textContent =
+            `${fmtIdmSize(done)} ( ${((done / total) * 100).toFixed(2)} %)`;
+        } else if (done > 0) {
+          downEl.textContent = fmtIdmSize(done);
         }
-        statsEl.textContent = parts.filter(Boolean).join(' · ');
+        // Transfer rate / Time left describe a live transfer
+        // only: while paused or finalising the rows leave with
+        // the numbers they would repeat. A stalled transfer
+        // honestly reads 0.000 KB/sec (the app zeroes stale
+        // rates itself, F-15).
+        const active = st !== 'paused' && !finalizing;
+        rowsEl.rate.style.display = active ? '' : 'none';
+        if (active) rateEl.textContent = fmtIdmRate(last.rate_bps);
+        const eta = Number(last.eta_secs) || 0;
+        rowsEl.time.style.display = active && eta > 0 ? '' : 'none';
+        if (active && eta > 0) timeEl.textContent = fmtIdmEta(eta);
+        // Resume capability is a property of the download, not
+        // of the live transfer: the row stays in every state the
+        // poll has spoken for, as long as the app mirrored an
+        // answer (an older app's silence hides the row).
+        const resumeWord = idmResumeWord(last.resume_capability);
+        rowsEl.resume.style.display = resumeWord ? '' : 'none';
+        if (resumeWord) resumeEl.textContent = resumeWord;
+        paintDetails(progEls);
         if (finalizing) {
           btnPause.style.display = 'none';
           btnResume.style.display = 'none';
@@ -1232,21 +1650,58 @@
           btnCancel.style.display = '';
           btnShow.style.display = st === 'paused' ? '' : 'none';
         }
+        syncLimiter();
       }
 
       function renderFinished() {
         terminal = true;
         stopPoll();
-        showFlyTitle(`100% — ${entry.name}`);
+        showFlyTitle(`100% ${entry.name}`);
+        // IDM closes its dialog at 100%; the card lives in the
+        // page, so it settles into the same panel carrying IDM's
+        // own finished word — "Complete", its main-list Status —
+        // and the final numbers from the last poll, when the poll
+        // ever gave any.
         bodyEl.innerHTML = `
           <div class="ndm-fly-prog">
-            <div class="ndm-fly-prog-head">Download complete</div>
-            <div class="ndm-fly-stats">${escapeHtml(entry.name)}</div>
+            <div class="ndm-fly-purl"></div>
+            <div class="ndm-fly-prow"><span class="ndm-fly-plab">Status</span><span class="ndm-fly-pval">Complete</span></div>
+            <div class="ndm-fly-prow ndm-fly-rfsize2" style="display:none"><span class="ndm-fly-plab">File size</span><span class="ndm-fly-pval ndm-fly-pfsize2"></span></div>
+            <div class="ndm-fly-prow ndm-fly-rdown2" style="display:none"><span class="ndm-fly-plab">Downloaded</span><span class="ndm-fly-pval ndm-fly-pdown2"></span></div>
+            <div class="ndm-fly-prow ndm-fly-rresume2" style="display:none"><span class="ndm-fly-plab">Resume capability</span><span class="ndm-fly-pval ndm-fly-presume2"></span></div>
+            <div class="ndm-fly-bar"><div class="ndm-fly-bar-fill" style="width:100%"></div></div>
             <div class="ndm-fly-btns">
-              <button class="ndm-btn ndm-btn-primary ndm-fly-show2" type="button">Show in NDM</button>
+              <button class="ndm-pbtn ndm-fly-dtoggle" type="button" style="display:none">Show details &gt;&gt;</button>
+              <button class="ndm-pbtn ndm-fly-show2" type="button">Show in NDM</button>
+              <span class="ndm-fly-btnsp"></span>
             </div>
+            ${detailsHtml()}
           </div>
         `;
+        const urlEl2 = bodyEl.querySelector('.ndm-fly-purl');
+        urlEl2.textContent = targetUrl;
+        urlEl2.title = targetUrl;
+        const total = last ? Number(last.total) || 0 : 0;
+        const done = last ? Number(last.done_bytes) || 0 : 0;
+        if (total > 0) {
+          bodyEl.querySelector('.ndm-fly-rfsize2').style.display = '';
+          bodyEl.querySelector('.ndm-fly-pfsize2').textContent =
+            fmtIdmSize(total);
+          bodyEl.querySelector('.ndm-fly-rdown2').style.display = '';
+          bodyEl.querySelector('.ndm-fly-pdown2').textContent =
+            `${fmtIdmSize(done)} ( ${((done / total) * 100).toFixed(2)} %)`;
+        }
+        // The static rows of the panel survive the finish line:
+        // Resume capability was true of the transfer all along,
+        // and the details section keeps the final per-connection
+        // record (full block map, session byte counts) behind
+        // the same toggle, in the state the user left it.
+        const resumeWord2 = last ? idmResumeWord(last.resume_capability) : '';
+        if (resumeWord2) {
+          bodyEl.querySelector('.ndm-fly-rresume2').style.display = '';
+          bodyEl.querySelector('.ndm-fly-presume2').textContent = resumeWord2;
+        }
+        paintDetails(wireDetails(bodyEl));
         bodyEl.querySelector('.ndm-fly-show2').addEventListener('click', () => {
           chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
         });
@@ -1264,13 +1719,17 @@
             : 'The download stopped with an error in NDM.');
         bodyEl.innerHTML = `
           <div class="ndm-fly-prog">
-            <div class="ndm-fly-prog-head">${st === 'cancelled' ? 'Cancelled' : 'Download failed'}</div>
-            <div class="ndm-fly-stats">${escapeHtml(msg)}</div>
+            <div class="ndm-fly-purl"></div>
+            <div class="ndm-fly-prow"><span class="ndm-fly-plab">Status</span><span class="ndm-fly-pval">${st === 'cancelled' ? 'Cancelled' : 'Error'}</span></div>
+            <div class="ndm-fly-pmsg">${escapeHtml(msg)}</div>
             <div class="ndm-fly-btns">
-              <button class="ndm-btn ndm-btn-secondary ndm-fly-show3" type="button">Show in NDM</button>
+              <button class="ndm-pbtn ndm-fly-show3" type="button">Show in NDM</button>
             </div>
           </div>
         `;
+        const urlEl3 = bodyEl.querySelector('.ndm-fly-purl');
+        urlEl3.textContent = targetUrl;
+        urlEl3.title = targetUrl;
         bodyEl.querySelector('.ndm-fly-show3').addEventListener('click', () => {
           chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
         });
@@ -1283,7 +1742,7 @@
           // rebuild the live view so the error is gone from the
           // card entirely. (The card only ever renders an error
           // text that belongs to the entry's CURRENT error state.)
-          const statsEl2 = bodyEl.querySelector('.ndm-fly-stats');
+          const statsEl2 = bodyEl.querySelector('.ndm-fly-pmsg');
           flyPollTimer = setInterval(async () => {
             if (closed) {
               stopPoll();
@@ -1353,12 +1812,21 @@
         terminal = true;
         stopPoll();
         syncRegistry('cancelled');
-        headEl.textContent = 'Cancelled';
-        statsEl.textContent = '';
+        statusEl.textContent = 'Cancelled';
+        setStatusLive(false);
+        rowsEl.rate.style.display = 'none';
+        rowsEl.time.style.display = 'none';
         btnPause.style.display = 'none';
         btnResume.style.display = 'none';
         btnCancel.style.display = 'none';
         btnShow.style.display = '';
+        // The details section freezes with the entry: its Info
+        // column must stop claiming connections are receiving
+        // the moment the entry is cancelled.
+        if (last) {
+          last = Object.assign({}, last, { status: 'cancelled' });
+          paintDetails(progEls);
+        }
       });
       btnShow.addEventListener('click', () => {
         chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
@@ -1435,12 +1903,23 @@
         btnCancel.textContent = 'Cancel';
         btns.appendChild(btnPause);
         btns.appendChild(btnCancel);
+        // The row speaks the progress dialog's language (SPEC
+        // §4.6 — IDM itself has one dialog per download, no
+        // combined view to copy): "<percent>% <name>" as the
+        // title line, the classic green bar under it, and the
+        // Downloaded line / state word beneath the bar.
+        const mbar = document.createElement('div');
+        mbar.className = 'ndm-fly-mbar';
+        const mfill = document.createElement('div');
+        mfill.className = 'ndm-fly-mbar-fill';
+        mbar.appendChild(mfill);
         row.appendChild(name);
         row.appendChild(pct);
         row.appendChild(btns);
+        row.appendChild(mbar);
         wrap.appendChild(row);
         const rw = {
-          en, pctEl: pct, btnPause, btnCancel, btns,
+          en, pctEl: pct, nameEl: name, fillEl: mfill, btnPause, btnCancel, btns,
           done: false, touched: false,
           lastTotal: 0, lastDone: 0, lastSt: '',
           busy: false, // a control message is in flight
@@ -1485,8 +1964,16 @@
          by the poll and the control buttons. */
       function applyRowState(rw) {
         const st = rw.lastSt;
+        const pct =
+          rw.lastTotal > 0
+            ? Math.min(100, Math.floor((rw.lastDone / rw.lastTotal) * 100))
+            : null;
+        rw.fillEl.style.width = pct != null ? pct + '%' : '0%';
+        rw.nameEl.textContent =
+          pct != null ? `${pct}% ${rw.en.name}` : rw.en.name;
         if (st === 'finished') {
-          rw.pctEl.textContent = 'Done';
+          rw.nameEl.textContent = `100% ${rw.en.name}`;
+          rw.pctEl.textContent = 'Complete';
           rw.btns.style.display = 'none';
         } else if (st === 'cancelled') {
           rw.pctEl.textContent = 'Cancelled';
@@ -1512,9 +1999,13 @@
           rw.btnCancel.disabled = rw.busy;
           if (rw.lastTotal > 0) {
             rw.pctEl.textContent =
-              Math.min(100, Math.floor((rw.lastDone / rw.lastTotal) * 100)) + '%';
+              `${fmtIdmSize(rw.lastDone)} ( ${((rw.lastDone / rw.lastTotal) * 100).toFixed(2)} %)`;
+          } else if (rw.lastDone > 0) {
+            rw.pctEl.textContent = fmtIdmSize(rw.lastDone);
           } else if (!rw.touched) {
             rw.pctEl.textContent = '…';
+          } else {
+            rw.pctEl.textContent = '';
           }
         }
       }
@@ -1547,14 +2038,14 @@
           })
         );
         if (!closed && rows.every(rw => rw.done)) {
-          titleEl.textContent = `Done — ${entries.length} downloads`;
+          titleEl.textContent = `100% ${entries.length} downloads`;
           stopPoll();
         } else if (!closed) {
           const tot = rows.reduce((s, rw) => s + (rw.lastTotal || 0), 0);
           const don = rows.reduce((s, rw) => s + (rw.lastDone || 0), 0);
           if (tot > 0) {
             titleEl.textContent =
-              `${Math.min(100, Math.floor((don / tot) * 100))}% — ${entries.length} downloads`;
+              `${Math.min(100, Math.floor((don / tot) * 100))}% ${entries.length} downloads`;
           }
         }
       };
@@ -1566,6 +2057,44 @@
     function renderList() {
       const list = qualities.length ? qualities : DEFAULT_QUALITIES;
       bodyEl.innerHTML = '';
+      // Media header (restored): the video's thumbnail, title and
+      // a details line (duration • uploader) above the quality
+      // rows — the card header the panel originally had, at the
+      // original metrics (104×59 thumb, 8px radius, 13px title
+      // clamped to two lines, 11.5px details line). The thumb
+      // comes from the probe when it sent one, else the page's
+      // own poster / YouTube / og:image art. A thumb that fails
+      // to load hides itself — never a broken-image box.
+      const media = document.createElement('div');
+      media.className = 'ndm-fly-media';
+      const thumbSrc =
+        probedThumb || guessFallbackThumbnail(targetUrl, currentAnchor);
+      if (thumbSrc) {
+        const img = document.createElement('img');
+        img.className = 'ndm-fly-thumb';
+        img.alt = '';
+        img.src = thumbSrc;
+        img.addEventListener('error', () => {
+          img.style.display = 'none';
+        });
+        media.appendChild(img);
+      }
+      const meta = document.createElement('div');
+      meta.className = 'ndm-fly-meta';
+      const mTitle = document.createElement('div');
+      mTitle.className = 'ndm-fly-mtitle';
+      mTitle.textContent = probedTitle;
+      mTitle.title = probedTitle;
+      const mSub = document.createElement('div');
+      mSub.className = 'ndm-fly-msub';
+      mSub.textContent =
+        [fmtDuration(probedDuration), probedUploader]
+          .filter(Boolean)
+          .join(' • ') || 'Nill Download Manager';
+      meta.appendChild(mTitle);
+      meta.appendChild(mSub);
+      media.appendChild(meta);
+      bodyEl.appendChild(media);
       list.forEach((q, i) => {
         const row = document.createElement('div');
         row.className = 'ndm-fly-row';
@@ -1593,7 +2122,16 @@
               (q.audio ? audioRowExt(q) : q.ext) ||
               (q.audio ? 'Audio' : 'MP4')
           ).toUpperCase();
-          sub.textContent = `${ext} file, quality ${qualityText(q)}`;
+          // The row carries its size again (restored): the
+          // producer's own formatted size when it sent one, else
+          // the byte count formatted here. Unknown size stays
+          // absent — never an invented figure.
+          const size =
+            String(q.size_text || '').trim() ||
+            (Number(q.size_bytes) > 0 ? fmtBytes(q.size_bytes) : '');
+          sub.textContent =
+            `${ext} file, quality ${qualityText(q)}` +
+            (size ? ` • ${size}` : '');
         }
         row.appendChild(t);
         row.appendChild(sub);
@@ -1661,9 +2199,48 @@
       if (!info) return;
       rendered = true;
       if (info.title) probedTitle = info.title;
+      if (info.thumbnail) probedThumb = info.thumbnail;
+      if (Number(info.duration) > 0) probedDuration = Number(info.duration);
+      if (info.uploader) probedUploader = info.uploader;
       qualities = info.options || info.qualities || [];
+      warmResolve();
       renderList();
       settleProbe();
+    }
+
+    /* Warm resolve (start-latency fix, FINDINGS-START-LATENCY
+       §5): both info paths — page-hook instant info and the
+       fetched probe — converge in applyInfo, so this is the one
+       point where the flyout's real options become known. Fire
+       a fire-and-forget 'ndm-warm' ONCE per target URL so the
+       app pre-resolves these selectors' streams in the
+       background; the click that follows then starts from the
+       cache (~0.78 s to first byte instead of ~3.8 s cold).
+       The reply and any error are deliberately ignored, and
+       nothing here can delay or block the list: no options with
+       selectors, no send. */
+    function warmResolve() {
+      if (warmSentFor === targetUrl) return;
+      const items = qualities
+        .filter(o => o && typeof o.selector === 'string' && o.selector)
+        .slice(0, 4)
+        .map(o => ({
+          selector: o.selector, // the same string the row's click passes
+          audio: !!o.audio,     // the same flag its click sends
+        }));
+      if (!items.length) return;
+      warmSentFor = targetUrl;
+      try {
+        chrome.runtime.sendMessage(
+          {
+            action: 'ndm-warm',
+            url: targetUrl,
+            pageUrl: location.href,
+            items,
+          },
+          () => void chrome.runtime.lastError
+        );
+      } catch (e) {}
     }
 
     /* The probe has produced a list (real formats or the failure
@@ -2378,20 +2955,6 @@
       .replace(/"/g, '&quot;');
   }
 
-  function flashPill(btn, pill, ok, text) {
-    if (!btn || !pill) return;
-    pill.classList.toggle('sent', ok);
-    pill.classList.toggle('error', !ok);
-    btn.textContent = text;
-    place();
-    setTimeout(() => {
-      pill.classList.remove('sent', 'error');
-      btn.innerHTML = '<span>Download with NDM</span><span class="caret">▾</span>';
-      btn.disabled = false;
-      place();
-    }, 2800);
-  }
-
   function buildPanel() {
     if (panelHost) panelHost.remove();
     panelHost = document.createElement('div');
@@ -2697,9 +3260,10 @@
 
       /* ── IDM-style video flyout ─────────────────────────────
          A compact card anchored at the player (the pill's corner),
-         NOT a centered dialog: a "Download all" header row, then
-         plain numbered text rows; after a click the same card is
-         the progress view. The backdrop is transparent — it only
+         NOT a centered dialog: a "Download all" header row, a
+         media header (thumbnail + title + duration), then
+         numbered rows carrying their sizes; after a click the
+         same card is the progress view. The backdrop is transparent — it only
          catches outside clicks / Esc, the page stays visible. */
       .ndm-fly-backdrop {
         position: fixed; inset: 0; z-index: 2147483646;
@@ -2748,6 +3312,29 @@
         display: flex; align-items: center; gap: 9px;
         padding: 8px 12px; color: #48637f;
       }
+      /* Media header (restored): thumbnail + title + details
+         line at the top of the list view, at the original
+         card's metrics — 104×59 thumb with an 8px radius,
+         13px two-line title, 11.5px muted details line. */
+      .ndm-fly-media {
+        display: flex; gap: 10px; align-items: flex-start;
+        padding: 4px 12px 9px;
+        border-bottom: 1px solid #e6eef7;
+      }
+      .ndm-fly-thumb {
+        width: 104px; height: 59px; object-fit: cover;
+        border-radius: 8px; flex: none; background: #e6eef7;
+      }
+      .ndm-fly-meta { flex: 1; min-width: 0; }
+      .ndm-fly-mtitle {
+        font-size: 13px; font-weight: 600; line-height: 1.35;
+        display: -webkit-box; -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical; overflow: hidden;
+      }
+      .ndm-fly-msub {
+        font-size: 11.5px; color: #48637f; margin-top: 3px;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
       .ndm-fly-row {
         padding: 5px 12px; cursor: pointer;
       }
@@ -2778,42 +3365,158 @@
       .ndm-fly-dupe {
         display: flex; gap: 8px; padding: 8px 12px 10px;
       }
-      .ndm-fly-prog { padding: 9px 12px 11px; }
-      .ndm-fly-prog-head {
-        font-weight: 600; margin-bottom: 7px;
+      /* ── Progress view = IDM's download dialog ──────────────
+         The classic tab strip — "Download status" | "Speed
+         Limiter" — over the panels (SPEC: ndm-research/
+         idm-dialog-ref/SPEC.md §1.2); the Speed Limiter pane
+         drives the entry's real per-file limit through the
+         bridge. The "Download status" panel, element for
+         element: URL line, then
+         Status / File size / Downloaded / Transfer rate /
+         Time left / Resume capability label rows in Tahoma, the
+         classic green bar with an inset border, and flat classic
+         buttons — Pause/Resume + Cancel right, IDM's own details
+         toggle in the left slot ("Show in NDM", the card's real
+         open-in-app action, sits beside it). The expanded
+         details section below the button row — caption, segment
+         chart, N. / Downloaded / Info connection table — renders
+         from the progress mirror's blocks / conns_detail fields;
+         against an older app that mirrors neither, the toggle
+         simply never appears. */
+      .ndm-fly-prog {
+        padding: 9px 12px 11px;
+        font-family: Tahoma, "Segoe UI", sans-serif;
+        font-size: 11.5px; color: #000;
+      }
+      .ndm-fly-purl {
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        margin-bottom: 6px;
       }
-      .ndm-fly-bar {
-        height: 8px; border-radius: 4px;
-        background: #dbe5f0; overflow: hidden; margin-bottom: 7px;
-      }
-      .ndm-fly-bar-fill {
-        height: 100%; width: 0%;
-        background: linear-gradient(90deg, #1d9e57, #35c172);
-        transition: width .3s ease;
-      }
-      .ndm-fly-stats { color: #48637f; font-size: 12px; min-height: 16px; }
-      .ndm-fly-btns { display: flex; gap: 8px; margin-top: 9px; }
-      .ndm-fly-btns .ndm-btn { height: 27px; padding: 0 12px; font-size: 12px; }
-      .ndm-fly-multi { padding: 2px 0; }
-      .ndm-fly-mrow {
-        display: flex; align-items: center; justify-content: space-between; gap: 10px;
-        padding: 4px 12px;
-      }
-      .ndm-fly-mname {
+      .ndm-fly-prow { display: flex; line-height: 1.55; }
+      .ndm-fly-plab { flex: 0 0 108px; white-space: nowrap; }
+      .ndm-fly-pval {
         flex: 1; min-width: 0;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
-      .ndm-fly-mpct { color: #48637f; flex: none; }
-      .ndm-fly-mbtns { display: flex; gap: 6px; flex: none; }
+      .ndm-fly-pstatus { color: #0000ee; text-decoration: underline; }
+      .ndm-fly-pmsg { margin-top: 6px; line-height: 1.45; overflow-wrap: break-word; }
+      /* IDM's tab strip (SPEC §1.2): classic raised tabs above
+         the panel body — "Download status" | "Speed Limiter".
+         The bar, button row and details section stay below both
+         panes, as in the dialog. The strip renders only when the
+         progress mirror reports the entry's speed_limit. */
+      .ndm-fly-tabs {
+        display: flex; gap: 2px; padding: 0 2px;
+        border-bottom: 1px solid #7f7f7f; margin-bottom: 8px;
+      }
+      .ndm-fly-tab {
+        background: #e4e4e4; border: 1px solid #7f7f7f; border-bottom: none;
+        border-radius: 0; box-shadow: none; cursor: pointer;
+        padding: 3px 12px; margin-bottom: -1px;
+        font: 400 11.5px Tahoma, "Segoe UI", sans-serif; color: #000;
+      }
+      .ndm-fly-tab-on { background: #fff; }
+      /* The Speed Limiter pane (reference 04): the live speed
+         line, the "Use Speed Limiter" checkbox, and the
+         "Maximum download speed:" value + unit, in the dialog's
+         own plain controls. The note line carries rejections —
+         the panel never claims a limit the app did not take. */
+      .ndm-fly-lrow { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+      .ndm-fly-luserow { cursor: pointer; }
+      .ndm-fly-luse { margin: 0 2px 0 0; }
+      .ndm-fly-lval {
+        width: 62px; height: 21px; padding: 0 4px;
+        border: 1px solid #7f7f7f; border-radius: 0;
+        background: #fff; color: #000;
+        font: 400 11.5px Tahoma, "Segoe UI", sans-serif;
+      }
+      .ndm-fly-lval:disabled { background: #f0f0f0; color: #838383; }
+      .ndm-fly-lunit {
+        height: 23px; border: 1px solid #7f7f7f; border-radius: 0;
+        background: #fff; color: #000;
+        font: 400 11.5px Tahoma, "Segoe UI", sans-serif;
+      }
+      .ndm-fly-lunit:disabled { color: #838383; }
+      .ndm-fly-lnote { color: #b00020; margin-top: 5px; min-height: 13px; }
+      .ndm-fly-bar {
+        height: 14px; border: 1px solid #7f7f7f;
+        background: #e6e6e6; overflow: hidden; margin-top: 8px;
+      }
+      .ndm-fly-bar-fill {
+        height: 100%; width: 0%;
+        background: #00b050;
+        transition: width .3s ease;
+      }
+      .ndm-fly-btns { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+      .ndm-fly-btnsp { flex: 1; }
+      .ndm-pbtn {
+        height: 23px; min-width: 86px; padding: 0 10px;
+        background: #f0f0f0; border: 1px solid #7f7f7f; border-radius: 0;
+        color: #000; font: 400 11px Tahoma, "Segoe UI", sans-serif;
+        cursor: pointer; white-space: nowrap; box-shadow: none;
+      }
+      .ndm-pbtn:hover:not(:disabled) { background: #e5f1fb; border-color: #0078d7; }
+      .ndm-pbtn:disabled { color: #838383; border-color: #c0c0c0; cursor: default; }
+      .ndm-pbtn-def { font-weight: 700; }
+      /* IDM's details section (SPEC §1.7): centred caption, the
+         segment chart (one cell per block of the poll's block
+         map — filled = downloaded, pale = in flight, white =
+         pending), then the connections table in a bordered,
+         scrolling box with a classic header row. */
+      .ndm-fly-details { margin-top: 10px; }
+      .ndm-fly-dcap { text-align: center; margin-bottom: 5px; }
+      .ndm-fly-dchart {
+        display: flex; height: 14px; border: 1px solid #7f7f7f;
+        background: #fff; overflow: hidden; margin-bottom: 6px;
+      }
+      .ndm-fly-dchart i { flex: 1 1 0; min-width: 0; }
+      .ndm-fly-dchart i.b1 { background: #8fb0dc; }
+      .ndm-fly-dchart i.b2 { background: #d7e5f5; }
+      .ndm-fly-dtwrap {
+        max-height: 118px; overflow-y: auto;
+        border: 1px solid #7f7f7f; background: #fff;
+      }
+      .ndm-fly-dtable { width: 100%; border-collapse: collapse; }
+      .ndm-fly-dtable th, .ndm-fly-dtable td {
+        text-align: left; padding: 2px 6px; font-weight: 400;
+        white-space: nowrap;
+      }
+      .ndm-fly-dtable thead th {
+        background: #f0f0f0; border-bottom: 1px solid #7f7f7f;
+        position: sticky; top: 0;
+      }
+      .ndm-fly-dtable .ndm-dc-n { width: 30px; }
+      .ndm-fly-dtable .ndm-dc-d { width: 108px; }
+      .ndm-fly-multi { padding: 2px 0; }
+      .ndm-fly-mrow {
+        display: flex; flex-wrap: wrap; align-items: center;
+        column-gap: 10px; row-gap: 3px;
+        padding: 6px 12px 7px;
+        font-family: Tahoma, "Segoe UI", sans-serif;
+        font-size: 11.5px; color: #000;
+      }
+      .ndm-fly-mname {
+        order: 1; flex: 1; min-width: 0;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .ndm-fly-mbtns { order: 2; display: flex; gap: 6px; flex: none; }
+      .ndm-fly-mbar {
+        order: 3; flex: 0 0 100%; height: 10px;
+        border: 1px solid #7f7f7f; background: #e6e6e6; overflow: hidden;
+      }
+      .ndm-fly-mbar-fill {
+        height: 100%; width: 0%;
+        background: #00b050; transition: width .3s ease;
+      }
+      .ndm-fly-mpct { order: 4; flex: 0 0 100%; color: #000; min-height: 15px; }
       .ndm-fly-mbtn {
-        background: linear-gradient(180deg, #ffffff 0%, #e6eef7 100%);
-        border: 1px solid #96aec9; color: #1c314a;
-        border-radius: 5px; height: 22px; padding: 0 8px;
+        background: #f0f0f0;
+        border: 1px solid #7f7f7f; color: #000;
+        border-radius: 0; height: 23px; padding: 0 10px;
         font: inherit; font-size: 11px; cursor: pointer;
       }
-      .ndm-fly-mbtn:hover:not(:disabled) { background: #f5f9ff; }
-      .ndm-fly-mbtn:disabled { opacity: .5; cursor: default; }
+      .ndm-fly-mbtn:hover:not(:disabled) { background: #e5f1fb; border-color: #0078d7; }
+      .ndm-fly-mbtn:disabled { color: #838383; border-color: #c0c0c0; cursor: default; }
       .ndm-fly-state { color: #1d7a3a; font-weight: 600; }
 
       /* Non-intrusive Bottom-Right Background Download Toast */
