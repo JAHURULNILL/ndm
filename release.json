@@ -1,12 +1,32 @@
 {
- "deb_sha256": "c1d3ad8fa07e54c2c9995fa9cef06f9261989f099319be6bcdbe43fe1db01264",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_amd64.deb",
- "ext_sha256": "3e6b171b4b527d0497a40da0c4c5a2ae5d0c4b1cd552820fb5ee97e6344fc7b7",
- "min_supported": "1.0.0",
- "notes": "Nill Download Manager 2.0.3 \u2014 the Windows downloads are now the size they should be. The installer drops from 101.5 MB to about 5 MB and the portable ZIP from 134 MB to about 6 MB, because the video components (yt-dlp, deno, ffmpeg) are no longer bundled: like Linux, the app fetches them once in the background on first launch, each verified against a pinned SHA-256, with no setup screens or prompts \u2014 a video started while they are still arriving begins on its own when they land. Existing Windows installs keep the components they already have, so nothing is re-downloaded. Also fixed: Ctrl/Shift multi-row selection in the download list could silently fall back to a single selection on WebKit setups that drop modifier state from click events. The interface, the download engine and Linux behaviour are otherwise unchanged.",
- "version": "2.0.3",
- "win_setup_sha256": "",
- "win_setup_url": "",
- "win_sha256": "",
- "win_url": ""
+  "version": "2.0.3",
+  "min_supported": "1.0.0",
+  "notes": "The Windows downloads shrink to the size class Linux has always had: the installer is now about 5 MB and the portable ZIP about 6 MB, down from 101.5 MB and 134 MB. The video components (yt-dlp, deno, ffmpeg) are no longer bundled; on first launch the app downloads them once, in the background, verifying SHA-256 hashes pinned in the app. Upgraders from 2.0.2 keep their existing components \u2014 nothing is re-downloaded. Two smaller changes ride along: row selection with Ctrl/Shift is now reliable on WebKit setups that drop modifier state from click events, and the list's right-click menu gains Select All and Delete All, for clearing the list with the mouse alone. Everything else is unchanged.",
+  "assets": {
+    "linux_deb": {
+      "name": "NDM_2.0.3_amd64.deb",
+      "sha256": "af9df454bdd95dd10dfe42af557f5ea17b63a4bbe5b3b1fc5ccc40b06058cdd4",
+      "url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_amd64.deb"
+    },
+    "linux_portable": {
+      "name": "",
+      "sha256": "",
+      "url": ""
+    },
+    "windows_setup": {
+      "name": "",
+      "sha256": "",
+      "url": ""
+    },
+    "windows_portable": {
+      "name": "",
+      "sha256": "",
+      "url": ""
+    },
+    "extension_zip": {
+      "name": "ndm-extension-2.0.3.zip",
+      "sha256": "3e6b171b4b527d0497a40da0c4c5a2ae5d0c4b1cd552820fb5ee97e6344fc7b7",
+      "url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/ndm-extension-2.0.3.zip"
+    }
+  }
 }

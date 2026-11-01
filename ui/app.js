@@ -1259,6 +1259,16 @@ function rangeSelect(id) {
   render();
 }
 
+/* Select every visible row — exactly what Ctrl+A does; shared so
+   the keyboard and the mouse paths can never drift apart. */
+function selectAllVisible() {
+  const list = visibleItems();
+  selectedIds.clear();
+  for (const d of list) selectedIds.add(d.id);
+  if (!selectedId || !selectedIds.has(selectedId)) selectedId = list.length ? list[0].id : null;
+  render();
+}
+
 /* ---------- row context menu (IDM's right-click menu) ---------- */
 const ctxMenu = $('ctxMenu');
 function hideCtxMenu() { ctxMenu.classList.add('hidden'); }
@@ -1314,6 +1324,9 @@ function showCtxMenu(x, y, id) {
     else selectedId = id;
     openDeleteConfirm();
   });
+  const sep4 = document.createElement('div'); sep4.className = 'ctx-sep'; ctxMenu.appendChild(sep4);
+  add('Select All', () => selectAllVisible());
+  add('Delete All…', () => deleteAllEntries());
   ctxMenu.classList.remove('hidden');
   const w = ctxMenu.offsetWidth, h = ctxMenu.offsetHeight;
   ctxMenu.style.left = Math.max(4, Math.min(x, window.innerWidth - w - 8)) + 'px';
@@ -1373,6 +1386,21 @@ function openDeleteConfirm() {
   $('delConfirm').focus();
 }
 $('btnDelete').onclick = openDeleteConfirm;
+/* Delete All: mark EVERY entry (not just the visible rows) and let
+   the same confirmation dialog + confirm handler do the rest — one
+   dialog, one file checkbox, the same per-entry remove underneath,
+   so an in-flight entry is stopped first exactly as a batch delete
+   of a hand-made selection already does. It exists because clearing
+   a restored list one row at a time (or by Ctrl+A, whose modifiers
+   some WebKits drop) should not be the only way to empty the list. */
+function deleteAllEntries() {
+  if (!items.size) return;
+  selectedIds.clear();
+  for (const id of items.keys()) selectedIds.add(id);
+  selectedId = items.keys().next().value;
+  render();
+  openDeleteConfirm();
+}
 function closeDeleteConfirm() { deleteTargets = null; $('delmodal').classList.add('hidden'); }
 $('delModalClose').onclick = $('delCancel').onclick = closeDeleteConfirm;
 $('delmodal').addEventListener('click', e => { if (e.target === $('delmodal')) closeDeleteConfirm(); });
@@ -3378,11 +3406,7 @@ document.addEventListener('keydown', e => {
     const openModal = document.querySelector('.modal:not(.hidden)');
     if (openModal && openModal.id !== 'cmodal') return;
     e.preventDefault();
-    const list = visibleItems();
-    selectedIds.clear();
-    for (const d of list) selectedIds.add(d.id);
-    if (!selectedId || !selectedIds.has(selectedId)) selectedId = list.length ? list[0].id : null;
-    render();
+    selectAllVisible();
     return;
   }
   if (e.key !== 'Escape') return;
@@ -4003,8 +4027,10 @@ const menuActions = {
   startall: startAllDownloads,
   pauseall: pauseAllDownloads,
   stopall: () => $('btnStopAll').click(),
+  selall: () => selectAllVisible(),
   del: () => $('btnDelete').click(),
   deldone: deleteCompleted,
+  delall: () => deleteAllEntries(),
   grabber: () => $('btnGrabber').click(),
   scheduler: () => $('btnScheduler').click(),
   options: openOptions,
