@@ -125,6 +125,10 @@ Section "Install"
     Rename "$INSTDIR\ndm-host.exe" "$INSTDIR\ndm-host.exe.old"
   ${EndIf}
   File "${SRCROOT}\ndm-host.exe"
+  ; WebView2 loader DLL: ndm-app.exe links the loader through this
+  ; DLL (see src-tauri/Cargo.toml [patch] note) — it must sit beside
+  ; the exe. The DLL itself imports only KERNEL32.
+  File "${SRCROOT}\WebView2Loader.dll"
 
   SetOutPath "$INSTDIR\extension"
   File /r "${SRCROOT}\extension\*.*"
@@ -193,6 +197,7 @@ Section "Uninstall"
   Delete "$INSTDIR\ndm-app.exe.old"
   Delete "$INSTDIR\ndm-host.exe"
   Delete "$INSTDIR\ndm-host.exe.old"
+  Delete "$INSTDIR\WebView2Loader.dll"
   Delete "$INSTDIR\installed.flag"
   ; a pre-slim install's bundled engine folder, if one is there —
   ; slim installs never create it (their engine lives in %APPDATA%,

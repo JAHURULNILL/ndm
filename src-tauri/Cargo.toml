@@ -23,3 +23,13 @@ ndm = { path = ".." }
 
 [profile.release]
 opt-level = 3
+
+# Vendored webview2-com-sys 0.39.1 with one patch (see
+# vendor/webview2-com-sys/src/lib.rs): on MSVC it links the WebView2
+# loader through its DLL import library instead of the prebuilt
+# WebView2LoaderStatic.lib, whose Chromium-built objects drag
+# dynamic-UCRT (api-ms-win-crt-*) imports into ndm-app.exe and break
+# startup on Windows 7/8 despite +crt-static. WebView2Loader.dll
+# (imports: KERNEL32 only) is shipped beside ndm-app.exe.
+[patch.crates-io]
+webview2-com-sys = { path = "vendor/webview2-com-sys" }
