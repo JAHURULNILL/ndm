@@ -93,8 +93,13 @@ function stampNow() {
   return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
 }
 const pctOf = d => (d.total > 0 ? Math.min(100, (100 * d.done_bytes) / d.total) : 0);
-const KNOWN_STATUS = ['downloading', 'paused', 'queued', 'finished', 'error', 'cancelled'];
+const KNOWN_STATUS = ['starting', 'downloading', 'merging', 'paused', 'queued', 'finished', 'error', 'cancelled'];
 const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+// A2: the video pipeline's phase statuses get proper labels
+// wherever entry status text is rendered; every other status
+// keeps the plain capitalized word ('downloading' included)
+const STATUS_TEXT = { starting: 'Starting…', merging: 'Merging…' };
+const statusText = s => STATUS_TEXT[s] || cap(s);
 
 /* ---------- DOM refs ---------- */
 const $ = id => document.getElementById(id);
@@ -719,6 +724,9 @@ function cellHtml(colId, d, st, left) {
       // the percentage branch and sit at "0.00%", indistinguishable
       // from a paused entry that simply had not started
       else if (st === 'queued') txt = 'Queued';
+      // A2: the phase labels win over the percentage — a merging
+      // row at 100% must say what it is doing, not sit at "100.00%"
+      else if (STATUS_TEXT[st]) txt = STATUS_TEXT[st];
       else if (d.total > 0) txt = pctOf(d).toFixed(2) + '%';
       else txt = cap(st);
       return '<span class="sdot"></span>' + txt;
@@ -1036,7 +1044,7 @@ function renderDetail() {
     syncLimiterPanel();
   }
   $('dUrl').textContent = d.url;
-  $('dStatus').textContent = cap(d.status) + (d.error ? ' — ' + d.error : '');
+  $('dStatus').textContent = statusText(d.status) + (d.error ? ' — ' + d.error : '');
   $('dSize').textContent = d.total > 0 || d.status === 'finished' ? fmtSize(d.total) : 'Unknown';
   $('dDone').textContent = d.total > 0
     ? `${fmtSize(d.done_bytes)} (${pctOf(d).toFixed(1)}%)`
@@ -2753,7 +2761,7 @@ function renderSchedFiles() {
     nm.title = d.url;
     const st = document.createElement('span');
     st.className = 's-st';
-    st.textContent = cap(d.status || '');
+    st.textContent = statusText(d.status || '');
     const move = upWanted => {
       if (!schedOrder) return;
       const j = upWanted ? i - 1 : i + 1;
@@ -3689,7 +3697,13 @@ const completeQueue = [];
 let completeCurrent = null;
 function showNextComplete() {
   const cm = $('cmodal');
-  if (!cm || completeCurrent || !completeQueue.length) return;
+  if (!cm || !completeQueue.length) return;
+  // one completion dialog at a time, and no queue stacked
+  // behind it: finishes that land while a completion dialog
+  // is already open are not announced again — the finished
+  // entries are in the list anyway, so the user never has
+  // to dismiss a pile of these boxes one by one
+  if (completeCurrent) { completeQueue.length = 0; return; }
   // a completion whose entry has since been deleted must not
   // surface — the announcement outlived the download it was
   // about (R3: the dialog appeared after its entry was deleted).

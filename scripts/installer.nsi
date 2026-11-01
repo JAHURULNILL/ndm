@@ -11,8 +11,6 @@
 ;                                       the app's self-update reads
 ;                                       this exact file name)
 ;   <InstallDir>\uninstall.exe
-;   <InstallDir>\ucrtbase.dll + api-ms-win-*.dll
-;                                       (app-local UCRT — below)
 ;
 ; The video engine (yt-dlp, deno, ffmpeg) is deliberately NOT in
 ; the package — that is what keeps this installer IDM-sized. The
@@ -47,7 +45,7 @@
 ; instantly, and any failure leaves the NDM install to complete.
 
 !ifndef VERSION
-  !define VERSION "2.0.5"
+  !define VERSION "2.0.6"
 !endif
 !ifndef SRCROOT
   !define SRCROOT "NDM-Windows-Portable"
@@ -131,15 +129,6 @@ Section "Install"
   ; DLL (see src-tauri/Cargo.toml [patch] note) — it must sit beside
   ; the exe. The DLL itself imports only KERNEL32.
   File "${SRCROOT}\WebView2Loader.dll"
-  ; App-local Universal CRT: Windows 7/8 carry no in-box UCRT,
-  ; and ndm-app.exe still references six api-ms-win-crt-*
-  ; forwarders out of Microsoft's static UCRT (see the
-  ; .cargo/config.toml note). The SDK redist set is copied into
-  ; SRCROOT by CI's Assemble step and lands beside the exes, so
-  ; the loader resolves the forwarders from the app's own
-  ; folder; on Windows 10/11 nothing changes in practice.
-  File "${SRCROOT}\ucrtbase.dll"
-  File "${SRCROOT}\api-ms-win-*.dll"
 
   SetOutPath "$INSTDIR\extension"
   File /r "${SRCROOT}\extension\*.*"
@@ -209,8 +198,6 @@ Section "Uninstall"
   Delete "$INSTDIR\ndm-host.exe"
   Delete "$INSTDIR\ndm-host.exe.old"
   Delete "$INSTDIR\WebView2Loader.dll"
-  Delete "$INSTDIR\ucrtbase.dll"
-  Delete "$INSTDIR\api-ms-win-*.dll"
   Delete "$INSTDIR\installed.flag"
   ; a pre-slim install's bundled engine folder, if one is there —
   ; slim installs never create it (their engine lives in %APPDATA%,

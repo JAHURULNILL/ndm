@@ -467,8 +467,15 @@ fn parse_output_path_line(line: &str) -> Option<PathBuf> {
 
 #[derive(Clone)]
 pub struct VideoProgress {
-    pub status: String, // downloading | paused | finished | error | cancelled
+    pub status: String, // starting | downloading | merging | paused | finished | error | cancelled
     pub total: u64,
+    /// A1: set once every engine part has reported a probed total:
+    /// `total` then holds the parts' sum and the engine poll loop
+    /// never rewrites it (before the lock, `total` keeps whatever
+    /// hint it already had instead of tracking partial per-part
+    /// sums). The finalize paths may still replace it — together
+    /// with `done` — with the merged file's length.
+    pub total_locked: bool,
     pub done: u64,
     pub speed_bps: f64,
     pub conns: usize,
@@ -486,6 +493,7 @@ impl Default for VideoProgress {
         VideoProgress {
             status: "downloading".into(),
             total: 0,
+            total_locked: false,
             done: 0,
             speed_bps: 0.0,
             conns: 0,
@@ -593,6 +601,12 @@ pub struct VideoJob {
     stop_flag: Mutex<Option<String>>, // "paused" | "cancelled" when WE stopped it
     spawn_lock: Mutex<()>,
     gen: std::sync::atomic::AtomicU64,
+    /// true while this job's spawn thread is in flight (resolving,
+    /// downloading, merging — any phase). Set synchronously by
+    /// spawn() and cleared by the thread's exit guard, so
+    /// payload_of can tell a live run's real (still-zero) numbers
+    /// from a settled job's (A3)
+    alive: std::sync::atomic::AtomicBool,
     /// the chosen formats carry a sound stream (learned from yt-dlp's own
     /// resolution) — a "finished" video without sound is then a failure,
     /// never a success
@@ -1154,6 +1168,20 @@ pub fn seed_picker_resolutions(
     }
 }
 
+/// Clears `VideoJob::alive` when the spawn thread exits — on
+/// EVERY path, including the thread body's many early returns and
+/// a panic: the flag claims "a run is in flight", and a dead
+/// thread must never leave that claim standing (A3).
+struct AliveGuard(Arc<VideoJob>);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0
+            .alive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl VideoJob {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
@@ -1199,6 +1227,7 @@ impl VideoJob {
             stop_flag: Mutex::new(None),
             spawn_lock: Mutex::new(()),
             gen: std::sync::atomic::AtomicU64::new(0),
+            alive: std::sync::atomic::AtomicBool::new(false),
             expect_audio: Mutex::new(false),
             expected_media: Mutex::new(None),
             pair_audio_url: Mutex::new(None),
@@ -1449,9 +1478,16 @@ impl VideoJob {
             let mut all_finished = true;
             let mut any_error = false;
             let mut any_paused = false;
+            // A1: the total may lock only when EVERY part has
+            // reported a probed total — a part that has not probed
+            // yet reports 0 and vetoes the lock
+            let mut all_totals_known = !dls.is_empty();
 
             for d in &dls {
                 let pr = d.progress();
+                if pr.total == 0 {
+                    all_totals_known = false;
+                }
                 total_sum = total_sum.saturating_add(pr.total);
                 done_sum = done_sum.saturating_add(pr.done_bytes);
                 if pr.status == ndm::Status::Downloading {
@@ -1476,8 +1512,14 @@ impl VideoJob {
 
             {
                 let mut p = self.progress.lock().unwrap();
-                if total_sum > 0 {
+                // A1: once every part has probed, the total is the
+                // parts' sum — set ONCE and locked. Before the lock
+                // the total keeps its hint value instead of jumping
+                // with each part that happens to report early; after
+                // it, per-part sum drift can never move it again.
+                if !p.total_locked && all_totals_known && total_sum > 0 {
                     p.total = total_sum;
+                    p.total_locked = true;
                 }
                 if done_sum != p.done {
                     p.last_progress_at = Instant::now();
@@ -1491,8 +1533,13 @@ impl VideoJob {
                 };
                 p.status = if any_paused {
                     "paused".to_string()
-                } else {
+                } else if done_sum > 0 || p.total_locked {
+                    // bytes are moving — or every stream has
+                    // reported in (probed), which ends "starting"
+                    // even before the first byte lands
                     "downloading".to_string()
+                } else {
+                    "starting".to_string()
                 };
             }
 
@@ -1520,6 +1567,11 @@ impl VideoJob {
             if p.total > 0 {
                 p.done = p.total;
             }
+            // A2: every part has arrived — from here to the
+            // finalize verdict the job is merging (the ffmpeg run
+            // below plus the ensure_audio window); the finalize
+            // branches replace this with their own verdict
+            p.status = "merging".to_string();
             p.speed_bps = 0.0;
             p.conns = 0;
         }
@@ -2012,7 +2064,16 @@ impl VideoJob {
             + 1;
         {
             let mut p = self.progress.lock().unwrap();
-            p.status = "downloading".to_string();
+            // A2: a fresh attempt starts as "starting" — it stays
+            // that way until bytes actually move (the engine poll
+            // loop / the yt-dlp progress handler promote it to
+            // "downloading"), so the resolve-and-connect window no
+            // longer masquerades as a running download
+            p.status = "starting".to_string();
+            // a new attempt re-earns its total lock: the parts
+            // re-probe, and until they have all reported, `total`
+            // keeps the previous attempt's value as the hint
+            p.total_locked = false;
             // a (re)start supersedes the previous attempt's
             // failure: the stored error clears NOW, so progress
             // payloads never carry a stale error alongside a live
@@ -2022,10 +2083,16 @@ impl VideoJob {
             p.conns = ndm::global_connections().clamp(1, 32);
             p.last_progress_at = Instant::now();
         }
+        // claimed synchronously, before the thread spawns, so a
+        // payload sampled in the gap already sees the live run (A3)
+        self.alive
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let job = self.clone();
         let comp_dir = components_dir.to_path_buf();
         std::thread::spawn(move || {
+            // clears `alive` on every exit path of this thread (A3)
+            let _alive_guard = AliveGuard(job.clone());
             // 0. A previous run merged the file but was paused before
             // it could be finalized: verify and publish that merge
             // instead of downloading everything again.
@@ -2042,6 +2109,9 @@ impl VideoJob {
                     // guard skips this finalize (R3-EXT-01)
                     let downloaded = job.progress.lock().unwrap().total;
                     let expected_media = *job.expected_media.lock().unwrap();
+                    // the audio check below is part of the finalize
+                    // window: report it as "merging", not "starting"
+                    job.progress.lock().unwrap().status = "merging".to_string();
                     let audio_result = job.ensure_audio(&merged, &comp_dir);
                     // a stop that landed DURING the audio check wins
                     // over the kept merge's verdict, exactly as in
@@ -2134,6 +2204,10 @@ impl VideoJob {
             {
                 return;
             }
+            // the fallback is a fresh attempt: whatever phase the
+            // engine reached, this one starts at "starting" again
+            // and earns "downloading" from its first bytes (A2)
+            job.progress.lock().unwrap().status = "starting".to_string();
 
             // 2. Fallback to yt-dlp with concurrent fragments for HLS/DASH streams
             let mut args = base_args_for_url(&job.url, &comp_dir, job.cookies.as_deref());
@@ -2259,6 +2333,12 @@ impl VideoJob {
             let mut base: u64 = 0;
             let mut cur_done: u64 = 0;
             let mut cur_total: u64 = 0;
+            // A1: has the CURRENT file reported an exact
+            // total_bytes yet? Once it has, its total_bytes_estimate
+            // lines must never move the total again (the estimate
+            // keeps arriving and used to overwrite the exact figure
+            // — one source of the total changing size mid-download)
+            let mut cur_exact = false;
             let mut detected_final: Option<PathBuf> = None;
 
             for line in BufReader::new(stdout).lines() {
@@ -2275,6 +2355,7 @@ impl VideoJob {
                         if cur_done > 262_144 && d + 262_144 < cur_done {
                             base += if cur_total > 0 { cur_total } else { cur_done };
                             cur_total = 0;
+                            cur_exact = false;
                         }
                         cur_done = d;
                         let new_done = base + cur_done;
@@ -2282,11 +2363,32 @@ impl VideoJob {
                             p.last_progress_at = Instant::now();
                         }
                         p.done = new_done;
+                        // A2: the first real bytes end "starting"
+                        if p.done > 0 && p.status == "starting" {
+                            p.status = "downloading".to_string();
+                        }
                     }
-                    if let Some(t) = parse(1).or_else(|| parse(2)) {
-                        if t > 0.0 {
-                            cur_total = t as u64;
-                            p.total = base + cur_total;
+                    // A1: exact total_bytes wins for the current
+                    // file from the first time it appears; the
+                    // estimate is used only until then. The reported
+                    // total never decreases mid-download (an early
+                    // over-estimate stays until the finalize replaces
+                    // total and done together with the merged length)
+                    let exact = parse(1).filter(|&t| t > 0.0);
+                    let estimate = parse(2).filter(|&t| t > 0.0);
+                    let reported = match exact {
+                        Some(e) => {
+                            cur_exact = true;
+                            Some(e)
+                        }
+                        None if !cur_exact => estimate,
+                        None => None,
+                    };
+                    if let Some(t) = reported {
+                        cur_total = t as u64;
+                        let new_total = base + cur_total;
+                        if new_total > p.total {
+                            p.total = new_total;
                         }
                     }
                     if let Some(sp) = parse(3) {
@@ -2295,12 +2397,22 @@ impl VideoJob {
                 } else {
                     if let Some(fp) = parse_output_path_line(&line) {
                         detected_final = Some(fp);
+                        // yt-dlp has named a file it is writing:
+                        // the download proper has begun (A2)
+                        let mut p = job.progress.lock().unwrap();
+                        if p.status == "starting" {
+                            p.status = "downloading".to_string();
+                        }
                     }
                     if line.contains("[Merger]") || line.contains("[ExtractAudio]") {
                         let mut p = job.progress.lock().unwrap();
                         if p.total > 0 {
                             p.done = p.total;
                         }
+                        // A2: the merge / audio-extraction window —
+                        // including the ensure_audio check that runs
+                        // after this loop — reports as "merging"
+                        p.status = "merging".to_string();
                         p.speed_bps = 0.0;
                     }
                 }
@@ -2516,7 +2628,13 @@ impl VideoJob {
             let _ = c.kill();
         }
         let mut p = self.progress.lock().unwrap();
-        if p.status == "downloading" {
+        // "starting" included (A2): a pause that lands while the
+        // job is still resolving has no downloads and no child to
+        // observe the stop — without the flip here the entry would
+        // sit in "starting" after its thread has gone. ("merging"
+        // is deliberately absent: the merge finalize sees the stop
+        // flag itself and publishes the pause with its kept merge.)
+        if p.status == "downloading" || p.status == "starting" {
             p.status = "paused".to_string();
             p.speed_bps = 0.0;
             p.conns = 0;
@@ -2543,6 +2661,14 @@ impl VideoJob {
         let mut p = self.progress.lock().unwrap();
         p.status = "cancelled".to_string();
         p.conns = 0;
+    }
+
+    /// Is a run of this job in flight right now (its spawn thread
+    /// is alive in any phase)? payload_of uses it for the A3 rule:
+    /// the restored-session byte hint may stand in for progress
+    /// only while NO live job owns the entry's numbers.
+    pub fn is_live(&self) -> bool {
+        self.alive.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// True once nothing of this job is still running: the yt-dlp
@@ -2706,6 +2832,7 @@ mod tests {
             ext: "MP4".to_string(),
             note: String::new(),
             size_bytes: 0,
+            size_approx: false,
             size_text: String::new(),
             audio,
             height,

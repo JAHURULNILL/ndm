@@ -14,6 +14,13 @@ pub struct QualityOption {
     pub ext: String,
     pub note: String,
     pub size_bytes: u64,
+    /// True when `size_bytes` is an estimate (yt-dlp's
+    /// filesize_approx or a bitrate×duration guess) rather than an
+    /// exact filesize — the picker shows such sizes as approximate
+    /// instead of stating them as fact. Defaults to false when an
+    /// older saved payload has no such field.
+    #[serde(default)]
+    pub size_approx: bool,
     pub size_text: String,
     pub audio: bool,
     pub height: u64,
@@ -270,12 +277,16 @@ fn fetch_thumbnail_data_uri(url: &str) -> Option<String> {
 }
 
 /// Extract or estimate the byte size of one yt-dlp format entry.
-fn format_size_bytes(f: &serde_json::Value, duration_secs: f64) -> u64 {
+/// Returns (bytes, is_approx): the size is exact only when yt-dlp
+/// reported a real `filesize`; `filesize_approx` and the
+/// bitrate×duration fallback are estimates, and an unknown size
+/// (0) is never presented as exact either.
+fn format_size_bytes(f: &serde_json::Value, duration_secs: f64) -> (u64, bool) {
     if let Some(s) = f["filesize"].as_u64().filter(|&s| s > 0) {
-        return s;
+        return (s, false);
     }
     if let Some(s) = f["filesize_approx"].as_u64().filter(|&s| s > 0) {
-        return s;
+        return (s, true);
     }
     let kbps = f["tbr"]
         .as_f64()
@@ -287,9 +298,9 @@ fn format_size_bytes(f: &serde_json::Value, duration_secs: f64) -> u64 {
         })
         .unwrap_or(0.0);
     if kbps > 0.0 && duration_secs > 0.0 {
-        ((kbps * 1000.0 / 8.0) * duration_secs) as u64
+        (((kbps * 1000.0 / 8.0) * duration_secs) as u64, true)
     } else {
-        0
+        (0, true)
     }
 }
 
@@ -517,8 +528,10 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
     // Also track HOW the audio is delivered: an audio option built
     // from HLS renditions must not be labelled "MP3" (F-EXT-02).
     let mut best_m4a_size: u64 = 0;
+    let mut best_m4a_approx = true;
     let mut best_m4a_ext = String::new();
     let mut best_any_audio_size: u64 = 0;
+    let mut best_any_audio_approx = true;
     let mut best_any_audio_ext = String::new();
     // Preference-ordered candidates for the size-less case below:
     // the ext of an m4a/aac-preferred audio format, and of any
@@ -536,7 +549,7 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
             } else {
                 has_direct_audio = true;
             }
-            let sz = format_size_bytes(f, duration_f64);
+            let (sz, sz_approx) = format_size_bytes(f, duration_f64);
             let ext = f["ext"].as_str().unwrap_or("");
             if ext == "m4a" || acodec.starts_with("mp4a") || acodec.starts_with("aac") {
                 // yt-dlp lists formats worst→best, so the LAST
@@ -545,12 +558,14 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
                 pref_m4a_ext = ext.to_string();
                 if sz > best_m4a_size {
                     best_m4a_size = sz;
+                    best_m4a_approx = sz_approx;
                     best_m4a_ext = ext.to_string();
                 }
             }
             pref_any_audio_ext = ext.to_string();
             if sz > best_any_audio_size {
                 best_any_audio_size = sz;
+                best_any_audio_approx = sz_approx;
                 best_any_audio_ext = ext.to_string();
             }
         }
@@ -583,6 +598,16 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
     } else {
         0
     };
+    // The audio size is approximate when the winning format's size
+    // was estimated — and the duration-based fallback above is an
+    // estimate by construction, as is an unknown (0) size.
+    let audio_approx = if best_m4a_size > 0 {
+        best_m4a_approx
+    } else if best_any_audio_size > 0 {
+        best_any_audio_approx
+    } else {
+        true
+    };
 
     // Any real video stream at all? Storyboards (mhtml) don't count.
     let has_video = formats.iter().any(|f| {
@@ -604,7 +629,9 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
     heights.dedup();
 
     // Estimate size for a given height `h` by finding the format our selector prefers.
-    let size_for_height = |h: u64| -> u64 {
+    // Returns (bytes, is_approx): a combined video+audio size is
+    // approximate when ANY of its parts is.
+    let size_for_height = |h: u64| -> (u64, bool) {
         let mut best_rank = (0u8, 0u8, 0u64);
         let mut chosen: Option<&serde_json::Value> = None;
         for f in formats {
@@ -626,7 +653,7 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
             } else {
                 1
             };
-            let sz = format_size_bytes(f, duration_f64);
+            let (sz, _) = format_size_bytes(f, duration_f64);
             let has_size: u8 = if sz > 0 { 1 } else { 0 };
             let rank = (codec_tier, has_size, sz);
             if chosen.is_none() || rank > best_rank {
@@ -635,21 +662,21 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
             }
         }
         if let Some(f) = chosen {
-            let v_sz = format_size_bytes(f, duration_f64);
+            let (v_sz, v_approx) = format_size_bytes(f, duration_f64);
             if v_sz == 0 {
-                return 0;
+                return (0, true);
             }
             // Only an EXPLICIT acodec "none" marks a video-only
             // stream whose size needs the audio added. A real
             // acodec — or an unknown one (null: a direct file is
             // muxed, so its size already covers the audio) — does not.
             if reported_acodec(f) == Some("none") {
-                v_sz + audio_bytes
+                (v_sz + audio_bytes, v_approx || audio_approx)
             } else {
-                v_sz
+                (v_sz, v_approx)
             }
         } else {
-            0
+            (0, true)
         }
     };
 
@@ -665,11 +692,15 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
         // the audio option (pushed below) is returned.
     } else if heights.is_empty() {
         // Fallback when extractor reports no pixel heights (e.g. direct stream)
-        let top_size = formats
-            .iter()
-            .map(|f| format_size_bytes(f, duration_f64))
-            .max()
-            .unwrap_or(0);
+        let mut top_size: u64 = 0;
+        let mut top_approx = true;
+        for f in formats.iter() {
+            let (sz, ap) = format_size_bytes(f, duration_f64);
+            if sz > top_size {
+                top_size = sz;
+                top_approx = ap;
+            }
+        }
         let st = fmt_size(top_size);
         let note = if st.is_empty() {
             "MP4 • Video + Audio".to_string()
@@ -682,13 +713,14 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
             ext: "MP4".into(),
             note,
             size_bytes: top_size,
+            size_approx: top_approx,
             size_text: st,
             audio: false,
             height: 0,
         });
     } else {
         for &h in heights.iter().rev() {
-            let sz = size_for_height(h);
+            let (sz, sz_approx) = size_for_height(h);
             let st = fmt_size(sz);
             let tag = quality_tag(h);
             let label = if tag.is_empty() {
@@ -707,6 +739,7 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
                 ext: "MP4".into(),
                 note,
                 size_bytes: sz,
+                size_approx: sz_approx,
                 size_text: st,
                 audio: false,
                 height: h,
@@ -740,6 +773,7 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
         ext: a_ext.into(),
         note: audio_note,
         size_bytes: audio_bytes,
+        size_approx: audio_approx,
         size_text: audio_st,
         audio: true,
         height: 0,
@@ -1300,6 +1334,53 @@ mod tests {
         assert_eq!(clean_probe_title("Plain Title", "video-1"), "Plain Title");
         // the suffix alone is never a title
         assert_eq!(clean_probe_title(" (1)", "video-1"), " (1)");
+    }
+
+    #[test]
+    fn size_approx_flags_estimates_and_combines() {
+        // A6: an exact `filesize` is the only non-approx source.
+        // Here the VIDEO size is exact but the AUDIO size comes
+        // from filesize_approx, so the combined video option (and
+        // the audio option) must both report approx.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 5_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize_approx": 900_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 60.0);
+        let video = options
+            .iter()
+            .find(|o| !o.audio)
+            .expect("a video option must exist");
+        assert_eq!(video.size_bytes, 5_900_000);
+        assert!(video.size_approx, "one estimated part taints the sum");
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert!(audio.size_approx);
+
+        // Fully exact sources stay exact.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 5_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": 900_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 60.0);
+        let video = options
+            .iter()
+            .find(|o| !o.audio)
+            .expect("a video option must exist");
+        assert!(!video.size_approx);
+        let audio = options.iter().find(|o| o.audio).expect("audio option");
+        assert!(!audio.size_approx);
     }
 }
 

@@ -105,6 +105,11 @@
     let bestM4aBytes = 0;
     let bestAudioKbps = 128;
     let bestM4aKbps = 128;
+    // A size is approximate when it was derived from bitrate ×
+    // duration because the stream carried no contentLength —
+    // consumers mark those with a "~" instead of claiming exact.
+    let bestAudioApprox = false;
+    let bestM4aApprox = false;
 
     for (const f of allFormats) {
       const mime = (f.mimeType || '').toLowerCase();
@@ -116,16 +121,22 @@
       if (est > bestAudioBytes) {
         bestAudioBytes = est;
         bestAudioKbps = kbps;
+        bestAudioApprox = cl <= 0;
       }
       if (mime.includes('mp4') && est > bestM4aBytes) {
         bestM4aBytes = est;
         bestM4aKbps = kbps;
+        bestM4aApprox = cl <= 0;
       }
     }
     if (bestAudioBytes === 0 && duration > 0) {
       bestAudioBytes = Math.round((128000 * duration) / 8);
+      bestAudioApprox = true;
     }
-    if (bestM4aBytes === 0) bestM4aBytes = bestAudioBytes;
+    if (bestM4aBytes === 0) {
+      bestM4aBytes = bestAudioBytes;
+      bestM4aApprox = bestAudioApprox;
+    }
 
     // Group video streams by height
     const byHeight = new Map();
@@ -137,6 +148,7 @@
       const cl = parseInt(f.contentLength || '0', 10);
       const br = f.averageBitrate || f.bitrate || 0;
       const vBytes = cl > 0 ? cl : duration > 0 && br > 0 ? Math.round((br * duration) / 8) : 0;
+      const vApprox = cl <= 0 && vBytes > 0;
       const isMp4 = mime.includes('mp4');
       const hasBundledAudio = !!(f.audioQuality || f.audioSampleRate);
       const fps = parseInt(f.fps || '0', 10) || 30;
@@ -148,6 +160,7 @@
         byHeight.set(h, {
           height: h,
           vBytes,
+          vApprox,
           hasBundledAudio,
           fps,
           score,
@@ -172,8 +185,9 @@
       const tag = heightTag(h);
       const fpsTag = item.fps > 30 ? ` ${item.fps}fps` : '';
       const label = tag ? `${h}p (${tag}${fpsTag})` : `${h}p${fpsTag}`;
+      // fps lives in the label only — baking it into the note as
+      // well printed it twice on every row.
       const noteParts = ['MP4'];
-      if (item.fps > 30) noteParts.push(`${item.fps}fps`);
       if (sizeText) noteParts.push(sizeText);
 
       options.push({
@@ -183,33 +197,40 @@
         note: noteParts.join(' • '),
         size_bytes: totalBytes,
         size_text: sizeText,
+        size_approx:
+          totalBytes > 0 &&
+          (item.vApprox || (!item.hasBundledAudio && bestM4aApprox)),
         audio: false,
         height: h,
       });
     }
 
-    // This row's selector is also m4a-first (ba[ext=m4a]/ba/b), so
-    // its size/kbps are the M4A stream's, not the largest audio's.
-    const mp3SizeText = fmtSize(bestM4aBytes);
+    // Both audio rows are m4a-first selectors (ba[ext=m4a]/…), so
+    // the file lands as .m4a and the rows say M4A — an "MP3" label
+    // here promised a conversion the app never performs. Their
+    // size/kbps are the M4A stream's, not the largest audio's.
+    const bestM4aSizeText = fmtSize(bestM4aBytes);
+    const bestM4aApproxFlag = bestM4aBytes > 0 && bestM4aApprox;
     options.push({
       selector: 'ba[ext=m4a]/ba/b',
-      label: 'Audio Only (MP3 — High Quality)',
-      ext: 'mp3',
-      note: ['MP3', `${bestM4aKbps} kbps`, mp3SizeText].filter(Boolean).join(' • '),
+      label: 'Audio Only (M4A — High Quality)',
+      ext: 'm4a',
+      note: ['M4A', `${bestM4aKbps} kbps`, bestM4aSizeText].filter(Boolean).join(' • '),
       size_bytes: bestM4aBytes,
-      size_text: mp3SizeText,
+      size_text: bestM4aSizeText,
+      size_approx: bestM4aApproxFlag,
       audio: true,
       height: 0,
     });
 
-    const m4aSizeText = fmtSize(bestM4aBytes);
     options.push({
       selector: 'ba[ext=m4a]/ba',
       label: 'Audio Only (M4A — Original)',
       ext: 'm4a',
-      note: ['M4A', 'AAC Audio', m4aSizeText].filter(Boolean).join(' • '),
+      note: ['M4A', 'AAC Audio', bestM4aSizeText].filter(Boolean).join(' • '),
       size_bytes: bestM4aBytes,
-      size_text: m4aSizeText,
+      size_text: bestM4aSizeText,
+      size_approx: bestM4aApproxFlag,
       audio: true,
       height: 0,
     });

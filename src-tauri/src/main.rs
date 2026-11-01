@@ -1463,9 +1463,15 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             .map(|r| (r.total, r.done_bytes))
             .unwrap_or((0, 0));
         let total = if p.total > 0 { p.total } else { hint_total };
+        // A3: the restored-session hint may stand in for progress
+        // only while NO live job owns this entry — a job that is
+        // running (resolving, downloading, merging) reports its own
+        // real numbers, even while they are still 0, instead of the
+        // previous session's byte count flashing as current progress
+        let job_live = job.is_live();
         let done_bytes = if p.done > 0 {
             p.done
-        } else if p.status == "downloading" && hint_done > 0 {
+        } else if !job_live && p.status == "downloading" && hint_done > 0 {
             if total > 0 {
                 hint_done.min(total)
             } else {
@@ -1473,6 +1479,14 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             }
         } else {
             p.done
+        };
+        // A1: done never exceeds total in a payload — while a total
+        // is still settling (estimate vs exact vs merged length) a
+        // transient done > total would render as >100%
+        let done_bytes = if total > 0 && done_bytes > total {
+            total
+        } else {
+            done_bytes
         };
         let display_name = p
             .final_path
@@ -2968,7 +2982,14 @@ fn count_active(state: &AppState) -> usize {
         .iter()
         .filter_map(|id| state.get(id))
         .filter(|e| {
-            e.starting.load(Ordering::Relaxed) || payload_of(e).status == "downloading"
+            // a video job in its "starting"/"merging" phases is as
+            // active as one in "downloading" (A2) — the cap must
+            // keep counting it, or the resolve window over-admits
+            e.starting.load(Ordering::Relaxed)
+                || matches!(
+                    payload_of(e).status.as_str(),
+                    "downloading" | "starting" | "merging"
+                )
         })
         .count()
 }
@@ -3364,7 +3385,10 @@ fn count_active_for(state: &AppState, queue: &str) -> usize {
             entry_queue(&e) == queue
                 && (e.starting.load(Ordering::Relaxed)
                     || e.slot_preclaimed.load(Ordering::Relaxed)
-                    || payload_of(e).status == "downloading")
+                    || matches!(
+                        payload_of(e).status.as_str(),
+                        "downloading" | "starting" | "merging"
+                    ))
         })
         .count()
 }
@@ -4106,7 +4130,13 @@ fn start_all(app: AppHandle, state: State<'_, AppState>) -> usize {
     for id in &order {
         let Some(e) = state.get(id) else { continue };
         let status = payload_of(&e).status;
-        if matches!(status.as_str(), "finished" | "downloading" | "cancelled") {
+        // "starting"/"merging" video jobs are already running
+        // (A2): offering them a start would double-spawn a job
+        // into its own files — they skip exactly like "downloading"
+        if matches!(
+            status.as_str(),
+            "finished" | "downloading" | "starting" | "merging" | "cancelled"
+        ) {
             continue;
         }
         // errored entries are offered too (the old Start All
@@ -7504,6 +7534,23 @@ fn main() {
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
         })
+        .on_page_load(|webview, payload| {
+            // A4: the main window starts hidden ("visible": false
+            // in tauri.conf.json) and is shown only once its first
+            // page has finished loading — i.e. once it has actually
+            // painted. Showing it from setup() flashed a blank
+            // white window on cold start. A --background launch
+            // stays hidden (its later page loads included); setup()
+            // keeps a 3 s fallback show in case this event never
+            // arrives. Later loads of an already-visible window make
+            // show() a no-op.
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Finished)
+                && !std::env::args().any(|a| a == "--background")
+            {
+                let _ = webview.window().show();
+            }
+        })
         .on_window_event(|window, event| {
             // N-12: closing the main window IS the user leaving —
             // there is no tray and no close-to-tray mode anywhere
@@ -7550,7 +7597,20 @@ fn main() {
                 if std::env::args().any(|a| a == "--background") {
                     let _ = w.hide();
                 } else {
-                    let _ = w.show();
+                    // A4: the window is shown by the builder's
+                    // on_page_load handler once the first page has
+                    // painted (no blank-window flash). This timer is
+                    // only the fallback for a page load that never
+                    // finishes, so the app can never sit invisible
+                    // forever — and it leaves an already-shown
+                    // window exactly as it is.
+                    let w2 = w.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_secs(3));
+                        if !w2.is_visible().unwrap_or(false) {
+                            let _ = w2.show();
+                        }
+                    });
                 }
             }
             let dir = app.path().app_data_dir()?;

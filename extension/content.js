@@ -828,6 +828,12 @@
     let probedTitle = fallbackTitle;
     let probedThumb = '';
     let probedDuration = 0;
+    // The duplicate state this dialog is showing after a send
+    // the app answered with an existing entry: null, 'again'
+    // (Download again / Show in NDM on screen) or 'retry' (the
+    // entry is errored — the footer offers its resume instead).
+    let dupeMode = null;
+    let dupeEntryId = null;
 
     function closePicker() {
       if (closed) return;
@@ -853,7 +859,17 @@
       }
     });
     btnClose.addEventListener('click', () => closePicker());
-    btnCancel.addEventListener('click', () => closePicker());
+    btnCancel.addEventListener('click', () => {
+      // In the duplicate state the footer's left button reads
+      // "Show in NDM": it opens the app on the existing entry
+      // and closes this dialog — it is not a plain cancel.
+      if (dupeMode) {
+        chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
+        closePicker();
+        return;
+      }
+      closePicker();
+    });
 
     function showThumbnail(src) {
       if (!src) return;
@@ -904,11 +920,14 @@
     function sizeLabelFor(q) {
       // The pill shows the number clean; whether the size is
       // exact is carried by the size_bytes flag (the .exact
-      // class), the same split the flyout uses.
-      return (
+      // class), the same split the flyout uses. A size the
+      // producer flagged approximate (bitrate × duration, no
+      // contentLength) is marked with a "~" rather than
+      // presented as exact.
+      const base =
         String(q.size_text || '').replace('≈', '').trim() ||
-        (Number(q.size_bytes) > 0 ? fmtBytes(q.size_bytes) : '')
-      );
+        (Number(q.size_bytes) > 0 ? fmtBytes(q.size_bytes) : '');
+      return q.size_approx && base ? `~${base}` : base;
     }
 
     function renderQualities(qualities) {
@@ -929,11 +948,14 @@
         const sizeLabel = sizeLabelFor(q) || (q.id === 'best' ? 'Auto' : 'Stream');
         // The row note is the probe's own note minus the parts
         // the badge and the size pill already say (the old
-        // dialog's cleanNote rule).
+        // dialog's cleanNote rule). A standalone fps token goes
+        // too: the label already carries it, so a note copy
+        // printed it twice (defensive — cached or older probe
+        // data may still bake it in).
         const cleanNote = (q.note || '')
           .split('•')
           .map(p => p.trim())
-          .filter(p => p && p.toUpperCase() !== extBadge && !/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i.test(p))
+          .filter(p => p && p.toUpperCase() !== extBadge && !/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i.test(p) && !/^\d+(\.\d+)?\s*fps$/i.test(p))
           .join(' · ');
         row.innerHTML = `
           <div class="ndm-q-left">
@@ -943,7 +965,7 @@
             ${cleanNote ? `<span class="ndm-q-note">${escapeHtml(cleanNote)}</span>` : ''}
           </div>
           <div class="ndm-q-right">
-            <span class="ndm-q-size ${q.size_bytes ? 'exact' : ''}">${escapeHtml(sizeLabel)}</span>
+            <span class="ndm-q-size ${Number(q.size_bytes) > 0 && !q.size_approx ? 'exact' : ''}">${escapeHtml(sizeLabel)}</span>
           </div>
         `;
         // A row click SELECTS — it never sends (the speculative
@@ -965,11 +987,57 @@
         el.classList.remove('sel');
       }
       row.classList.add('sel');
+      // The duplicate state belongs to the quality that was
+      // sent, not to a row picked afterwards: choosing another
+      // row returns the footer to its plain meaning.
+      if (dupeMode) {
+        dupeMode = null;
+        dupeEntryId = null;
+        btnStart.textContent = 'Download';
+        btnCancel.textContent = 'Cancel';
+        setStatus('Select a quality, then Download', false);
+      }
+    }
+
+    let warmSentFor = ''; // target URL the warm resolve was fired for
+
+    /* Warm resolve (E9): the same fire-and-forget 'ndm-warm'
+       the flyout sends from its applyInfo. Every info path in
+       this dialog converges in applyInfo, so this is the one
+       point where the real options become known — warming here
+       lets the app pre-resolve these selectors' streams, and
+       the Download click that follows starts from its 600 s
+       resolution cache instead of a fresh full yt-dlp resolve.
+       Once per target URL; the reply and any error are ignored,
+       and nothing here can delay or block the list. */
+    function warmResolve(list) {
+      if (warmSentFor === targetUrl) return;
+      const items = (list || [])
+        .filter(o => o && typeof o.selector === 'string' && o.selector)
+        .slice(0, 4)
+        .map(o => ({
+          selector: o.selector, // the same string the Download send passes
+          audio: !!o.audio,     // the same flag its send carries
+        }));
+      if (!items.length) return;
+      warmSentFor = targetUrl;
+      try {
+        chrome.runtime.sendMessage(
+          {
+            action: 'ndm-warm',
+            url: targetUrl,
+            pageUrl: location.href,
+            items,
+          },
+          () => void chrome.runtime.lastError
+        );
+      } catch (e) {}
     }
 
     function applyInfo(info) {
       if (!info || closed) return;
       rendered = true;
+      warmResolve(info.options || info.qualities || []);
       if (info.title) {
         probedTitle = info.title;
         if (!titleIn.value || titleIn.value === fallbackTitle) {
@@ -1024,6 +1092,61 @@
       );
     }
 
+    /* One entry-progress poll, the same channel the flyout's
+       pollOnce uses — the duplicate state below must choose
+       from the existing entry's real state, not from the mere
+       fact that the app named it. */
+    async function pollEntryOnce(id) {
+      try {
+        const r = await chrome.runtime.sendMessage({
+          action: 'ndm-entry-progress',
+          id,
+        });
+        return r && r.ok ? r : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    /* A duplicate answer, presented the way the flyout's
+       showDuplicate presents it: poll the entry the app named
+       ONCE, then keep this dialog open on a persistent state.
+       An ERRORED entry shows the error state with a Retry —
+       never a "✓ Already in NDM" claim, which used to toast
+       over entries that had in fact failed. Any other state
+       (or no answer) shows the duplicate state: "Download
+       again" re-sends with force, "Show in NDM" opens the app.
+       The footer buttons are relabelled here, once, as the
+       state is entered — they keep that meaning until the user
+       picks another row (selectRow resets them) or leaves. */
+    async function enterDuplicateState(q, existingId) {
+      let st = '';
+      let errText = '';
+      if (existingId) {
+        const r = await pollEntryOnce(existingId);
+        if (closed) return;
+        if (r) {
+          st = String(r.status || '');
+          if (typeof r.error === 'string' && r.error) errText = r.error;
+        }
+      }
+      if (closed) return;
+      dupeEntryId = existingId || null;
+      sending = false;
+      btnStart.disabled = false;
+      btnCancel.disabled = false;
+      btnCancel.textContent = 'Show in NDM';
+      if (st === 'error') {
+        dupeMode = 'retry';
+        setStatus(errText || 'The download stopped with an error in NDM.', true);
+        btnStart.textContent = 'Retry';
+      } else {
+        dupeMode = 'again';
+        setStatus('This video is already in your download list.', false);
+        btnStart.textContent = 'Download again';
+      }
+    }
+
     /* The one send in this panel: the selected quality, through
        the same video_direct payload (and response mapping) the
        flyout's startQuality uses. */
@@ -1034,6 +1157,30 @@
       btnCancel.disabled = true;
       btnStart.textContent = 'Starting…';
       const q = selectedOption;
+      if (dupeMode === 'retry' && dupeEntryId) {
+        // Resume the errored entry, then follow it live in the
+        // flyout's progress card — the same handoff a fresh
+        // start takes below.
+        btnStart.textContent = 'Retrying…';
+        try {
+          await chrome.runtime.sendMessage({
+            action: 'ndm-resume-entry',
+            entry: dupeEntryId,
+          });
+        } catch (e) {}
+        if (closed) return;
+        const handoff = {
+          id: dupeEntryId,
+          name: toastNameFor(q),
+          q,
+          title: titleIn.value.trim() || probedTitle || fallbackTitle,
+          thumb: probedThumb || fallbackThumb,
+          duration: probedDuration,
+        };
+        closePicker();
+        openBrowserModal(pillBtn, pillContainer, srcUrl, null, handoff);
+        return;
+      }
       const chosenDir = dirIn.value.trim() || '~/Downloads';
       try {
         chrome.storage.local.set({ ndmSaveDir: chosenDir }).catch(() => {});
@@ -1051,7 +1198,9 @@
           dir: chosenDir,
           later: false,
           total: Number(q.size_bytes) || 0,
-          force: false,
+          // In the duplicate state the footer's send is "Download
+          // again": the one deliberate forced second copy.
+          force: dupeMode === 'again',
         });
         if (resp && resp.ok && resp.id && !resp.dupe) res = { id: resp.id };
         else if (resp && resp.dupe) res = { duplicate: true, id: resp.id || null };
@@ -1078,11 +1227,11 @@
            title while no entry or file for the title existed
            (release BLOCKER, the phantom download). The flyout's
            row handler guards the same way (`res.id &&
-           !res.duplicate`); here the duplicate earns the toast,
-           never the card. */
-        const name = toastNameFor(q);
-        closePicker();
-        showBrowserToast(name, q.label || '', sizeLabelFor(q), false, '✓ Already in NDM');
+           !res.duplicate`); here the duplicate earns the
+           in-modal duplicate state (E1), never the card and
+           never a toast: the entry is polled once and this
+           dialog stays open on what is actually true of it. */
+        await enterDuplicateState(q, res.id);
       } else if (res.id || res.unknown) {
         const name = toastNameFor(q);
         /* F-202-1: a genuine start hands the entry to the
@@ -1107,7 +1256,7 @@
         sending = false;
         btnStart.disabled = false;
         btnCancel.disabled = false;
-        btnStart.textContent = 'Download';
+        btnStart.textContent = dupeMode === 'again' ? 'Download again' : 'Download';
         setStatus(res.error, true);
       }
     });
@@ -1184,7 +1333,11 @@
 
     requestMainWorldPlayerInfo();
     const currentAnchor = srcAnchor || anchor || pickAnchor();
-    const rawTargetUrl = await resolveVideoUrl(currentAnchor);
+    // A file handoff (E2) names its own URL: the card tracks a
+    // FILE entry, and resolving a video URL from this page's
+    // player would put the wrong URL on the card's URL line.
+    const rawTargetUrl =
+      handoff && handoff.url ? handoff.url : await resolveVideoUrl(currentAnchor);
     const targetUrl = canonicalVideoKey(rawTargetUrl);
     const fallbackTitle = cleanPageTitle();
 
@@ -1629,7 +1782,13 @@
       for (const q of list) {
         const res = await startQuality(q, false);
         if (closed) return;
-        if (res.id) {
+        // A duplicate is NOT a start (E5): its id names the
+        // EXISTING entry, so registering it here would put the
+        // old entry in the multi-progress view as if this click
+        // had started it — the same guard onRowClick applies
+        // (`res.id && !res.duplicate`). Duplicates count as
+        // skipped, exactly like refusals.
+        if (res.id && !res.duplicate) {
           flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
           started.push({
             id: res.id,
@@ -1727,23 +1886,39 @@
       // error with a retry, never as a plain "already in list".
       // Any other state (finished, downloading, paused) — or no
       // answer at all — keeps the duplicate state below.
+      let existingStatus = '';
       if (existingId) {
         const r = await pollOnce(existingId);
         if (closed) return;
-        if (r && String(r.status || '') === 'error') {
+        if (r) existingStatus = String(r.status || '');
+        if (existingStatus === 'error') {
           showErroredExisting(q, existingId, r);
           return;
         }
       }
+      // A live entry (downloading or paused) can be watched from
+      // here (E8): the duplicate state gains a "View progress"
+      // action that opens this card's progress view on THAT
+      // entry — no trip to the app just to see it move.
+      const canViewProgress =
+        !!existingId && (existingStatus === 'downloading' || existingStatus === 'paused');
       showFlyListHead();
       btnAll.disabled = false;
       bodyEl.innerHTML = `
         <div class="ndm-fly-note">This video is already in your download list.</div>
         <div class="ndm-fly-dupe">
+          ${canViewProgress ? '<button class="ndm-btn ndm-btn-secondary ndm-fly-viewp" type="button">View progress</button>' : ''}
           <button class="ndm-btn ndm-btn-secondary ndm-fly-again" type="button">Download again</button>
           <button class="ndm-btn ndm-btn-secondary ndm-fly-showd" type="button">Show in NDM</button>
         </div>
       `;
+      if (canViewProgress) {
+        bodyEl.querySelector('.ndm-fly-viewp').addEventListener('click', () => {
+          flyEntryRegistry.set(regKeyFor(q), { id: existingId, name: fileNameFor(q) });
+          setProgressVideo(q);
+          showProgress({ id: existingId, name: fileNameFor(q), regKey: regKeyFor(q) });
+        });
+      }
       bodyEl.querySelector('.ndm-fly-showd').addEventListener('click', () => {
         chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
       });
@@ -2206,11 +2381,16 @@
         const pct =
           total > 0 ? Math.min(100, Math.floor((done / total) * 100)) : null;
         const st = String(last.status || '');
-        // Every byte is in but the entry has not settled to
-        // 'finished': the app is merging / finalising. There is
-        // nothing left to pause or cancel — those buttons must
-        // not stay live in this window.
-        const finalizing = st !== 'paused' && total > 0 && done >= total;
+        // The app names its pre-byte and merge phases outright
+        // ('starting', 'merging'): trust those words first. The
+        // done>=total inference survives only as the fallback
+        // for a 'downloading' entry whose bytes are all in but
+        // which has not settled to 'finished' — in either case
+        // there is nothing left to pause or cancel, so those
+        // buttons must not stay live in this window.
+        const merging = st === 'merging';
+        const finalizing =
+          merging || (st === 'downloading' && total > 0 && done >= total);
         // The "<percent>% <filename>" line belongs to the card's
         // title bar only (IDM's progress-dialog title); the body
         // carries the labelled status rows instead. Printing the
@@ -2219,11 +2399,15 @@
         statusEl.textContent =
           st === 'paused'
             ? 'Paused'
-            : finalizing
-              ? 'Finishing...'
-              : st === 'queued'
-                ? 'Queued'
-                : 'Receiving data...';
+            : st === 'starting'
+              ? 'Preparing…'
+              : merging
+                ? 'Merging video + audio…'
+                : finalizing
+                  ? 'Finishing...'
+                  : st === 'queued'
+                    ? 'Queued'
+                    : 'Receiving data...';
         setStatusLive(st !== 'paused');
         fillEl.style.width = pct != null ? pct + '%' : '0%';
         // File size / Downloaded (SPEC §1.3): a row appears only
@@ -2948,7 +3132,15 @@
       }
       const hq = handoff.q || {};
       const hKey = regKeyFor(hq);
-      setProgressVideo(hq);
+      if (handoff.file) {
+        // A file entry has no video header to snapshot, and no
+        // player anchors this card: pin it to the corner instead
+        // of wherever positionFly left it.
+        card.style.top = '12px';
+        card.style.right = '12px';
+      } else {
+        setProgressVideo(hq);
+      }
       if (handoff.id) {
         flyEntryRegistry.set(hKey, { id: handoff.id, name: handoff.name });
         showProgress({ id: handoff.id, name: handoff.name, regKey: hKey });
@@ -3036,6 +3228,24 @@
   /* ---------------------------------------------------------------- */
   /* In-Browser IDM Download File Info Modal (.iso, .zip, .exe, etc.) */
   /* ---------------------------------------------------------------- */
+
+  /* E2: hand an already-started FILE entry to the flyout's
+     progress card — the same component (and poll) a video start
+     lands in, so a file download gets the bar / rate / pause /
+     cancel card too instead of the file dialog's status notes.
+     The flyout opens straight into the entry's progress view
+     from the handoff; `file: true` keeps the video header off
+     and `url` puts the file's own URL on the card. */
+  function openEntryProgressCard(id, name, url) {
+    openBrowserModal(null, null, '', null, {
+      id,
+      name,
+      q: {},
+      title: name,
+      url,
+      file: true,
+    });
+  }
 
   async function openBrowserFileModal(opts) {
     if (!panelHost || !panelHost.isConnected || !shadowRoot) {
@@ -3227,7 +3437,13 @@
 
       if (ok) {
         closeBrowserModal();
-        if (resp && resp.dupe) {
+        if (!later && resp && resp.id) {
+          // E2: a classic-path "Download Now" start lands in the
+          // same progress card as a speculative one. (A "later"
+          // start is queued in the app on purpose — the toast
+          // below stays its confirmation.)
+          openEntryProgressCard(resp.id, chosenName, targetUrl);
+        } else if (resp && resp.dupe) {
           // IDM asks about duplicates; the silent path just points
           // at the entry that is already downloading
           showBrowserToast(chosenName, 'This file is already in the download list', '', false, '✓ Already in NDM');
@@ -3260,10 +3476,7 @@
       pending: null, // 'keep' | 'later' | 'cancel' clicked mid-flight
       timer: null, // the 4 s probe-hang fallback start
       closed: false,
-      pollTimer: null, // 1 s entry-progress poll (F-EXT-12)
-      entryStatus: '', // last status the app reported for the entry
-      finished: false, // entry reached 'finished' — closing keeps it
-      lastPct: -1,
+      pollTimer: null, // retired in-dialog poll handle (stopSpecPoll guard)
     };
 
     function specNote(text) {
@@ -3286,85 +3499,12 @@
       }
     }
 
-    /* The video flyout polls its entry — the file dialog must
-       reflect the same truth (F-EXT-12). A 29-byte file is
-       finished long before a human can read this dialog, and a
-       dialog still saying "Downloading…" invites an Esc that
-       used to discard the FINISHED entry from the list. */
-    function startSpecPoll() {
-      if (!spec.id || spec.pollTimer) return;
-      // Set while the note shows an error text: if the entry
-      // leaves the error state (the app retries it), the next
-      // live status must overwrite the note — a stale error left
-      // on screen after the entry recovered would be a lie.
-      let errorShown = false;
-      const tickSpec = async () => {
-        if (spec.closed || myToken !== activeProbeToken || !backdrop.isConnected) {
-          stopSpecPoll();
-          return;
-        }
-        let r = null;
-        try {
-          r = await chrome.runtime.sendMessage({
-            action: 'ndm-entry-progress',
-            id: spec.id,
-          });
-        } catch (e) {}
-        if (!r || !r.ok || spec.closed) return;
-        const st = String(r.status || '');
-        spec.entryStatus = st;
-        if (st === 'finished') {
-          spec.finished = true;
-          stopSpecPoll();
-          specNote('✓ Download complete');
-          btnStart.disabled = false;
-          btnStart.textContent = 'Close';
-          // Exactly ONE Close button once finished (R3-EXT-06):
-          // Cancel and Download Later have no meaning for a
-          // completed entry — hide them instead of relabelling
-          // Cancel into a second "Close".
-          btnLater.style.display = 'none';
-          btnCancel.style.display = 'none';
-        } else if (st === 'downloading' || st === 'queued') {
-          if (errorShown) {
-            // Back from an error: force the note to refresh even
-            // if the percentage has not moved.
-            errorShown = false;
-            spec.lastPct = -1;
-          }
-          const total = Number(r.total) || 0;
-          const done = Number(r.done_bytes) || 0;
-          if (total > 0) {
-            const pct = Math.min(100, Math.floor((done / total) * 100));
-            if (pct !== spec.lastPct) {
-              spec.lastPct = pct;
-              specNote(`⬇ Downloading in NDM… ${pct}%`);
-            }
-          } else if (spec.lastPct !== -2) {
-            spec.lastPct = -2;
-            specNote('⬇ Downloading in NDM…');
-          }
-        } else if (st === 'paused') {
-          errorShown = false;
-          specNote('⏸ Paused in NDM');
-        } else if (st === 'error') {
-          // Do NOT stop polling: if the entry is restarted and
-          // leaves the error state, the branches above replace
-          // this text with the live status.
-          errorShown = true;
-          specNote(
-            typeof r.error === 'string' && r.error
-              ? r.error
-              : 'The download stopped with an error in NDM.'
-          );
-        } else if (st === 'cancelled') {
-          stopSpecPoll();
-          specNote('The download was cancelled in NDM.');
-        }
-      };
-      tickSpec();
-      spec.pollTimer = setInterval(tickSpec, 1000);
-    }
+    /* The in-dialog progress poll (startSpecPoll) is gone:
+       E2 closes this dialog the moment a start lands and hands
+       the entry to the flyout's progress card, which polls it
+       from there. The one thing the poll still fed — learning
+       that the entry had finished — now happens as a one-shot
+       poll inside dismissAsCancel, the only path that needs it. */
 
     function dismissAsKeep() {
       spec.closed = true;
@@ -3391,19 +3531,35 @@
       );
     }
 
-    function dismissAsCancel() {
+    async function dismissAsCancel() {
       if (spec.closed) return;
       // A FINISHED entry is never discarded by closing this
       // dialog (F-EXT-12): Esc/× after completion is a plain
       // close that KEEPS the entry — the discard path applies
       // only while the download is unfinished (and the backend
-      // now refuses to discard finished entries too).
-      if (spec.finished) {
-        spec.closed = true;
-        if (spec.timer) clearTimeout(spec.timer);
-        stopSpecPoll();
-        closeBrowserModal();
-        return;
+      // now refuses to discard finished entries too). The old
+      // in-dialog poll used to learn "finished" into
+      // spec.finished; with that poll gone (E2 moved progress
+      // to the flyout card), ask ONCE, here, before any cancel
+      // is sent — a tiny file can finish while the start ack
+      // was still in flight.
+      if (spec.owned && spec.id) {
+        let st = '';
+        try {
+          const r = await chrome.runtime.sendMessage({
+            action: 'ndm-entry-progress',
+            id: spec.id,
+          });
+          if (r && r.ok) st = String(r.status || '');
+        } catch (e) {}
+        if (spec.closed) return; // closed by another path meanwhile
+        if (st === 'finished') {
+          spec.closed = true;
+          if (spec.timer) clearTimeout(spec.timer);
+          stopSpecPoll();
+          closeBrowserModal();
+          return;
+        }
       }
       spec.closed = true;
       if (spec.timer) clearTimeout(spec.timer);
@@ -3420,9 +3576,9 @@
        modal-teardown paths (activeModalDismiss), per R3-EXT-02:
        IDM's progress dialog never kills the download when it is
        merely closed. If this dialog's download has started, a
-       dismiss is exactly the "✓ Keep downloading" button — the
-       dialog closes, the entry keeps downloading in the app, and
-       the toast says so. If the start is still in flight, the
+       dismiss means "keep downloading" — the dialog closes, the
+       entry keeps downloading in the app, and the toast says so.
+       If the start is still in flight, the
        pending decision becomes 'keep' so the landing start is let
        to download. Before anything has started (or when the entry
        is not ours), a dismiss is a plain close — and the pending
@@ -3493,40 +3649,37 @@
           dismissAsLater();
           return;
         }
-        if (spec.pending === 'keep') {
-          dismissAsKeep();
-          return;
-        }
-        startSpecPoll();
-        if (spec.dupe) {
-          specNote('Already in your NDM download list — downloading there.');
-          btnStart.textContent = 'OK';
-          btnLater.disabled = true;
-        } else {
-          specNote('⬇ Downloading in NDM…');
-          btnStart.textContent = '✓ Keep downloading';
-          // honest label: the file is already downloading, so
-          // "Later" now pauses it in the app (IDM's Later never
-          // starts the file, but this dialog's download has started)
-          btnLater.textContent = '⏸ Pause in NDM';
-        }
+        // E2/E3: the download has started — this dialog's work
+        // is done. It closes and the entry moves to the flyout's
+        // progress card (the same card a video start lands in:
+        // bar / rate / pause / cancel), which polls it from
+        // here. The dialog no longer stays open past the start,
+        // so its buttons never need a second meaning: the old
+        // post-start relabelling ("Download Later" → "⏸ Pause
+        // in NDM", "Download Now" → "✓ Keep downloading") and
+        // the in-dialog progress poll are gone with the states
+        // that needed them. A duplicate's entry is tracked the
+        // same way — it is the entry that is downloading.
+        spec.closed = true;
+        stopSpecPoll();
+        if (spec.timer) clearTimeout(spec.timer);
+        closeBrowserModal();
+        openEntryProgressCard(spec.id, chosenName, targetUrl);
+        return;
       } else if (!gone) {
         spec.failed = true;
         // the speculative start failed → classic send-on-click:
         // the fields must be editable again
         nameIn.disabled = false;
         dirIn.disabled = false;
+        // E3: say so, visibly — silence left the user pressing
+        // buttons whose fallback meaning they had no way to know.
+        specNote("Couldn't start in NDM — use Download Now");
       }
     }
 
     btnStart.addEventListener('click', () => {
-      if (spec.finished) {
-        // the button reads "Close" now: a plain close that
-        // keeps the finished entry (F-EXT-12)
-        spec.closed = true;
-        stopSpecPoll();
-        closeBrowserModal();
-      } else if (spec.dupe) {
+      if (spec.dupe) {
         spec.closed = true;
         closeBrowserModal();
       } else if (spec.owned) {
