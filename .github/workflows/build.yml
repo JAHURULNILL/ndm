@@ -74,7 +74,7 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-  env:
+  env:  
         # Belt-and-braces with the .cargo/config.toml files: guarantee
         # +crt-static reaches every rustc invocation in this job.
         RUSTFLAGS: "-C target-feature=+crt-static"
