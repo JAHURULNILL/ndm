@@ -1,12 +1,12 @@
 {
- "deb_sha256": "0b6797c0fe95b2eb67e86984d1021efc0d2a007a18b5a34ced9137448bd207f1",
+ "deb_sha256": "caa46cc0abe3b3267d697200cdb5f0e1036b657b9747e9fb5f87f296878d6e45",
  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_amd64.deb",
- "ext_sha256": "fa6845b88bc8855c6f8d8cdb89ef0f0b69ff64e950ffcb9c4fbc5cce6735fa45",
+ "ext_sha256": "8548d19302bd0ffeb1c9346b64d9fbcab16a99bb4fbdc3a79d806a0e83860965",
  "min_supported": "1.0.0",
  "notes": "The Windows downloads shrink to the size class Linux has always had: the installer is now about 5 MB and the portable ZIP about 6 MB, down from 101.5 MB and 134 MB. The video components (yt-dlp, deno, ffmpeg) are no longer bundled; on first launch the app downloads them once, in the background, verifying SHA-256 hashes pinned in the app. Upgraders from 2.0.2 keep their existing components \u2014 nothing is re-downloaded. Two smaller changes ride along: row selection with Ctrl/Shift is now reliable on WebKit setups that drop modifier state from click events, and the list's right-click menu gains Select All and Delete All, for clearing the list with the mouse alone. Everything else is unchanged.",
  "version": "2.0.3",
- "win_setup_sha256": "",
- "win_setup_url": "",
- "win_sha256": "",
- "win_url": ""
+ "win_setup_sha256": "e4e12cb8735943dd71912d577b1516e0396bcc8775a6733962b933c72e0a9130",
+ "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_x64-setup.exe",
+ "win_sha256": "118ff2714f31e8cf03a9568ea2b2daa729b6a6889423c12e0f47ae588ab61fba",
+ "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_Windows_Portable.zip"
 }
