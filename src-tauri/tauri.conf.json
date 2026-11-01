@@ -1,1 +1,62 @@
-ewogICIkc2NoZW1hIjogImh0dHBzOi8vc2NoZW1hLnRhdXJpLmFwcC9jb25maWcvMiIsCiAgImFwcCI6IHsKICAgICJzZWN1cml0eSI6IHsKICAgICAgImNzcCI6ICJkZWZhdWx0LXNyYyAnc2VsZic7IHNjcmlwdC1zcmMgJ3NlbGYnICd1bnNhZmUtaW5saW5lJzsgc3R5bGUtc3JjICdzZWxmJyAndW5zYWZlLWlubGluZSc7IGltZy1zcmMgJ3NlbGYnIGRhdGE6IGJsb2I6IGh0dHBzOiBodHRwOjsgbWVkaWEtc3JjICdzZWxmJyBibG9iOjsgY29ubmVjdC1zcmMgJ3NlbGYnIGlwYzogaHR0cDovL2lwYy5sb2NhbGhvc3QiCiAgICB9LAogICAgIndpbmRvd3MiOiBbCiAgICAgIHsKICAgICAgICAiYmFja2dyb3VuZENvbG9yIjogIiNlY2VmZjIiLAogICAgICAgICJjZW50ZXIiOiB0cnVlLAogICAgICAgICJoZWlnaHQiOiA3MjAsCiAgICAgICAgImxhYmVsIjogIm1haW4iLAogICAgICAgICJtaW5IZWlnaHQiOiA1NDAsCiAgICAgICAgIm1pbldpZHRoIjogODYwLAogICAgICAgICJ0aXRsZSI6ICJOaWxsIERvd25sb2FkIE1hbmFnZXIgMi4wLjMiLAogICAgICAgICJ2aXNpYmxlIjogZmFsc2UsCiAgICAgICAgIndpZHRoIjogMTEyMAogICAgICB9LAogICAgICB7CiAgICAgICAgImFsd2F5c09uVG9wIjogdHJ1ZSwKICAgICAgICAiYmFja2dyb3VuZENvbG9yIjogIiMxZjZmZDAiLAogICAgICAgICJkZWNvcmF0aW9ucyI6IGZhbHNlLAogICAgICAgICJoZWlnaHQiOiAxMTgsCiAgICAgICAgImxhYmVsIjogImJhc2tldCIsCiAgICAgICAgInJlc2l6YWJsZSI6IGZhbHNlLAogICAgICAgICJza2lwVGFza2JhciI6IHRydWUsCiAgICAgICAgInRpdGxlIjogIk5ETSBEcm9wIEJhc2tldCIsCiAgICAgICAgInVybCI6ICJiYXNrZXQuaHRtbCIsCiAgICAgICAgInZpc2libGUiOiBmYWxzZSwKICAgICAgICAid2lkdGgiOiAyMzIKICAgICAgfQogICAgXSwKICAgICJ3aXRoR2xvYmFsVGF1cmkiOiB0cnVlCiAgfSwKICAiYnVpbGQiOiB7CiAgICAiZnJvbnRlbmREaXN0IjogIi4uL3VpIgogIH0sCiAgImJ1bmRsZSI6IHsKICAgICJhY3RpdmUiOiB0cnVlLAogICAgImNhdGVnb3J5IjogIlV0aWxpdHkiLAogICAgImljb24iOiBbCiAgICAgICJpY29ucy8zMngzMi5wbmciLAogICAgICAiaWNvbnMvNjR4NjQucG5nIiwKICAgICAgImljb25zLzEyOHgxMjgucG5nIiwKICAgICAgImljb25zLzEyOHgxMjhAMngucG5nIiwKICAgICAgImljb25zL2ljb24ucG5nIiwKICAgICAgImljb25zL2ljb24uaWNvIgogICAgXSwKICAgICJsaW51eCI6IHsKICAgICAgImRlYiI6IHsKICAgICAgICAiZGVwZW5kcyI6IFtdCiAgICAgIH0KICAgIH0sCiAgICAic2hvcnREZXNjcmlwdGlvbiI6ICJORE0g4oCUIGZhc3QsIHJlc3VtYWJsZSBkb3dubG9hZHMgZm9yIExpbnV4IGFuZCBXaW5kb3dzIiwKICAgICJ0YXJnZXRzIjogWwogICAgICAiZGViIgogICAgXQogIH0sCiAgImlkZW50aWZpZXIiOiAiY29tLm5kbS5kb3dubG9hZG1hbmFnZXIiLAogICJwcm9kdWN0TmFtZSI6ICJORE0iLAogICJ2ZXJzaW9uIjogIjIuMC4zIgp9
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; media-src 'self' blob:; connect-src 'self' ipc: http://ipc.localhost"
+    },
+    "windows": [
+      {
+        "backgroundColor": "#eceff2",
+        "center": true,
+        "height": 720,
+        "label": "main",
+        "minHeight": 540,
+        "minWidth": 860,
+        "title": "Nill Download Manager 2.0.3",
+        "visible": false,
+        "width": 1120
+      },
+      {
+        "alwaysOnTop": true,
+        "backgroundColor": "#1f6fd0",
+        "decorations": false,
+        "height": 118,
+        "label": "basket",
+        "resizable": false,
+        "skipTaskbar": true,
+        "title": "NDM Drop Basket",
+        "url": "basket.html",
+        "visible": false,
+        "width": 232
+      }
+    ],
+    "withGlobalTauri": true
+  },
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "bundle": {
+    "active": true,
+    "category": "Utility",
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    },
+    "shortDescription": "NDM — fast, resumable downloads for Linux and Windows",
+    "targets": [
+      "deb"
+    ]
+  },
+  "identifier": "com.ndm.downloadmanager",
+  "productName": "NDM",
+  "version": "2.0.3"
+}

@@ -1,1 +1,66 @@
-ewogICJtYW5pZmVzdF92ZXJzaW9uIjogMywKICAibmFtZSI6ICJOaWxsIERvd25sb2FkIE1hbmFnZXIiLAogICJ2ZXJzaW9uIjogIjIuMC4zIiwKICAiZGVzY3JpcHRpb24iOiAiU2VuZCBkb3dubG9hZHMgYW5kIG9ubGluZSB2aWRlb3MgZnJvbSB5b3VyIGJyb3dzZXIgdG8gTmlsbCBEb3dubG9hZCBNYW5hZ2VyLCBhIGZhc3QgZGVza3RvcCBkb3dubG9hZCBtYW5hZ2VyLiIsCiAgImljb25zIjogewogICAgIjE2IjogImljb24xNi5wbmciLAogICAgIjQ4IjogImljb240OC5wbmciLAogICAgIjEyOCI6ICJpY29uMTI4LnBuZyIKICB9LAogICJwZXJtaXNzaW9ucyI6IFsKICAgICJuYXRpdmVNZXNzYWdpbmciLAogICAgImNvbnRleHRNZW51cyIsCiAgICAibm90aWZpY2F0aW9ucyIsCiAgICAiZG93bmxvYWRzIiwKICAgICJhY3RpdmVUYWIiLAogICAgInRhYnMiLAogICAgIndlYlJlcXVlc3QiLAogICAgInN0b3JhZ2UiLAogICAgImNvb2tpZXMiLAogICAgInNjcmlwdGluZyIKICBdLAogICJob3N0X3Blcm1pc3Npb25zIjogWwogICAgIjxhbGxfdXJscz4iCiAgXSwKICAiYmFja2dyb3VuZCI6IHsKICAgICJzZXJ2aWNlX3dvcmtlciI6ICJiYWNrZ3JvdW5kLmpzIgogIH0sCiAgImFjdGlvbiI6IHsKICAgICJkZWZhdWx0X3BvcHVwIjogInBvcHVwLmh0bWwiLAogICAgImRlZmF1bHRfaWNvbiI6IHsKICAgICAgIjE2IjogImljb24xNi5wbmciLAogICAgICAiNDgiOiAiaWNvbjQ4LnBuZyIsCiAgICAgICIxMjgiOiAiaWNvbjEyOC5wbmciCiAgICB9CiAgfSwKICAiY29udGVudF9zY3JpcHRzIjogWwogICAgewogICAgICAibWF0Y2hlcyI6IFsKICAgICAgICAiKjovLyoueW91dHViZS5jb20vKiIKICAgICAgXSwKICAgICAgImpzIjogWwogICAgICAgICJwYWdlLWhvb2suanMiCiAgICAgIF0sCiAgICAgICJydW5fYXQiOiAiZG9jdW1lbnRfaWRsZSIsCiAgICAgICJ3b3JsZCI6ICJNQUlOIiwKICAgICAgImFsbF9mcmFtZXMiOiBmYWxzZQogICAgfSwKICAgIHsKICAgICAgIm1hdGNoZXMiOiBbCiAgICAgICAgIjxhbGxfdXJscz4iCiAgICAgIF0sCiAgICAgICJqcyI6IFsKICAgICAgICAiY29udGVudC5qcyIKICAgICAgXSwKICAgICAgInJ1bl9hdCI6ICJkb2N1bWVudF9pZGxlIiwKICAgICAgImFsbF9mcmFtZXMiOiB0cnVlCiAgICB9CiAgXSwKICAiYnJvd3Nlcl9zcGVjaWZpY19zZXR0aW5ncyI6IHsKICAgICJnZWNrbyI6IHsKICAgICAgImlkIjogIm5kbUBuaWxsLmRvd25sb2FkIgogICAgfQogIH0sCiAgImtleSI6ICJNSUlCSWpBTkJna3Foa2lHOXcwQkFRRUZBQU9DQVE4QU1JSUJDZ0tDQVFFQXRSN3VPVlg1WThxanJvaEhhN3U1WHN0ZUxCWGNROFJWa1ZHdzhySXU3VGpKZG5nSE9OSGdQVjNuMEN1Wmk4dmh1SThPT2VuSnJKUmoxSW9RZEUvRklWSHlXbEJMcnZJVU14OVpzTmpTaGlza3l3TDMyblgyZGZEQW41dThZNFV4VkptU21YUDNCNHdEL3o3T3VBMEdBcHg4REtUa3pnOWdkWHJrNFJGVXZ4cHFnalJiTEMyTVlyNnRoUGRSbVZlaWhWMVBKTVJxbHREWk1uRFMyZHBXUmMyd0wyTmV0RmtLYkhxdllWR3NwTktKNlJPNHBLMmZBd2h4TzRvemRnbWRVOU9FOTcxcDdiTDRicllEUjJZeFVKdkJUNUd2RjlPSVgxa2V0VDlVRTdBUDJhQ3FZZC9iSkozeEJYU2VydWZ2NHdvUmxYNW14L2FmckdMdXoyVzBzd0lEQVFBQiIKfQo=
+{
+  "manifest_version": 3,
+  "name": "Nill Download Manager",
+  "version": "2.0.3",
+  "description": "Send downloads and online videos from your browser to Nill Download Manager, a fast desktop download manager.",
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "permissions": [
+    "nativeMessaging",
+    "contextMenus",
+    "notifications",
+    "downloads",
+    "activeTab",
+    "tabs",
+    "webRequest",
+    "storage",
+    "cookies",
+    "scripting"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.youtube.com/*"
+      ],
+      "js": [
+        "page-hook.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "ndm@nill.download"
+    }
+  },
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtR7uOVX5Y8qjrohHa7u5XsteLBXcQ8RVkVGw8rIu7TjJdngHONHgPV3n0CuZi8vhuI8OOenJrJRj1IoQdE/FIVHyWlBLrvIUMx9ZsNjShiskywL32nX2dfDAn5u8Y4UxVJmSmXP3B4wD/z7OuA0GApx8DKTkzg9gdXrk4RFUvxpqgjRbLC2MYr6thPdRmVeihV1PJMRqltDZMnDS2dpWRc2wL2NetFkKbHqvYVGspNKJ6RO4pK2fAwhxO4ozdgmdU9OE971p7bL4brYDR2YxUJvBT5GvF9OIX1ketT9UE7AP2aCqYd/bJJ3xBXSerufv4woRlX5mx/afrGLuz2W0swIDAQAB"
+}

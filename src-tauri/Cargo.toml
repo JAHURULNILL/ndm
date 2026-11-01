@@ -1,1 +1,25 @@
-W3BhY2thZ2VdCm5hbWUgPSAibmRtLWFwcCIKdmVyc2lvbiA9ICIyLjAuMyIKZWRpdGlvbiA9ICIyMDIxIgpkZXNjcmlwdGlvbiA9ICJORE0g4oCUIElETS1jbGFzcyBkb3dubG9hZCBtYW5hZ2VyIChUYXVyaSBzaGVsbCBvdmVyIHRoZSBuZG0gZW5naW5lKSIKbGljZW5zZSA9ICJNSVQgT1IgQXBhY2hlLTIuMCIKYXV0aG9ycyA9IFsiTmlsbCJdCgpbW2Jpbl1dCm5hbWUgPSAibmRtLWFwcCIKcGF0aCA9ICJzcmMvbWFpbi5ycyIKCltidWlsZC1kZXBlbmRlbmNpZXNdCnRhdXJpLWJ1aWxkID0geyB2ZXJzaW9uID0gIjIiLCBmZWF0dXJlcyA9IFtdIH0KCltkZXBlbmRlbmNpZXNdCnRhdXJpID0geyB2ZXJzaW9uID0gIjIiLCBmZWF0dXJlcyA9IFtdIH0Kc2VyZGUgPSB7IHZlcnNpb24gPSAiMSIsIGZlYXR1cmVzID0gWyJkZXJpdmUiXSB9CnNlcmRlX2pzb24gPSAiMSIKY2hyb25vID0geyB2ZXJzaW9uID0gIjAuNCIsIGRlZmF1bHQtZmVhdHVyZXMgPSBmYWxzZSwgZmVhdHVyZXMgPSBbImNsb2NrIiwgInN0ZCJdIH0KYXJib2FyZCA9IHsgdmVyc2lvbiA9ICIzIiwgZGVmYXVsdC1mZWF0dXJlcyA9IGZhbHNlIH0KbmRtID0geyBwYXRoID0gIi4uIiB9CgpbcHJvZmlsZS5yZWxlYXNlXQpvcHQtbGV2ZWwgPSAzCg==
+[package]
+name = "ndm-app"
+version = "2.0.3"
+edition = "2021"
+description = "NDM — IDM-class download manager (Tauri shell over the ndm engine)"
+license = "MIT OR Apache-2.0"
+authors = ["Nill"]
+
+[[bin]]
+name = "ndm-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+arboard = { version = "3", default-features = false }
+ndm = { path = ".." }
+
+[profile.release]
+opt-level = 3
