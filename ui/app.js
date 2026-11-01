@@ -1201,12 +1201,26 @@ function select(id, openDetail) {
 }
 
 /* physical modifier state, tracked independently of click events
-   (see the row click handler — e.ctrlKey is not reliable here) */
+   (see the row click handler — e.ctrlKey is not reliable here).
+   This WebKit has been seen dropping the modifier from SOME event
+   of a press while keeping it in another (F-22; and the 2.0.2
+   field report of Ctrl+click not marking rows on a real laptop,
+   1 Nov 2026). So the tracker takes the modifier's own keydown
+   AND the ctrlKey/shiftKey flag of any other key event: while a
+   modifier is physically down, every key event carries its flag,
+   so a dropped modifier-keydown is covered by the next key's
+   event. The flag can only ever prove its OWN modifier, never
+   substitute a wrong one. (Verified 1 Nov 2026 with a DOM-level
+   diagnostic in the Xvfb rig: the shipped signals already arrive
+   correctly there — selections were exact in the 2.0.2, 2.0.3 and
+   diagnostic builds; this strengthening is for the laptop-class
+   environments where the drop was reported, and is additive
+   only.) */
 let ctrlHeld = false;
 let shiftHeld = false;
 window.addEventListener('keydown', e => {
-  if (e.key === 'Control') ctrlHeld = true;
-  if (e.key === 'Shift') shiftHeld = true;
+  if (e.key === 'Control' || e.ctrlKey) ctrlHeld = true;
+  if (e.key === 'Shift' || e.shiftKey) shiftHeld = true;
 }, true);
 window.addEventListener('keyup', e => {
   if (e.key === 'Control') ctrlHeld = false;
@@ -2023,9 +2037,12 @@ function fmtDuration(sec) {
            : `${m}:${String(s).padStart(2, '0')}`;
 }
 
-/* The slim installer ships without the video engine (yt-dlp + deno);
-   the app fetches it once, on first use, with progress shown in this
-   dialog. Until it is ready, probing would only fail — gate it. */
+/* The slim installer ships without the video engine (yt-dlp, deno,
+   ffmpeg); the app fetches it once, silently in the background —
+   IDM-style, the user is never told components exist. Until it is
+   ready, probing would only fail, so a probe waits invisibly: the
+   dialog just looks like a slow page read, and the probe runs the
+   moment the engine lands. Gate it here. */
 let componentsReady = false;
 let setupWanted = false; // a probe is waiting for the setup to finish
 let ffmpegNoteShown = false;
@@ -2047,37 +2064,32 @@ async function gateComponents() {
       return true;
     }
   } catch (e) { /* status unavailable: let the probe try anyway */ return true; }
-  $('vSetup').classList.remove('hidden');
-  $('vSetupText').classList.remove('error');
-  $('vSetupText').textContent = 'Setting up the video engine — a one-time download (about 83 MB)…';
+  // not ready: make sure the silent background fetch is running and
+  // let the caller wait — nothing about a setup is shown, ever
   invoke('ensure_components').catch(() => {});
   return false;
 }
 function onComponentsProgress(p) {
-  const bar = $('vSetupBar');
-  if (p.phase === 'downloading') {
-    $('vSetupText').classList.remove('error');
-    const mb = b => (b / 1048576).toFixed(1);
-    $('vSetupText').textContent = p.total
-      ? `Setting up the video engine — ${p.name}: ${mb(p.downloaded)} of ${mb(p.total)} MB`
-      : `Setting up the video engine — ${p.name}: ${mb(p.downloaded)} MB`;
-    if (p.total) bar.style.width = Math.min(100, (p.downloaded / p.total) * 100) + '%';
-  } else if (p.phase === 'verifying' || p.phase === 'extracting') {
-    $('vSetupText').textContent = `Setting up the video engine — ${p.name}: ${p.phase}…`;
-    bar.style.width = '100%';
-  } else if (p.phase === 'done') {
+  // the background fetch is invisible by design: per-component
+  // progress phases are deliberately not surfaced anywhere
+  if (p.phase === 'done') {
     componentsReady = true;
     $('vSetup').classList.add('hidden');
-    bar.style.width = '0%';
+    $('vSetupBar').style.width = '0%';
     if (setupWanted && !$('vmodal').classList.contains('hidden')) {
       setupWanted = false;
       fetchVideoInfo();
     }
   } else if (p.phase === 'error') {
-    setupWanted = false;
-    $('vSetupText').innerHTML = '';
-    $('vSetupText').textContent = 'Video engine setup failed: ' + (p.message || 'unknown error') + ' — check the connection, then press Fetch Info to try again.';
-    $('vSetupText').classList.add('error');
+    // the one case a waiting user hears about: the fetch gave up
+    // (e.g. the machine stayed offline). It reads as an ordinary
+    // network failure of the probe itself — never as a setup screen
+    if (setupWanted && !$('vmodal').classList.contains('hidden')) {
+      setupWanted = false;
+      const st = $('vStatus');
+      st.textContent = 'Could not read this page — check the connection, then try again.';
+      st.classList.add('error');
+    }
   }
 }
 
@@ -2089,7 +2101,12 @@ async function fetchVideoInfo() {
     if (await gateComponents()) {
       setupWanted = false;
     } else {
-      $('vStatus').textContent = '';
+      // the engine is still arriving in the background: wait
+      // invisibly — the dialog shows the ordinary reading state,
+      // and onComponentsProgress re-runs this probe when it lands
+      const st = $('vStatus');
+      st.textContent = 'Reading video qualities & file sizes…';
+      st.classList.remove('error');
       return;
     }
   }
@@ -2465,7 +2482,7 @@ function openOptions() {
   $('oEngine').textContent = '…';
   if (TAURI) invoke('components_status').then(st => {
     $('oEngine').textContent = st && st.ready
-      ? 'Ready (yt-dlp + deno installed)'
+      ? 'Ready (video engine installed)'
       : 'Sets itself up automatically in the background';
   }).catch(() => { $('oEngine').textContent = '—'; });
   showOptionsTab('opGeneral');
@@ -3345,7 +3362,7 @@ document.addEventListener('keydown', e => {
     }
     return;
   }
-  if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === 'a') {
+  if ((e.ctrlKey || e.metaKey || ctrlHeld) && !e.shiftKey && e.key.toLowerCase() === 'a') {
     // Ctrl+A marks every visible download (IDM does the same) — the
     // selection Delete then confirms once for the whole batch
     const active = document.activeElement;

@@ -3004,8 +3004,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
         spawn_emit_loop(app.clone(), entry);
         return;
     }
-    if entry.kind == "video"
-        && video::find_tool("yt-dlp", &app.state::<AppState>().components()).is_none()
+    if entry.kind == "video" && video_engine_missing(&app.state::<AppState>())
     {
         // The video engine itself is still downloading in the
         // background. Dying here with an error helps nobody — wait in
@@ -4608,6 +4607,27 @@ fn set_completion(state: State<'_, AppState>, id: String, action: String) -> Res
     Ok(())
 }
 
+/// Is the video engine usable right now? yt-dlp is the engine
+/// proper. On Windows ffmpeg is a fetched component too (no
+/// package manager supplies it there), so a video that started
+/// before ffmpeg lands would only fail at the merge — the engine
+/// counts as missing until the whole fetched set is here. On
+/// Linux ffmpeg is a package dependency and stays out of this
+/// check, exactly as before.
+fn video_engine_missing(state: &AppState) -> bool {
+    let dir = state.components();
+    if video::find_tool("yt-dlp", &dir).is_none() {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if video::find_tool("ffmpeg", &dir).is_none() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Which video components are not installed anywhere the app looks.
 /// The slim installer ships without them (that is what keeps it
 /// IDM-sized); they are fetched on first use into the app-data
@@ -5596,7 +5616,7 @@ fn do_add_video(
     // A video that arrives while the engine itself is still
     // downloading waits in the queue like any other not-now download —
     // it must not be rejected for a condition the user cannot fix.
-    let engine_missing = video::find_tool("yt-dlp", &state.components()).is_none();
+    let engine_missing = video_engine_missing(state);
     // a Download Later aimed at a queue WITH an enabled schedule
     // joins that schedule instead of parking (see later_entry_queued,
     // R5-5a): created queued below, claimed by the pump at the window
