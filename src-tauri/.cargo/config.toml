@@ -1,0 +1,17 @@
+# Windows: statically link the MSVC C runtime into our binaries.
+#
+# Without this, Rust's x86_64-pc-windows-msvc target links the
+# Universal CRT dynamically: the exe imports ucrtbase.dll /
+# api-ms-win-crt-*.dll, which ship in-box only on Windows 10+.
+# On Windows 8/8.1 (and unpatched Windows 7) the loader aborts
+# before main() with "api-ms-win-crt-math-l1-1-0.dll is missing"
+# unless the user has installed the VC++ Redistributable — our
+# installer does not install it, so the app simply never starts.
+# +crt-static bakes the CRT into ndm-app.exe / ndm-host.exe /
+# ndm.exe themselves; the exes grow by a few hundred KB and gain
+# no external runtime dependency.
+#
+# Target-scoped only: host builds (build scripts, proc macros)
+# and all non-Windows targets are completely unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

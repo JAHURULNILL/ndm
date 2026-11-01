@@ -1,12 +1,12 @@
 {
- "deb_sha256": "eb345e63cdbd4f22c1b2da60fd27438c16eaa94d1b9511666b00770e62cd3643",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.4/NDM_2.0.4_amd64.deb",
- "ext_sha256": "33bf763f8c8213add96f388fbfd7025cb57fc87278f29ce629b6100dc1e04abf",
+ "deb_sha256": "b3993f9863c92ea2bef90ab468c89ee109786a0c916d9a8e23678278e5859634",
+ "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_amd64.deb",
+ "ext_sha256": "7badbf7187b391404c11c24e5ea62a8acbf9fd19ddfc00a152d0d7ff6f968309",
  "min_supported": "1.0.0",
- "notes": "Nill Download Manager 2.0.4 is a speed release, and the packages stay in the same small size class as 2.0.3. Downloads now use dynamic segmentation: when one connection slows down, the connections that finish early take over the unstarted remainder of its segment instead of waiting, so a single slow connection no longer sets the pace for the whole file. Video downloads no longer split their connections evenly between picture and sound \u2014 the video stream, which carries most of the bytes, gets all but two of them, which matters on sites that cap the speed of each connection. Downloads also start sooner: starting one used to probe the server twice and now probes once, a brief network hiccup during that probe is retried instead of failing the start, and the video picker opens with its quality list already resolved in the background. The download list gains a checkbox column \u2014 tick any mix of rows with the mouse alone and delete them together. Everything else is unchanged.",
- "version": "2.0.4",
- "win_setup_sha256": "b5a72e79baedabdd8e896cddba79432654b0a90c798d1325eeee800f77b5def8",
- "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.4/NDM_2.0.4_x64-setup.exe",
- "win_sha256": "ed239c547f8df8658a4418bb9c1f38bbd24cf9400ec78cd0e185ed057e42aa51",
- "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.4/NDM_2.0.4_Windows_Portable.zip"
+ "notes": "Nill Download Manager 2.0.5 is a compatibility fix for older Windows. The app and its browser-bridge program now carry their C runtime with them instead of borrowing it from the system, so they start on Windows 7 and 8 machines where that runtime was never installed \u2014 previously the app closed instantly with a missing-DLL error there. The installer also looks after the WebView2 runtime the app window is drawn with. It is part of Windows 10 and 11, but on Windows 7, 8 and 8.1 the installer now sets up the last WebView2 version that runs on those systems \u2014 a pinned copy of Microsoft's own 109.0.1518.78 installer, checked against its SHA-256 before it runs \u2014 downloaded once during setup and installed silently in the background, with nothing for the user to click. Machines that already have both runtimes are completely unaffected, and the package sizes stay in the same small class. Everything else is unchanged.",
+ "version": "2.0.5",
+ "win_setup_sha256": "",
+ "win_setup_url": "",
+ "win_sha256": "",
+ "win_url": ""
 }

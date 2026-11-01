@@ -32,9 +32,20 @@
 ; Build (CI, from the repo root):
 ;   makensis /DVERSION=<x.y.z> /DSRCROOT=<assembled portable dir> \
 ;            /DOUTFILE=<NDM_<x.y.z>_x64-setup.exe> scripts\installer.nsi
+;
+; WebView2 on older Windows: the app window needs Microsoft's
+; WebView2 runtime — in-box on Windows 10/11, absent on 7/8/8.1,
+; and Microsoft has retired every download of the last build that
+; still runs there (109.0.1518.78). The Install section therefore
+; runs scripts\webview2-setup.ps1, which silently fetches a
+; pinned, hash-verified copy of that genuine installer from this
+; project's own GitHub (release tag webview2-runtime-v109) and
+; installs it in the background. Nothing is shown to the user in
+; any mode; machines that already have the runtime skip the step
+; instantly, and any failure leaves the NDM install to complete.
 
 !ifndef VERSION
-  !define VERSION "2.0.4"
+  !define VERSION "2.0.5"
 !endif
 !ifndef SRCROOT
   !define SRCROOT "NDM-Windows-Portable"
@@ -128,6 +139,19 @@ Section "Install"
 
   Delete "$INSTDIR\ndm-app.exe.old"
   Delete "$INSTDIR\ndm-host.exe.old"
+
+  ; WebView2 runtime for older Windows — see the header comment
+  ; and scripts\webview2-setup.ps1. The script does nothing when
+  ; the runtime is already present, is fully silent in every mode,
+  ; always exits 0 and is internally time-bounded; the /TIMEOUT
+  ; here is only a last-resort guard so this step can never wedge
+  ; the installer. Its exit code is ignored by design.
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  File "${__FILEDIR__}/webview2-setup.ps1"
+  nsExec::ExecToLog /TIMEOUT=1650000 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$PLUGINSDIR\webview2-setup.ps1"'
+  Pop $0
+  SetOutPath "$INSTDIR"
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
