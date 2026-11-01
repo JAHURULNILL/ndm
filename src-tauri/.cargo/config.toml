@@ -14,14 +14,16 @@
 # Target-scoped only: host builds (build scripts, proc macros)
 # and all non-Windows targets are completely unaffected.
 #
-# /NODEFAULTLIB:ucrt.lib (2.0.5 experiment): keep the Windows SDK
-# umbrella import library off the link line. libucrt.lib (the
-# static CRT) covers most symbols, but references that fall
-# through to the umbrella lib resolve as imports of the
-# api-ms-win-crt-* forwarders even under +crt-static — six of
-# them (math/heap/locale/runtime/stdio/string) survived in
-# ndm-app.exe. If a needed symbol truly lives only in the
-# umbrella lib, this link fails loudly instead of silently
-# shipping a binary that cannot start on Windows 7/8.
+# Six api-ms-win-crt-* forwarders (math/heap/locale/runtime/
+# stdio/string) still survive in ndm-app.exe: they come out of
+# Microsoft's static UCRT itself — libucrt.lib ships a subset of
+# its functions (locale is the textbook case) only as thunks to
+# the shared DLLs, so any binary that references them imports
+# the forwarders even under +crt-static. Excluding the umbrella
+# lib instead (/NODEFAULTLIB:ucrt.lib, tried in CI run #39)
+# fails the link outright. The fix is app-local deployment: CI
+# ships the SDK's UCRT redist set (ucrtbase.dll + the
+# api-ms-win-* stubs) beside the exes, so Windows 7/8 resolve
+# the forwarders from the app's own folder.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/NODEFAULTLIB:ucrt.lib"]
+rustflags = ["-C", "target-feature=+crt-static"]
