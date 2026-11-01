@@ -1,32 +1,12 @@
 {
-  "version": "2.0.3",
-  "min_supported": "1.0.0",
-  "notes": "The Windows downloads shrink to the size class Linux has always had: the installer is now about 5 MB and the portable ZIP about 6 MB, down from 101.5 MB and 134 MB. The video components (yt-dlp, deno, ffmpeg) are no longer bundled; on first launch the app downloads them once, in the background, verifying SHA-256 hashes pinned in the app. Upgraders from 2.0.2 keep their existing components \u2014 nothing is re-downloaded. Two smaller changes ride along: row selection with Ctrl/Shift is now reliable on WebKit setups that drop modifier state from click events, and the list's right-click menu gains Select All and Delete All, for clearing the list with the mouse alone. Everything else is unchanged.",
-  "assets": {
-    "linux_deb": {
-      "name": "NDM_2.0.3_amd64.deb",
-      "sha256": "af9df454bdd95dd10dfe42af557f5ea17b63a4bbe5b3b1fc5ccc40b06058cdd4",
-      "url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_amd64.deb"
-    },
-    "linux_portable": {
-      "name": "",
-      "sha256": "",
-      "url": ""
-    },
-    "windows_setup": {
-      "name": "",
-      "sha256": "",
-      "url": ""
-    },
-    "windows_portable": {
-      "name": "",
-      "sha256": "",
-      "url": ""
-    },
-    "extension_zip": {
-      "name": "ndm-extension-2.0.3.zip",
-      "sha256": "3e6b171b4b527d0497a40da0c4c5a2ae5d0c4b1cd552820fb5ee97e6344fc7b7",
-      "url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/ndm-extension-2.0.3.zip"
-    }
-  }
+ "deb_sha256": "0b6797c0fe95b2eb67e86984d1021efc0d2a007a18b5a34ced9137448bd207f1",
+ "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_amd64.deb",
+ "ext_sha256": "fa6845b88bc8855c6f8d8cdb89ef0f0b69ff64e950ffcb9c4fbc5cce6735fa45",
+ "min_supported": "1.0.0",
+ "notes": "The Windows downloads shrink to the size class Linux has always had: the installer is now about 5 MB and the portable ZIP about 6 MB, down from 101.5 MB and 134 MB. The video components (yt-dlp, deno, ffmpeg) are no longer bundled; on first launch the app downloads them once, in the background, verifying SHA-256 hashes pinned in the app. Upgraders from 2.0.2 keep their existing components \u2014 nothing is re-downloaded. Two smaller changes ride along: row selection with Ctrl/Shift is now reliable on WebKit setups that drop modifier state from click events, and the list's right-click menu gains Select All and Delete All, for clearing the list with the mouse alone. Everything else is unchanged.",
+ "version": "2.0.3",
+ "win_setup_sha256": "",
+ "win_setup_url": "",
+ "win_sha256": "",
+ "win_url": ""
 }
