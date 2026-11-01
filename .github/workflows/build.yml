@@ -2,8 +2,8 @@
 #
 # Linux:   the .deb (Debian/Ubuntu family) and the portable tarball
 #          (any distro) — the same packaging scripts used locally.
-# Windows: a portable ZIP (ndm-app.exe + ndm-host.exe + components +
-#          extension) AND a per-user NSIS installer
+# Windows: a portable ZIP (ndm-app.exe + ndm-host.exe + extension)
+#          AND a per-user NSIS installer
 #          (NDM_<ver>_x64-setup.exe, built from scripts/installer.nsi
 #          over the same assembled tree, silent-install tested in
 #          the job). Both run on any Windows 10/11 PC that has the
@@ -77,16 +77,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Fetch bundled tools (Windows builds)
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force tools, dl | Out-Null
-          Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile tools/yt-dlp.exe
-          Invoke-WebRequest https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip -OutFile dl/deno.zip
-          Expand-Archive dl/deno.zip -DestinationPath tools -Force
-          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip -OutFile dl/ff.zip
-          Expand-Archive dl/ff.zip -DestinationPath dl/ff -Force
-          Copy-Item dl/ff/*/bin/ffmpeg.exe tools/ffmpeg.exe
+      # No engine staging step: the video engine (yt-dlp, deno,
+      # ffmpeg) is NOT packaged — the app fetches it once, silently
+      # in the background on first launch, hash-verified against
+      # pins in src/components.rs, exactly as on Linux. That is
+      # what keeps both Windows packages IDM-sized.
       - name: Build
         run: |
           cargo build --release
@@ -104,10 +99,9 @@ jobs:
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
           $dir = "NDM-Windows-Portable"
-          New-Item -ItemType Directory -Force $dir/components | Out-Null
+          New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item src-tauri/target/release/ndm-app.exe $dir/
           Copy-Item target/release/ndm-host.exe $dir/
-          Copy-Item tools/yt-dlp.exe, tools/deno.exe, tools/ffmpeg.exe $dir/components/
           Copy-Item extension $dir/extension -Recurse
           Compress-Archive $dir "NDM_${v}_Windows_Portable.zip"
       - name: Smoke — host handshake (gate) + app launch (report)
@@ -166,7 +160,6 @@ jobs:
           Start-Process $setup -ArgumentList "/S" -PassThru | Out-Null
           $want = @(
             "ndm-app.exe", "ndm-host.exe", "installed.flag", "uninstall.exe",
-            "components\yt-dlp.exe", "components\deno.exe", "components\ffmpeg.exe",
             "extension\manifest.json", "extension\background.js"
           )
           $deadline = (Get-Date).AddSeconds(180)
@@ -178,6 +171,10 @@ jobs:
           }
           if ($missing) { throw "install layout incomplete, missing: $($missing -join ', ')" }
           Write-Host "install layout complete in $installDir"
+          # the slim layout must NOT carry a bundled engine: if a
+          # components folder ever reappears in the installer, the
+          # package is bloated again — fail here, not in the field
+          if (Test-Path "$installDir\components") { throw "slim install must not contain a components folder" }
           if ((Get-Content "$installDir\installed.flag" -Raw) -notmatch [regex]::Escape($v)) { throw "installed.flag does not carry version $v" }
           if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Nill Download Manager\Nill Download Manager.lnk")) { throw "Start Menu shortcut missing" }
           if (-not (Test-Path "$env:USERPROFILE\Desktop\Nill Download Manager.lnk")) { throw "desktop shortcut missing" }
