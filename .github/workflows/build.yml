@@ -106,6 +106,14 @@ jobs:
           # webview2-com-sys) - it must sit beside the exe, in the
           # portable ZIP and, via SRCROOT, in the NSIS installer.
           Copy-Item src-tauri/vendor/webview2-com-sys/x64/WebView2Loader.dll $dir/
+          # App-local Universal CRT (see .cargo/config.toml):
+          # the SDK redist set ships beside the exes so Windows
+          # 7/8 resolve ndm-app.exe's remaining api-ms-win-crt-*
+          # forwarders app-locally. The installer packages this
+          # same folder (SRCROOT), so one copy covers both.
+          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
+          if (-not $ucrtBase) { throw "UCRT redist set (x64) not found on this runner" }
+          Copy-Item (Join-Path $ucrtBase.DirectoryName "*.dll") $dir/
           Copy-Item extension $dir/extension -Recurse
           Compress-Archive $dir "NDM_${v}_Windows_Portable.zip"
       - name: Smoke — host handshake (gate) + app launch (report)
@@ -163,7 +171,7 @@ jobs:
           $installDir = "$env:LOCALAPPDATA\Programs\Nill Download Manager"
           Start-Process $setup -ArgumentList "/S" -PassThru | Out-Null
           $want = @(
-            "ndm-app.exe", "ndm-host.exe", "installed.flag", "uninstall.exe",
+            "ndm-app.exe", "ndm-host.exe", "WebView2Loader.dll", "ucrtbase.dll", "installed.flag", "uninstall.exe",
             "extension\manifest.json", "extension\background.js"
           )
           $deadline = (Get-Date).AddSeconds(180)
