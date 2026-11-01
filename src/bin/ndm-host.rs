@@ -146,7 +146,42 @@ fn process_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    // Win32 probe, declared directly so the engine needs no extra
+    // dependency for three kernel32 calls. OpenProcess failing
+    // with ERROR_INVALID_PARAMETER names a pid that does not
+    // exist: a DEFINITIVE dead, stale at once. Every other
+    // outcome stays conservative — access denied means the
+    // process exists but is not ours to inspect, and an exit
+    // code of STILL_ACTIVE cannot be told apart from a process
+    // that genuinely exited with that code — so ambiguity always
+    // reports alive and a live owner's lock is never stolen.
+    mod win {
+        use std::ffi::c_void;
+        pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        pub const STILL_ACTIVE: u32 = 259;
+        pub const ERROR_INVALID_PARAMETER: u32 = 87;
+        extern "system" {
+            pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            pub fn GetExitCodeProcess(handle: *mut c_void, code: *mut u32) -> i32;
+            pub fn CloseHandle(handle: *mut c_void) -> i32;
+            pub fn GetLastError() -> u32;
+        }
+    }
+    unsafe {
+        let handle = win::OpenProcess(win::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return win::GetLastError() != win::ERROR_INVALID_PARAMETER;
+        }
+        let mut code: u32 = 0;
+        let ok = win::GetExitCodeProcess(handle, &mut code);
+        win::CloseHandle(handle);
+        ok == 0 || code == win::STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_alive(_pid: u32) -> bool {
     // no cheap liveness probe on this platform: assume alive and
     // let the age backstop below reap true debris
