@@ -78,7 +78,7 @@ jobs:
         # Belt-and-braces with the .cargo/config.toml files: guarantee
         # +crt-static reaches every rustc invocation in this job.
         RUSTFLAGS: "-C target-feature=+crt-static"
-  
+
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
