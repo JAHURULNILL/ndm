@@ -1,0 +1,23 @@
+name: Host WebView2 v109 runtime
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the archived Microsoft installer
+        run: |
+          curl -L --fail --retry 3 -o MicrosoftEdgeWebView2RuntimeInstallerX64.exe "https://web.archive.org/web/20230328162723id_/https://msedge.sf.dl.delivery.mp.microsoft.com/filestreamingservice/files/16a7c184-5c17-4c74-9ea3-e9a4e3135f4f/MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+          ls -l MicrosoftEdgeWebView2RuntimeInstallerX64.exe
+      - name: Verify SHA-256
+        run: echo "f2cc49863e221402d4664d9fa944a47f22543da2dcb363438c3e598789b9fd5b  MicrosoftEdgeWebView2RuntimeInstallerX64.exe" | sha256sum -c -
+      - name: Create the hosting release and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create webview2-runtime-v109 --repo JAHURULNILL/ndm --title "WebView2 Runtime 109 - legacy Windows support asset" --notes "Microsoft WebView2 standalone installer 109.0.1518.78 (the last version that runs on Windows 7/8/8.1), mirrored here because Microsoft no longer serves this file. NDM installer downloads it automatically, in the background, only on machines that do not already have a WebView2 runtime. SHA-256: f2cc49863e221402d4664d9fa944a47f22543da2dcb363438c3e598789b9fd5b" MicrosoftEdgeWebView2RuntimeInstallerX64.exe
