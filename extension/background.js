@@ -440,6 +440,21 @@ function sendToNdm(message) {
         const ok = !!(response && response.ok);
         setHostStatus(ok ? 'ok' : 'fail');
         if (!ok) console.warn('NDM host rejected the download:', response);
+        if (ok && response.queued === true) {
+          // The host's ack wait timed out and it answered with the
+          // QUEUE LINE's id — a line in the app's incoming file,
+          // not a download entry. Passing it on as an entry id
+          // would open a progress card keyed to an id that can
+          // never report the real download (release BLOCKER). The
+          // honest answer is the same one the 25 s timeout below
+          // gives: accepted, outcome unknown — the page renders
+          // its untracked state and the entry appears in the app
+          // when the app drains its queue. (The warm path's
+          // `queued` is a COUNT, not this flag — strict === true
+          // keeps it on the normal mapping.)
+          finish({ ok: true, unknown: true, dupe: false, error: '' });
+          return;
+        }
         finish({
           ok,
           // the app's entry id and duplicate flag ride along: the

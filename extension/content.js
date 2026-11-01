@@ -613,7 +613,558 @@
     place();
   }
 
-  async function openBrowserModal(pillBtn, pillContainer, srcUrl, onShellOpen) {
+  /* Map a raw probe/engine error to plain language for the
+     panel banners (R3-EXT-05). The raw text is yt-dlp / tool
+     stderr: PyInstaller extraction crashes, tracebacks and
+     library paths must never reach the user verbatim. Only three
+     honest shapes survive: an HTTP status the user can act on,
+     a transport failure (where "check your connection" is the
+     truth), and a short single-line message with no internals
+     in it. Everything else collapses to '' and the caller uses
+     its plain fallback sentence. */
+  function plainErrorText(raw) {
+    const t = String(raw || '').trim();
+    if (!t) return '';
+    const http = t.match(/HTTP Error (\d{3})(?::?\s*([A-Za-z][A-Za-z ]*))?/i) ||
+      t.match(/\b(404 Not Found|403 Forbidden|410 Gone|429 Too Many Requests|5\d\d [A-Za-z ]+)\b/);
+    if (http) {
+      return http[2] ? `HTTP ${http[1]} ${http[2].trim()}` : `HTTP ${http[1]}`;
+    }
+    if (/unsupported url/i.test(t)) return 'This page is not a downloadable video.';
+    if (
+      /timed? ?out|name (resolution|or service)|failed to resolve|temporary failure in name|connection (refused|reset|aborted)|network is unreachable|no route to host|eof occurred|curl:\s*\(\d+\)/i.test(t)
+    ) {
+      return 'Could not reach the site — check your connection.';
+    }
+    const firstLine = t.split('\n')[0].replace(/^ERROR:\s*/i, '').trim();
+    if (
+      firstLine.length > 0 &&
+      firstLine.length <= 90 &&
+      !/traceback|pyinstaller|\.so\b|\.py\b|site-packages|\\|\/usr\/|\/tmp\/|appdata/i.test(firstLine)
+    ) {
+      return firstLine;
+    }
+    return '';
+  }
+
+  // Used only when probing produced no format list at all (the
+  // same two automatic choices the old dialog fell back to).
+  const DEFAULT_QUALITIES = [
+    {
+      id: 'best',
+      label: 'Best available quality (Auto)',
+      selector: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
+      audio: false,
+      ext: 'MP4',
+      size_bytes: null,
+      height: 1080,
+    },
+    {
+      id: 'audio',
+      // No format claim: probing failed, so the container the
+      // audio job will land in is unknown from here (the app
+      // saves the chosen stream as-is — M4A, MP3, …). The label
+      // renders verbatim on the row, and '' is this file's "no
+      // honest ext word" marker (see the flyout's audioRowExt).
+      label: 'Audio only',
+      selector: 'ba/b',
+      audio: true,
+      ext: '',
+      size_bytes: null,
+      height: 0,
+    },
+  ];
+
+  /* ---------------------------------------------------------------- */
+  /* In-Browser Video Picker Modal — "Download Video with NDM"        */
+  /* ---------------------------------------------------------------- */
+  /* The centered picker the pill (and the popup / context-menu open  */
+  /* message) presents: preview (real thumbnail + duration chip), an  */
+  /* editable Video Title / File Name field with the source line, a   */
+  /* radio quality list (format badge + label + file-size pill), a    */
+  /* Save to folder field, a status line, and a footer of exactly     */
+  /* two buttons — Cancel (a plain close; nothing has started) and    */
+  /* Download (starts the SELECTED quality, once, through the same    */
+  /* video_direct payload the flyout's rows send). Nothing is sent    */
+  /* on open, on probe completion, or on selection changes. The       */
+  /* finish is Glass Match, scoped by .ndm-vp so the file modal —     */
+  /* which shares the .ndm-m-* shell classes — keeps its own look.    */
+
+  async function openVideoPickerModal(pillBtn, pillContainer, srcUrl, onShellOpen) {
+    if (!shadowRoot) return;
+    dismissActiveModal();
+    modalOpen = true;
+    const myToken = ++activeProbeToken;
+
+    // EX-m4 (kept from the flyout): a caller that names the exact
+    // stream anchors the panel to THAT element, not the largest.
+    let srcAnchor = null;
+    if (srcUrl) {
+      for (const v of document.querySelectorAll('video')) {
+        if (v.currentSrc === srcUrl || v.src === srcUrl) { srcAnchor = v; break; }
+        const sEl = v.querySelector('source[src]');
+        if (sEl && sEl.src === srcUrl) { srcAnchor = v; break; }
+      }
+      if (srcAnchor) anchor = srcAnchor;
+    }
+
+    requestMainWorldPlayerInfo();
+    const currentAnchor = srcAnchor || anchor || pickAnchor();
+    const rawTargetUrl = await resolveVideoUrl(currentAnchor);
+    const targetUrl = canonicalVideoKey(rawTargetUrl);
+    const fallbackTitle = cleanPageTitle();
+    const fallbackThumb = guessFallbackThumbnail(targetUrl, currentAnchor);
+
+    let savedDir = '~/Downloads';
+    try {
+      const st = await chrome.storage.local.get({ ndmSaveDir: '~/Downloads' });
+      if (st && st.ndmSaveDir) savedDir = st.ndmSaveDir;
+    } catch (e) {}
+
+    // A close may have landed while the URL was being resolved:
+    // building the dialog now would leave a zombie nobody can
+    // dismiss (the flyout's rule, kept).
+    if (myToken !== activeProbeToken || !shadowRoot || !panelHost) return;
+
+    const isAudio = !!(currentAnchor && currentAnchor.tagName === 'AUDIO');
+
+    const backdrop = document.createElement('div');
+    backdrop.className = 'ndm-modal-backdrop ndm-vp-backdrop';
+    for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'dblclick']) {
+      backdrop.addEventListener(evt, e => e.stopPropagation());
+    }
+    backdrop.addEventListener('click', e => {
+      e.stopPropagation();
+      if (e.target === backdrop) closePicker();
+    });
+
+    const dialog = document.createElement('div');
+    dialog.className = 'ndm-modal ndm-vp';
+    dialog.innerHTML = `
+      <div class="ndm-m-head">
+        <div class="ndm-m-brand">
+          <span class="ndm-m-logo">⬇</span>
+          <span>Download Video with NDM</span>
+        </div>
+        <button class="ndm-m-x" type="button" title="Close">×</button>
+      </div>
+      <div class="ndm-m-body">
+        <div class="ndm-m-preview">
+          <div class="ndm-m-thumb-wrap">
+            <img class="ndm-m-thumb" alt="" style="display:none" />
+            <div class="ndm-m-thumb-ph">🎬</div>
+            <span class="ndm-m-dur" style="display:none"></span>
+          </div>
+          <div class="ndm-m-meta">
+            <label class="ndm-m-lbl">Video Title / File Name</label>
+            <input class="ndm-m-input ndm-vp-title" type="text" value="" placeholder="Video title" />
+            <div class="ndm-m-sub">
+              <span class="ndm-vp-uploader"></span>
+              <span class="ndm-vp-host">${escapeHtml(location.hostname)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="ndm-m-qhead">
+          <span>Select Quality &amp; Format</span>
+          <span class="ndm-m-qhint">File Size</span>
+        </div>
+        <div class="ndm-m-qlist">
+          <div class="ndm-m-loading">
+            <div class="ndm-spinner"></div>
+            <div>
+              <div class="ndm-m-load-title">Reading ${isAudio ? 'audio' : 'video'} qualities &amp; calculating MB sizes…</div>
+              <div class="ndm-m-load-sub">Fetching stream manifest via NDM high-speed engine</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="ndm-m-folder-row">
+          <label class="ndm-m-lbl">Save to folder</label>
+          <input class="ndm-m-input ndm-vp-dir" type="text" value="" placeholder="~/Downloads" />
+        </div>
+        <div class="ndm-m-status ndm-vp-status">Select a quality, then Download</div>
+      </div>
+      <div class="ndm-m-foot">
+        <div class="ndm-m-foot-right">
+          <button class="ndm-btn ndm-btn-secondary ndm-vp-cancel" type="button">Cancel</button>
+          <button class="ndm-btn ndm-btn-primary ndm-vp-start" type="button" disabled>Download</button>
+        </div>
+      </div>
+    `;
+
+    backdrop.appendChild(dialog);
+    shadowRoot.appendChild(backdrop);
+    modalEl = backdrop;
+    syncHostParent();
+    panelHost.style.display = 'block';
+    // EX-m5 (kept): focus the backdrop so Esc/Enter work without
+    // a first click inside the dialog.
+    backdrop.tabIndex = -1;
+    backdrop.focus();
+    // EX-m12 (kept): the shell is open — callers waiting on this
+    // open (popup) are answered NOW, not after the probe settles.
+    if (typeof onShellOpen === 'function') onShellOpen();
+
+    const titleIn = dialog.querySelector('.ndm-vp-title');
+    const dirIn = dialog.querySelector('.ndm-vp-dir');
+    const thumbImg = dialog.querySelector('.ndm-m-thumb');
+    const thumbPh = dialog.querySelector('.ndm-m-thumb-ph');
+    const durBadge = dialog.querySelector('.ndm-m-dur');
+    const uploaderEl = dialog.querySelector('.ndm-vp-uploader');
+    const qListEl = dialog.querySelector('.ndm-m-qlist');
+    const statusEl = dialog.querySelector('.ndm-vp-status');
+    const btnClose = dialog.querySelector('.ndm-m-x');
+    const btnCancel = dialog.querySelector('.ndm-vp-cancel');
+    const btnStart = dialog.querySelector('.ndm-vp-start');
+
+    titleIn.value = fallbackTitle;
+    dirIn.value = savedDir;
+
+    let closed = false;
+    let rendered = false;
+    let sending = false;
+    let selectedOption = null;
+    let probedTitle = fallbackTitle;
+    let probedThumb = '';
+    let probedDuration = 0;
+
+    function closePicker() {
+      if (closed) return;
+      closed = true;
+      closeBrowserModal();
+    }
+    activeModalDismiss = closePicker;
+
+    function setStatus(text, isErr) {
+      statusEl.style.display = 'block';
+      statusEl.className = 'ndm-m-status ndm-vp-status' + (isErr ? ' err' : '');
+      statusEl.textContent = text;
+    }
+
+    backdrop.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closePicker();
+      } else if (e.key === 'Enter' && !btnStart.disabled) {
+        e.preventDefault();
+        btnStart.click();
+      }
+    });
+    btnClose.addEventListener('click', () => closePicker());
+    btnCancel.addEventListener('click', () => closePicker());
+
+    function showThumbnail(src) {
+      if (!src) return;
+      thumbImg.onload = () => {
+        thumbImg.style.display = 'block';
+        thumbPh.style.display = 'none';
+      };
+      thumbImg.onerror = () => {
+        if (src !== fallbackThumb && fallbackThumb) {
+          thumbImg.src = fallbackThumb;
+        }
+      };
+      thumbImg.src = src;
+    }
+    if (fallbackThumb) showThumbnail(fallbackThumb);
+
+    /* The container the audio job will actually produce (the
+       flyout's audioOutputExt rule, applied to this dialog's
+       target): a direct audio file's own extension, else the
+       extension the selector pins first, else none — never an
+       invented one. Used only for the toast's file name. */
+    function audioOutExt(q) {
+      try {
+        const u = new URL(targetUrl);
+        const tail = (u.pathname.split('/').pop() || '').toLowerCase();
+        const dot = tail.lastIndexOf('.');
+        if (dot > 0) {
+          const e = tail.slice(dot + 1);
+          if (['mp3', 'm4a', 'm4b', 'aac', 'flac', 'wav', 'ogg', 'opus', 'wma'].includes(e)) {
+            return e;
+          }
+        }
+      } catch (e) {}
+      const pin = String((q && q.selector) || '').match(/\[ext=([a-z0-9]+)\]/i);
+      if (pin) return pin[1].toLowerCase();
+      return '';
+    }
+
+    function toastNameFor(q) {
+      const title = titleIn.value.trim() || probedTitle || fallbackTitle;
+      if (q.audio) {
+        const ext = audioOutExt(q);
+        return ext ? `${title}.${ext}` : title;
+      }
+      return `${title}.${(q.ext || 'mp4').toLowerCase()}`;
+    }
+
+    function sizeLabelFor(q) {
+      // The pill shows the number clean; whether the size is
+      // exact is carried by the size_bytes flag (the .exact
+      // class), the same split the flyout uses.
+      return (
+        String(q.size_text || '').replace('≈', '').trim() ||
+        (Number(q.size_bytes) > 0 ? fmtBytes(q.size_bytes) : '')
+      );
+    }
+
+    function renderQualities(qualities) {
+      const list = qualities && qualities.length ? qualities : DEFAULT_QUALITIES;
+      qListEl.innerHTML = '';
+      // The panel's standing default: 1080p when offered, else
+      // 720p, else the first row (the video-era rule).
+      selectedOption =
+        list.find(q => q.height === 1080) ||
+        list.find(q => q.height === 720) ||
+        list[0];
+      for (const q of list) {
+        const row = document.createElement('div');
+        row.className = 'ndm-q-row' + (q === selectedOption ? ' sel' : '');
+        const extBadge = (
+          q.ext || (q.audio ? audioOutExt(q) || 'Audio' : 'MP4')
+        ).toUpperCase();
+        const sizeLabel = sizeLabelFor(q) || (q.id === 'best' ? 'Auto' : 'Stream');
+        // The row note is the probe's own note minus the parts
+        // the badge and the size pill already say (the old
+        // dialog's cleanNote rule).
+        const cleanNote = (q.note || '')
+          .split('•')
+          .map(p => p.trim())
+          .filter(p => p && p.toUpperCase() !== extBadge && !/^\d+(\.\d+)?\s*(B|KB|MB|GB)$/i.test(p))
+          .join(' · ');
+        row.innerHTML = `
+          <div class="ndm-q-left">
+            <span class="ndm-q-radio"></span>
+            <span class="ndm-q-badge ${q.audio ? 'audio' : 'video'}">${escapeHtml(extBadge)}</span>
+            <span class="ndm-q-label">${escapeHtml(q.label || '')}</span>
+            ${cleanNote ? `<span class="ndm-q-note">${escapeHtml(cleanNote)}</span>` : ''}
+          </div>
+          <div class="ndm-q-right">
+            <span class="ndm-q-size ${q.size_bytes ? 'exact' : ''}">${escapeHtml(sizeLabel)}</span>
+          </div>
+        `;
+        // A row click SELECTS — it never sends (the speculative
+        // auto-start the old dialog had is gone by design: the
+        // footer Download button is the one send in this panel).
+        row.addEventListener('click', () => selectRow(q, row));
+        row.addEventListener('dblclick', () => {
+          selectRow(q, row);
+          btnStart.click();
+        });
+        qListEl.appendChild(row);
+      }
+      btnStart.disabled = false;
+    }
+
+    function selectRow(q, row) {
+      selectedOption = q;
+      for (const el of qListEl.querySelectorAll('.ndm-q-row')) {
+        el.classList.remove('sel');
+      }
+      row.classList.add('sel');
+    }
+
+    function applyInfo(info) {
+      if (!info || closed) return;
+      rendered = true;
+      if (info.title) {
+        probedTitle = info.title;
+        if (!titleIn.value || titleIn.value === fallbackTitle) {
+          titleIn.value = info.title;
+        }
+      }
+      if (info.thumbnail) {
+        probedThumb = info.thumbnail;
+        showThumbnail(info.thumbnail);
+      }
+      if (info.duration) {
+        probedDuration = Number(info.duration) || 0;
+        durBadge.textContent = fmtDuration(info.duration);
+        durBadge.style.display = 'inline-block';
+      }
+      if (info.uploader) {
+        uploaderEl.textContent = info.uploader + ' · ';
+      }
+      renderQualities(info.options || info.qualities || []);
+    }
+
+    function showNoMedia() {
+      rendered = true;
+      qListEl.innerHTML = '<div class="ndm-vp-empty">No video found on this page.</div>';
+      setStatus('This page is not a downloadable video.', true);
+    }
+
+    function probeFailed(errText) {
+      rendered = true;
+      // Belt and braces (R2-EXT-08, kept): a probe target that IS
+      // this page's own document, on a page with no detected
+      // media, is the no-media state — never a document offered
+      // as a video row, never a raw tool error.
+      if (
+        !currentAnchor &&
+        !videoDetected() &&
+        canonicalVideoKey(targetUrl) === canonicalVideoKey(location.href)
+      ) {
+        showNoMedia();
+        return;
+      }
+      renderQualities([]);
+      // The automatic choices stay available; the failure is a
+      // PLAIN-language status only (R3-EXT-05) — raw probe text
+      // is tool stderr and never reaches the user.
+      const plain = plainErrorText(errText);
+      setStatus(
+        plain
+          ? `${plain} — automatic quality is still available below.`
+          : 'Could not read exact formats — automatic quality is still available below.',
+        false
+      );
+    }
+
+    /* The one send in this panel: the selected quality, through
+       the same video_direct payload (and response mapping) the
+       flyout's startQuality uses. */
+    btnStart.addEventListener('click', async () => {
+      if (!selectedOption || sending || closed) return;
+      sending = true;
+      btnStart.disabled = true;
+      btnCancel.disabled = true;
+      btnStart.textContent = 'Starting…';
+      const q = selectedOption;
+      const chosenDir = dirIn.value.trim() || '~/Downloads';
+      try {
+        chrome.storage.local.set({ ndmSaveDir: chosenDir }).catch(() => {});
+      } catch (e) {}
+      let res;
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'ndm-download',
+          kind: 'video_direct',
+          url: targetUrl,
+          pageUrl: location.href,
+          title: titleIn.value.trim() || probedTitle || fallbackTitle,
+          selector: q.selector,
+          audio: !!q.audio,
+          dir: chosenDir,
+          later: false,
+          total: Number(q.size_bytes) || 0,
+          force: false,
+        });
+        if (resp && resp.ok && resp.id && !resp.dupe) res = { id: resp.id };
+        else if (resp && resp.dupe) res = { duplicate: true, id: resp.id || null };
+        else if (resp && typeof resp.error === 'string' && resp.error.startsWith('duplicate:')) {
+          res = { duplicate: true, id: resp.error.slice('duplicate:'.length).trim() || resp.id || null };
+        } else if (resp && resp.unknown) res = { unknown: true };
+        else {
+          res = {
+            error:
+              (resp && resp.error) ||
+              'NDM could not be started. Make sure the NDM desktop app is installed.',
+          };
+        }
+      } catch (e) {
+        res = { error: 'Could not reach NDM desktop app.' };
+      }
+      if (closed) return;
+      if (res.duplicate) {
+        /* The duplicate outcome MUST be tested before the id
+           below: a duplicate carries the EXISTING entry's id
+           (that is how the app names it), so checking res.id
+           first handed every duplicate to the progress card —
+           the card then tracked the old entry under THIS
+           title while no entry or file for the title existed
+           (release BLOCKER, the phantom download). The flyout's
+           row handler guards the same way (`res.id &&
+           !res.duplicate`); here the duplicate earns the toast,
+           never the card. */
+        const name = toastNameFor(q);
+        closePicker();
+        showBrowserToast(name, q.label || '', sizeLabelFor(q), false, '✓ Already in NDM');
+      } else if (res.id || res.unknown) {
+        const name = toastNameFor(q);
+        /* F-202-1: a genuine start hands the entry to the
+           progress card — the flyout opens straight into this
+           entry's progress view (its own registry, video-header
+           snapshot and poll), replacing this modal. Duplicates
+           and errors keep this panel's toast / status behaviour
+           below; only a start (or a send that may have landed)
+           earns the card. */
+        const handoff = {
+          id: res.id || null,
+          unknown: !!res.unknown,
+          name,
+          q,
+          title: titleIn.value.trim() || probedTitle || fallbackTitle,
+          thumb: probedThumb || fallbackThumb,
+          duration: probedDuration,
+        };
+        closePicker();
+        openBrowserModal(pillBtn, pillContainer, srcUrl, null, handoff);
+      } else {
+        sending = false;
+        btnStart.disabled = false;
+        btnCancel.disabled = false;
+        btnStart.textContent = 'Download';
+        setStatus(res.error, true);
+      }
+    });
+
+    // 1. Instant cache (0ms on YouTube or pre-probed pages)
+    const cached =
+      localProbeCache.get(targetUrl) ||
+      localProbeCache.get(canonicalVideoKey(location.href));
+    if (cached && (cached.options || cached.qualities || []).length) {
+      applyInfo(cached);
+      return;
+    }
+
+    /* R2-EXT-08 gate (kept): with NO detected media there is
+       nothing to offer, and the page must not be probed as if it
+       were a video. Detected media here means: a player element
+       to anchor to, a known video page, or a stream the
+       background sniffed on this page. */
+    let mediaKnown = !!currentAnchor || videoDetected();
+    if (!mediaKnown) {
+      try {
+        const mediaResp = await chrome.runtime.sendMessage({
+          action: 'ndm-tab-media',
+          pageUrl: location.href,
+          key: canonicalVideoKey(location.href),
+        });
+        if (mediaResp && mediaResp.streamUrl) mediaKnown = true;
+      } catch (e) {}
+      if (myToken !== activeProbeToken || closed) return;
+      if (!mediaKnown) {
+        showNoMedia();
+        return;
+      }
+    }
+
+    // 2. MAIN-world page-hook info, if it lands within milliseconds
+    onInstantInfoCallback = info => {
+      if (myToken !== activeProbeToken || rendered || closed) return;
+      applyInfo(info);
+    };
+
+    // 3. Otherwise await the in-flight or a fresh native probe
+    try {
+      const res = await fetchOrReuseProbe(targetUrl);
+      if (myToken !== activeProbeToken || rendered || closed) return;
+      if (res && res.ok && res.info) {
+        applyInfo(res.info);
+      } else {
+        probeFailed((res && res.error) || '');
+      }
+    } catch (e) {
+      if (myToken !== activeProbeToken || rendered || closed) return;
+      probeFailed('');
+    }
+  }
+
+  async function openBrowserModal(pillBtn, pillContainer, srcUrl, onShellOpen, handoff) {
     if (!shadowRoot) return;
     dismissActiveModal();
     modalOpen = true;
@@ -743,33 +1294,120 @@
     let wantAll = false;      // "Download all" clicked while still probing
     let warmSentFor = '';     // target URL the warm resolve was fired for
 
-    // Used only when probing produced no format list at all (the
-    // same two automatic choices the old dialog fell back to).
-    const DEFAULT_QUALITIES = [
-      {
-        id: 'best',
-        label: 'Best available quality (Auto)',
-        selector: 'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b',
-        audio: false,
-        ext: 'MP4',
-        size_bytes: null,
-        height: 1080,
-      },
-      {
-        id: 'audio',
-        // No format claim: probing failed, so the container the
-        // audio job will land in is unknown from here (the app
-        // saves the chosen stream as-is — M4A, MP3, …). The label
-        // renders verbatim on the row, and '' is this file's "no
-        // honest ext word" marker (see audioRowExt).
-        label: 'Audio only',
-        selector: 'ba/b',
-        audio: true,
-        ext: '',
-        size_bytes: null,
-        height: 0,
-      },
-    ];
+    /* ── Progress-card video header ───────────────────────────
+       The download dialog's media header (Concept A "Glass
+       Match"): for a VIDEO download whose probe supplied real
+       metadata, the progress card carries the video's thumbnail
+       (with its duration chip), its title, and the chosen
+       quality / size / format as chips — the same fields the
+       list view's media header already renders from
+       (probedThumb / probedTitle / probedDuration + the chosen
+       option). Captured at the moment a start succeeds, from
+       that start's own option; an audio start, or a probe that
+       offered neither art nor title, leaves it null and the
+       card renders exactly as before — no header, and no chip
+       is ever invented: the size chip starts from the option's
+       own size and the live poll's total replaces it. */
+    let progressVideo = null;
+
+    function setProgressVideo(q) {
+      if (!q || q.audio) {
+        progressVideo = null;
+        return;
+      }
+      const thumb =
+        probedThumb || guessFallbackThumbnail(targetUrl, currentAnchor);
+      const title = probedTitle || fallbackTitle || '';
+      if (!thumb && !title) {
+        progressVideo = null;
+        return;
+      }
+      let quality = '';
+      if (Number(q.height) > 0) quality = `${q.height}p`;
+      else if (q.label && q.label.length <= 14) quality = q.label;
+      progressVideo = {
+        thumb: thumb || '',
+        title,
+        duration: probedDuration || 0,
+        quality,
+        size: Number(q.size_bytes) || 0,
+        format: String(q.container || q.ext || '').toUpperCase(),
+      };
+    }
+
+    function videoHeaderHtml(fileName) {
+      const v = progressVideo;
+      if (!v) return '';
+      const m = String(fileName || '').match(/\.([A-Za-z0-9]{2,5})$/);
+      const format = m ? m[1].toUpperCase() : v.format;
+      const chips = [];
+      if (v.quality) {
+        chips.push(
+          `<span class="ndm-fly-vh-chip ndm-fly-vh-q">${escapeHtml(v.quality)}</span>`
+        );
+      }
+      chips.push(
+        `<span class="ndm-fly-vh-chip ndm-fly-vh-size"${
+          v.size > 0 ? '' : ' style="display:none"'
+        }>${v.size > 0 ? fmtIdmSize(v.size) : ''}</span>`
+      );
+      if (format) {
+        chips.push(
+          `<span class="ndm-fly-vh-chip">${escapeHtml(format)}</span>`
+        );
+      }
+      const thumb = v.thumb
+        ? `
+        <div class="ndm-fly-vh-thumb">
+          <img class="ndm-fly-vh-img" alt="">
+          <span class="ndm-fly-vh-play"></span>
+          ${
+            v.duration > 0
+              ? `<span class="ndm-fly-vh-dur">${fmtDuration(v.duration)}</span>`
+              : ''
+          }
+        </div>`
+        : '';
+      return `
+      <div class="ndm-fly-vh">${thumb}
+        <div class="ndm-fly-vh-meta">
+          <div class="ndm-fly-vh-name" title="${escapeHtml(v.title)}">${escapeHtml(v.title)}</div>
+          <div class="ndm-fly-vh-chips">${chips.join('')}</div>
+        </div>
+      </div>`;
+    }
+
+    /* The header's <img> takes its src by property (never by
+       markup) and a thumbnail the host refuses or cannot serve
+       removes its box silently — the header never shows a
+       broken-image frame. */
+    function wireVideoHeader(root) {
+      const v = progressVideo;
+      if (!v || !v.thumb) return;
+      const img = root.querySelector('.ndm-fly-vh-img');
+      if (!img) return;
+      img.addEventListener('error', () => {
+        const box = root.querySelector('.ndm-fly-vh-thumb');
+        if (box) box.style.display = 'none';
+      });
+      img.src = v.thumb;
+    }
+
+    /* The poll's total is the size's truth once it speaks; the
+       option's own size stands until then. */
+    function syncVideoSize(root, bytes) {
+      const chip = root.querySelector('.ndm-fly-vh-size');
+      if (!chip) return;
+      const b = Number(bytes) || 0;
+      if (b > 0) {
+        chip.style.display = '';
+        chip.textContent = fmtIdmSize(b);
+      }
+    }
+
+    // DEFAULT_QUALITIES (the probe-failure fallback rows) is
+    // defined once at module scope — the video picker modal
+    // renders the same two automatic choices.
 
     function positionFly() {
       const el = currentAnchor && currentAnchor.isConnected
@@ -904,39 +1542,9 @@
       return `${targetUrl}|${(q && q.selector) || ''}|${q && q.audio ? 'a' : 'v'}`;
     }
 
-    /* Map a raw probe/engine error to plain language for the
-       flyout banner (R3-EXT-05). The raw text is yt-dlp / tool
-       stderr: PyInstaller extraction crashes, tracebacks and
-       library paths leaked verbatim into the banner. Only three
-       honest shapes survive: an HTTP status the user can act on,
-       a transport failure (where "check your connection" is the
-       truth), and a short single-line message with no internals
-       in it. Everything else collapses to '' and the caller uses
-       its plain fallback sentence. */
-    function plainErrorText(raw) {
-      const t = String(raw || '').trim();
-      if (!t) return '';
-      const http = t.match(/HTTP Error (\d{3})(?::?\s*([A-Za-z][A-Za-z ]*))?/i) ||
-        t.match(/\b(404 Not Found|403 Forbidden|410 Gone|429 Too Many Requests|5\d\d [A-Za-z ]+)\b/);
-      if (http) {
-        return http[2] ? `HTTP ${http[1]} ${http[2].trim()}` : `HTTP ${http[1]}`;
-      }
-      if (/unsupported url/i.test(t)) return 'This page is not a downloadable video.';
-      if (
-        /timed? ?out|name (resolution|or service)|failed to resolve|temporary failure in name|connection (refused|reset|aborted)|network is unreachable|no route to host|eof occurred|curl:\s*\(\d+\)/i.test(t)
-      ) {
-        return 'Could not reach the site — check your connection.';
-      }
-      const firstLine = t.split('\n')[0].replace(/^ERROR:\s*/i, '').trim();
-      if (
-        firstLine.length > 0 &&
-        firstLine.length <= 90 &&
-        !/traceback|pyinstaller|\.so\b|\.py\b|site-packages|\\|\/usr\/|\/tmp\/|appdata/i.test(firstLine)
-      ) {
-        return firstLine;
-      }
-      return '';
-    }
+    // plainErrorText (raw error -> plain language, R3-EXT-05)
+    // is defined once at module scope — the video picker modal
+    // renders its probe failures through the same mapping.
 
     /* ── Sending ────────────────────────────────────────────────
        The ONLY two send sites of this panel: a row click (one
@@ -996,8 +1604,10 @@
       card.classList.remove('busy');
       if (res.id && !res.duplicate) {
         flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
+        setProgressVideo(q);
         showProgress({ id: res.id, name: fileNameFor(q), regKey: regKeyFor(q) });
       } else if (res.unknown) {
+        setProgressVideo(q);
         showProgress({ id: null, name: fileNameFor(q) });
       } else if (res.duplicate) {
         showDuplicate(q, res.id);
@@ -1067,12 +1677,14 @@
     function showErroredExisting(q, id, r) {
       startBusy = false;
       btnAll.disabled = false;
+      setProgressVideo(q);
       showFlyTitle(fileNameFor(q));
       const msg =
         (r && typeof r.error === 'string' && r.error) ||
         'The download stopped with an error in NDM.';
       bodyEl.innerHTML = `
         <div class="ndm-fly-prog">
+          ${videoHeaderHtml(fileNameFor(q))}
           <div class="ndm-fly-purl"></div>
           <div class="ndm-fly-prow"><span class="ndm-fly-plab">Status</span><span class="ndm-fly-pval">Error</span></div>
           <div class="ndm-fly-pmsg">${escapeHtml(msg)}</div>
@@ -1085,6 +1697,7 @@
       const urlElE = bodyEl.querySelector('.ndm-fly-purl');
       urlElE.textContent = targetUrl;
       urlElE.title = targetUrl;
+      wireVideoHeader(bodyEl);
       bodyEl.querySelector('.ndm-fly-showe').addEventListener('click', () => {
         chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
       });
@@ -1141,8 +1754,10 @@
         if (closed) return;
         if (res.id) {
           flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
+          setProgressVideo(q);
           showProgress({ id: res.id, name: fileNameFor(q), regKey: regKeyFor(q) });
         } else if (res.unknown) {
+          setProgressVideo(q);
           showProgress({ id: null, name: fileNameFor(q) });
         } else {
           btn.disabled = false;
@@ -1324,6 +1939,7 @@
 
       bodyEl.innerHTML = `
         <div class="ndm-fly-prog">
+          ${videoHeaderHtml(entry.name)}
           <div class="ndm-fly-tabs" style="display:none">
             <button class="ndm-fly-tab ndm-fly-tab-status ndm-fly-tab-on" type="button">Download status</button>
             <button class="ndm-fly-tab ndm-fly-tab-limit" type="button">Speed Limiter</button>
@@ -1379,6 +1995,7 @@
         resume: bodyEl.querySelector('.ndm-fly-rresume'),
       };
       const progEls = wireDetails(bodyEl);
+      wireVideoHeader(bodyEl);
       const fillEl = bodyEl.querySelector('.ndm-fly-bar-fill');
       const btnPause = bodyEl.querySelector('.ndm-fly-pause');
       const btnResume = bodyEl.querySelector('.ndm-fly-resume');
@@ -1611,6 +2228,7 @@
         fillEl.style.width = pct != null ? pct + '%' : '0%';
         // File size / Downloaded (SPEC §1.3): a row appears only
         // when its number is actually known — never invented.
+        syncVideoSize(bodyEl, total);
         rowsEl.fsize.style.display = total > 0 ? '' : 'none';
         if (total > 0) fsizeEl.textContent = fmtIdmSize(total);
         rowsEl.down.style.display = total > 0 || done > 0 ? '' : 'none';
@@ -1664,6 +2282,7 @@
         // ever gave any.
         bodyEl.innerHTML = `
           <div class="ndm-fly-prog">
+            ${videoHeaderHtml(entry.name)}
             <div class="ndm-fly-purl"></div>
             <div class="ndm-fly-prow"><span class="ndm-fly-plab">Status</span><span class="ndm-fly-pval">Complete</span></div>
             <div class="ndm-fly-prow ndm-fly-rfsize2" style="display:none"><span class="ndm-fly-plab">File size</span><span class="ndm-fly-pval ndm-fly-pfsize2"></span></div>
@@ -1681,8 +2300,10 @@
         const urlEl2 = bodyEl.querySelector('.ndm-fly-purl');
         urlEl2.textContent = targetUrl;
         urlEl2.title = targetUrl;
+        wireVideoHeader(bodyEl);
         const total = last ? Number(last.total) || 0 : 0;
         const done = last ? Number(last.done_bytes) || 0 : 0;
+        syncVideoSize(bodyEl, total);
         if (total > 0) {
           bodyEl.querySelector('.ndm-fly-rfsize2').style.display = '';
           bodyEl.querySelector('.ndm-fly-pfsize2').textContent =
@@ -1719,6 +2340,7 @@
             : 'The download stopped with an error in NDM.');
         bodyEl.innerHTML = `
           <div class="ndm-fly-prog">
+            ${videoHeaderHtml(entry.name)}
             <div class="ndm-fly-purl"></div>
             <div class="ndm-fly-prow"><span class="ndm-fly-plab">Status</span><span class="ndm-fly-pval">${st === 'cancelled' ? 'Cancelled' : 'Error'}</span></div>
             <div class="ndm-fly-pmsg">${escapeHtml(msg)}</div>
@@ -1730,6 +2352,7 @@
         const urlEl3 = bodyEl.querySelector('.ndm-fly-purl');
         urlEl3.textContent = targetUrl;
         urlEl3.title = targetUrl;
+        wireVideoHeader(bodyEl);
         bodyEl.querySelector('.ndm-fly-show3').addEventListener('click', () => {
           chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
         });
@@ -2179,12 +2802,16 @@
             total > 0
               ? ` · Downloading ${Math.min(100, Math.floor((done / total) * 100))}%`
               : ' · Downloading…';
-          row._ndmLiveClick = () =>
+          row._ndmLiveClick = () => {
+            setProgressVideo(q);
             showProgress({ id: reg.id, name: reg.name, regKey: key });
+          };
         } else if (st === 'paused') {
           badge.textContent = ' · Paused';
-          row._ndmLiveClick = () =>
+          row._ndmLiveClick = () => {
+            setProgressVideo(q);
             showProgress({ id: reg.id, name: reg.name, regKey: key });
+          };
         } else if (st === 'finished') {
           badge.textContent = ' · Downloaded';
           row._ndmLiveClick = () => showDuplicate(q, reg.id);
@@ -2300,6 +2927,37 @@
           : 'Could not read exact formats — automatic quality is still available below.'
       );
       footEl.style.display = 'flex';
+    }
+
+    /* F-202-1 handoff: the video picker already started this
+       entry — its Download is the flow's send now, and this
+       flyout is the progress side of the same flow. Open
+       straight into the entry's progress view, driven by this
+       function's own machinery (the registry entry a row-click
+       start would have written, the setProgressVideo snapshot,
+       the showProgress poll) — and skip the probe/list
+       entirely: the quality was already chosen in the picker.
+       The picker's probed metadata seeds the header snapshot
+       so the card carries the same thumbnail / title /
+       duration the picker showed. */
+    if (handoff && (handoff.id || handoff.unknown)) {
+      if (handoff.title) probedTitle = handoff.title;
+      if (handoff.thumb) probedThumb = handoff.thumb;
+      if (Number(handoff.duration) > 0) {
+        probedDuration = Number(handoff.duration);
+      }
+      const hq = handoff.q || {};
+      const hKey = regKeyFor(hq);
+      setProgressVideo(hq);
+      if (handoff.id) {
+        flyEntryRegistry.set(hKey, { id: handoff.id, name: handoff.name });
+        showProgress({ id: handoff.id, name: handoff.name, regKey: hKey });
+      } else {
+        // The send may have landed but returned no id: the same
+        // static progress state a row-click timeout degrades to.
+        showProgress({ id: null, name: handoff.name });
+      }
+      return;
     }
 
     // 1. Instant cache (0ms on YouTube or pre-probed pages)
@@ -3258,6 +3916,136 @@
         background: rgba(255,255,255,.65);
       }
 
+      /* ── Video picker modal: Glass Match finish ────────────
+         Every override is scoped under .ndm-vp: the file modal
+         shares the .ndm-m-* shell classes and keeps its own
+         finish untouched. Same language as the app's Glass
+         Light and the flyout concept: frosted white glass, the
+         #1f6fd0 blue story, soft ambient shadow, glass header
+         strip, primary action solid blue. */
+      .ndm-vp-backdrop {
+        background: rgba(8, 15, 28, .55);
+        -webkit-backdrop-filter: blur(5px);
+        backdrop-filter: blur(5px);
+      }
+      .ndm-modal.ndm-vp {
+        background: linear-gradient(165deg, rgba(255,255,255,.94), rgba(238,246,253,.90));
+        -webkit-backdrop-filter: blur(18px) saturate(1.5);
+        backdrop-filter: blur(18px) saturate(1.5);
+        border: 1px solid rgba(255,255,255,.75);
+        border-radius: 14px;
+        box-shadow: 0 30px 70px -18px rgba(10,30,60,.55),
+          0 10px 28px rgba(10,30,60,.28),
+          0 0 0 1px rgba(31,111,208,.14),
+          0 0 44px rgba(64,145,220,.20);
+        color: #16283c;
+      }
+      .ndm-vp .ndm-m-head {
+        background: linear-gradient(to bottom, rgba(255,255,255,.65), rgba(255,255,255,.12));
+        border-bottom: 1px solid rgba(31,111,208,.14);
+        color: #14335c;
+      }
+      .ndm-vp .ndm-m-logo {
+        background: linear-gradient(180deg, #3c8be0, #1f6fd0);
+        border-radius: 7px;
+      }
+      .ndm-vp .ndm-m-x {
+        color: #5b7186; border-radius: 7px;
+      }
+      .ndm-vp .ndm-m-x:hover {
+        background: rgba(31,111,208,.12); color: #14335c;
+      }
+      .ndm-vp .ndm-m-preview {
+        background: rgba(255,255,255,.55);
+        border: 1px solid rgba(31,111,208,.16);
+        border-radius: 12px;
+      }
+      .ndm-vp .ndm-m-thumb-wrap {
+        border-radius: 10px;
+        border: 1px solid rgba(255,255,255,.7);
+        box-shadow: 0 4px 12px rgba(18,44,77,.22);
+      }
+      .ndm-vp .ndm-m-lbl { color: #5b7186; }
+      .ndm-vp .ndm-m-input {
+        border: 1px solid rgba(31,111,208,.30); border-radius: 9px;
+        background: rgba(255,255,255,.85); color: #16283c;
+      }
+      .ndm-vp .ndm-m-input:focus {
+        border-color: #1f6fd0;
+        box-shadow: 0 0 0 3px rgba(31,111,208,.25);
+      }
+      .ndm-vp .ndm-m-sub { color: #5b7186; }
+      .ndm-vp .ndm-m-qhead { color: #33506e; }
+      .ndm-vp .ndm-m-qlist {
+        background: rgba(255,255,255,.55);
+        border: 1px solid rgba(31,111,208,.16);
+        border-radius: 12px;
+      }
+      .ndm-vp .ndm-q-row {
+        border-bottom: 1px solid rgba(31,111,208,.09);
+      }
+      .ndm-vp .ndm-q-row:hover { background: rgba(31,111,208,.07); }
+      .ndm-vp .ndm-q-row.sel {
+        background: linear-gradient(180deg, rgba(31,111,208,.16), rgba(31,111,208,.10));
+        color: #0f2c52;
+      }
+      .ndm-vp .ndm-q-radio { border-color: #8494a7; }
+      .ndm-vp .ndm-q-row.sel .ndm-q-radio { border-color: #1f6fd0; }
+      .ndm-vp .ndm-q-row.sel .ndm-q-radio::after { background: #1f6fd0; }
+      .ndm-vp .ndm-q-badge { border-radius: 6px; }
+      .ndm-vp .ndm-q-badge.video {
+        background: rgba(31,111,208,.12); color: #0f4c8c;
+        border: 1px solid rgba(31,111,208,.30);
+      }
+      .ndm-vp .ndm-q-badge.audio {
+        background: rgba(245,197,66,.18); color: #8a5a12;
+        border: 1px solid rgba(214,164,32,.35);
+      }
+      .ndm-vp .ndm-q-label { color: #16283c; }
+      .ndm-vp .ndm-q-note { color: #5b7186; }
+      .ndm-vp .ndm-q-size {
+        background: rgba(255,255,255,.6); color: #33506e;
+        border: 1px solid rgba(31,111,208,.18);
+      }
+      .ndm-vp .ndm-q-size.exact {
+        background: rgba(31,111,208,.12); color: #0f4c8c;
+        border-color: rgba(31,111,208,.28);
+      }
+      .ndm-vp .ndm-q-row.sel .ndm-q-size {
+        background: linear-gradient(to bottom, #3c8be0, #1f6fd0);
+        color: #fff; border-color: #1e4e96;
+      }
+      .ndm-vp .ndm-m-status {
+        background: rgba(31,111,208,.08);
+        border: 1px solid rgba(31,111,208,.16);
+        color: #33506e; border-radius: 9px;
+      }
+      .ndm-vp .ndm-m-status.err {
+        background: #fff1f2; border-color: #fecdd3; color: #9f1239;
+      }
+      .ndm-vp .ndm-m-foot {
+        background: linear-gradient(to bottom, rgba(255,255,255,.35), rgba(255,255,255,.10));
+        border-top: 1px solid rgba(31,111,208,.14);
+        justify-content: flex-end;
+      }
+      .ndm-vp .ndm-btn {
+        border-radius: 9px; height: 32px; padding: 0 16px;
+      }
+      .ndm-vp .ndm-btn-primary {
+        background: linear-gradient(to bottom, #3c8be0, #1f6fd0);
+        border: 1px solid #1e4e96;
+        box-shadow: 0 1px 4px rgba(18,44,77,.18), inset 0 1px 0 rgba(255,255,255,.25);
+      }
+      .ndm-vp .ndm-btn-secondary {
+        background: linear-gradient(to bottom, #ffffff, #e9f0f7);
+        border: 1px solid rgba(31,111,208,.28); color: #16283c;
+        box-shadow: 0 1px 3px rgba(18,44,77,.10);
+      }
+      .ndm-vp-empty {
+        padding: 22px 16px; color: #5b7186;
+        font-size: 12.5px; text-align: center;
+      }
+
       /* ── IDM-style video flyout ─────────────────────────────
          A compact card anchored at the player (the pill's corner),
          NOT a centered dialog: a "Download all" header row, a
@@ -3276,9 +4064,12 @@
         position: fixed;
         width: 348px; max-width: calc(100vw - 16px);
         max-height: 70vh; overflow-y: auto;
-        background: #ffffff; color: #17293f;
-        border: 1px solid #b9c9da; border-radius: 8px;
-        box-shadow: 0 10px 32px rgba(10, 25, 45, .28);
+        background: linear-gradient(165deg, rgba(255,255,255,.94), rgba(238,246,253,.90));
+        -webkit-backdrop-filter: blur(18px) saturate(1.5);
+        backdrop-filter: blur(18px) saturate(1.5);
+        color: #16283c;
+        border: 1px solid rgba(255,255,255,.75); border-radius: 14px;
+        box-shadow: 0 30px 70px -18px rgba(10,30,60,.55), 0 10px 28px rgba(10,30,60,.28), 0 0 0 1px rgba(31,111,208,.14), 0 0 44px rgba(64,145,220,.20);
         font-size: 13px; line-height: 1.45;
       }
       /* The progress view IS IDM's download dialog, so while it
@@ -3293,10 +4084,10 @@
       .ndm-fly:has(.ndm-fly-prog) { width: 526px; }
       .ndm-fly-head {
         display: flex; align-items: center; justify-content: space-between;
-        padding: 7px 8px 7px 12px;
-        border-bottom: 1px solid #dbe5f0;
-        background: #f2f6fb;
-        border-radius: 8px 8px 0 0;
+        padding: 10px 10px 9px 14px;
+        border-bottom: 1px solid rgba(31,111,208,.14);
+        background: linear-gradient(to bottom, rgba(255,255,255,.65), rgba(255,255,255,.12));
+        border-radius: 14px 14px 0 0;
       }
       .ndm-fly-all {
         background: none; border: none; padding: 2px 4px;
@@ -3307,16 +4098,19 @@
       .ndm-fly-all:disabled { color: #8aa0b8; cursor: default; }
       .ndm-fly-title {
         flex: 1; min-width: 0; margin-right: 8px;
-        font-weight: 600; color: #17293f;
+        font-size: 13px; font-weight: 600; color: #14335c;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
       .ndm-fly-x {
         background: none; border: none; cursor: pointer;
-        font-size: 17px; line-height: 1; color: #5b7189;
-        width: 24px; height: 24px; border-radius: 5px; padding: 0;
+        font-size: 15px; line-height: 1; color: #5b7186;
+        width: 24px; height: 24px; border-radius: 7px; padding: 0;
       }
-      .ndm-fly-x:hover { background: #e3ecf6; color: #17293f; }
+      .ndm-fly-x:hover { background: rgba(31,111,208,.12); color: #14335c; }
       .ndm-fly-body { padding: 6px 0; }
+      /* the progress view carries its own body padding (the
+         concept's 10/14/13) — the shell's list padding goes */
+      .ndm-fly-body:has(.ndm-fly-prog) { padding: 0; }
       .ndm-fly.busy .ndm-fly-body { opacity: .55; pointer-events: none; }
       .ndm-fly-loading {
         display: flex; align-items: center; gap: 9px;
@@ -3375,64 +4169,127 @@
       .ndm-fly-dupe {
         display: flex; gap: 8px; padding: 8px 12px 10px;
       }
-      /* ── Progress view = IDM's download dialog ──────────────
+      /* ── Progress view = IDM's download dialog, in the
+         Glass Match finish (Concept A) ──────────────────────
          The classic tab strip — "Download status" | "Speed
          Limiter" — over the panels (SPEC: ndm-research/
          idm-dialog-ref/SPEC.md §1.2); the Speed Limiter pane
          drives the entry's real per-file limit through the
          bridge. The "Download status" panel, element for
-         element: URL line, then
-         Status / File size / Downloaded / Transfer rate /
-         Time left / Resume capability label rows in Tahoma, the
-         classic green bar with an inset border, and flat classic
-         buttons — Pause/Resume + Cancel right, IDM's own details
-         toggle in the left slot ("Show in NDM", the card's real
-         open-in-app action, sits beside it). The expanded
-         details section below the button row — caption, segment
-         chart, N. / Downloaded / Info connection table — renders
-         from the progress mirror's blocks / conns_detail fields;
-         against an older app that mirrors neither, the toggle
-         simply never appears. */
+         element: (for a video, the media header), the URL line,
+         then Status / File size / Downloaded / Transfer rate /
+         Time left / Resume capability label rows, the classic
+         green bar, and the button row — Pause/Resume + Cancel
+         right, IDM's own details toggle in the left slot ("Show
+         in NDM", the card's real open-in-app action, sits beside
+         it). The anatomy is the dialog's own; only the finish
+         is glass — frosted card, the #1f6fd0 story, soft
+         buttons with the primary action in solid blue. The
+         expanded details section below the button row —
+         caption, segment chart, N. / Downloaded / Info
+         connection table — renders from the progress mirror's
+         blocks / conns_detail fields; against an older app
+         that mirrors neither, the toggle simply never appears. */
       .ndm-fly-prog {
-        padding: 9px 12px 11px;
-        font-family: Tahoma, "Segoe UI", sans-serif;
-        font-size: 11px; color: #000;
+        padding: 10px 14px 13px;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 12.5px; color: #16283c;
       }
-      /* IDM's text block sits deeper than its bar: labels at
-         ≈26 px from the dialog's edge, the value column at
-         ≈129 px (pixel-measured, refs 01/02), while the bar and
-         button row keep the ≈12 px container inset. The status
-         pane carries that extra indent; with the 104 px label
-         column below, values land on the dialog's 129 px. */
-      .ndm-fly-pane-status { padding-left: 12px; }
+      /* The label column carries the dialog's indent (Concept
+         A: labels muted at the card's padding edge, the value
+         column 129 px into the row). */
+      .ndm-fly-pane-status { padding-left: 0; }
       .ndm-fly-purl {
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         margin-bottom: 6px;
+        font-size: 12px; color: #33506e;
       }
-      .ndm-fly-prow { display: flex; line-height: 1.55; }
-      .ndm-fly-plab { flex: 0 0 104px; white-space: nowrap; }
+      .ndm-fly-prow { display: flex; line-height: 19px; }
+      .ndm-fly-plab { flex: 0 0 129px; white-space: nowrap; color: #5b7186; }
       .ndm-fly-pval {
-        flex: 1; min-width: 0;
+        flex: 1; min-width: 0; color: #16283c;
+        font-variant-numeric: tabular-nums;
         white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
-      .ndm-fly-pstatus { color: #0000ee; text-decoration: underline; }
+      .ndm-fly-pstatus { color: #1f6fd0; text-decoration: underline; }
       .ndm-fly-pmsg { margin-top: 6px; line-height: 1.45; overflow-wrap: break-word; }
-      /* IDM's tab strip (SPEC §1.2): classic raised tabs above
+      /* The video header (Concept A): the real thumbnail with
+         its play disc + duration chip, the video's title, and
+         quality / size / format chips — rendered only when the
+         probe supplied the metadata (see setProgressVideo). */
+      .ndm-fly-vh {
+        display: flex; gap: 12px; align-items: flex-start;
+        padding-bottom: 10px; margin-bottom: 11px;
+        border-bottom: 1px solid rgba(31,111,208,.13);
+      }
+      .ndm-fly-vh-thumb {
+        flex: 0 0 118px; width: 118px; height: 66px;
+        border-radius: 10px; overflow: hidden; position: relative;
+        border: 1px solid rgba(255,255,255,.7);
+        box-shadow: 0 4px 12px rgba(18,44,77,.22);
+        background: #dbe5ef;
+      }
+      .ndm-fly-vh-img { display: block; width: 100%; height: 100%; object-fit: cover; }
+      .ndm-fly-vh-play {
+        position: absolute; left: 50%; top: 50%;
+        width: 28px; height: 28px; margin: -14px 0 0 -14px;
+        border-radius: 50%;
+        background: rgba(13,26,46,.42);
+        border: 1px solid rgba(255,255,255,.55);
+      }
+      .ndm-fly-vh-play::after {
+        content: ''; position: absolute; left: 50%; top: 50%;
+        margin: -6px 0 0 -3.5px;
+        border-left: 9px solid #fff;
+        border-top: 6px solid transparent;
+        border-bottom: 6px solid transparent;
+      }
+      .ndm-fly-vh-dur {
+        position: absolute; right: 4px; bottom: 4px;
+        background: rgba(9,19,34,.74); color: #fff;
+        font-size: 10px; font-weight: 600; line-height: 1;
+        padding: 3px 5px; border-radius: 5px;
+        font-variant-numeric: tabular-nums;
+      }
+      .ndm-fly-vh-meta { flex: 1; min-width: 0; padding-top: 1px; }
+      .ndm-fly-vh-name {
+        font-size: 12.5px; font-weight: 600; line-height: 1.35; color: #14335c;
+        display: -webkit-box; -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical; overflow: hidden;
+      }
+      .ndm-fly-vh-chips { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+      .ndm-fly-vh-chip {
+        font-size: 10.5px; font-weight: 600; line-height: 1;
+        padding: 4px 8px; border-radius: 999px;
+        background: rgba(255,255,255,.55);
+        border: 1px solid rgba(31,111,208,.25); color: #33506e;
+        font-variant-numeric: tabular-nums;
+      }
+      .ndm-fly-vh-q {
+        background: linear-gradient(to bottom, #3c8be0, #1f6fd0);
+        border-color: #1e4e96; color: #fff;
+        box-shadow: 0 1px 4px rgba(18,44,77,.18);
+      }
+      /* The tab strip (SPEC §1.2): raised glass tabs above
          the panel body — "Download status" | "Speed Limiter".
          The bar, button row and details section stay below both
          panes, as in the dialog. The strip renders only when the
          progress mirror reports the entry's speed_limit. */
       .ndm-fly-tabs {
-        display: flex; gap: 2px; padding: 0 2px;
-        border-bottom: 1px solid #7f7f7f; margin-bottom: 8px;
+        display: flex; gap: 6px; padding: 0;
+        border-bottom: 1px solid rgba(31,111,208,.16); margin-bottom: 8px;
       }
       .ndm-fly-tab {
-        background: #e4e4e4; border: 1px solid #7f7f7f; border-bottom: none;
-        border-radius: 0; box-shadow: none; cursor: pointer;
-        padding: 3px 12px; margin-bottom: -1px;
-        font: 400 11px Tahoma, "Segoe UI", sans-serif; color: #000;
+        background: rgba(255,255,255,.38);
+        border: 1px solid rgba(31,111,208,.14); border-bottom: none;
+        border-radius: 8px 8px 0 0; box-shadow: none; cursor: pointer;
+        padding: 5px 13px; margin-bottom: -1px;
+        font: 400 12px "Segoe UI", system-ui, sans-serif; color: #5b7186;
       }
-      .ndm-fly-tab-on { background: #fff; }
+      .ndm-fly-tab-on {
+        background: rgba(255,255,255,.92); color: #0f4c8c; font-weight: 600;
+        box-shadow: 0 -2px 8px rgba(18,44,77,.06);
+      }
       /* The Speed Limiter pane (reference 04): the live speed
          line, the "Use Speed Limiter" checkbox, and the
          "Maximum download speed:" value + unit, in the dialog's
@@ -3442,56 +4299,80 @@
       .ndm-fly-luserow { cursor: pointer; }
       .ndm-fly-luse { margin: 0 2px 0 0; }
       .ndm-fly-lval {
-        width: 62px; height: 21px; padding: 0 4px;
-        border: 1px solid #7f7f7f; border-radius: 0;
-        background: #fff; color: #000;
-        font: 400 11px Tahoma, "Segoe UI", sans-serif;
+        width: 66px; height: 24px; padding: 0 6px;
+        border: 1px solid rgba(31,111,208,.28); border-radius: 6px;
+        background: rgba(255,255,255,.85); color: #16283c;
+        font: 400 12px "Segoe UI", system-ui, sans-serif;
       }
-      .ndm-fly-lval:disabled { background: #f0f0f0; color: #838383; }
+      .ndm-fly-lval:disabled { background: rgba(240,244,248,.6); color: #8aa0b8; }
       .ndm-fly-lunit {
-        height: 23px; border: 1px solid #7f7f7f; border-radius: 0;
-        background: #fff; color: #000;
-        font: 400 11px Tahoma, "Segoe UI", sans-serif;
+        height: 24px; border: 1px solid rgba(31,111,208,.28); border-radius: 6px;
+        background: rgba(255,255,255,.85); color: #16283c;
+        font: 400 12px "Segoe UI", system-ui, sans-serif;
       }
-      .ndm-fly-lunit:disabled { color: #838383; }
+      .ndm-fly-lunit:disabled { color: #8aa0b8; }
       .ndm-fly-lnote { color: #b00020; margin-top: 5px; min-height: 13px; }
       .ndm-fly-bar {
-        height: 14px; border: 1px solid #7f7f7f;
-        background: #e6e6e6; overflow: hidden; margin-top: 8px;
+        height: 14px; border-radius: 4px;
+        background: #dbe5ef; box-shadow: inset 0 0 0 1px rgba(90,110,130,.45);
+        overflow: hidden; margin-top: 10px;
       }
       .ndm-fly-bar-fill {
         height: 100%; width: 0%;
         background: #00b050;
         transition: width .3s ease;
       }
-      .ndm-fly-btns { display: flex; align-items: center; gap: 8px; margin-top: 10px; padding-left: 10px; }
+      .ndm-fly-btns { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
       .ndm-fly-btnsp { flex: 1; }
       .ndm-pbtn {
-        height: 23px; min-width: 90px; padding: 0 10px;
-        background: #f0f0f0; border: 1px solid #7f7f7f; border-radius: 0;
-        color: #000; font: 400 11px Tahoma, "Segoe UI", sans-serif;
-        cursor: pointer; white-space: nowrap; box-shadow: none;
+        height: 27px; padding: 0 16px;
+        background: linear-gradient(to bottom, #ffffff, #e9f0f7);
+        border: 1px solid rgba(31,111,208,.28); border-radius: 9px;
+        color: #16283c; font: 400 12.5px "Segoe UI", system-ui, sans-serif;
+        cursor: pointer; white-space: nowrap;
+        box-shadow: 0 1px 3px rgba(18,44,77,.10);
       }
-      .ndm-pbtn:hover:not(:disabled) { background: #e5f1fb; border-color: #0078d7; }
-      .ndm-pbtn:disabled { color: #838383; border-color: #c0c0c0; cursor: default; }
-      .ndm-pbtn-def { font-weight: 700; }
+      .ndm-pbtn:hover:not(:disabled) {
+        border-color: rgba(31,111,208,.5);
+        box-shadow: 0 2px 6px rgba(18,44,77,.12);
+      }
+      .ndm-pbtn:disabled {
+        color: #8aa0b8; border-color: rgba(31,111,208,.16);
+        box-shadow: none; cursor: default;
+      }
+      .ndm-pbtn-def { font-weight: 600; }
+      /* The card's primary action — Pause while the transfer
+         runs, Resume in its place while it rests — carries the
+         story's solid blue (Concept A's Pause button). */
+      .ndm-fly-pause, .ndm-fly-resume {
+        background: linear-gradient(to bottom, #3c8be0, #1f6fd0);
+        border-color: #1e4e96; color: #fff; font-weight: 600;
+        box-shadow: 0 1px 4px rgba(18,44,77,.18), inset 0 1px 0 rgba(255,255,255,.25);
+      }
+      .ndm-fly-pause:hover:not(:disabled), .ndm-fly-resume:hover:not(:disabled) {
+        background: linear-gradient(to bottom, #4a94e6, #2273d8);
+        border-color: #1e4e96;
+        box-shadow: 0 2px 6px rgba(18,44,77,.20), inset 0 1px 0 rgba(255,255,255,.25);
+      }
       /* IDM's details section (SPEC §1.7): centred caption, the
          segment chart (one cell per block of the poll's block
          map — filled = downloaded, pale = in flight, white =
          pending), then the connections table in a bordered,
          scrolling box with a classic header row. */
       .ndm-fly-details { margin-top: 10px; }
-      .ndm-fly-dcap { text-align: center; margin-bottom: 5px; }
+      .ndm-fly-dcap { text-align: center; margin-bottom: 5px; color: #5b7186; }
       .ndm-fly-dchart {
-        display: flex; height: 14px; border: 1px solid #7f7f7f;
-        background: #fff; overflow: hidden; margin-bottom: 6px;
+        display: flex; height: 14px;
+        border: 1px solid rgba(31,111,208,.25); border-radius: 4px;
+        background: rgba(255,255,255,.6); overflow: hidden; margin-bottom: 6px;
       }
       .ndm-fly-dchart i { flex: 1 1 0; min-width: 0; }
       .ndm-fly-dchart i.b1 { background: #8fb0dc; }
       .ndm-fly-dchart i.b2 { background: #d7e5f5; }
       .ndm-fly-dtwrap {
         max-height: 118px; overflow-y: auto;
-        border: 1px solid #7f7f7f; background: #fff;
+        border: 1px solid rgba(31,111,208,.22); border-radius: 6px;
+        background: rgba(255,255,255,.65);
       }
       .ndm-fly-dtable { width: 100%; border-collapse: collapse; }
       .ndm-fly-dtable th, .ndm-fly-dtable td {
@@ -3499,7 +4380,8 @@
         white-space: nowrap;
       }
       .ndm-fly-dtable thead th {
-        background: #f0f0f0; border-bottom: 1px solid #7f7f7f;
+        background: rgba(255,255,255,.88);
+        border-bottom: 1px solid rgba(31,111,208,.18);
         position: sticky; top: 0;
       }
       .ndm-fly-dtable .ndm-dc-n { width: 30px; }
@@ -3509,8 +4391,8 @@
         display: flex; flex-wrap: wrap; align-items: center;
         column-gap: 10px; row-gap: 3px;
         padding: 6px 12px 7px;
-        font-family: Tahoma, "Segoe UI", sans-serif;
-        font-size: 11.5px; color: #000;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        font-size: 12px; color: #16283c;
       }
       .ndm-fly-mname {
         order: 1; flex: 1; min-width: 0;
@@ -3519,21 +4401,23 @@
       .ndm-fly-mbtns { order: 2; display: flex; gap: 6px; flex: none; }
       .ndm-fly-mbar {
         order: 3; flex: 0 0 100%; height: 10px;
-        border: 1px solid #7f7f7f; background: #e6e6e6; overflow: hidden;
+        border-radius: 4px; background: #dbe5ef;
+        box-shadow: inset 0 0 0 1px rgba(90,110,130,.45); overflow: hidden;
       }
       .ndm-fly-mbar-fill {
         height: 100%; width: 0%;
         background: #00b050; transition: width .3s ease;
       }
-      .ndm-fly-mpct { order: 4; flex: 0 0 100%; color: #000; min-height: 15px; }
+      .ndm-fly-mpct { order: 4; flex: 0 0 100%; color: #16283c; min-height: 15px; }
       .ndm-fly-mbtn {
-        background: #f0f0f0;
-        border: 1px solid #7f7f7f; color: #000;
-        border-radius: 0; height: 23px; padding: 0 10px;
-        font: inherit; font-size: 11px; cursor: pointer;
+        background: linear-gradient(to bottom, #ffffff, #e9f0f7);
+        border: 1px solid rgba(31,111,208,.28); color: #16283c;
+        border-radius: 7px; height: 24px; padding: 0 10px;
+        font: inherit; font-size: 11.5px; cursor: pointer;
+        box-shadow: 0 1px 3px rgba(18,44,77,.10);
       }
-      .ndm-fly-mbtn:hover:not(:disabled) { background: #e5f1fb; border-color: #0078d7; }
-      .ndm-fly-mbtn:disabled { color: #838383; border-color: #c0c0c0; cursor: default; }
+      .ndm-fly-mbtn:hover:not(:disabled) { border-color: rgba(31,111,208,.5); }
+      .ndm-fly-mbtn:disabled { color: #8aa0b8; border-color: rgba(31,111,208,.16); box-shadow: none; cursor: default; }
       .ndm-fly-state { color: #1d7a3a; font-weight: 600; }
 
       /* Non-intrusive Bottom-Right Background Download Toast */
@@ -3605,7 +4489,7 @@
     btn.title = 'Choose video quality & download with NDM';
     btn.addEventListener('click', e => {
       e.stopPropagation();
-      openBrowserModal(btn, pill);
+      openVideoPickerModal(btn, pill);
     });
 
     const close = document.createElement('button');
@@ -3924,7 +4808,7 @@
         answered = true;
         try { sendResponse({ ok }); } catch (e) {}
       };
-      openBrowserModal(btn, cardEl, msg.srcUrl || '', () => answer(true))
+      openVideoPickerModal(btn, cardEl, msg.srcUrl || '', () => answer(true))
         .then(() => answer(!!(modalOpen && modalEl)))
         .catch(() => answer(false));
       return true;

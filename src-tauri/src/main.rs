@@ -5423,6 +5423,104 @@ fn unique_video_name(state: &AppState, dir: &Path, raw_title: &str, audio: bool)
     base_stem
 }
 
+/// Split off the " (N)" copy suffix `unique_video_name` appends
+/// when a name is taken ("Title (1)" → "Title"). Only a trailing
+/// parenthesised number counts — a title that merely ends in
+/// parentheses ("Title (Director's Cut)") is left alone.
+fn split_copy_suffix(stem: &str) -> &str {
+    let stem = stem.trim_end();
+    if let Some(open) = stem.rfind(" (") {
+        let tail = &stem[open + 2..];
+        if tail.len() > 1 && tail.ends_with(')') {
+            let digits = &tail[..tail.len() - 1];
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                return &stem[..open];
+            }
+        }
+    }
+    stem
+}
+
+/// The target-path family of an EXISTING video entry's name: its
+/// stem with any machine-added " (N)" copy suffix removed,
+/// normalised the way a fresh title is. Two downloads are the
+/// same target when their families are equal — they would write
+/// the same file.
+fn video_entry_family(entry_name: &str) -> String {
+    let base = split_copy_suffix(entry_name);
+    let stem = video::safe_filename_stem(base);
+    if stem.is_empty() {
+        base.trim().to_string()
+    } else {
+        stem
+    }
+}
+
+/// The target-path family of a NEW video title, exactly as typed:
+/// a user who literally titles a download "Title (1)" means that
+/// name, so no copy suffix is stripped on this side.
+fn video_title_family(raw_name: &str) -> String {
+    let stem = video::safe_filename_stem(raw_name);
+    if stem.is_empty() {
+        raw_name.trim().to_string()
+    } else {
+        stem
+    }
+}
+
+/// The video duplicate check (release BLOCKER fix): an existing
+/// video entry is a duplicate of a new add only when it is the
+/// same video — url + folder + selector + audio — AND the same
+/// target path: the new title's family equals the existing
+/// entry's family. The check used to ignore the title entirely,
+/// so re-sending a video under a DIFFERENT name while the first
+/// copy was still in flight was refused as a "duplicate" of the
+/// old entry (and, down the host-timeout path, could surface as
+/// the old entry's success) — the user's new title never got an
+/// entry or a file of its own. Now a different title is a
+/// different target: it falls through and mints its own entry,
+/// and `unique_video_name` resolves any on-disk collision with
+/// a " (N)" suffix as usual.
+///
+/// State rule (unchanged from the inline check this replaces):
+/// a FINISHED copy counts as a duplicate too (F-EXT-07) and so
+/// does an ERRORED one (R2-EXT-04 — the caller surfaces the
+/// existing entry, the flyout shows its error with a Retry,
+/// instead of silently minting a "(2)" copy that orphans the
+/// failed entry's partial progress). Only cancelled entries
+/// fall through: a cancel was a deliberate discard, so a fresh
+/// add is a fresh start.
+fn find_video_duplicate(
+    state: &AppState,
+    url: &str,
+    dir: &Path,
+    selector: &str,
+    audio: bool,
+    new_family: &str,
+) -> Option<String> {
+    // snapshot first, payloads computed unlocked (see
+    // find_active_duplicate for why the lock must not be held)
+    let entries: Vec<Arc<Entry>> = state
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    entries
+        .iter()
+        .find(|e| {
+            e.kind == "video"
+                && e.url == url
+                && e.out_path == dir
+                && e.selector == selector
+                && e.audio == audio
+                && video_entry_family(&e.name) == new_family
+                && !matches!(payload_of(e).status.as_str(), "cancelled")
+        })
+        .map(|e| e.id.clone())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_add_video(
     app: &AppHandle,
@@ -5461,51 +5559,26 @@ fn do_add_video(
         .filter(|t| state.cookies_path(t).is_some())
         .unwrap_or_default();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create folder: {e}"))?;
-    if !force {
-        // snapshot first, payloads computed unlocked (see
-        // find_active_duplicate for why the lock must not be held)
-        let entries: Vec<Arc<Entry>> = state
-            .entries
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        let dupe = entries.iter().find(|e| {
-            e.kind == "video"
-                && e.url == url
-                && e.out_path == dir
-                && e.selector == selector
-                && e.audio == audio
-                // a FINISHED copy counts as a duplicate too
-                // (F-EXT-07): re-adding it used to slip past this
-                // check and silently re-download everything under a
-                // "(1)" name, so the browser card's "already in your
-                // download list" state could never appear. An
-                // ERRORED copy counts as well (R2-EXT-04): the
-                // caller surfaces the existing entry — the browser
-                // flyout shows its error with a Retry button —
-                // instead of silently minting a "(2)" copy that
-                // orphans the failed entry's partial progress. Only
-                // cancelled entries fall through: a cancel was a
-                // deliberate discard, so a fresh add is a fresh
-                // start. (Plain file downloads keep their
-                // rename-on-re-add behaviour in
-                // find_active_duplicate's callers.)
-                && !matches!(payload_of(e).status.as_str(), "cancelled")
-        });
-        if let Some(existing) = dupe {
-            // IDM asks instead of silently refusing or duplicating:
-            // the caller decides (dialog confirm / "Download again")
-            // and retries with force to get a second copy.
-            return Err(format!("duplicate:{}", existing.id));
-        }
-    }
     let raw_name = if title.trim().is_empty() {
         file_name_for(&url)
     } else {
         title.trim().to_string()
     };
+    if !force {
+        // duplicate = same video AND same target path (the title
+        // decides the path — find_video_duplicate). A re-send
+        // under a different title is a different target and gets
+        // its own entry below.
+        let new_family = video_title_family(&raw_name);
+        if let Some(existing) =
+            find_video_duplicate(state, &url, &dir, &selector, audio, &new_family)
+        {
+            // IDM asks instead of silently refusing or duplicating:
+            // the caller decides (dialog confirm / "Download again")
+            // and retries with force to get a second copy.
+            return Err(format!("duplicate:{existing}"));
+        }
+    }
     let name = unique_video_name(state, &dir, &raw_name, audio);
     let category = if audio {
         "Music".to_string()
@@ -8419,6 +8492,148 @@ mod tests {
         assert!(!e.pause_requested.load(Ordering::SeqCst));
         // a second claim finds nothing to claim
         assert!(!claim_queued(&e));
+    }
+
+    // ── Release BLOCKER: video dedupe keys on the target path ──
+
+    const DUPE_URL: &str = "https://www.youtube.com/watch?v=fixture";
+    const DUPE_SEL: &str = "bv*[height<=360]+ba/b";
+
+    fn dupe_video_entry(id: &str, name: &str, status: &str) -> Entry {
+        let mut e = restored_entry(
+            name,
+            "video",
+            1000,
+            PathBuf::from("/tmp/Downloads"),
+        );
+        e.id = id.to_string();
+        e.url = DUPE_URL.to_string();
+        e.selector = DUPE_SEL.to_string();
+        *e.restored.lock().unwrap() = Some(Restored {
+            total: 1000,
+            done_bytes: 0,
+            blocks: Vec::new(),
+            resumable: true,
+            status: status.to_string(),
+            error: String::new(),
+        });
+        e
+    }
+
+    fn dupe_state(entries: Vec<Entry>) -> AppState {
+        let state = state_with_data_file(PathBuf::new());
+        {
+            let mut map = state.entries.lock().unwrap();
+            let mut order = state.order.lock().unwrap();
+            for e in entries {
+                order.push(e.id.clone());
+                map.insert(e.id.clone(), Arc::new(e));
+            }
+        }
+        state
+    }
+
+    fn dupe_check(state: &AppState, new_title: &str) -> Option<String> {
+        find_video_duplicate(
+            state,
+            DUPE_URL,
+            Path::new("/tmp/Downloads"),
+            DUPE_SEL,
+            false,
+            &video_title_family(new_title),
+        )
+    }
+
+    #[test]
+    fn video_duplicate_same_title_in_flight_is_a_duplicate() {
+        // the same target path while the first copy is still
+        // downloading: duplicate — the picker shows "Already in
+        // NDM" and no second entry is minted
+        let state = dupe_state(vec![dupe_video_entry("dl-2", "My Video", "downloading")]);
+        assert_eq!(dupe_check(&state, "My Video"), Some("dl-2".to_string()));
+    }
+
+    #[test]
+    fn video_duplicate_different_title_in_flight_is_not_a_duplicate() {
+        // THE BLOCKER: same video + quality under a DIFFERENT
+        // title targets a different file — it must get its own
+        // entry, not be absorbed by the in-flight one
+        let state = dupe_state(vec![dupe_video_entry("dl-2", "My Video", "downloading")]);
+        assert_eq!(dupe_check(&state, "Another Title"), None);
+    }
+
+    #[test]
+    fn video_duplicate_copy_suffixed_entry_matches_the_base_title() {
+        // an existing forced copy ("My Video (1)") still counts
+        // as the same target family for the base title
+        let state = dupe_state(vec![dupe_video_entry("dl-7", "My Video (1)", "finished")]);
+        assert_eq!(dupe_check(&state, "My Video"), Some("dl-7".to_string()));
+    }
+
+    #[test]
+    fn video_duplicate_literal_suffix_title_is_its_own_target() {
+        // a title the user literally typed with a " (1)" in it is
+        // a different target from the base title's download
+        let state = dupe_state(vec![dupe_video_entry("dl-2", "My Video", "downloading")]);
+        assert_eq!(dupe_check(&state, "My Video (1)"), None);
+    }
+
+    #[test]
+    fn video_duplicate_finished_and_errored_still_count() {
+        // F-EXT-07 / R2-EXT-04 state rule: finished and errored
+        // copies are duplicates (same title); cancelled is not
+        let state = dupe_state(vec![dupe_video_entry("dl-3", "My Video", "finished")]);
+        assert_eq!(dupe_check(&state, "My Video"), Some("dl-3".to_string()));
+        let state = dupe_state(vec![dupe_video_entry("dl-4", "My Video", "error")]);
+        assert_eq!(dupe_check(&state, "My Video"), Some("dl-4".to_string()));
+        let state = dupe_state(vec![dupe_video_entry("dl-5", "My Video", "cancelled")]);
+        assert_eq!(dupe_check(&state, "My Video"), None);
+    }
+
+    #[test]
+    fn video_duplicate_needs_same_selector_dir_and_kind() {
+        // a different quality or folder is a different download
+        // even under the same title
+        let state = dupe_state(vec![dupe_video_entry("dl-2", "My Video", "downloading")]);
+        assert_eq!(
+            find_video_duplicate(
+                &state,
+                DUPE_URL,
+                Path::new("/tmp/Downloads"),
+                "bv*[height<=720]+ba/b",
+                false,
+                &video_title_family("My Video"),
+            ),
+            None
+        );
+        assert_eq!(
+            find_video_duplicate(
+                &state,
+                DUPE_URL,
+                Path::new("/tmp/Elsewhere"),
+                DUPE_SEL,
+                false,
+                &video_title_family("My Video"),
+            ),
+            None
+        );
+        // an http entry for the same page url is not a video dupe
+        let mut f = dupe_video_entry("dl-9", "My Video", "downloading");
+        f.kind = "http".to_string();
+        let state = dupe_state(vec![f]);
+        assert_eq!(dupe_check(&state, "My Video"), None);
+    }
+
+    #[test]
+    fn video_name_families_normalise_like_the_namer() {
+        // extension is stripped the same way unique_video_name
+        // sees the title; a parenthesised non-number ending is
+        // part of the title, not a copy suffix
+        assert_eq!(video_title_family("My Video.mp4"), "My Video");
+        assert_eq!(video_entry_family("My Video (2)"), "My Video");
+        assert_eq!(video_entry_family("Title (Director's Cut)"), "Title (Director's Cut)");
+        assert_eq!(video_title_family("Title (Director's Cut)"), "Title (Director's Cut)");
+        assert_eq!(split_copy_suffix("A (1) (2)"), "A (1)");
     }
 }
 

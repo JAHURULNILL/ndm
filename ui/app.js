@@ -647,30 +647,46 @@ let lastStructSig = '';
 
 function cellHtml(colId, d, st, left) {
   switch (colId) {
-    case 'name':
-      // the file's own 16×16 type icon before the name (IDM);
-      // single-line rows — there is NO in-row progress bar,
-      // progress is the Status cell's percentage text
-      return `<span class="ficon">${fileIconSvg(d)}</span>${escapeHtml(d.name)}`;
+    case 'name': {
+      // the file's own 16×16 type icon before the name (IDM).
+      // An active row (downloading/paused with a known total)
+      // also carries the concept-A progress line under the name:
+      // a slim track + fill with the integer percent at its
+      // right; every other row stays single-line. The fill's
+      // WIDTH is deliberately not part of this string — this
+      // WebKit drops percentage widths parsed from innerHTML —
+      // updateRowCells sets it via the DOM after the write.
+      let h = `<span class="ficon">${fileIconSvg(d)}</span>${escapeHtml(d.name)}`;
+      if ((st === 'downloading' || st === 'paused') && d.total > 0) {
+        h += `<span class="rowprog"><span class="rp-track"><span class="rp-fill"></span></span><span class="rp-pct">${pctOf(d).toFixed(0)}%</span></span>`;
+      }
+      return h;
+    }
     case 'q':
       // IDM: the small green queue icon while the entry is a
       // queue's work, blank otherwise — never a number or name
       return (st === 'downloading' || st === 'paused' || st === 'queued') ? Q_ICON : '';
     case 'size':
       return d.total > 0 || st === 'finished' ? fmtListSize(d.total) : 'Unknown';
-    case 'status':
-      // IDM's vocabulary, always plain black: "Complete" when
+    case 'status': {
+      // IDM's vocabulary, always plain text: "Complete" when
       // done, "Error" alone when failed (the message lives in
       // the tooltip and the status dialog), and while there is
-      // progress to report the bare 2-decimal percentage
-      if (st === 'finished') return 'Complete';
-      if (st === 'error') return 'Error';
+      // progress to report the bare 2-decimal percentage.
+      // Before the text sits the concept-A state dot — its
+      // colour comes from the per-state class updateRowCells
+      // puts on the cell (.stcell.st-*), never from this string.
+      let txt;
+      if (st === 'finished') txt = 'Complete';
+      else if (st === 'error') txt = 'Error';
       // W193-10: a queued entry must SAY so — it used to fall into
       // the percentage branch and sit at "0.00%", indistinguishable
       // from a paused entry that simply had not started
-      if (st === 'queued') return 'Queued';
-      if (d.total > 0) return pctOf(d).toFixed(2) + '%';
-      return cap(st);
+      else if (st === 'queued') txt = 'Queued';
+      else if (d.total > 0) txt = pctOf(d).toFixed(2) + '%';
+      else txt = cap(st);
+      return '<span class="sdot"></span>' + txt;
+    }
     case 'timeleft':
       return left != null ? fmtListLeft(left) : '';
     case 'rate':
@@ -702,10 +718,14 @@ function updateRowCells(tr, d) {
     if (td._h !== html) {
       td.innerHTML = html;
       td._h = html;
+      td._fill = null; // a cached progress fill died with the old markup
     }
     if (colId === 'status') {
-      // no state classes: status text is plain black in every
-      // state (IDM); the error MESSAGE rides the tooltip
+      // the per-state class colours the cell's dot (the TEXT
+      // stays plain in every state); the error MESSAGE rides
+      // the tooltip
+      const cls = 'stcell st-' + st;
+      if (td.className !== cls) td.className = cls;
       const title = st === 'error' && d.error ? d.error : '';
       if (td.title !== title) td.title = title;
     }
@@ -714,7 +734,19 @@ function updateRowCells(tr, d) {
       const t = d.queue || 'Main download queue';
       if (td.title !== t) td.title = t;
     }
-    if (colId === 'name' && td.className !== 'name') td.className = 'name';
+    if (colId === 'name') {
+      if (td.className !== 'name') td.className = 'name';
+      // the in-row progress fill: width via the DOM only (see
+      // cellHtml) — one style write per tick on the rows that
+      // carry a bar, and none when the value is unchanged
+      if ((st === 'downloading' || st === 'paused') && d.total > 0) {
+        if (!td._fill) td._fill = td.querySelector('.rp-fill');
+        if (td._fill) {
+          const w = pctOf(d).toFixed(1) + '%';
+          if (td._fill.style.width !== w) td._fill.style.width = w;
+        }
+      }
+    }
   }
   const sel = selectedIds.has(d.id) || d.id === selectedId;
   if (tr.classList.contains('selected') !== sel) tr.classList.toggle('selected', sel);
@@ -1009,12 +1041,28 @@ function toggleTheme() {
    export/count confirmations) are not errors and must not look
    like one. */
 let flashTimer = null;
-function toast(msg, kind) {
+function toast(msg, kind, opts) {
   const el = $('flashMsg');
   el.textContent = msg;
   el.classList.toggle('info', kind === 'info');
   el.classList.remove('hidden');
   clearTimeout(flashTimer);
+  flashTimer = null;
+  // F-202-2: a STICKY toast never auto-hides — it stays until
+  // the user dismisses it with its × button. Reserved for the
+  // manual update check's verdict: an answer that vanishes in
+  // ~5 s is an answer most users never see. (Setting textContent
+  // above wiped any previous ×, so it is (re)built here.)
+  if (opts && opts.sticky) {
+    const x = document.createElement('button');
+    x.className = 'flash-x';
+    x.type = 'button';
+    x.textContent = '×';
+    x.title = 'Dismiss';
+    x.addEventListener('click', () => el.classList.add('hidden'));
+    el.appendChild(x);
+    return;
+  }
   flashTimer = setTimeout(() => el.classList.add('hidden'), 5000);
 }
 
@@ -1145,6 +1193,7 @@ function select(id, openDetail) {
     // W193-8: the Speed Limiter tab must show THIS download's
     // limit the moment the dialog opens — sync explicitly here,
     // not only on the next progress tick's renderDetail
+    limiterDirty = false;
     syncLimiterPanel();
     requestAnimationFrame(() => renderDetail());
   }
@@ -1382,9 +1431,9 @@ if ($('dQueueSel')) $('dQueueSel').addEventListener('change', async () => {
 });
 $('dPause').onclick = $('btnPause').onclick;
 $('dResumeBtn').onclick = $('btnResume').onclick;
-$('dHide').onclick = () => { detailEl.classList.add('hidden'); showNextComplete(); };
-if ($('dModalClose')) $('dModalClose').onclick = () => { detailEl.classList.add('hidden'); showNextComplete(); };
-detailEl.addEventListener('click', e => { if (e.target === detailEl) { detailEl.classList.add('hidden'); showNextComplete(); } });
+$('dHide').onclick = () => { limiterDirty = false; detailEl.classList.add('hidden'); showNextComplete(); };
+if ($('dModalClose')) $('dModalClose').onclick = () => { limiterDirty = false; detailEl.classList.add('hidden'); showNextComplete(); };
+detailEl.addEventListener('click', e => { if (e.target === detailEl) { limiterDirty = false; detailEl.classList.add('hidden'); showNextComplete(); } });
 $('btnStopAll').onclick = async () => {
   for (const d of items.values()) {
     if (d.status !== 'downloading') continue;
@@ -2367,8 +2416,11 @@ function openOptions() {
   $('oDir').value = settings.default_dir;
   $('oConns').value = settings.max_connections;
   $('oLimitOn').checked = settings.speed_limit_bps > 0;
+  // F-202-5: round the displayed MB/s to 3 decimals — the raw
+  // quotient leaks binary-float residue (314573 B/s read back
+  // as "0.3000001"). The stored bps is untouched.
   $('oLimitVal').value = settings.speed_limit_bps > 0
-    ? settings.speed_limit_bps / (1024 * 1024) : 2;
+    ? Math.round(settings.speed_limit_bps / (1024 * 1024) * 1000) / 1000 : 2;
   $('oSimul').value = settings.max_simultaneous;
   $('oAutoResume').checked = settings.auto_resume;
   $('oVideoQ').value = settings.video_quality;
@@ -3151,7 +3203,19 @@ $('gDownload').onclick = async () => {
 
 
 /* ---------- detail tabs + completion options + speed limiter + open/refresh ---------- */
+// F-202-4: once the user edits this panel, progress-tick syncs must
+// not overwrite the edit before Apply reads it. The old focus-only
+// guard failed the moment focus moved to the Apply button itself:
+// the tick between mousedown and click reset the checkbox and the
+// typed value from the entry, so Apply silently applied "no limit".
+// Same pattern as the completion-radios guard above: never sync
+// over an in-progress user interaction — here, an unapplied edit.
+let limiterDirty = false;
+if ($('dLimitOn')) $('dLimitOn').addEventListener('change', () => { limiterDirty = true; });
+if ($('dLimitVal')) $('dLimitVal').addEventListener('input', () => { limiterDirty = true; });
+
 function syncLimiterPanel() {
+  if (limiterDirty) return;
   // IDM's Speed Limiter tab is PER DOWNLOAD — it used to read and
   // write the GLOBAL limit, so "limiting this download" silently
   // throttled everything (and the label disagreed with Options)
@@ -3189,6 +3253,7 @@ if ($('dLimitApply')) {
     const on = $('dLimitOn').checked;
     const valMb = Math.max(0.1, Number($('dLimitVal').value) || 1);
     const bps = on ? Math.round(valMb * 1024 * 1024) : 0;
+    limiterDirty = false;
     if (TAURI) {
       try { await invoke('set_entry_limit', { id: d.id, limit: bps }); }
       catch (e) { toast('Could not set the limit: ' + e); return; }
@@ -3718,9 +3783,14 @@ async function manualUpdateCheck() {
   try {
     const r = await invoke('check_update');
     if (r.status === 'available') showUpdate(r);
-    else if (r.status === 'current') toast(`NDM is up to date (${r.version})`, 'info');
-    else toast('Could not reach the update server — try again later');
-  } catch (e) { toast('Update check failed: ' + e); }
+    // F-202-2: the manual check's verdict (and its failures)
+    // stay on screen until dismissed — the user asked a
+    // question; the answer must not evaporate. The transient
+    // "Checking for updates…" line above stays transient: the
+    // sticky verdict replaces it.
+    else if (r.status === 'current') toast(`NDM is up to date (${r.version})`, 'info', { sticky: true });
+    else toast('Could not reach the update server — try again later', undefined, { sticky: true });
+  } catch (e) { toast('Update check failed: ' + e, undefined, { sticky: true }); }
 }
 function onUpdateProgress(p) {
   if (p.phase === 'downloading') {

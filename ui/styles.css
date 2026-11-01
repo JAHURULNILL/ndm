@@ -3,41 +3,65 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 /* IDM hubuhu STRUCTURE (menubar, icon-over-label toolbar, tree,
    8-column listview) with a DESIGNER FINISH on top: one colour
-   story — a deepened IDM-blue family over blue-tinted neutrals —
+   story — the #1f6fd0 blue family over blue-tinted neutrals —
    carried by three token layers (primitives → semantics →
-   component values below). Depth comes from hairline gradients
-   and soft shadows only: no glass, no blur, nothing that costs
-   the WebKitGTK renderer a frame. */
+   component values below). LIGHT THEME = "Glass Light": an
+   ambient blue-grey gradient backdrop, frosted translucent
+   chrome (menubar / toolbar / rail get backdrop blur; the
+   scrolling grid never does, so the table stays cheap to paint),
+   white-glass surfaces, ~12px radii and deep soft shadows.
+   Where the renderer has no compositing (the test rig), the
+   blur simply no-ops and the rgba fills still read as glass.
+   The DARK theme keeps the previous opaque finish untouched. */
 :root {
   /* primitives — the blue family + tinted slate neutrals */
   --blue-700: #1e4e96; --blue-600: #2f66b8; --blue-500: #3574c8; --blue-400: #5b8bd4;
   --blue-100: #dce9f7; --blue-50: #eef4fb;
   --ink-900: #1d2a38; --ink-500: #5c6b7e; --ink-400: #8494a7;
   --n-25: #f7f9fb; --n-50: #f2f5f8; --n-100: #e8ecf1; --n-200: #dfe5ec; --n-300: #c3cedb;
-  /* semantics */
-  --bg: #e8ecf1; --panel: #ffffff; --panel2: var(--n-50); --line: var(--n-300);
-  --line-soft: var(--n-200); --rail: var(--n-25);
-  --text: var(--ink-900); --dim: var(--ink-500); --blue: var(--blue-600); --blue2: var(--blue-500);
+  /* semantics — Glass Light values (concept A's tokens) */
+  --bg: #dfe9f3; --panel: #ffffff; --panel2: #edf3f9; --line: #c7d3e0;
+  --line-soft: #dde6ee; --rail: rgba(255,255,255,.34);
+  --text: #16283c; --dim: #5b7186; --blue: #1f6fd0; --blue2: #2f7fd1;
   --green: #2e7d4f; --yellow: #9c7200;
-  --title-bg: #edf1f5; --hover: #e1ecf9; --th-bg: #edf1f6;
-  --row-line: #e5eaf0; --row-hover: var(--blue-50); --sel: var(--blue-600); --sel-hover: #2a5ca8;
+  /* state-dot + in-row progress accents (concept A) */
+  --amber: #de9610; --red: #d84a3a; --dot-idle: #a7b4c2; --rp-track: #d6e4f2;
+  --title-bg: #edf1f5; --hover: rgba(31,111,208,.12); --th-bg: #edf1f6;
+  --row-line: #e4ebf2; --row-hover: rgba(31,111,208,.055); --sel: #1f6fd0; --sel-hover: #1a63ba;
   --track: var(--n-200); --seg-bg: #f4f6f9; --input-bg: #ffffff;
-  --bar-text: #ffffff; --bar-shadow: none;
-  --seg-done: var(--blue-500); --seg-active: #f2b33d; --seg-active2: #c79a1d; --seg-pending: #d3dae2;
+  --bar-text: #ffffff;
+  /* F-202-6: the detail bar's centred % label is white; over
+     the pale unfilled track it needs a dark halo to stay
+     legible (the dark theme always had one). The halo reads
+     over the blue fill too. */
+  --bar-shadow: 0 0 3px rgba(13,33,55,.6), 0 1px 2px rgba(13,33,55,.5);
+  --seg-done: #2f7fd1; --seg-active: #f2b33d; --seg-active2: #c79a1d; --seg-pending: #d3dae2;
+  /* the ambient backdrop the glass chrome floats on */
+  --app-bg:
+    radial-gradient(1000px 620px at 12% -5%, rgba(64,145,220,.34), rgba(64,145,220,0) 60%),
+    radial-gradient(900px 700px at 92% 105%, rgba(31,111,208,.18), rgba(31,111,208,0) 55%),
+    linear-gradient(155deg, #ccdcee, #eaf1f8 46%, #d6e3f0);
+  --content-bg: linear-gradient(to bottom, rgba(255,255,255,.96), rgba(248,251,253,.93));
+  --card-bg: linear-gradient(165deg, rgba(255,255,255,.98), rgba(243,248,252,.96));
+  --pop-bg: rgba(255,255,255,.95);
+  --scrim: rgba(20,44,77,.34);
+  --tree-sel-bg: rgba(31,111,208,.16); --tree-sel-ink: #0f4c8c;
   /* component finish tokens */
-  --chrome-hi: #fcfdfe; --chrome-lo: #e7ecf2; --chrome-shine: rgba(255,255,255,.7);
-  --th-hi: #fdfdff; --th-lo: #e6ecf3;
-  --sel-hi: #3873c6; --sel-lo: #2a5ca8;
-  --btn-hi: #ffffff; --btn-lo: #edf1f5; --hover-line: #a9c6e8;
-  --ring: rgba(47,102,184,.35);
-  --menu-shadow: 0 10px 28px rgba(23,42,66,.16), 0 2px 6px rgba(23,42,66,.10);
-  --modal-shadow: 0 18px 44px rgba(23,42,66,.22), 0 3px 10px rgba(23,42,66,.12);
+  --chrome-hi: rgba(255,255,255,.82); --chrome-lo: rgba(255,255,255,.55); --chrome-shine: rgba(255,255,255,.65);
+  --th-hi: rgba(255,255,255,.97); --th-lo: rgba(240,246,251,.94);
+  --sel-hi: #2f7fd1; --sel-lo: #1f6fd0;
+  --btn-hi: #ffffff; --btn-lo: #edf1f5; --hover-line: rgba(31,111,208,.38);
+  --ring: rgba(31,111,208,.32);
+  --menu-shadow: 0 16px 40px -8px rgba(18,44,77,.28), 0 4px 12px rgba(18,44,77,.12);
+  --modal-shadow: 0 30px 70px -18px rgba(18,44,77,.40), 0 8px 24px rgba(18,44,77,.16);
 }
 [data-theme="dark"] {
   --bg: #21262d; --panel: #272c34; --panel2: #2e353f; --line: #424c59;
   --line-soft: #333b45; --rail: #242a31;
   --text: #e9edf2; --dim: #9fabb9; --blue: #3f8fe0; --blue2: #55a0ea;
   --green: #43b581; --yellow: #f5c542;
+  /* state-dot + in-row progress accents (concept A) */
+  --amber: #f5c542; --red: #e0685c; --dot-idle: #78838f; --rp-track: #39434f;
   --title-bg: #1b1f24; --hover: #37424e; --th-bg: #232930;
   --row-line: #2e353e; --row-hover: #2b333c; --sel: #2a5486; --sel-hover: #2f5c94;
   --track: #1b1f24; --seg-bg: #191d21; --input-bg: #1b1f24;
@@ -50,11 +74,18 @@
   --ring: rgba(85,160,234,.4);
   --menu-shadow: 0 10px 28px rgba(0,0,0,.5), 0 2px 6px rgba(0,0,0,.4);
   --modal-shadow: 0 18px 44px rgba(0,0,0,.55), 0 3px 10px rgba(0,0,0,.4);
+  /* glass-finish tokens, dark values = the previous opaque finish */
+  --app-bg: #21262d;
+  --content-bg: var(--panel);
+  --card-bg: var(--panel);
+  --pop-bg: var(--panel);
+  --scrim: rgba(0,0,0,.35);
+  --tree-sel-bg: linear-gradient(to bottom, var(--sel-hi), var(--sel-lo)); --tree-sel-ink: #fff;
 }
 html, body { height: 100%; }
 body {
   font-family: Tahoma, "Segoe UI", -apple-system, Roboto, "Noto Sans", Ubuntu, sans-serif;
-  background: var(--bg); color: var(--text); font-size: 11px;
+  background: var(--app-bg); color: var(--text); font-size: 11px;
   display: flex; flex-direction: column; overflow: hidden;
 }
 
@@ -77,7 +108,7 @@ body {
 .toolbar .tool {
   display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
   gap: 3px; min-width: 60px; flex: none; padding: 4px 5px 3px;
-  background: transparent; border: 1px solid transparent; border-radius: 6px;
+  background: transparent; border: 1px solid transparent; border-radius: 9px;
   font-size: 11px; color: var(--text); cursor: pointer;
   transition: background .18s ease, border-color .18s ease, box-shadow .18s ease;
 }
@@ -112,7 +143,7 @@ body {
 }
 .queue-drop {
   position: absolute; top: calc(100% + 2px); right: 0; min-width: 200px; z-index: 45;
-  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  background: var(--pop-bg); border: 1px solid var(--line); border-radius: 10px;
   box-shadow: var(--menu-shadow); padding: 5px;
   display: flex; flex-direction: column;
 }
@@ -126,7 +157,7 @@ body {
 .tool {
   background: linear-gradient(to bottom, var(--btn-hi), var(--btn-lo));
   color: var(--text); border: 1px solid var(--line);
-  border-radius: 4px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
+  border-radius: 8px; padding: 6px 12px; font-size: 12.5px; cursor: pointer;
   transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, transform .05s;
 }
 .tool:hover:not(:disabled) {
@@ -138,13 +169,15 @@ body {
 /* the primary button is the ONE accent moment in a dialog: the
    deepened IDM blue as a soft vertical gradient, white label */
 .tool.primary {
-  background: linear-gradient(to bottom, #3a77c9, #2a5ca8);
+  background: linear-gradient(to bottom, #2f7fd1, #1f6fd0);
   border-color: var(--blue-700); color: #ffffff; font-weight: 600;
   box-shadow: 0 1px 2px rgba(23,42,66,.18), inset 0 1px 0 rgba(255,255,255,.18);
 }
 .tool.primary:hover:not(:disabled) {
-  background: linear-gradient(to bottom, #4482d2, #2f66b8); border-color: var(--blue-700);
+  background: linear-gradient(to bottom, #3c8be0, #2273d8); border-color: var(--blue-700);
 }
+[data-theme="dark"] .tool.primary { background: linear-gradient(to bottom, #3a77c9, #2a5ca8); }
+[data-theme="dark"] .tool.primary:hover:not(:disabled) { background: linear-gradient(to bottom, #4482d2, #2f66b8); }
 .tool-sep {
   width: 1px; align-self: stretch; margin: 2px 4px; flex: none;
   background: linear-gradient(to bottom, transparent, var(--line) 22%, var(--line) 78%, transparent);
@@ -179,6 +212,7 @@ body {
 .trow {
   display: flex; align-items: center; height: 19px; padding-right: 4px;
   cursor: pointer; white-space: nowrap; color: var(--text);
+  border-radius: 7px; margin-right: 5px;
 }
 .tbox {
   flex: none; width: 9px; height: 9px; margin: 0 3px 0 1px; padding: 0;
@@ -199,7 +233,11 @@ body {
   transition: background .15s ease;
 }
 .trow:not(.sel):hover > .tlabel { background: var(--row-hover); }
-.trow.sel > .tlabel { background: linear-gradient(to bottom, var(--sel-hi), var(--sel-lo)); color: #fff; }
+/* Glass Light: the selected node is a soft blue pill spanning the
+   row, dark-blue text (concept A). In the dark theme the token
+   carries the previous solid gradient + white text, unchanged. */
+.trow.sel { background: var(--tree-sel-bg); }
+.trow.sel > .tlabel { background: none; color: var(--tree-sel-ink); font-weight: 600; }
 .tchildren { margin-left: 9px; padding-left: 10px; border-left: 1px dotted #b7c7d9; }
 .tchildren .trow { position: relative; }
 .tchildren .trow::before {
@@ -207,7 +245,7 @@ body {
   border-top: 1px dotted #b7c7d9;
 }
 
-.content { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--panel); }
+.content { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--content-bg); }
 .grid-wrap { flex: 1; min-height: 0; overflow-y: auto; overflow-x: auto; }
 .grid thead th { position: sticky; top: 0; z-index: 1; }
 .grid { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
@@ -244,18 +282,59 @@ body {
    including the status cell, whose state colour would otherwise
    fight the background */
 .grid tbody tr.selected td { color: #fff; }
-/* progress bar used by DIALOGS (video setup, updater). The file
-   LIST has no in-row progress bar at all (IDM carries list
-   progress as Status-cell text), so nothing in the grid uses
-   this. The fill child's width is set via the DOM after render
-   (see app.js) — inline-style percentages do not survive this
-   WebKit's parsing inside innerHTML */
-.pbar { height: 5px; border-radius: 2px; margin-top: 4px; width: 150px; background: var(--track); overflow: hidden; }
-.pbar i { display: block; height: 100%; background: var(--blue2); border-radius: 2px; }
+/* progress bar used by DIALOGS (video setup, updater); the
+   list's own in-row bar is .rowprog below. The fill child's
+   width is set via the DOM after render (see app.js) —
+   inline-style percentages do not survive this WebKit's
+   parsing inside innerHTML */
+.pbar { height: 5px; border-radius: 3px; margin-top: 4px; width: 150px; background: var(--track); overflow: hidden; }
+.pbar i { display: block; height: 100%; background: linear-gradient(90deg, var(--blue2), var(--blue)); border-radius: 3px; }
 .bar #dBarFill.ind { width: 35%; animation: indslide2 1s ease-in-out infinite alternate; }
 @keyframes indslide2 { from { margin-left: 0; } to { margin-left: 65%; } }
-/* (status text in the list is plain black in every state — IDM
-   does not colour-code it — so there are no .st-* classes) */
+/* in-row progress (concept A, user-ordered): under the file
+   name of an active row — a slim track, blue fill, integer
+   percent at its right. Only downloading/paused rows with a
+   known total carry the element (app.js decides); finished
+   rows stay clean. Same DOM-width rule as .pbar: the fill's
+   width arrives via el.style.width after the render. */
+.grid td.name .rowprog { display: flex; align-items: center; gap: 6px; margin: 2px 0 1px 21px; }
+.grid td.name .rp-track { flex: 1; min-width: 0; height: 4px; border-radius: 2px; background: var(--rp-track); overflow: hidden; }
+.grid td.name .rp-fill { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--blue2), var(--blue)); border-radius: 2px; }
+.grid td.name .rp-pct { flex: none; font-size: 10px; color: var(--blue); }
+/* on the solid selection gradient the blue fill would drown
+   in the row — track and fill switch to white tints there */
+.grid tbody tr.selected .rp-track { background: rgba(255,255,255,.35); }
+.grid tbody tr.selected .rp-fill { background: #ffffff; }
+.grid tbody tr.selected .rp-pct { color: #ffffff; }
+/* the list's state dot (concept A, user-ordered): the status
+   TEXT stays plain in every state (IDM's vocabulary,
+   uncoloured) — the colour lives in a 7px dot before it,
+   driven by the per-state class app.js puts on the cell.
+   Downloading pulses gently (opacity only, so the 200 ms
+   tick never pays for layout); any state without a named
+   colour keeps the neutral idle dot. */
+.sdot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  margin-right: 6px; vertical-align: 1px; background: var(--dot-idle);
+}
+.stcell.st-downloading .sdot { background: var(--blue); animation: sdot-pulse 1.6s ease-in-out infinite; }
+.stcell.st-paused .sdot { background: var(--amber); }
+.stcell.st-finished .sdot { background: var(--green); }
+.stcell.st-error .sdot { background: var(--red); }
+@keyframes sdot-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .3; } }
+/* on the selection blue a bare dot would drown — a pale ring
+   keeps every state legible */
+.grid tbody tr.selected .sdot { box-shadow: 0 0 0 1px rgba(255,255,255,.6); }
+/* F-202-7: the DOWNLOADING dot is blue on the blue selection —
+   at the pulse's low point (opacity .3, ring included) it all
+   but vanished. On a selected row the dot gets a near-solid
+   2px ring and its pulse keeps a high opacity floor, so it
+   stays clearly visible through the whole cycle. */
+.grid tbody tr.selected .stcell.st-downloading .sdot {
+  box-shadow: 0 0 0 2px rgba(255,255,255,.95);
+  animation-name: sdot-pulse-sel;
+}
+@keyframes sdot-pulse-sel { 0%, 100% { opacity: 1; } 50% { opacity: .8; } }
 .empty { padding: 26px; text-align: center; color: var(--dim); }
 
 /* detail modal (IDM Download Status floating window) */
@@ -273,9 +352,9 @@ body {
 .detail-modal .detail-body { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 .detail-modal .detail-btns { flex: none; }
 .detail-tabs { display: flex; gap: 2px; padding: 0 2px; border-bottom: 1px solid var(--line); }
-.detail-tabs .tab { padding: 6px 12px; color: var(--dim); border-radius: 3px 3px 0 0; cursor: pointer; font-weight: 600; font-size: 12.5px; }
+.detail-tabs .tab { padding: 6px 12px; color: var(--dim); border-radius: 8px 8px 0 0; cursor: pointer; font-weight: 600; font-size: 12.5px; }
 .detail-tabs .tab.active { background: var(--panel2); color: var(--text); border: 1px solid var(--line); border-bottom-color: var(--panel2); margin-bottom: -1px; }
-.detail-body { padding: 12px 14px; background: var(--panel2); border: 1px solid var(--line); border-top: none; border-radius: 0 0 3px 3px; }
+.detail-body { padding: 12px 14px; background: var(--panel2); border: 1px solid var(--line); border-top: none; border-radius: 0 0 10px 10px; }
 .d-conns { margin: 6px 0 2px; font-size: 12px; color: var(--dim); }
 .d-conn-row { display: flex; justify-content: space-between; padding: 2px 0; border-bottom: 1px dashed var(--line, #ddd); }
 .d-conn-row:last-child { border-bottom: none; }
@@ -285,7 +364,7 @@ body {
   position: relative; height: 16px; background: var(--track); border-radius: 2px;
   overflow: hidden; margin-bottom: 8px; text-align: center;
 }
-.bar #dBarFill { position: absolute; inset: 0; width: 0%; background: var(--blue2); transition: width .3s; }
+.bar #dBarFill { position: absolute; inset: 0; width: 0%; background: linear-gradient(90deg, var(--blue2), var(--blue)); transition: width .3s; }
 .bar span { position: relative; font-size: 11px; line-height: 16px; color: var(--bar-text); text-shadow: var(--bar-shadow); }
 .seg-label { color: var(--dim); margin-bottom: 4px; }
 #segMap { width: 100%; height: 86px; background: var(--seg-bg); border: 1px solid var(--line); border-radius: 2px; }
@@ -293,7 +372,7 @@ body {
 .detail-btns button {
   background: linear-gradient(to bottom, var(--btn-hi), var(--btn-lo));
   color: var(--text); border: 1px solid var(--line);
-  border-radius: 4px; padding: 5px 14px; cursor: pointer;
+  border-radius: 8px; padding: 5px 14px; cursor: pointer;
   transition: background .18s ease, border-color .18s ease;
 }
 .detail-btns button:hover:not(:disabled) {
@@ -304,7 +383,7 @@ body {
 
 /* modal */
 .modal {
-  position: fixed; inset: 0; background: rgba(0, 0, 0, .35);
+  position: fixed; inset: 0; background: var(--scrim);
   display: flex; z-index: 50;
   overflow-y: auto; padding: 12px 8px;
 }
@@ -317,8 +396,8 @@ body {
      With auto margins the card centres when it fits and aligns to
      the top — fully scrollable — when it does not. */
   margin: auto;
-  width: 430px; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 8px; padding: 16px; box-shadow: var(--modal-shadow);
+  width: 430px; background: var(--card-bg); border: 1px solid var(--line);
+  border-radius: 14px; padding: 16px; box-shadow: var(--modal-shadow);
   /* at the minimum window height a tall card (grabber, options) must
      scroll internally — centred overflow off both ends is a trap.
      The 60px pairs with the overlay's 48px top padding below. */
@@ -349,13 +428,13 @@ body {
   font-weight: 600; font-size: 13px; display: flex; justify-content: space-between;
   align-items: center; letter-spacing: .01em;
   background: linear-gradient(to bottom, var(--chrome-hi), var(--chrome-lo));
-  border-bottom: 1px solid var(--line); border-radius: 7px 7px 0 0;
+  border-bottom: 1px solid var(--line); border-radius: 13px 13px 0 0;
   margin: -16px -16px 12px; padding: 8px 12px;
 }
 .modal-head > span:last-child { cursor: pointer; color: var(--dim); font-size: 15px; line-height: 1; padding: 0 2px; }
 .modal-card label { display: block; color: var(--dim); margin-bottom: 11px; font-size: 12px; }
 .modal-card input {
-  width: 100%; margin-top: 4px; padding: 6px 8px; border-radius: 4px;
+  width: 100%; margin-top: 4px; padding: 6px 8px; border-radius: 8px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
   transition: border-color .15s ease, box-shadow .15s ease;
 }
@@ -371,7 +450,7 @@ body {
 .modal-card input.invalid { border-color: #d84a3a; }
 .cat-row { display: flex; gap: 6px; margin-top: 4px; }
 .cat-row select {
-  flex: 1; min-width: 0; padding: 6px 8px; border-radius: 4px;
+  flex: 1; min-width: 0; padding: 6px 8px; border-radius: 8px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
   transition: border-color .15s ease, box-shadow .15s ease;
 }
@@ -396,7 +475,7 @@ body {
   transition: background .15s ease;
 }
 .menu-btn:hover, .menu-btn.open { background: var(--hover, rgba(90, 140, 200, .16)); }
-.menu-drop { position: absolute; top: calc(100% + 2px); left: 0; min-width: 264px; background: var(--panel, #fff); border: 1px solid var(--line, #dde3e8); border-radius: 6px; box-shadow: var(--menu-shadow); padding: 5px; display: flex; flex-direction: column; }
+.menu-drop { position: absolute; top: calc(100% + 2px); left: 0; min-width: 264px; background: var(--pop-bg, #fff); border: 1px solid var(--line, #dde3e8); border-radius: 10px; box-shadow: var(--menu-shadow); padding: 5px; display: flex; flex-direction: column; }
 .menu-drop > button { display: flex; justify-content: space-between; align-items: center; gap: 18px; background: none; border: none; font: inherit; font-size: 11px; text-align: left; padding: 5px 9px; border-radius: 4px; cursor: pointer; color: inherit; white-space: nowrap; transition: background .15s ease; }
 .menu-drop > button:hover { background: var(--hover, rgba(90, 140, 200, .16)); }
 .menu-drop .mkey { opacity: .55; font-size: 11px; }
@@ -406,7 +485,7 @@ body {
 .menu-drop > button:has(> .mcheck) { justify-content: flex-start; gap: 4px; }
 .menu-sep { height: 1px; background: var(--line-soft, #dde3e8); margin: 5px 4px; }
 body.no-side .sidebar { display: none; }
-.ta { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px; border: 1px solid var(--line, #ccd4dc); border-radius: 2px; background: var(--input-bg, #fff); color: inherit; resize: vertical; }
+.ta { width: 100%; box-sizing: border-box; font: inherit; font-size: 13px; padding: 8px; border: 1px solid var(--line, #ccd4dc); border-radius: 8px; background: var(--input-bg, #fff); color: inherit; resize: vertical; }
 .shortcuts div { display: flex; gap: 14px; padding: 5px 2px; font-size: 13.5px; }
 .shortcuts b { min-width: 110px; font-weight: 600; }
 .about { text-align: center; padding: 6px 4px 2px; }
@@ -473,14 +552,14 @@ body.no-side .sidebar { display: none; }
 }
 .v-options label:hover { background: var(--row-hover); }
 .v-options label.sel {
-  background: rgba(49, 106, 197, .12);
+  background: rgba(31, 111, 208, .11);
   border-color: var(--blue2, #316ac5);
 }
 .v-options input { width: auto; margin: 0; }
 .v-options .q-badge {
   font-size: 10.5px; font-weight: 700; padding: 2px 6px;
   border-radius: 2px; letter-spacing: .3px; flex: none;
-  background: rgba(49, 106, 197, .14); color: var(--blue2, #316ac5);
+  background: rgba(31, 111, 208, .13); color: var(--blue2, #316ac5);
 }
 .v-options .q-badge.audio {
   background: rgba(214, 137, 16, .16); color: #b7791f;
@@ -494,7 +573,7 @@ body.no-side .sidebar { display: none; }
   background: var(--panel2, #eef3f8); color: var(--text);
 }
 .v-options .q-size.exact {
-  background: rgba(49, 106, 197, .15); color: var(--blue2, #316ac5);
+  background: rgba(31, 111, 208, .14); color: var(--blue2, #316ac5);
 }
 
 /* options + scheduler modals */
@@ -502,7 +581,7 @@ body.no-side .sidebar { display: none; }
 .opt-row > span { flex: 0 0 168px; }
 .opt-row .opt-unit { flex: 0 0 auto; }
 .opt-row input, .opt-row select {
-  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 4px;
+  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 8px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text); font-size: 13px; outline: none;
   transition: border-color .15s ease, box-shadow .15s ease;
 }
@@ -511,7 +590,7 @@ body.no-side .sidebar { display: none; }
    read as inert, the way a disabled control does in IDM */
 .opt-row input:disabled, .opt-row select:disabled { opacity: .5; }
 .opt-row textarea {
-  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 4px;
+  flex: 1; min-width: 0; margin-top: 0; padding: 6px 8px; border-radius: 8px;
   border: 1px solid var(--line); background: var(--input-bg); color: var(--text);
   font: inherit; font-size: 13px; outline: none; resize: vertical;
   transition: border-color .15s ease, box-shadow .15s ease;
@@ -587,17 +666,24 @@ body.no-side .sidebar { display: none; }
 
 /* audit additions: transient message + completion options */
 .flash {
-  margin: 8px 12px 0; padding: 8px 12px; border-radius: 6px;
+  margin: 8px 12px 0; padding: 8px 12px; border-radius: 10px;
   background: #fdecec; color: #a12622; border: 1px solid #f3c2c0;
   font-size: 13px;
 }
+/* F-202-2: the sticky toast's dismiss button */
+.flash-x {
+  float: right; margin-left: 10px; padding: 0 3px;
+  background: none; border: none; font: inherit; font-size: 15px;
+  line-height: 1; color: inherit; cursor: pointer; opacity: .65;
+}
+.flash-x:hover { opacity: 1; }
 [data-theme="dark"] .flash { background: #3d2323; color: #f0a9a5; border-color: #6e3a38; }
 /* informational messages (up-to-date, export done, counts) are not
    errors — they get a neutral banner, in both themes */
 .flash.info { background: var(--panel2); color: var(--text); border-color: var(--line); }
 /* W193-11: persistent download-limit banner above the list */
 .quota-banner {
-  margin: 8px 12px 0; padding: 8px 12px; border-radius: 6px;
+  margin: 8px 12px 0; padding: 8px 12px; border-radius: 10px;
   background: #fdf3e0; color: #7a5410; border: 1px solid #ecd9a8;
   font-size: 13px;
 }
@@ -617,8 +703,8 @@ body.no-side .sidebar { display: none; }
 /* row right-click context menu (IDM-style) */
 .ctx-menu {
   position: fixed; z-index: 90; min-width: 210px; padding: 5px;
-  background: var(--panel, #ffffff); color: inherit;
-  border: 1px solid var(--line, #ccd4db); border-radius: 6px;
+  background: var(--pop-bg, #ffffff); color: inherit;
+  border: 1px solid var(--line, #ccd4db); border-radius: 10px;
   box-shadow: var(--menu-shadow);
 }
 .ctx-menu button {
@@ -627,7 +713,7 @@ body.no-side .sidebar { display: none; }
   cursor: pointer; border-radius: 4px; color: inherit;
   transition: background .15s ease;
 }
-.ctx-menu button:hover:not(:disabled) { background: rgba(49, 106, 197, .14); }
+.ctx-menu button:hover:not(:disabled) { background: rgba(31, 111, 208, .13); }
 .ctx-menu button:disabled { opacity: .45; cursor: default; }
 .ctx-menu .ctx-sep { border-top: 1px solid var(--line, #dde3e8); margin: 4px 2px; }
 .ctx-menu .ctx-head {
@@ -697,6 +783,55 @@ body.no-side .sidebar { display: none; }
 #omodal .opt-panel { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
 #omodal .modal-head, #omodal .opt-tabs, #omodal .modal-btns { flex: none; }
 
+/* ---------- Glass Light: frost + the one bar accent (light only)
+   Backdrop blur is applied ONLY to the two chrome strips and the
+   categories rail — small, mostly static layers. The scrolling
+   grid, modal cards and dropdowns use translucent or gradient
+   fills with NO backdrop filter, so a long list never pays for
+   blur. A renderer without compositing (the test rig) ignores
+   backdrop-filter entirely; the rgba fills still read as glass
+   over the ambient backdrop, which is the graceful fallback. */
+html:not([data-theme="dark"]) .menubar,
+html:not([data-theme="dark"]) .toolbar,
+html:not([data-theme="dark"]) .sidebar {
+  backdrop-filter: blur(18px) saturate(1.5);
+  -webkit-backdrop-filter: blur(18px) saturate(1.5);
+}
+/* concept A's single accent moment on the bar: Add URL rests on a
+   soft blue glass tint — the existing #btnAdd id is the styling
+   hook, no markup change */
+html:not([data-theme="dark"]) .toolbar #btnAdd {
+  background: rgba(31,111,208,.10); border-color: rgba(31,111,208,.16);
+}
+html:not([data-theme="dark"]) .toolbar #btnAdd:hover:not(:disabled) {
+  background: rgba(31,111,208,.17); border-color: rgba(31,111,208,.30);
+  box-shadow: 0 2px 6px rgba(18,44,77,.10);
+}
+/* the dialog progress fills gradient only in the light story;
+   dark keeps its previous solid fill */
+[data-theme="dark"] .pbar i { background: var(--blue2); }
+[data-theme="dark"] .bar #dBarFill { background: var(--blue2); }
+
+/* F-202-3: native <select> painting on this WebKit ignores the
+   background the dialog rules above set — in the dark theme the
+   closed control stayed UA-white while its text followed the
+   theme's near-white, i.e. white on white (measured ~1.1:1 on
+   Options' Default video quality). Taking the control out of
+   native painting (appearance:none) makes the token background
+   real in BOTH themes; the chevron is drawn here instead, and
+   the padding makes room for it. Placed after every other
+   select rule so its longhands win; the specific rules still
+   own layout (flex/width/padding-left via their shorthands'
+   other sides are unaffected — only padding-right is claimed). */
+.modal-card select {
+  -webkit-appearance: none; appearance: none;
+  background-color: var(--input-bg);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%238494a7' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  padding-right: 26px;
+}
+
 /* ---------- designer finish: global touches ----------
    Keyboard focus is always visible (accent ring, offset so it
    never eats the control's own border); text fields keep their
@@ -733,4 +868,8 @@ body.no-side .sidebar { display: none; }
 body { -webkit-font-smoothing: antialiased; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
+  .stcell.st-downloading .sdot { animation: none; }
+  /* the F-202-7 selected-row pulse override is more specific
+     than the rule above — name it here too */
+  .grid tbody tr.selected .stcell.st-downloading .sdot { animation: none; }
 }
