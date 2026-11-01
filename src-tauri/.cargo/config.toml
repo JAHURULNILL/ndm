@@ -13,5 +13,15 @@
 #
 # Target-scoped only: host builds (build scripts, proc macros)
 # and all non-Windows targets are completely unaffected.
+#
+# /NODEFAULTLIB:ucrt.lib (2.0.5 experiment): keep the Windows SDK
+# umbrella import library off the link line. libucrt.lib (the
+# static CRT) covers most symbols, but references that fall
+# through to the umbrella lib resolve as imports of the
+# api-ms-win-crt-* forwarders even under +crt-static — six of
+# them (math/heap/locale/runtime/stdio/string) survived in
+# ndm-app.exe. If a needed symbol truly lives only in the
+# umbrella lib, this link fails loudly instead of silently
+# shipping a binary that cannot start on Windows 7/8.
 [target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/NODEFAULTLIB:ucrt.lib"]
