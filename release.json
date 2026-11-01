@@ -1,12 +1,12 @@
 {
- "deb_sha256": "10d5dc838cc4a1563c8653afca53a196d7269bc73cb3c9eb5f61ae8604373d0d",
+ "deb_sha256": "e732efda72570a0199f5b05d9d804f72bc9a6a65069b4f5abf3c33fde5cf83f4",
  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.2/NDM_2.0.2_amd64.deb",
- "ext_sha256": "39e80052396d2a0bd530a9f684ff515fcdea02e3e4380fbe00e9d0deffd306ee",
+ "ext_sha256": "ba8a38d2f3ac204a10d74a58abf2e81d7cab0303aa91f0ec4de84b1bd409d690",
  "min_supported": "1.0.0",
  "notes": "Nill Download Manager 2.0.2 \u2014 a visual release with one honesty fix underneath. The main window, the browser video picker and the download progress card now share a single light glass finish, and the download list carries status dots and an in-row progress bar. The video picker opens as a proper panel \u2014 thumbnail, title, quality list with real sizes, and just two buttons: Cancel and Download. Re-sending a video that is already downloading now behaves honestly: a different name gets its own download, the same name is recognised as already downloading. Also fixed: Speed Limiter edits lost while typing, unreadable dark-theme dropdowns, a manual update-check verdict that vanished too soon, a speed field that could show 0.3000001, an unreadable detail-bar percentage, and the downloading dot disappearing on selected rows.",
  "version": "2.0.2",
- "win_setup_sha256": "",
- "win_setup_url": "",
- "win_sha256": "",
- "win_url": ""
+ "win_setup_sha256": "939b0eeb4ef176652d771207a3dec8de994f417be8d6e72b58d99717a414cb9e",
+ "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.2/NDM_2.0.2_x64-setup.exe",
+ "win_sha256": "a59f75f2b8d86e7911975b4ada5996c229d6892071815dcfb27cbe0aa423d9eb",
+ "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.2/NDM_2.0.2_Windows_Portable.zip"
 }
