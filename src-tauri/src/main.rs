@@ -9734,9 +9734,26 @@ mod tests {
         state.entries.lock().unwrap().insert("dl-9".to_string(), e);
         state.order.lock().unwrap().push("dl-9".to_string());
         persist(&state);
+        // compare the recorded path semantically, by parsing the
+        // journal: in the raw JSON text a Windows path's
+        // backslashes are escaped ("\\"), so searching the raw
+        // text for the un-escaped path can never match there
         let text = std::fs::read_to_string(&data_file).unwrap();
-        assert!(
-            text.contains(&format!("\"final_path\":\"{}\"", merged.display())),
+        let journal: serde_json::Value =
+            serde_json::from_str(&text).expect("journal is valid JSON");
+        let recorded = journal
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|s| s.get("id").and_then(|v| v.as_str()) == Some("dl-9"))
+            })
+            .and_then(|s| s.get("final_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("journal must record the merged path: {text}"));
+        assert_eq!(
+            recorded,
+            merged.to_string_lossy().as_ref(),
             "journal must record the merged path: {text}"
         );
 
