@@ -1,12 +1,12 @@
 {
- "deb_sha256": "ae152a9cfac0c6aeb694b0682afdc4c89f6ee5a89467ba7189b205bdd7c7a9d5",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_amd64.deb",
- "ext_sha256": "5b289a2cf33df2d9dcda9d6cf57b5dfdc03de5292c43eba30909bc3d8e16db4a",
- "min_supported": "1.0.0",
- "notes": "Nill Download Manager 2.0.5 is a compatibility fix for older Windows. The app and its browser-bridge program now carry their C runtime with them instead of borrowing it from the system, so they start on Windows 7 and 8 machines where that runtime was never installed — previously the app closed instantly with a missing-DLL error there. The installer also looks after the WebView2 runtime the app window is drawn with. It is part of Windows 10 and 11, but on Windows 7, 8 and 8.1 the installer now sets up the last WebView2 version that runs on those systems — a pinned copy of Microsoft's own 109.0.1518.78 installer, checked against its SHA-256 before it runs — downloaded once during setup and installed silently in the background, with nothing for the user to click. Machines that already have both runtimes are completely unaffected, and the package sizes stay in the same small class. Everything else is unchanged.",
- "version": "2.0.5",
- "win_setup_sha256": "de5328ceab2ef97f9b02163362c2a748711d84b0cc38d243041e86a38aca2d09",
- "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_x64-setup.exe",
- "win_sha256": "5264a0de11edae51ed5db09076dcc3db2a2c17e666e607089135aaefd2481494",
- "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_Windows_Portable.zip"
+ "deb_sha256": "4a45bcd7bbbdc2295366594122d85804610dc84f7601010087a326eae6b63e98",
+ "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.6/NDM_2.0.6_amd64.deb",
+ "ext_sha256": "ca39d68ba6584f320bb735752ab5ffcfd467cf7dac3fa241a73ce6645cee98ad",
+ "min_supported": "2.0.6",
+ "notes": "Nill Download Manager 2.0.6 fixes the rough edges found in a full review of the download flow. Asking for a video that is already downloaded now says so, in place, with Download again and Show in NDM — and shows the real state, including Retry, when the earlier copy failed. File downloads (ISOs, archives, programs) now get the same progress card videos always had, with the same pause and cancel. A video's total size is locked once its parts are measured, so the percentage no longer jumps mid-download, and the card now shows real phases — Preparing, then Receiving data, then Merging video + audio — instead of guessing. Duplicate 60fps labels are gone, estimated sizes are marked with a ~, the audio option no longer claims MP3 when the file is M4A, and Download all no longer counts files you already have as new downloads. Completion popups no longer stack up when several downloads finish in a row. The app also opens without the white flash, and update notes display in full.",
+ "version": "2.0.6",
+ "win_setup_sha256": "9df04e74d074f3c86cd9e6075ce29da6d7f1c4d8914010c1e81acd98fcf54caa",
+ "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.6/NDM_2.0.6_x64-setup.exe",
+ "win_sha256": "a5550eea28e2594c002331ec5884f49bc5df7e3def482d52e4e24d5be464a3d9",
+ "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.6/NDM_2.0.6_Windows_Portable.zip"
 }
