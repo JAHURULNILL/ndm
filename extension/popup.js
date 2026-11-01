@@ -44,7 +44,22 @@ async function init() {
   });
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url || !/^https?:\/\//i.test(tab.url)) return;
+  if (!tab || !tab.url || !/^https?:\/\//i.test(tab.url)) {
+    // Non-web pages (chrome://, about:, file:, PDF viewer…):
+    // the per-tab / per-site / video controls have nothing to
+    // act on here. Initialise them DETERMINISTICALLY — correct
+    // stored state where one exists, disabled — instead of the
+    // old early return that left them live-looking with default
+    // values after only the global checkbox had been wired.
+    const tabOffEarly = tabOffStored.ndmTabOff || {};
+    chkTabOff.checked = !!(tab && tab.id != null && tabOffEarly[tab.id]);
+    chkTabOff.disabled = true;
+    btnSite.disabled = true;
+    btnSite.textContent = 'Not available on this page';
+    btn.disabled = true;
+    btn.textContent = 'No video found on this page';
+    return;
+  }
   const host = (() => {
     try {
       return new URL(tab.url).hostname.toLowerCase();

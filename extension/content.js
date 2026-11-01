@@ -71,7 +71,7 @@
     }
     if (host === 'youtu.be') return true;
     if (host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'fb.watch') {
-      return document.querySelector('video') !== null ||
+      return queryMediaDeep('video').length > 0 ||
         location.pathname.includes('/videos/') ||
         location.pathname.startsWith('/watch') ||
         location.pathname.startsWith('/reel/');
@@ -89,21 +89,47 @@
       host === 'reddit.com' || host.endsWith('.reddit.com') ||
       host === 'bilibili.com' || host.endsWith('.bilibili.com')
     ) {
-      return document.querySelector('video') !== null;
+      return queryMediaDeep('video').length > 0;
     }
     return false;
   }
 
+  /* Media collection (#25): a flat querySelectorAll never sees
+     players inside open shadow roots (most modern embeds are
+     custom elements), so collection walks the document AND
+     every open shadow root. ONE geometry rule for every
+     consumer — a video player counts at >=160×90, the anchor
+     gate — so detection and anchoring can never disagree about
+     a 170×95 player again (they used to: detect ≥180×100,
+     anchor ≥160×90). Audio has NO geometry gate: a hidden
+     <audio> behind custom UI still registers. */
+  const MEDIA_MIN_W = 160;
+  const MEDIA_MIN_H = 90;
+
+  function queryMediaDeep(selector) {
+    const out = [];
+    const walk = root => {
+      if (!root || !root.querySelectorAll) return;
+      for (const el of root.querySelectorAll(selector)) out.push(el);
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    };
+    walk(document);
+    return out;
+  }
+
   function hasPlayableVideoElement() {
-    for (const v of document.querySelectorAll('video')) {
+    for (const v of queryMediaDeep('video')) {
       const r = v.getBoundingClientRect();
-      if (r.width < 180 || r.height < 100) continue;
+      if (r.width < MEDIA_MIN_W || r.height < MEDIA_MIN_H) continue;
       const src = v.currentSrc || v.src || '';
       if (src && !src.startsWith('blob:')) return true;
       const s = v.querySelector('source[src]');
       if (s && !(s.getAttribute('src') || '').startsWith('blob:')) return true;
-      // Visible substantial video player that has loaded metadata or is playing
-      if (r.width >= 240 && r.height >= 135 && (v.readyState >= 1 || !v.paused || v.duration > 3)) {
+      // Visible player that has loaded metadata or is playing
+      // (same unified gate — no second, larger threshold)
+      if (v.readyState >= 1 || !v.paused || v.duration > 3) {
         return true;
       }
     }
@@ -112,11 +138,10 @@
 
   /* IDM's panel also appears on audio-only pages (with audio
      formats): an <audio> player with a real source counts as media
-     worth offering the panel for. */
+     worth offering the panel for. No width requirement: custom
+     players routinely drive a fully hidden <audio> element. */
   function hasPlayableAudioElement() {
-    for (const a of document.querySelectorAll('audio')) {
-      const r = a.getBoundingClientRect();
-      if (r.width < 180) continue;
+    for (const a of queryMediaDeep('audio')) {
       const src = a.currentSrc || a.src || '';
       if (src && !src.startsWith('blob:')) return true;
       const srcEl = a.querySelector('source[src]');
@@ -133,9 +158,9 @@
   function pickAnchor() {
     let best = null;
     let bestArea = 0;
-    for (const v of document.querySelectorAll('video')) {
+    for (const v of queryMediaDeep('video')) {
       const r = v.getBoundingClientRect();
-      if (r.width < 160 || r.height < 90) continue;
+      if (r.width < MEDIA_MIN_W || r.height < MEDIA_MIN_H) continue;
       const visW = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
       const visH = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
       const area = visW * visH;
@@ -145,8 +170,10 @@
       }
     }
     if (best) return best;
-    // audio-only page: anchor the pill to the widest visible player
-    for (const a of document.querySelectorAll('audio')) {
+    // audio-only page: anchor the pill to the widest visible
+    // player (an anchor needs real geometry to place the pill —
+    // detection above is gate-free, anchoring is not)
+    for (const a of queryMediaDeep('audio')) {
       const r = a.getBoundingClientRect();
       if (r.width < 160) continue;
       const visW = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
@@ -270,7 +297,7 @@
   function fmtBytes(n) {
     const b = Number(n) || 0;
     if (b <= 0) return '';
-    const units = ['B', 'KB', 'MB', 'GB'];
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
     let v = b;
     let i = 0;
     while (v >= 1024 && i < units.length - 1) {
@@ -420,7 +447,46 @@
   }
 
   const localProbeCache = new Map(); // canonicalUrl -> info
-  const inFlightProbes = new Map();  // canonicalUrl -> Promise<res>
+  /* Probe provenance + freshness (#20): a WARM probe is
+     cookie-less (fired passively for a pill the user may never
+     click), so its result must never satisfy a REAL (user-click)
+     probe — an age-gated / members video would otherwise be
+     stuck with the cookie-less answer for the page's lifetime.
+     Warm entries may seed the UI, but a real fetch re-probes
+     with cookies. Entries also expire (TTL) and the cache is
+     size-bounded with oldest-first eviction; it used to live
+     forever, unbounded. Page-hook player info counts as real
+     provenance: it comes from the page's own signed-in player. */
+  const PROBE_TTL_MS = 5 * 60 * 1000;
+  const PROBE_CACHE_MAX = 40;
+  const probeMeta = new Map(); // canonicalUrl -> { ts, warm }
+  const inFlightProbes = new Map();  // canonicalUrl|w|r -> Promise<res>
+
+  function probeCacheSet(key, info, warm) {
+    if (!key || !info) return;
+    localProbeCache.set(key, info);
+    probeMeta.set(key, { ts: Date.now(), warm: !!warm });
+    while (localProbeCache.size > PROBE_CACHE_MAX) {
+      const oldest = localProbeCache.keys().next().value;
+      localProbeCache.delete(oldest);
+      probeMeta.delete(oldest);
+    }
+  }
+
+  function probeCacheGet(key, forReal) {
+    const info = localProbeCache.get(key);
+    if (!info) return null;
+    const m = probeMeta.get(key);
+    if (m) {
+      if (Date.now() - m.ts > PROBE_TTL_MS) {
+        localProbeCache.delete(key);
+        probeMeta.delete(key);
+        return null;
+      }
+      if (forReal && m.warm) return null;
+    }
+    return info;
+  }
   /* Entries this page started from the video flyout, keyed
      `${canonicalUrl}|${selector}|${audio?'a':'v'}` ->
      { id, name }. The flyout is rebuilt on every open, so without
@@ -493,9 +559,9 @@
       if (!validOptions.length) return;
       info.options = validOptions;
 
-      if (info.url) localProbeCache.set(canonicalVideoKey(info.url), info);
-      if (e.data.pageUrl) localProbeCache.set(canonicalVideoKey(e.data.pageUrl), info);
-      localProbeCache.set(canonicalVideoKey(location.href), info);
+      if (info.url) probeCacheSet(canonicalVideoKey(info.url), info, false);
+      if (e.data.pageUrl) probeCacheSet(canonicalVideoKey(e.data.pageUrl), info, false);
+      probeCacheSet(canonicalVideoKey(location.href), info, false);
       if (typeof onInstantInfoCallback === 'function') {
         onInstantInfoCallback(info);
       }
@@ -510,11 +576,18 @@
 
   function fetchOrReuseProbe(targetUrl, warm) {
     const key = canonicalVideoKey(targetUrl);
-    if (localProbeCache.has(key)) {
-      return Promise.resolve({ ok: true, info: localProbeCache.get(key) });
+    // A warm (cookie-less) entry never satisfies a real probe,
+    // and a stale entry satisfies nobody (probeCacheGet, #20).
+    const cached = probeCacheGet(key, !warm);
+    if (cached) {
+      return Promise.resolve({ ok: true, info: cached });
     }
-    if (inFlightProbes.has(key)) {
-      return inFlightProbes.get(key);
+    // Warm and real probes also fly separately: a real click
+    // must not join a cookie-less in-flight probe and inherit
+    // its result.
+    const flightKey = key + (warm ? '|w' : '|r');
+    if (inFlightProbes.has(flightKey)) {
+      return inFlightProbes.get(flightKey);
     }
     const p = chrome.runtime
       .sendMessage({
@@ -527,17 +600,17 @@
         warm: !!warm,
       })
       .then(res => {
-        inFlightProbes.delete(key);
+        inFlightProbes.delete(flightKey);
         if (res && res.ok && res.info && (res.info.options || res.info.qualities || []).length) {
-          localProbeCache.set(key, res.info);
+          probeCacheSet(key, res.info, !!warm);
         }
         return res;
       })
       .catch(err => {
-        inFlightProbes.delete(key);
+        inFlightProbes.delete(flightKey);
         throw err;
       });
-    inFlightProbes.set(key, p);
+    inFlightProbes.set(flightKey, p);
     return p;
   }
 
@@ -551,14 +624,14 @@
     // never does — it resolves formats when its panel is clicked.
     // Warm only a page's main video, and warm probes carry no
     // session cookies (see fetchOrReuseProbe).
-    if (document.querySelectorAll('video, audio').length > 3) return;
+    if (queryMediaDeep('video, audio').length > 3) return;
     const targetUrl = await resolveVideoUrl(curAnchor);
     const key = canonicalVideoKey(targetUrl);
-    if (!key || key === lastPreProbedUrl || localProbeCache.has(key)) return;
+    if (!key || key === lastPreProbedUrl || probeCacheGet(key, false)) return;
     lastPreProbedUrl = key;
     // Wait briefly for MAIN-world page-hook on YouTube; if not populated, warm cache via ndm-host
     setTimeout(() => {
-      if (!localProbeCache.has(key)) {
+      if (!probeCacheGet(key, false)) {
         fetchOrReuseProbe(key, true).catch(() => {});
       }
     }, 120);
@@ -690,7 +763,7 @@
   /* finish is Glass Match, scoped by .ndm-vp so the file modal —     */
   /* which shares the .ndm-m-* shell classes — keeps its own look.    */
 
-  async function openVideoPickerModal(pillBtn, pillContainer, srcUrl, onShellOpen) {
+  async function openVideoPickerModal(pillBtn, pillContainer, srcUrl, onShellOpen, linkUrl) {
     if (!shadowRoot) return;
     dismissActiveModal();
     modalOpen = true;
@@ -700,7 +773,7 @@
     // stream anchors the panel to THAT element, not the largest.
     let srcAnchor = null;
     if (srcUrl) {
-      for (const v of document.querySelectorAll('video')) {
+      for (const v of queryMediaDeep('video')) {
         if (v.currentSrc === srcUrl || v.src === srcUrl) { srcAnchor = v; break; }
         const sEl = v.querySelector('source[src]');
         if (sEl && sEl.src === srcUrl) { srcAnchor = v; break; }
@@ -709,8 +782,14 @@
     }
 
     requestMainWorldPlayerInfo();
-    const currentAnchor = srcAnchor || anchor || pickAnchor();
-    const rawTargetUrl = await resolveVideoUrl(currentAnchor);
+    // #6: a caller may name the exact video PAGE — the context
+    // menu's "Download with NDM" on a video LINK, or a relayed
+    // embedded-player frame. The picker then targets THAT URL:
+    // probing or downloading the current page's own video for a
+    // link the user right-clicked was the bug.
+    const explicitUrl = linkUrl ? String(linkUrl) : '';
+    const currentAnchor = explicitUrl ? null : (srcAnchor || anchor || pickAnchor());
+    const rawTargetUrl = explicitUrl || (await resolveVideoUrl(currentAnchor));
     const targetUrl = canonicalVideoKey(rawTargetUrl);
     const fallbackTitle = cleanPageTitle();
     const fallbackThumb = guessFallbackThumbnail(targetUrl, currentAnchor);
@@ -1173,6 +1252,10 @@
           id: dupeEntryId,
           name: toastNameFor(q),
           q,
+          // Carry THIS picker's target into the flyout: with a
+          // linkUrl open (#6) the flyout must not re-resolve the
+          // current page's video in the picker's place.
+          url: targetUrl,
           title: titleIn.value.trim() || probedTitle || fallbackTitle,
           thumb: probedThumb || fallbackThumb,
           duration: probedDuration,
@@ -1246,6 +1329,7 @@
           unknown: !!res.unknown,
           name,
           q,
+          url: targetUrl,
           title: titleIn.value.trim() || probedTitle || fallbackTitle,
           thumb: probedThumb || fallbackThumb,
           duration: probedDuration,
@@ -1263,8 +1347,8 @@
 
     // 1. Instant cache (0ms on YouTube or pre-probed pages)
     const cached =
-      localProbeCache.get(targetUrl) ||
-      localProbeCache.get(canonicalVideoKey(location.href));
+      probeCacheGet(targetUrl, true) ||
+      probeCacheGet(canonicalVideoKey(location.href), true);
     if (cached && (cached.options || cached.qualities || []).length) {
       applyInfo(cached);
       return;
@@ -1274,8 +1358,11 @@
        nothing to offer, and the page must not be probed as if it
        were a video. Detected media here means: a player element
        to anchor to, a known video page, or a stream the
-       background sniffed on this page. */
-    let mediaKnown = !!currentAnchor || videoDetected();
+       background sniffed on this page. An explicit linkUrl (#6)
+       is its own evidence: the caller already classified that
+       URL as a video page, and this page's media says nothing
+       about the link's. */
+    let mediaKnown = !!explicitUrl || !!currentAnchor || videoDetected();
     if (!mediaKnown) {
       try {
         const mediaResp = await chrome.runtime.sendMessage({
@@ -1323,7 +1410,7 @@
     // <video>) anchors the panel to THAT element, not the largest.
     let srcAnchor = null;
     if (srcUrl) {
-      for (const v of document.querySelectorAll('video')) {
+      for (const v of queryMediaDeep('video')) {
         if (v.currentSrc === srcUrl || v.src === srcUrl) { srcAnchor = v; break; }
         const sEl = v.querySelector('source[src]');
         if (sEl && sEl.src === srcUrl) { srcAnchor = v; break; }
@@ -1779,9 +1866,15 @@
       const list = qualities.length ? qualities : DEFAULT_QUALITIES;
       const started = [];
       let skipped = 0;
+      let unknown = 0;
       for (const q of list) {
         const res = await startQuality(q, false);
-        if (closed) return;
+        // Closing the card mid-loop does NOT abandon the
+        // remaining formats: the sends are independent of the
+        // card, and silently stopping left the rest unstarted
+        // with no word anywhere. The loop finishes regardless
+        // of card visibility; only the rendering below is
+        // skipped when the card is gone.
         // A duplicate is NOT a start (E5): its id names the
         // EXISTING entry, so registering it here would put the
         // old entry in the multi-progress view as if this click
@@ -1795,17 +1888,31 @@
             regKey: regKeyFor(q),
             name: `${probedTitle || fallbackTitle} — ${qualityText(q)}`,
           });
+        } else if (res.unknown) {
+          // A timed-out send may still land in the app: it is
+          // neither a start nor a skip, and must be reported as
+          // what it is — started, unconfirmed.
+          unknown++;
         } else {
           skipped++;
         }
       }
       card.classList.remove('busy');
+      if (closed) return;
+      const notes = [];
+      if (skipped) {
+        notes.push(`${skipped} format${skipped > 1 ? 's' : ''} skipped (already in the list or refused).`);
+      }
+      if (unknown) {
+        notes.push(`${unknown} format${unknown > 1 ? 's' : ''} started — unconfirmed (NDM did not answer in time).`);
+      }
       if (started.length) {
-        showMultiProgress(
-          started,
-          skipped
-            ? `${skipped} format${skipped > 1 ? 's' : ''} skipped (already in the list or refused).`
-            : ''
+        showMultiProgress(started, notes.join(' '));
+      } else if (unknown) {
+        startBusy = false;
+        btnAll.disabled = false;
+        showNote(
+          `${unknown} format${unknown > 1 ? 's' : ''} may have started — NDM did not confirm in time. Check the NDM app before retrying.`
         );
       } else {
         startBusy = false;
@@ -3154,8 +3261,8 @@
 
     // 1. Instant cache (0ms on YouTube or pre-probed pages)
     const cached =
-      localProbeCache.get(targetUrl) ||
-      localProbeCache.get(canonicalVideoKey(location.href));
+      probeCacheGet(targetUrl, true) ||
+      probeCacheGet(canonicalVideoKey(location.href), true);
     if (cached && (cached.options || cached.qualities || []).length) {
       applyInfo(cached);
       return;
@@ -3209,6 +3316,22 @@
   function defaultFileNameFromUrl(url) {
     try {
       const u = new URL(url);
+      // Query-string filenames first (?file=setup.exe): the
+      // background layer's filenameFromUrl rule, mirrored. The
+      // click path used to ignore it, so the name started as
+      // "download" and a slow probe then locked that in.
+      for (const [k, v] of u.searchParams.entries()) {
+        if (/file|name|attachment|download/i.test(k) && v.includes('.')) {
+          const base = v.split(/[?#]/)[0].split(/[\\/]/).pop() || '';
+          if (base) {
+            try {
+              return decodeURIComponent(base);
+            } catch (e) {
+              return base;
+            }
+          }
+        }
+      }
       const tail = decodeURIComponent(u.pathname.split('/').pop() || '').trim();
       if (tail && tail !== '/') return tail;
     } catch (e) {}
@@ -3266,6 +3389,13 @@
       const st = await chrome.storage.local.get({ ndmSaveDir: '~/Downloads' });
       if (st && st.ndmSaveDir) savedDir = st.ndmSaveDir;
     } catch (e) {}
+
+    // #22: the token was claimed BEFORE this storage await — a
+    // second open (or a close) that landed meanwhile owns the
+    // token now, and building anyway would stack a second
+    // backdrop the teardown no longer knows about, orphaning
+    // the first. The video picker's post-await guard, mirrored.
+    if (myToken !== activeProbeToken) return;
 
     const backdrop = document.createElement('div');
     backdrop.className = 'ndm-modal-backdrop';
@@ -3393,6 +3523,7 @@
           title: nameIn.value.trim() || initialName,
         });
         if (resp && resp.ok) {
+          confirmTakeover();
           closeBrowserModal();
         } else {
           btnApp.disabled = false;
@@ -3429,6 +3560,11 @@
           dir: chosenDir,
           later: !!later,
           total: currentBytes,
+          // A classic send after the speculative one failed or
+          // timed out is a deliberate retry: force (#24) makes
+          // it a fresh native call instead of a join onto the
+          // earlier send of the same file.
+          force: !!spec.failed,
         });
         ok = !!(resp && resp.ok);
       } catch (e) {
@@ -3436,6 +3572,7 @@
       }
 
       if (ok) {
+        confirmTakeover();
         closeBrowserModal();
         if (!later && resp && resp.id) {
           // E2: a classic-path "Download Now" start lands in the
@@ -3478,6 +3615,38 @@
       closed: false,
       pollTimer: null, // retired in-dialog poll handle (stopSpecPoll guard)
     };
+
+    /* #5 takeover settlement: when the background's downloads
+       layer handed this dialog a browser download, that copy is
+       PAUSED in the browser — never cancelled, never erased —
+       until this dialog settles it exactly once:
+       confirmTakeover (a start landed in the app → the
+       background erases the browser copy) or releaseTakeover
+       (the dialog closes with nothing started → the background
+       resumes the browser copy). The download exists somewhere
+       at all times. Click-path dialogs have no browserItemId
+       and both helpers are no-ops there. */
+    const takeoverId =
+      opts && opts.browserItemId != null ? opts.browserItemId : null;
+    let takeoverSettled = false;
+    function confirmTakeover() {
+      if (takeoverId == null || takeoverSettled) return;
+      takeoverSettled = true;
+      try {
+        chrome.runtime
+          .sendMessage({ action: 'ndm-takeover-confirm', itemId: takeoverId })
+          .catch(() => {});
+      } catch (e) {}
+    }
+    function releaseTakeover() {
+      if (takeoverId == null || takeoverSettled) return;
+      takeoverSettled = true;
+      try {
+        chrome.runtime
+          .sendMessage({ action: 'ndm-takeover-release', itemId: takeoverId })
+          .catch(() => {});
+      } catch (e) {}
+    }
 
     function specNote(text) {
       statusEl.style.display = 'block';
@@ -3569,6 +3738,12 @@
       } else if (spec.inflight) {
         spec.pending = 'cancel';
       }
+      // The dialog's own Cancel releases the browser download
+      // back too (#5): if a takeover copy is still paused and
+      // unsettled, it resumes in the browser. (When an entry
+      // was started and confirmed above, this is a no-op — the
+      // app copy is the one being discarded.)
+      releaseTakeover();
       closeBrowserModal();
     }
 
@@ -3596,6 +3771,10 @@
       spec.closed = true;
       if (spec.timer) clearTimeout(spec.timer);
       stopSpecPoll();
+      // Nothing started and nothing in flight: a takeover's
+      // paused browser copy goes back to the browser (#5). An
+      // in-flight start settles itself in specStart instead.
+      if (!spec.inflight) releaseTakeover();
       closeBrowserModal();
     }
 
@@ -3628,6 +3807,16 @@
       spec.inflight = false;
       btnApp.disabled = false;
       const gone = spec.closed || myToken !== activeProbeToken;
+      // #5 settlement for the speculative start: any ok answer
+      // (entry id, duplicate, or the queued/unknown-ok mapping)
+      // means the app owns the download — confirm so the paused
+      // browser copy is erased. A failed start with the dialog
+      // already gone releases the browser copy back at once; a
+      // failed start with the dialog still open leaves it
+      // paused for the classic retry, and the eventual close
+      // releases it then.
+      if (resp && resp.ok) confirmTakeover();
+      else if (gone) releaseTakeover();
       if (resp && resp.ok && resp.id) {
         spec.id = resp.id;
         spec.dupe = !!resp.dupe;
@@ -3665,6 +3854,25 @@
         if (spec.timer) clearTimeout(spec.timer);
         closeBrowserModal();
         openEntryProgressCard(spec.id, chosenName, targetUrl);
+        return;
+      } else if (resp && resp.ok && !gone) {
+        // Ok but no entry id (the host's queued ack): the app
+        // owns the download — the takeover was confirmed above —
+        // there is just nothing to track in a progress card.
+        // Close with an honest unconfirmed toast instead of
+        // falling into the failure state, whose classic retry
+        // would send a second copy of a landed download.
+        spec.closed = true;
+        stopSpecPoll();
+        if (spec.timer) clearTimeout(spec.timer);
+        closeBrowserModal();
+        showBrowserToast(
+          chosenName,
+          'Started in NDM — unconfirmed',
+          currentBytes > 0 ? fmtBytes(currentBytes) : '',
+          false,
+          '⬇ Downloading in NDM'
+        );
         return;
       } else if (!gone) {
         spec.failed = true;
@@ -3732,11 +3940,18 @@
         } else {
           sizeEl.textContent = 'Stream / Unknown size';
         }
-        if (res.suggested_name && !userEditedName && !spec.started) {
+        if (res.suggested_name && !userEditedName && (!spec.started || spec.failed)) {
           // !spec.started, not !spec.id: once a speculative send is
           // in flight the entry is being created with the name the
           // dialog already had — a late probe must not rename the
-          // field under it (screen and disk would disagree)
+          // field under it (screen and disk would disagree). A
+          // FAILED speculative start created no entry, so the
+          // classic send that follows still reads this field and
+          // the correction is both safe and wanted. (A live entry
+          // cannot be renamed from here: the host protocol has no
+          // rename message — the query-string hint in
+          // defaultFileNameFromUrl is what keeps the common case
+          // right from the start.)
           nameIn.value = res.suggested_name;
           catEl.textContent = res.category || categoryForName(res.suggested_name);
         }
@@ -4642,6 +4857,24 @@
     btn.title = 'Choose video quality & download with NDM';
     btn.addEventListener('click', e => {
       e.stopPropagation();
+      if (window.top !== window.self) {
+        // Sub-frame (#27): the picker may only open in the top
+        // frame (the message paths enforce top-only) — opening
+        // it here would render it clipped inside this embed.
+        // Relay the request through the background to the top
+        // frame instead, with this frame's video as the target.
+        const src = (anchor && (anchor.currentSrc || anchor.src)) || '';
+        try {
+          chrome.runtime
+            .sendMessage({
+              action: 'ndm-relay-open-video',
+              srcUrl: src && !src.startsWith('blob:') ? src : '',
+              pageUrl: location.href,
+            })
+            .catch(() => {});
+        } catch (err) {}
+        return;
+      }
       openVideoPickerModal(btn, pill);
     });
 
@@ -4767,11 +5000,16 @@
   // the gesture still belongs to this page.
   let ndmPreventHeld = false;
   let lastPreventClickAt = 0;
+  let lastPreventClickUrl = '';
   function syncPreventHeld(e) {
     ndmPreventHeld = !!(e.altKey && e.shiftKey);
   }
   function notePreventClick(url) {
     lastPreventClickAt = Date.now();
+    // The witness is bound to the URL it was clicked on (#23):
+    // it vouches for that URL's download only, never for any
+    // other file this page later produces.
+    lastPreventClickUrl = url || '';
     try {
       chrome.runtime
         .sendMessage({ action: 'ndm-note-prevent', url: url || '' })
@@ -4790,6 +5028,20 @@
     ndmForceHeld = false;
     ndmPreventHeld = false;
   });
+  /* Esc of last resort for the in-page dialogs: each backdrop
+     carries its own Esc handler, but the progress views rebuild
+     their body (innerHTML), destroying the focused element —
+     focus falls back to the page and the backdrop handler never
+     sees Esc again until the user clicks inside. This
+     capture-phase document handler routes Esc to the open
+     modal's own dismiss logic whenever a modal is open,
+     regardless of where focus sits. */
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape' || !modalOpen) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dismissActiveModal();
+  }, true);
   try {
     chrome.storage.local.get({
       ndmIntercept: true,
@@ -4893,12 +5145,18 @@
         return;
       }
       if (e.altKey || e.shiftKey) return;
-      if (ndmTabDisabled) return;
+      // Insert held FORCES the download — the user's explicit
+      // override gesture, with ONE consistent meaning: it
+      // bypasses every per-page gate (per-tab pause, per-site
+      // exception, downloadable-type check alike). It used to
+      // skip only the last two, so Insert on a per-tab-paused
+      // tab silently did nothing. The extension-wide states
+      // above (global toggle, known-missing host) still win:
+      // they are not per-page gates.
+      const forced = ndmForceHeld;
+      if (!forced && ndmTabDisabled) return;
       const target = e.target && e.target.closest ? e.target.closest('a[href]') : null;
       if (!target || !/^https?:\/\//i.test(target.href)) return;
-      // Insert held FORCES the download: it bypasses the per-site
-      // exception and the downloadable-type check.
-      const forced = ndmForceHeld;
       if (!forced && ndmSiteExcepted) return;
       if (!forced && !isDirectDownloadLink(target)) return;
       e.preventDefault();
@@ -4921,12 +5179,42 @@
       // The background's downloads layer asks before taking over
       // a browser-started download (F-EXT-13): was Alt+Shift held
       // for the click that produced it — held right now, or a
-      // prevent click within the last few seconds?
+      // prevent click for THIS download's URL?
+      // The witness is URL-scoped and single-use (#23): a match
+      // must name the same URL the click was on, and answering a
+      // match consumes it, so one click shields exactly one
+      // download. The window matches the background's
+      // PREVENT_WINDOW_MS (60 s): long because the witness is
+      // URL-bound and consumed — that is what makes slow
+      // countdown/redirect portals safe to cover.
+      const want = msg.url || '';
+      let recent = false;
+      if (want && lastPreventClickUrl && Date.now() - lastPreventClickAt < 60000) {
+        try {
+          recent = new URL(lastPreventClickUrl).href === new URL(want).href;
+        } catch (e) {
+          recent = lastPreventClickUrl === want;
+        }
+      }
+      if (recent) {
+        lastPreventClickAt = 0;
+        lastPreventClickUrl = '';
+      }
       sendResponse({
         held: ndmPreventHeld,
-        recent: Date.now() - lastPreventClickAt < 5000,
+        recent,
         at: lastPreventClickAt,
       });
+      return false;
+    }
+    if (msg.action === 'ndm-ping') {
+      // The background (re)started — an MV3 worker restart
+      // forgets every media report while this frame's dedupe
+      // would never re-send (#21): clear it and report the
+      // current state afresh.
+      lastMediaState = null;
+      reportMediaState();
+      sendResponse({ ok: true });
       return false;
     }
     if (msg.action === 'ndm-query-media') {
@@ -4961,7 +5249,7 @@
         answered = true;
         try { sendResponse({ ok }); } catch (e) {}
       };
-      openVideoPickerModal(btn, cardEl, msg.srcUrl || '', () => answer(true))
+      openVideoPickerModal(btn, cardEl, msg.srcUrl || '', () => answer(true), msg.linkUrl || '')
         .then(() => answer(!!(modalOpen && modalEl)))
         .catch(() => answer(false));
       return true;
@@ -4976,6 +5264,8 @@
         filename: msg.filename || '',
         totalBytes: msg.totalBytes || 0,
         referrer: msg.referrer || location.href,
+        // #5: the paused browser download this dialog settles
+        browserItemId: msg.browserItemId != null ? msg.browserItemId : null,
       });
       sendResponse({ ok: true });
       return false;

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nill Download Manager 2.0.6</title>
+<title>Nill Download Manager 2.0.7</title>
 <script>
   // apply the saved theme before first paint (default: light)
   try {
@@ -162,6 +162,12 @@
          not a transient toast — it stays until the quota window
          rolls over (quota_cleared) or the limit is turned off -->
     <div id="quotaBanner" class="quota-banner hidden"></div>
+    <!-- 2.0.7 #1: the journal-failure banner — shown while
+         downloads.json cannot be written (persist_failed), so the
+         user knows the on-disk list is behind the screen instead
+         of learning it from a reverted list next launch; hidden
+         again when a save succeeds (persist_recovered) -->
+    <div id="persistBanner" class="quota-banner hidden"></div>
     <div class="grid-wrap">
     <table class="grid">
       <colgroup id="colGroup"></colgroup>

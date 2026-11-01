@@ -245,6 +245,16 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Raw-byte cap for a fetched thumbnail (finding #11): the probe
+/// reply travels over Chrome native messaging, whose hard cap is
+/// 1 MiB per message for the WHOLE JSON — and base64 inflates the
+/// image by 4/3 on top of the format list and metadata sharing the
+/// same reply. The old 768 KiB raw cap already encoded to ~1 MiB
+/// before any JSON overhead. 384 KiB raw encodes to ~512 KiB,
+/// leaving half the channel for everything else; the host's
+/// write_reply size guard is the final backstop.
+pub const THUMBNAIL_MAX_RAW_BYTES: usize = 384 * 1024;
+
 /// Fetch a thumbnail URL into a self-contained `data:image/...;base64,...` URI
 /// so that strict page CSPs, Facebook/Instagram CORP headers, or expiring signed
 /// URLs never break the preview image inside the browser overlay or desktop app.
@@ -257,7 +267,14 @@ fn fetch_thumbnail_data_uri(url: &str) -> Option<String> {
         .timeout_read(Duration::from_secs(4))
         .user_agent(crate::BROWSER_UA)
         .build();
-    let resp = agent.get(url).call().ok()?;
+    let resp = agent
+        .get(url)
+        .set("Accept-Encoding", "identity")
+        .call()
+        .ok()?;
+    if crate::response_encoding(&resp).is_some() {
+        return None;
+    }
     let mime = resp
         .header("Content-Type")
         .and_then(|ct| ct.split(';').next())
@@ -267,10 +284,10 @@ fn fetch_thumbnail_data_uri(url: &str) -> Option<String> {
     use std::io::Read as _;
     let mut buf = Vec::new();
     resp.into_reader()
-        .take(768 * 1024)
+        .take(THUMBNAIL_MAX_RAW_BYTES as u64 + 1)
         .read_to_end(&mut buf)
         .ok()?;
-    if buf.is_empty() || buf.len() >= 768 * 1024 {
+    if buf.is_empty() || buf.len() > THUMBNAIL_MAX_RAW_BYTES {
         return None;
     }
     Some(format!("data:{mime};base64,{}", base64_encode(&buf)))

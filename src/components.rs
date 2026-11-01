@@ -204,6 +204,18 @@ fn expected_sha256(spec: &ComponentSpec) -> String {
     }
 }
 
+/// Hard cap on one component body, enforced WHILE streaming: the
+/// pinned SHA-256 is only checked after the whole body lands, so
+/// without a cap a hostile or broken mirror could stream forever
+/// and fill the disk before the hash ever gets a say. The largest
+/// pinned asset (the Windows ffmpeg zip) is ~90 MB; 256 MiB leaves
+/// generous headroom for future pinned releases.
+pub const MAX_COMPONENT_BYTES: u64 = 256 * 1024 * 1024;
+
+fn component_size_ok(downloaded: u64) -> bool {
+    downloaded <= MAX_COMPONENT_BYTES
+}
+
 /// Download one component into `dir`, verify it, unpack it if needed
 /// and leave the runnable binary at `dir/<name>`. Any failure cleans
 /// up its partial files — a half-fetched component must never be
@@ -221,10 +233,23 @@ pub fn download_component(
         .get(&url)
         .call()
         .map_err(|e| format!("could not download {}: {e}", spec.name))?;
+    if let Some(enc) = crate::response_encoding(&resp) {
+        return Err(format!(
+            "{} was served with Content-Encoding: {enc} — the download was discarded",
+            spec.name
+        ));
+    }
     let total: u64 = resp
         .header("Content-Length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    if total > 0 && !component_size_ok(total) {
+        return Err(format!(
+            "{} is larger than the {} MiB component size cap — the download was refused",
+            spec.name,
+            MAX_COMPONENT_BYTES / (1024 * 1024)
+        ));
+    }
     let mut reader = resp.into_reader();
     let mut file =
         std::fs::File::create(&part).map_err(|e| format!("cannot write {}: {e}", spec.name))?;
@@ -241,6 +266,13 @@ pub fn download_component(
                     break Err(format!("cannot write {}: {e}", spec.name));
                 }
                 downloaded += n as u64;
+                if !component_size_ok(downloaded) {
+                    break Err(format!(
+                        "{} exceeded the {} MiB component size cap — the download was aborted and discarded",
+                        spec.name,
+                        MAX_COMPONENT_BYTES / (1024 * 1024)
+                    ));
+                }
                 if downloaded - last_report >= 512 * 1024 {
                     last_report = downloaded;
                     on_progress(Progress {
@@ -509,6 +541,16 @@ mod tests {
         let mut h = Sha256::new();
         h.update(bytes);
         format!("{:x}", h.finalize())
+    }
+
+    #[test]
+    fn component_size_cap_boundary() {
+        // the cap that download_component enforces mid-stream (a
+        // hostile mirror must be stopped during the download, not
+        // after the disk is full): at the cap is fine, past it not
+        assert!(component_size_ok(0));
+        assert!(component_size_ok(MAX_COMPONENT_BYTES));
+        assert!(!component_size_ok(MAX_COMPONENT_BYTES + 1));
     }
 
     #[test]

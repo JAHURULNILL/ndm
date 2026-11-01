@@ -15,6 +15,13 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
 
+/// Poison-tolerant lock for the settle/delete paths (mirrors the
+/// app side's LockOk): a delete must never die — on Windows as a
+/// SIGABRT — because some earlier panic poisoned a job mutex.
+fn lock_ok<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Build a Command for a bundled console tool (yt-dlp/ffmpeg).
 /// On Windows the app is a GUI-subsystem process with no console
 /// of its own, so a console child would allocate a flashing
@@ -2642,23 +2649,23 @@ impl VideoJob {
     }
 
     pub fn cancel(&self) {
-        let _spawn_guard = self.spawn_lock.lock().unwrap();
+        let _spawn_guard = lock_ok(&self.spawn_lock);
         // A finished job has nothing to cancel — and overwriting
         // its status here would let a stop that lost the finish
         // race flip a completed download to "cancelled", after
         // which a discard could sweep it as if it had never
         // finished (R2-EXT-05, the F-EXT-12 rule).
-        if self.progress.lock().unwrap().status == "finished" {
+        if lock_ok(&self.progress).status == "finished" {
             return;
         }
-        *self.stop_flag.lock().unwrap() = Some("cancelled".to_string());
-        for d in self.active_downloads.lock().unwrap().iter() {
+        *lock_ok(&self.stop_flag) = Some("cancelled".to_string());
+        for d in lock_ok(&self.active_downloads).iter() {
             d.control.cancel();
         }
-        if let Some(c) = self.child.lock().unwrap().as_mut() {
+        if let Some(c) = lock_ok(&self.child).as_mut() {
             let _ = c.kill();
         }
-        let mut p = self.progress.lock().unwrap();
+        let mut p = lock_ok(&self.progress);
         p.status = "cancelled".to_string();
         p.conns = 0;
     }
@@ -2671,6 +2678,16 @@ impl VideoJob {
         self.alive.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Has any run of this job ever been spawned? payload_of's
+    /// restored-session hint is legitimate only before the first
+    /// run: once a run has happened, a not-live job reporting
+    /// "downloading" is a wedged state, and standing the PREVIOUS
+    /// session's byte count in as its progress presents old bytes
+    /// as fresh movement (2.0.7 #7).
+    pub fn has_run(&self) -> bool {
+        self.gen.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     /// True once nothing of this job is still running: the yt-dlp
     /// child has exited and every engine stream is SETTLED —
     /// terminal with its final resume-state save on disk (a merely
@@ -2681,19 +2698,25 @@ impl VideoJob {
     /// the job's files, the way the HTTP path waits for its
     /// engine (F-EXT-08).
     pub fn is_settled(&self) -> bool {
-        let child_done = self
-            .child
-            .lock()
-            .unwrap()
+        // #18: the spawn thread itself is part of "running" — an
+        // ffmpeg merge executes as a blocking call ON that thread
+        // (not as the tracked child), and cancel() flips the
+        // status to "cancelled" the moment it is pressed, so a
+        // settle that ignored `alive` declared victory ~50 ms
+        // into a delete while ffmpeg was still writing the final
+        // file (and on Windows the "deleted" file then reappeared
+        // when the merge finished recreating it).
+        if self.is_live() {
+            return false;
+        }
+        let child_done = lock_ok(&self.child)
             .as_mut()
             .map(|c| matches!(c.try_wait(), Ok(Some(_)) | Err(_)))
             .unwrap_or(true);
         if !child_done {
             return false;
         }
-        self.active_downloads
-            .lock()
-            .unwrap()
+        lock_ok(&self.active_downloads)
             .iter()
             .all(|d| d.is_settled())
     }
@@ -3236,6 +3259,56 @@ At least one output file must be specified";
         assert_eq!(duration_in_ffmpeg_info(text2), Some(3723.5));
         assert_eq!(duration_in_ffmpeg_info("Duration: N/A"), None);
         assert_eq!(duration_in_ffmpeg_info("no duration here"), None);
+    }
+
+    fn bare_job() -> VideoJob {
+        VideoJob {
+            url: "https://example.com/v".to_string(),
+            dir: PathBuf::from("/tmp"),
+            selector: String::new(),
+            audio: false,
+            title: "t".to_string(),
+            cookies: None,
+            progress: Arc::new(Mutex::new(VideoProgress::default())),
+            chosen_stem: Mutex::new(None),
+            child: Mutex::new(None),
+            active_downloads: Mutex::new(Vec::new()),
+            stop_flag: Mutex::new(None),
+            spawn_lock: Mutex::new(()),
+            gen: std::sync::atomic::AtomicU64::new(0),
+            alive: std::sync::atomic::AtomicBool::new(false),
+            expect_audio: Mutex::new(false),
+            expected_media: Mutex::new(None),
+            pair_audio_url: Mutex::new(None),
+            limit_bps: std::sync::atomic::AtomicU64::new(0),
+            login: String::new(),
+            password: String::new(),
+            merged_final: Mutex::new(None),
+            expect_size: 0,
+            expect_duration: 0.0,
+        }
+    }
+
+    #[test]
+    fn is_settled_waits_for_the_spawn_thread_not_just_the_status() {
+        // 2.0.7 #18: cancel() flips the status to "cancelled"
+        // immediately, but an ffmpeg merge running on the spawn
+        // thread is still writing the final file — a job in that
+        // shape must NOT report settled, or delete sweeps race
+        // the merge (and the "deleted" file reappears on
+        // Windows when the merge lands)
+        let job = bare_job();
+        assert!(job.is_settled(), "an idle job is settled");
+        job.alive
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        job.progress.lock().unwrap().status = "cancelled".to_string();
+        assert!(
+            !job.is_settled(),
+            "cancelled status + live spawn thread (merge) is not settled"
+        );
+        job.alive
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(job.is_settled(), "thread gone: settled");
     }
 }
 

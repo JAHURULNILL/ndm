@@ -47,7 +47,7 @@
 ; instantly, and any failure leaves the NDM install to complete.
 
 !ifndef VERSION
-  !define VERSION "2.0.6"
+  !define VERSION "2.0.7"
 !endif
 !ifndef SRCROOT
   !define SRCROOT "NDM-Windows-Portable"

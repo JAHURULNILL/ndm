@@ -3603,6 +3603,29 @@ async function initTauri() {
     const b = $('quotaBanner');
     if (b) b.classList.add('hidden');
   });
+  // 2.0.7 #1: the download list could not be saved to disk —
+  // a persistent banner (not a vanishing toast) for as long as
+  // the on-disk list is behind what the screen shows
+  await listen('persist_failed', e => {
+    const msg = (e.payload || {}).message || '';
+    const b = $('persistBanner');
+    if (b) {
+      b.textContent = `NDM cannot save the download list${msg ? ` (${msg})` : ''} — free some disk space; changes are not being recorded until saving works again.`;
+      b.classList.remove('hidden');
+    }
+    toast('NDM cannot save the download list — changes are not being recorded.', 'info');
+  });
+  await listen('persist_recovered', () => {
+    const b = $('persistBanner');
+    if (b) b.classList.add('hidden');
+  });
+  // a history file that had to be set aside at startup (corrupt
+  // or partly unreadable): the backend kept a notice; show it
+  // once, sticky, so an empty-looking list is never a mystery
+  try {
+    const notice = await invoke('take_startup_notice');
+    if (notice) toast(notice, 'info', { sticky: true });
+  } catch (e) { /* older backend: no notice to show */ }
   // W193-12: "Exit when done" was vetoed by paused downloads —
   // say why the app is staying open
   await listen('exit_vetoed', e => {
@@ -3652,6 +3675,21 @@ async function initTauri() {
   }, 4000);
   await listen('components_progress', e => { onComponentsProgress(e.payload || {}); });
   await listen('update_available', e => { showUpdate(e.payload || {}); });
+  // #28: the startup check runs on a backend timer (12 s) and
+  // its emit is fire-and-forget — on a cold first launch this
+  // listener may not have been registered when the offer was
+  // emitted, and the offer then stayed lost until the 6-hour
+  // re-check. The backend latches the latest result; pull it
+  // now that we are listening (the same drain pattern as the
+  // pending link queues), skipping an offer the event already
+  // presented.
+  try {
+    const offer = await invoke('get_pending_update');
+    if (offer && offer.status === 'available'
+        && (!updateInfo || updateInfo.version !== offer.version)) {
+      showUpdate(offer);
+    }
+  } catch (e) { /* older backend: the event path still applies */ }
   await listen('update_installed', e => {
     const v = (e.payload && e.payload.version) || '';
     toast(v ? `NDM ${v} is installed — restart NDM to use it.` : 'Update installed — restart NDM to use it.', 'info');
@@ -4071,9 +4109,29 @@ $('iGo').onclick = async () => {
   let ok = 0;
   for (const r of rows) {
     if (!r || !r.url) continue;
+    // export writes the entry's location as `save_to` (exports
+    // from older builds used `path`): for a file download that
+    // is the full file path, so the folder is its parent; a
+    // value whose last part has no extension is already a
+    // folder. The entry's name, category and queue ride along,
+    // so an export → import round-trip keeps all four instead
+    // of silently dropping them.
+    const savedTo = r.save_to || r.path || '';
     let dir = settings.default_dir;
-    if (r.path) { const cut = r.path.lastIndexOf('/'); if (cut > 0) dir = r.path.slice(0, cut); }
-    try { await invoke('add_download', { url: r.url, dir, later: true }); ok++; }
+    if (savedTo) {
+      const cut = Math.max(savedTo.lastIndexOf('/'), savedTo.lastIndexOf('\\'));
+      const last = cut >= 0 ? savedTo.slice(cut + 1) : savedTo;
+      dir = cut > 0 && last.includes('.') ? savedTo.slice(0, cut) : savedTo;
+    }
+    try {
+      await invoke('add_download', {
+        url: r.url, dir, later: true,
+        name: r.name || undefined,
+        category: r.category || undefined,
+        queue: r.queue || undefined,
+      });
+      ok++;
+    }
     catch (e) { /* counted below */ }
   }
   $('iText').value = '';

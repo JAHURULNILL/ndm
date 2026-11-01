@@ -17,6 +17,24 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 mod video;
 
+/// Poison-tolerant locking for the hot paths (progress emit,
+/// persist, entry state, settle/delete): one panic anywhere must
+/// not wedge every later acquisition behind a PoisonError — the
+/// disk-full cascade of the 2.0.7 hunt, where a single rate-calc
+/// panic poisoned the shared mutexes and progress, persist and
+/// Delete all died behind it (the last as a SIGABRT). The state
+/// behind these mutexes is plain data; recovering the guard keeps
+/// the session alive and honest.
+trait LockOk<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockOk<T> for Mutex<T> {
+    fn lock_ok(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct ProgressPayload {
     id: String,
@@ -113,6 +131,14 @@ struct SavedEntry {
     /// (IDM's per-download Speed Limiter tab)
     #[serde(default)]
     speed_limit: u64,
+    /// video entries only: the merged final file's full path, once
+    /// a merge produced one ("" = none yet). In-memory job state
+    /// used to be the only record of it, so a restart after a kept
+    /// merge re-downloaded everything into a "(1)" duplicate and
+    /// orphaned the finished file (2.0.7 #15). Additive: journals
+    /// written before this field load with "".
+    #[serde(default)]
+    final_path: String,
 }
 
 fn default_kind() -> String {
@@ -923,7 +949,7 @@ fn queue_cfg(s: &Settings, name: &str) -> QueueCfg {
 
 /// The queue an entry currently belongs to.
 fn entry_queue(e: &Entry) -> String {
-    e.queue.lock().unwrap().clone()
+    e.queue.lock_ok().clone()
 }
 
 /// Base64 (standard alphabet) for the Basic authorization header —
@@ -1243,6 +1269,16 @@ struct AppState {
     /// (START-LATENCY.md R1). Single slot, take-once, short TTL —
     /// see take_probe_handoff for the match rules.
     probe_handoff: Mutex<Option<ProbeHandoff>>,
+    /// the last downloads.json save failure while the on-disk list
+    /// is behind the in-memory one (None = the journal is current):
+    /// surfaced to the UI as a visible banner instead of living
+    /// only in an eprintln nobody reads (2.0.7 #1)
+    persist_error: Mutex<Option<String>>,
+    /// a one-time notice produced while restoring the list at
+    /// startup (a quarantined or partially unreadable journal):
+    /// the frontend drains it once on load, so a history that was
+    /// set aside never looks like a list that was "just empty"
+    startup_notice: Mutex<Option<String>>,
 }
 
 /// A dialog probe result awaiting its Start. The handoff is valid
@@ -1337,7 +1373,7 @@ impl AppState {
 
 impl AppState {
     fn get(&self, id: &str) -> Option<Arc<Entry>> {
-        self.entries.lock().unwrap().get(id).cloned()
+        self.entries.lock_ok().get(id).cloned()
     }
 }
 
@@ -1454,7 +1490,7 @@ fn stamp_last_try(entry: &Entry) {
 
 fn payload_of(entry: &Entry) -> ProgressPayload {
     if let Some(job) = &entry.video {
-        let p = job.progress.lock().unwrap().clone();
+        let p = job.progress.lock_ok().clone();
         let (hint_total, hint_done) = entry
             .restored
             .lock()
@@ -1467,11 +1503,15 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         // only while NO live job owns this entry — a job that is
         // running (resolving, downloading, merging) reports its own
         // real numbers, even while they are still 0, instead of the
-        // previous session's byte count flashing as current progress
+        // previous session's byte count flashing as current progress.
+        // #7: the hint also ends at the job's first run — a job
+        // that ran and whose thread has since died (status wedged
+        // at "downloading", done back at 0) must not present the
+        // previous session's bytes as this session's progress.
         let job_live = job.is_live();
         let done_bytes = if p.done > 0 {
             p.done
-        } else if !job_live && p.status == "downloading" && hint_done > 0 {
+        } else if !job_live && !job.has_run() && p.status == "downloading" && hint_done > 0 {
             if total > 0 {
                 hint_done.min(total)
             } else {
@@ -1530,14 +1570,14 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             status: p.status.clone(),
             category: entry.category.clone(),
             added: entry.added.clone(),
-            last_try: entry.last_try.lock().unwrap().clone(),
+            last_try: entry.last_try.lock_ok().clone(),
             resume_capability: "Yes (yt-dlp resume)".to_string(),
-            completion: entry.completion.lock().unwrap().clone(),
+            completion: entry.completion.lock_ok().clone(),
             error: p.error.clone().unwrap_or_default(),
             queue: entry_queue(entry),
             conns_detail: Vec::new(),
-            description: entry.description.lock().unwrap().clone(),
-            speed_limit: *entry.speed_limit.lock().unwrap(),
+            description: entry.description.lock_ok().clone(),
+            speed_limit: *entry.speed_limit.lock_ok(),
             save_to: entry.out_path.to_string_lossy().to_string(),
             referer: entry.referer.clone(),
         };
@@ -1547,7 +1587,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         Some(dl) => {
             let p = dl.progress();
             let rate = if p.status == ndm::Status::Downloading {
-                let s = entry.sample.lock().unwrap();
+                let s = entry.sample.lock_ok();
                 // state honesty (F-15): the smoothed sample is a LIVE
                 // rate only while bytes are actually moving. If no
                 // byte has arrived past the sample's mark for a few
@@ -1574,7 +1614,7 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 p.conn_bytes,
             )
         }
-        None => match &*entry.restored.lock().unwrap() {
+        None => match &*entry.restored.lock_ok() {
             Some(r) => (
                 r.total,
                 r.done_bytes,
@@ -1604,6 +1644,18 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         && entry.queued.load(Ordering::Relaxed)
     {
         "queued".to_string()
+    } else if entry.download.is_none()
+        && entry.video.is_none()
+        && entry.starting.load(Ordering::Relaxed)
+    {
+        // D1: while a start is in flight (probe + engine bring-up
+        // can take minutes on a no-validator resume, where sealed
+        // blocks are re-verified over the wire) the entry reads
+        // "starting" with its TRUE total/done — the row explains
+        // the wait instead of looking frozen on its old status,
+        // which is what invited the redundant second Resume whose
+        // rejection then defaced the record
+        "starting".to_string()
     } else {
         status
     };
@@ -1619,18 +1671,18 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         blocks,
         category: entry.category.clone(),
         added: entry.added.clone(),
-        last_try: entry.last_try.lock().unwrap().clone(),
+        last_try: entry.last_try.lock_ok().clone(),
         resume_capability: if resumable {
             "Yes (Range supported)".to_string()
         } else {
             "No".to_string()
         },
-        completion: entry.completion.lock().unwrap().clone(),
+        completion: entry.completion.lock_ok().clone(),
         error: error_text,
         queue: entry_queue(entry),
         conns_detail,
-        description: entry.description.lock().unwrap().clone(),
-        speed_limit: *entry.speed_limit.lock().unwrap(),
+        description: entry.description.lock_ok().clone(),
+        speed_limit: *entry.speed_limit.lock_ok(),
         save_to: entry.out_path.to_string_lossy().to_string(),
         referer: entry.referer.clone(),
     }
@@ -1665,15 +1717,15 @@ fn create_private(tmp: &Path) -> std::io::Result<std::fs::File> {
 static DOWNLOADS_CORRUPT: AtomicBool = AtomicBool::new(false);
 
 fn persist(state: &AppState) {
-    let _guard = state.save_lock.lock().unwrap();
-    let path = state.data_file.lock().unwrap().clone();
+    let _guard = state.save_lock.lock_ok();
+    let path = state.data_file.lock_ok().clone();
     if path.as_os_str().is_empty() {
         return;
     }
-    if DOWNLOADS_CORRUPT.load(Ordering::Relaxed) && state.entries.lock().unwrap().is_empty() {
+    if DOWNLOADS_CORRUPT.load(Ordering::Relaxed) && state.entries.lock_ok().is_empty() {
         return;
     }
-    let order = state.order.lock().unwrap().clone();
+    let order = state.order.lock_ok().clone();
     let saved: Vec<SavedEntry> = order
         .iter()
         .filter_map(|id| state.get(id))
@@ -1696,11 +1748,35 @@ fn persist(state: &AppState) {
             // the list file, restart included (battery19 t1/t3).
             e.download.is_some()
                 || e.video.is_some()
-                || e.restored.lock().unwrap().is_some()
+                || e.restored.lock_ok().is_some()
                 || e.queued.load(Ordering::Relaxed)
         })
         .map(|e| {
             let p = payload_of(&e);
+            // a video entry's durable final file (#15): the live
+            // job's recorded final path (a kept merge included);
+            // for a job-less entry that is verifiably finished,
+            // the file the disk check resolves — so the record
+            // survives a persist cycle after a restore too
+            let final_path = if e.kind == "video" {
+                match &e.video {
+                    Some(job) => job
+                        .progress
+                        .lock_ok()
+                        .final_path
+                        .as_ref()
+                        .map(|fp| fp.to_string_lossy().to_string()),
+                    None => {
+                        if entry_is_finished(&e) {
+                            Some(resolve_video_file(&e).to_string_lossy().to_string())
+                        } else {
+                            None
+                        }
+                    }
+                }
+            } else {
+                None
+            };
             SavedEntry {
                 id: e.id.clone(),
                 name: e.name.clone(),
@@ -1710,7 +1786,18 @@ fn persist(state: &AppState) {
                 added: e.added.clone(),
                 last_try: p.last_try.clone(),
                 total: p.total,
-                done_bytes: p.done_bytes,
+                // #7: the DURABLE figure for a live engine entry
+                // is the sealed byte count — bytes in fully
+                // completed blocks only. The live payload's
+                // done_bytes also counts partial in-flight blocks
+                // a restart must re-fetch, so persisting it made
+                // every restart visibly regress (and the restored
+                // record claim progress that was never durable).
+                // The on-screen payload keeps the live figure.
+                done_bytes: match &e.download {
+                    Some(dl) => dl.progress().sealed_done_bytes,
+                    None => p.done_bytes,
+                },
                 status: if e.queued.load(Ordering::Relaxed) {
                     "queued".to_string()
                 } else {
@@ -1721,13 +1808,14 @@ fn persist(state: &AppState) {
                 audio: e.audio,
                 cookies: e.cookies.clone(),
                 referer: e.referer.clone(),
-                completion: e.completion.lock().unwrap().clone(),
+                completion: e.completion.lock_ok().clone(),
                 error: p.error.clone(),
                 queue: entry_queue(&e),
                 login: e.login.clone(),
                 password: e.password.clone(),
-                description: e.description.lock().unwrap().clone(),
-                speed_limit: *e.speed_limit.lock().unwrap(),
+                description: e.description.lock_ok().clone(),
+                speed_limit: *e.speed_limit.lock_ok(),
+                final_path: final_path.unwrap_or_default(),
             }
         })
         .collect();
@@ -1736,7 +1824,11 @@ fn persist(state: &AppState) {
     // list then quietly reverted on the next launch and nobody
     // could tell why. The write stays best-effort (persist runs
     // on hot paths and must never panic or block on a dialog),
-    // but a failure is always logged.
+    // but a failure is always logged — and since 2.0.7 (#1) it is
+    // also RECORDED on the state, so the periodic snapshot thread
+    // can surface it in the UI as a visible banner: while the
+    // journal cannot be written, the on-disk list is behind the
+    // screen and the user must know that before they trust it.
     let written = (|| -> std::io::Result<()> {
         let mut f = create_private(&tmp)?;
         use std::io::Write;
@@ -1746,9 +1838,35 @@ fn persist(state: &AppState) {
         drop(f);
         std::fs::rename(&tmp, &path)
     })();
-    if let Err(e) = written {
-        eprintln!("[ndm] could not save the download list to {}: {e}", path.display());
+    match written {
+        Ok(()) => {
+            *state.persist_error.lock_ok() = None;
+            // #17: the quarantine guard exists only until the
+            // CURRENT (post-quarantine) state has actually been
+            // saved once — from then on persist must behave
+            // normally again, or an emptied list early-returns
+            // forever and deleted entries resurrect next launch.
+            // The quarantined file itself is a different name and
+            // is never touched by this write.
+            DOWNLOADS_CORRUPT.store(false, Ordering::Relaxed);
+        }
+        Err(e) => {
+            // no .tmp litter behind a failed write
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!("[ndm] could not save the download list to {}: {e}", path.display());
+            *state.persist_error.lock_ok() = Some(format!("{e}"));
+        }
     }
+}
+
+/// The instantaneous rate of one sample window. Saturating on
+/// purpose: progress can REGRESS between samples (a restart that
+/// re-anchors on sealed blocks, a demote/rebuild of the entry) —
+/// the plain u64 subtraction underflowed there, panicking in
+/// debug and wrapping to an absurd rate/ETA in release, and the
+/// panic went on to poison the shared mutexes (2.0.7 #1).
+fn window_rate(done: u64, anchor: u64, dt: f64) -> f64 {
+    done.saturating_sub(anchor) as f64 / dt
 }
 
 /// Advance the smoothed rate sample. Called ONLY from the emit loop, so
@@ -1757,7 +1875,7 @@ fn persist(state: &AppState) {
 fn update_sample(entry: &Entry) {
     let Some(dl) = &entry.download else { return };
     let p = dl.progress();
-    let mut s = entry.sample.lock().unwrap();
+    let mut s = entry.sample.lock_ok();
     let now = Instant::now();
     let dt = now.duration_since(s.0).as_secs_f64();
     if dt >= 0.2 {
@@ -1765,7 +1883,7 @@ fn update_sample(entry: &Entry) {
             // bytes moved inside the window: fold the window's
             // instantaneous rate into the EMA and re-anchor BOTH
             // marks at the movement
-            let inst = (p.done_bytes - s.1) as f64 / dt;
+            let inst = window_rate(p.done_bytes, s.1, dt);
             s.2 = if s.2 == 0.0 { inst } else { 0.5 * s.2 + 0.5 * inst };
             s.0 = now;
             s.1 = p.done_bytes;
@@ -2001,6 +2119,10 @@ fn plain_server_error(err: &str) -> String {
     }
 }
 
+/// IDM's Scheduler default: a failed file is retried at most this
+/// many times, then it stays failed with its error visible.
+const RETRY_MAX: u32 = 10;
+
 /// Register a failed entry for an automatic retry — IDM's queue
 /// semantics: a failed file is retried (its Scheduler default is 10
 /// attempts) instead of sitting dead until the user notices.
@@ -2008,13 +2130,46 @@ fn register_retry(state: &AppState, entry: &Entry) {
     if error_is_permanent(&payload_of(entry).error) {
         return;
     }
-    let mut map = state.retries.lock().unwrap();
+    let mut map = state.retries.lock_ok();
     let (count, _) = map.get(&entry.id).cloned().unwrap_or((0, Instant::now()));
-    if count < 10 {
+    if count < RETRY_MAX {
         map.insert(
             entry.id.clone(),
             (count + 1, Instant::now() + Duration::from_secs(30)),
         );
+    }
+}
+
+/// What the scheduler does with one DUE retry registration,
+/// decided from the entry's current status and its PRESERVED
+/// attempt count (#4: the count lives in this map across cycles —
+/// draining the registration on re-queue used to erase it, so the
+/// cap never bit and transient errors retried ~every 30 s
+/// forever, and when-done never settled behind them).
+#[derive(PartialEq, Debug)]
+enum DueRetry {
+    /// the registration is over (entry resolved, user-parked, or
+    /// the attempt cap reached): remove it; an errored entry
+    /// simply stays failed with its visible error
+    Drop,
+    /// errored and under the cap: back into its queue for the pump
+    Requeue,
+    /// an attempt is already in flight or waiting for a slot:
+    /// keep the registration (and count) untouched
+    Keep,
+}
+
+fn due_retry_action(count: u32, status: &str) -> DueRetry {
+    match status {
+        "downloading" | "starting" | "merging" | "queued" => DueRetry::Keep,
+        "error" => {
+            if count >= RETRY_MAX {
+                DueRetry::Drop
+            } else {
+                DueRetry::Requeue
+            }
+        }
+        _ => DueRetry::Drop,
     }
 }
 
@@ -2025,12 +2180,13 @@ fn register_retry(state: &AppState, entry: &Entry) {
 fn total_done_bytes(state: &AppState) -> u64 {
     let entries: Vec<Arc<Entry>> = state
         .entries
-        .lock()
-        .unwrap()
+        .lock_ok()
         .values()
         .cloned()
         .collect();
-    entries.iter().map(|e| payload_of(e).done_bytes).sum()
+    entries
+        .iter()
+        .fold(0u64, |acc, e| acc.saturating_add(payload_of(e).done_bytes))
 }
 
 /// The quota meter: ALL bytes downloaded in the window — entries
@@ -2051,7 +2207,15 @@ fn quota_note_removed(state: &AppState, entry: &Entry) {
     }
 }
 
+/// Serialises quota saves: every caller used to share the one
+/// quota.json.tmp name with no lock, so two saves landing
+/// together could interleave into a torn file — which load_quota
+/// then silently read as "no window", resetting the budget.
+static QUOTA_SAVE_LOCK: Mutex<()> = Mutex::new(());
+static QUOTA_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn save_quota(state: &AppState) {
+    let _guard = QUOTA_SAVE_LOCK.lock_ok();
     let path = state.quota_file.lock().unwrap().clone();
     if path.as_os_str().is_empty() {
         return;
@@ -2059,8 +2223,11 @@ fn save_quota(state: &AppState) {
     let (baseline, start, warned) = *state.quota_state.lock().unwrap();
     let removed = *state.quota_removed.lock().unwrap();
     // tmp+rename like the other stores: a bare write torn by a crash
-    // used to silently reset the whole window's accounting
-    let tmp = path.with_extension("json.tmp");
+    // used to silently reset the whole window's accounting. The tmp
+    // name is unique per save, so even a caller outside the lock
+    // discipline can never share a half-written file.
+    let seq = QUOTA_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.tmp-{seq}"));
     let body = serde_json::json!({
         "baseline": baseline,
         "removed": removed,
@@ -2068,11 +2235,16 @@ fn save_quota(state: &AppState) {
         "warned": warned,
     })
     .to_string();
-    if let Ok(mut f) = create_private(&tmp) {
+    let written = (|| -> std::io::Result<()> {
+        let mut f = create_private(&tmp)?;
         use std::io::Write;
-        if f.write_all(body.as_bytes()).is_ok() && f.flush().is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        f.write_all(body.as_bytes())?;
+        f.flush()?;
+        drop(f);
+        std::fs::rename(&tmp, &path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -2123,16 +2295,36 @@ fn quota_blocks(state: &AppState) -> bool {
 /// nothing is active or queued anymore, the app closes itself.
 fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str) {
     let s = current_settings(state);
-    // "Turn off computer when done" (the queue's own action wins over
+    // "Turn off computer when done" (a queue's own action wins over
     // the global one) shares the exit-when-done trigger conditions:
-    // downloads ran, nothing is active, queued or awaiting retry
-    let qcfg = queue_cfg(&s, finished_queue);
-    let power = if !qcfg.power_when_done.is_empty() {
-        qcfg.power_when_done.clone()
-    } else {
-        s.power_when_done.clone()
+    // downloads ran, nothing is active, queued or awaiting retry.
+    // Every queue's action is evaluated, not only the finishing
+    // entry's queue: the drained checks below are global, so while
+    // any queue still works nothing fires — but once the app HAS
+    // drained, a queue that finished earlier must not lose its
+    // action just because another queue's entry finished last.
+    // Priority: the finishing queue, then the rest in settings
+    // order, then the global setting.
+    let mut power = String::new();
+    let mut exit_armed = s.exit_when_done;
+    let mut consider = |cfg: &QueueCfg| {
+        if power.is_empty() && !cfg.power_when_done.is_empty() {
+            power = cfg.power_when_done.clone();
+        }
+        if cfg.exit_when_done {
+            exit_armed = true;
+        }
     };
-    if power.is_empty() && !s.exit_when_done && !qcfg.exit_when_done {
+    consider(&queue_cfg(&s, finished_queue));
+    for cfg in &s.queues {
+        if cfg.name != finished_queue {
+            consider(cfg);
+        }
+    }
+    if power.is_empty() {
+        power = s.power_when_done.clone();
+    }
+    if power.is_empty() && !exit_armed {
         return;
     }
     if !state.had_active.load(Ordering::Relaxed) {
@@ -2141,7 +2333,7 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
     // a failed download awaiting its automatic retry is unfinished
     // queue work, not "done": the app used to close itself over a
     // pending retry (and over a user's cancel of the last file)
-    if !state.retries.lock().unwrap().is_empty() {
+    if !state.retries.lock_ok().is_empty() {
         return;
     }
     // an entry the user PAUSED is unfinished work, not "done":
@@ -2198,7 +2390,7 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
 
 /// The per-download "Options on completion" action, run once at finish.
 fn run_completion_action(entry: &Entry) {
-    let action = entry.completion.lock().unwrap().clone();
+    let action = entry.completion.lock_ok().clone();
     if !action.is_empty() {
         // audit trail (F-19): the value acted on is THIS entry's own
         // stored field — written per entry by set_completion and
@@ -2301,7 +2493,7 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                     // persist as a finished download (R2-EXT-05).
                     if entry.kind == "video" && !resolve_video_file(&entry).is_file() {
                         if let Some(job) = &entry.video {
-                            let mut p = job.progress.lock().unwrap();
+                            let mut p = job.progress.lock_ok();
                             p.status = "error".to_string();
                             p.error = Some(
                                 "the download finished but its file is missing from the save folder"
@@ -2317,7 +2509,7 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                     }
                     run_completion_action(&entry);
                     let state = app.state::<AppState>();
-                    state.retries.lock().unwrap().remove(&entry.id);
+                    state.retries.lock_ok().remove(&entry.id);
                     if current_settings(&state).sound_events {
                         play_event_sound(true);
                     }
@@ -2351,7 +2543,7 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                         }
                         register_retry(&state, &entry);
                     } else {
-                        state.retries.lock().unwrap().remove(&entry.id);
+                        state.retries.lock_ok().remove(&entry.id);
                     }
                     persist(&state);
                     pump_queue(&app);
@@ -2467,6 +2659,46 @@ fn swap_live(
     Ok(live)
 }
 
+/// start_engine rejections that are NOT failures of the entry: a
+/// rival start is already in flight for it, or the entry was
+/// removed while the start ran. Every caller must treat both as a
+/// pure no-op for the entry. Recording one as an "error" state
+/// defaces a healthy record — the double Resume that raced a slow
+/// start used to overwrite a paused 60% entry in downloads.json
+/// with status "error", total 0, done 0 (defect D1), and closing
+/// the app in that window reopened to a download that looked lost
+/// while its bytes sat sealed on disk.
+const ALREADY_STARTING: &str = "the download is already starting";
+const REMOVED_BEFORE_START: &str = "the download was removed before it could start";
+
+fn benign_start_rejection(e: &str) -> bool {
+    e == ALREADY_STARTING || e == REMOVED_BEFORE_START
+}
+
+/// Record a stub start's failure on the entry: the visible error
+/// record (counters zeroed — the entry is a stub again and its
+/// engine state file, not this record, carries the resume truth),
+/// an automatic retry, and a persist. Returns false WITHOUT
+/// touching anything when the "failure" is a benign rejection
+/// (see benign_start_rejection): a redundant start command
+/// changes nothing.
+fn record_start_failure(state: &AppState, entry: &Entry, e: &str) -> bool {
+    if benign_start_rejection(e) {
+        return false;
+    }
+    *entry.restored.lock().unwrap() = Some(Restored {
+        total: 0,
+        done_bytes: 0,
+        blocks: Vec::new(),
+        resumable: false,
+        status: "error".to_string(),
+        error: e.to_string(),
+    });
+    register_retry(state, entry);
+    persist(state);
+    true
+}
+
 async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, String> {
     let url = stub.url.clone();
     let out_path = stub.out_path.clone();
@@ -2504,7 +2736,7 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
     // adopted instead of treated as a rival claim.
     let preclaimed = stub.slot_preclaimed.swap(false, Ordering::SeqCst);
     if stub.starting.swap(true, Ordering::SeqCst) && !preclaimed {
-        return Err("the download is already starting".to_string());
+        return Err(ALREADY_STARTING.to_string());
     }
     // the attempt begins now, probe included: a probe that fails is
     // still a try, so the stamp lands before it, not after success.
@@ -2557,7 +2789,7 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
             // remove it so it cannot claim the path as a phantom later
             let _ = std::fs::remove_file(ndm::state_path_for(&stub.out_path));
             stub.starting.store(false, Ordering::SeqCst);
-            return Err("the download was removed before it could start".to_string());
+            return Err(REMOVED_BEFORE_START.to_string());
         }
     }
     let live = {
@@ -2575,7 +2807,7 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
                 }
                 let _ = std::fs::remove_file(ndm::state_path_for(&stub.out_path));
                 stub.starting.store(false, Ordering::SeqCst);
-                return Err("the download was removed before it could start".to_string());
+                return Err(REMOVED_BEFORE_START.to_string());
             }
         }
     };
@@ -2630,6 +2862,25 @@ fn resolve_dir(dir: &str) -> PathBuf {
     }
 }
 
+/// Re-cap a suffixed candidate at the 255-byte filesystem
+/// limit: the input name was capped BEFORE the " (n)"/timestamp
+/// suffix was appended, so a max-length name overflowed again
+/// and the create failed with ENAMETOOLONG — an error the retry
+/// machinery then retried forever. The stem truncates
+/// (char-boundary safe); suffix and extension survive whole.
+fn cap_suffixed_name(stem: &str, suffix: &str, ext: &str) -> String {
+    let fixed = suffix.len() + ext.len();
+    if stem.len() + fixed <= 255 {
+        return format!("{stem}{suffix}{ext}");
+    }
+    let budget = 255usize.saturating_sub(fixed);
+    let mut end = budget.min(stem.len());
+    while end > 0 && !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}{ext}", &stem[..end])
+}
+
 /// Pick a file name in `dir` that no live entry and no engine state file
 /// claims — two downloads must never share one output/state path.
 fn unique_out_path(state: &AppState, dir: &Path, name: &str) -> (String, PathBuf) {
@@ -2652,7 +2903,7 @@ fn unique_out_path(state: &AppState, dir: &Path, name: &str) -> (String, PathBuf
         _ => (name, ""),
     };
     for n in 1..1000 {
-        let candidate = format!("{stem} ({n}){ext}");
+        let candidate = cap_suffixed_name(stem, &format!(" ({n})"), ext);
         let p = dir.join(&candidate);
         if !taken(&p) {
             return (candidate, p);
@@ -2662,7 +2913,7 @@ fn unique_out_path(state: &AppState, dir: &Path, name: &str) -> (String, PathBuf
     // path, putting two entries on one output file and one engine
     // state file. A timestamped name preserves the invariant.
     let stamp = chrono::Utc::now().timestamp_millis();
-    let candidate = format!("{stem}-{stamp}{ext}");
+    let candidate = cap_suffixed_name(stem, &format!("-{stamp}"), ext);
     let p = dir.join(&candidate);
     (candidate, p)
 }
@@ -2891,11 +3142,14 @@ fn register_http_stub(
     password: &str,
     dir_explicit: bool,
 ) -> Result<Arc<Entry>, String> {
-    // a name the browser suggested (Content-Disposition) wins over the
-    // URL tail, stripped of any path parts a hostile page could smuggle
+    // a name the browser suggested (Content-Disposition) wins over
+    // the URL tail — run through the engine's full sanitiser, not
+    // just separator stripping: illegal characters and the Windows
+    // device names (CON, NUL, …) must come out creatable on every
+    // platform, exactly as they do for server-suggested names
     let base_name = name_hint
-        .map(|n| n.rsplit(['/', '\\']).next().unwrap_or(n).trim().to_string())
-        .filter(|n| !n.is_empty() && n != "." && n != "..")
+        .map(ndm::sanitize_suggested_name)
+        .filter(|n| !n.is_empty())
         .unwrap_or_else(|| file_name_for(url));
     // F-6: a browser- or user-supplied name skips file_name_of's
     // cap — apply the same 255-byte limit here so an over-long
@@ -3017,7 +3271,10 @@ fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<Entr
     let (snap_total, snap_done, snap_blocks, snap_resumable) =
         match ndm::peek_state(&entry.url, &entry.out_path) {
             Some(pk) => (pk.total, pk.done_bytes, pk.blocks, true),
-            None => (p.total, p.done_bytes, Vec::new(), false),
+            // no state file: the sealed count is still the honest
+            // durable figure (#7) — the live payload's done_bytes
+            // counts partial blocks a fresh engine re-fetches
+            None => (p.total, dl.progress().sealed_done_bytes, Vec::new(), false),
         };
     let stub = Arc::new(Entry {
         id: entry.id.clone(),
@@ -3153,7 +3410,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 // the last silent start path: a missing yt-dlp here
                 // used to leave the entry sitting on "paused" forever
                 {
-                    let mut p = job.progress.lock().unwrap();
+                    let mut p = job.progress.lock_ok();
                     p.status = "error".to_string();
                     p.error = Some(e);
                 }
@@ -3288,6 +3545,13 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(start_err) = start_engine(app.clone(), &entry).await {
+            // D1: a benign rejection is not this entry's failure —
+            // a rival start is already in flight and owns the
+            // entry's outcome (or the entry was removed mid-start):
+            // record nothing, persist nothing, deface nothing
+            if benign_start_rejection(&start_err) {
+                return;
+            }
             // a failed start must not sit on "Queued" forever: surface it
             // as an error the user can see and retry (the engine's state
             // file survives, so a retry still resumes). Only ever touch
@@ -3466,7 +3730,7 @@ fn terminal_snapshot(entry: &Entry) -> Option<(String, u64, u64, String)> {
         return Some((status, p.total, p.done_bytes, p.error.unwrap_or_default()));
     }
     if let Some(job) = &entry.video {
-        let p = job.progress.lock().unwrap().clone();
+        let p = job.progress.lock_ok().clone();
         if matches!(p.status.as_str(), "finished" | "error" | "cancelled") {
             return Some((
                 p.status.clone(),
@@ -4104,6 +4368,25 @@ fn scheduler_start_now(app: AppHandle, state: State<'_, AppState>, queue: Option
 fn scheduler_stop_now(app: AppHandle, state: State<'_, AppState>, queue: Option<String>) {
     let q = queue.unwrap_or_else(main_queue_name);
     state.sched_override.lock().unwrap().remove(&q);
+    // "Stop" means the queue stops — including its pending
+    // automatic retries, which the scheduler would otherwise fire
+    // ~30 s later behind the user's back (#4 tie-in)
+    let ids: Vec<String> = state.retries.lock_ok().keys().cloned().collect();
+    let doomed: Vec<String> = ids
+        .into_iter()
+        .filter(|id| {
+            state
+                .get(id)
+                .map(|e| entry_queue(&e) == q)
+                .unwrap_or(false)
+        })
+        .collect();
+    if !doomed.is_empty() {
+        let mut map = state.retries.lock_ok();
+        for id in doomed {
+            map.remove(&id);
+        }
+    }
     pause_all(&app, false, Some(&q));
 }
 
@@ -4265,7 +4548,7 @@ async fn add_download(
     // together used to both pass the check before either start
     // claimed its slot, overshooting the queue's cap
     let must_wait = {
-        let _gate = START_GATE.lock().unwrap();
+        let _gate = START_GATE.lock_ok();
         let wait = is_later
             || entry_blocks(&state, &entry_queue(&stub))
             || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
@@ -4460,6 +4743,34 @@ async fn resume_download(
     // W193-5: a stub about to (re)start must not write into a
     // finished entry's file — rehome first (no-op for live entries)
     let entry = rehome_if_finished_conflict(&app, &state, &entry);
+    // #16: a resume is a START — it goes through the same gate as
+    // a fresh add (the queue's scheduler window, the download
+    // quota, the simultaneous cap), whichever surface asked for
+    // it (toolbar, context menu, browser panel all land here).
+    // The old code resumed unconditionally, so Resume was a
+    // standing cap bypass. Over the gate → the entry QUEUES and
+    // the pump promotes it when a slot frees, exactly like an
+    // add that arrived while the queue was full. An entry that
+    // is already running needs no slot and is left alone.
+    if !matches!(
+        payload_of(&entry).status.as_str(),
+        "downloading" | "starting" | "merging"
+    ) {
+        let queue = entry_queue(&entry);
+        let must_wait = {
+            let _gate = START_GATE.lock_ok();
+            let max = effective_cap(&current_settings(&state), &queue);
+            entry_blocks(&state, &queue)
+                || (max > 0 && count_active_for(&state, &queue) >= max)
+        };
+        if must_wait {
+            entry.queued.store(true, Ordering::Relaxed);
+            let _ = app.emit("progress", payload_of(&entry));
+            persist(&state);
+            pump_queue(&app);
+            return Ok(());
+        }
+    }
     if let Some(dl) = &entry.download {
         dl.control.resume();
         stamp_last_try(&entry);
@@ -4572,22 +4883,21 @@ async fn resume_download(
         match start_engine(app.clone(), &entry).await {
             Ok(_) => Ok(()),
             Err(e) => {
-                // mirror start_entry's failure handling: a failed
-                // start must surface on the entry as a visible error
+                // mirror start_entry's failure handling: a genuine
+                // failure surfaces on the entry as a visible error
                 // with its reason and an automatic retry — it used
-                // to vanish into the caller, leaving a stale status
-                *entry.restored.lock().unwrap() = Some(Restored {
-                    total: 0,
-                    done_bytes: 0,
-                    blocks: Vec::new(),
-                    resumable: false,
-                    status: "error".to_string(),
-                    error: e.clone(),
-                });
+                // to vanish into the caller, leaving a stale status.
+                // A benign rejection records NOTHING (D1): a rival
+                // start is already in flight and owns this entry's
+                // outcome, so the redundant resume just reports the
+                // entry's true state and succeeds.
+                let recorded = record_start_failure(&state, &entry, &e);
                 let _ = app.emit("progress", payload_of(&entry));
-                register_retry(&state, &entry);
-                persist(&state);
-                Err(e)
+                if recorded {
+                    Err(e)
+                } else {
+                    Ok(())
+                }
             }
         }
     }
@@ -4600,7 +4910,7 @@ fn remove_download(
     id: String,
     delete_file: Option<bool>,
 ) -> Result<(), String> {
-    state.retries.lock().unwrap().remove(&id);
+    state.retries.lock_ok().remove(&id);
     delete_progress_file(&app, &id);
     if let Some(entry) = state.get(&id) {
         // judged BEFORE anything is cancelled: cancelling a video
@@ -4677,8 +4987,8 @@ fn remove_download(
         // same at its end)
         delete_progress_file(&app, &id);
     }
-    state.entries.lock().unwrap().remove(&id);
-    state.order.lock().unwrap().retain(|x| x != &id);
+    state.entries.lock_ok().remove(&id);
+    state.order.lock_ok().retain(|x| x != &id);
     // same removal signal discard_entry emits: this command is
     // normally invoked BY the window (which drops the row itself),
     // but the list must never depend on which path removed the
@@ -4920,15 +5230,21 @@ fn do_check_update(app: &AppHandle) -> serde_json::Value {
     };
     let current = env!("CARGO_PKG_VERSION");
     if ndm::updater::version_cmp(&info.version, current) != std::cmp::Ordering::Greater {
+        // #19: every check recomputes the latch FROM SCRATCH.
+        // The feed no longer offers anything newer, so nothing
+        // may stay blocked and no stale record may stay
+        // installable — a corrected feed used to leave downloads
+        // blocked (and a withdrawn version installable) until
+        // the app restarted, because nothing ever cleared these.
+        state.update_required.store(false, Ordering::SeqCst);
+        *state.pending_update.lock().unwrap() = None;
         return serde_json::json!({ "status": "current", "version": current });
     }
     let mandatory = !info.min_supported.is_empty()
         && ndm::updater::version_cmp(current, &info.min_supported)
             == std::cmp::Ordering::Less
         && usable_update_asset(&info);
-    if mandatory {
-        state.update_required.store(true, Ordering::SeqCst);
-    }
+    state.update_required.store(mandatory, Ordering::SeqCst);
     let payload = serde_json::json!({
         "status": "available",
         "version": info.version,
@@ -4947,18 +5263,78 @@ async fn check_update(app: AppHandle) -> Result<serde_json::Value, String> {
     joined.map_err(|e| e.to_string())
 }
 
+/// The offer payload for the latched update state — the same
+/// shape do_check_update emits and returns, built from state so
+/// the frontend can PULL it (#28): the emit is fire-and-forget,
+/// and on a cold first launch the startup check (a 12 s timer)
+/// can finish before the webview has registered its
+/// 'update_available' listener, losing the offer until the
+/// 6-hour re-check. The latch is the state #19 keeps honest —
+/// every check refreshes or clears it — so a pulled offer is
+/// never staler than the last completed check.
+fn pending_update_payload(
+    info: Option<&ndm::updater::ReleaseInfo>,
+    mandatory: bool,
+) -> serde_json::Value {
+    match info {
+        Some(info) => serde_json::json!({
+            "status": "available",
+            "version": info.version,
+            "notes": info.notes,
+            "mandatory": mandatory,
+        }),
+        None => serde_json::json!({
+            "status": "current",
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    }
+}
+
+#[tauri::command]
+fn get_pending_update(state: State<'_, AppState>) -> serde_json::Value {
+    pending_update_payload(
+        state.pending_update.lock_ok().as_ref(),
+        state.update_required.load(Ordering::SeqCst),
+    )
+}
+
 /// One-click update: download the new package, verify its hash,
 /// hand it to the system installer with admin rights, and let the
 /// UI offer a restart. Falls back to opening the package in the
 /// desktop's software installer when pkexec/apt is unavailable.
 #[tauri::command]
-fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let info = state
         .pending_update
         .lock()
         .unwrap()
         .clone()
         .ok_or("no update is waiting to install")?;
+    // #19: re-validate against the feed's CURRENT state before
+    // installing anything — the pending record may name a
+    // version the feed has since withdrawn or replaced (its
+    // hashes included). A fresh fetch that contradicts the
+    // record wins and refreshes what the app knows (latch
+    // included, via do_check_update); a failed fetch leaves the
+    // last known state in force.
+    let fetched = tauri::async_runtime::spawn_blocking(ndm::updater::fetch_release).await;
+    let info = match fetched {
+        Ok(Ok(fresh)) => {
+            let current = env!("CARGO_PKG_VERSION");
+            let still_offered = fresh.version == info.version
+                && ndm::updater::version_cmp(&fresh.version, current)
+                    == std::cmp::Ordering::Greater;
+            if !still_offered {
+                let app2 = app.clone();
+                let _ =
+                    tauri::async_runtime::spawn_blocking(move || do_check_update(&app2)).await;
+                return Err("that update is no longer offered — NDM has refreshed its update information".to_string());
+            }
+            *state.pending_update.lock().unwrap() = Some(fresh.clone());
+            fresh
+        }
+        _ => info,
+    };
     #[cfg(windows)]
     {
         // Windows installs in-process (see run_windows_update):
@@ -5310,6 +5686,14 @@ fn take_pending_videos(state: State<'_, AppState>) -> Vec<serde_json::Value> {
 #[tauri::command]
 fn take_pending_grabs(state: State<'_, AppState>) -> Vec<serde_json::Value> {
     std::mem::take(&mut state.pending_grabs.lock().unwrap())
+}
+
+/// The one-time startup notice (a quarantined or partially
+/// unreadable journal at restore), drained once by the frontend
+/// on load and shown to the user.
+#[tauri::command]
+fn take_startup_notice(state: State<'_, AppState>) -> Option<String> {
+    state.startup_notice.lock_ok().take()
 }
 
 /// The user closed the video dialog without starting the download:
@@ -5741,113 +6125,164 @@ fn do_add_video(
     } else {
         title.trim().to_string()
     };
-    if !force {
-        // duplicate = same video AND same target path (the title
-        // decides the path — find_video_duplicate). A re-send
-        // under a different title is a different target and gets
-        // its own entry below.
-        let new_family = video_title_family(&raw_name);
-        if let Some(existing) =
-            find_video_duplicate(state, &url, &dir, &selector, audio, &new_family)
-        {
-            // IDM asks instead of silently refusing or duplicating:
-            // the caller decides (dialog confirm / "Download again")
-            // and retries with force to get a second copy.
-            return Err(format!("duplicate:{existing}"));
-        }
-    }
-    let name = unique_video_name(state, &dir, &raw_name, audio);
     let category = if audio {
         "Music".to_string()
     } else {
         "Video".to_string()
     };
-    let id = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
     // a saved Site Login for this address applies to video
     // downloads too: it is stored on the entry and travels into
     // the job, which passes it to yt-dlp (--username/--password),
     // so a login-gated page resolves the way a browser tab would
     let (login, password) =
         site_login_for(&current_settings(state), &url).unwrap_or_default();
-    let max = effective_cap(&current_settings(state), &queue);
-    // A video that arrives while the engine itself is still
-    // downloading waits in the queue like any other not-now download —
-    // it must not be rejected for a condition the user cannot fix.
-    let engine_missing = video_engine_missing(state);
-    // a Download Later aimed at a queue WITH an enabled schedule
-    // joins that schedule instead of parking (see later_entry_queued,
-    // R5-5a): created queued below, claimed by the pump at the window
-    let joins_schedule = later_entry_queued(later, queue_has_schedule(&current_settings(state), &queue));
-    let should_wait = later
-        || engine_missing
-        || entry_blocks(state, &queue)
-        || (max > 0 && count_active_for(state, &queue) >= max);
-    if should_wait {
-        let initial_status = if later && !joins_schedule { "paused" } else { "queued" };
-        let entry = Arc::new(Entry {
-            id: id.clone(),
-            name,
-            url,
-            out_path: dir,
-            category,
-            added: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-            last_try: Mutex::new(String::new()),
-            download: None,
-            video: None,
-            kind: "video".to_string(),
-            selector,
-            cookies: cookies_token,
-            referer: String::new(),
-            audio,
-            restored: Mutex::new(Some(Restored {
-                total: total_hint,
-                done_bytes: 0,
-                blocks: Vec::new(),
-                resumable: true,
-                status: initial_status.to_string(),
-                error: String::new(),
-            })),
-            queued: AtomicBool::new(!later || joins_schedule),
-            sample: Mutex::new((Instant::now(), 0, 0.0)),
-            emitting: AtomicBool::new(false),
-            starting: AtomicBool::new(false),
-                slot_preclaimed: AtomicBool::new(false),
-            removed: AtomicBool::new(false),
-            pause_requested: AtomicBool::new(false),
-            completion: Mutex::new(String::new()),
-            queue: Mutex::new(queue.clone()),
-            login: login.clone(),
-            password: password.clone(),
-            description: Mutex::new(String::new()),
-            speed_limit: Mutex::new(0),
-        });
-        state
-            .entries
-            .lock()
-            .unwrap()
-            .insert(id.clone(), entry.clone());
-        state.order.lock().unwrap().push(id.clone());
-        let _ = app.emit("progress", payload_of(&entry));
-        persist(state);
-        return Ok(id);
+    // #16: the duplicate check, the cap check and the INSERTION
+    // happen under the same START_GATE the HTTP add path uses,
+    // and the entry is inserted BEFORE its job starts — as a
+    // "starting" claim the cap counter, the duplicate check and
+    // the name uniquifier can all see. The old order (check →
+    // start the job → insert) let two overlapping adds both pass
+    // every check and run two jobs into the same files.
+    enum Plan {
+        Wait(Arc<Entry>),
+        Start(Arc<Entry>),
     }
+    let plan = {
+        let _gate = START_GATE.lock_ok();
+        if !force {
+            // duplicate = same video AND same target path (the
+            // title decides the path — find_video_duplicate). A
+            // re-send under a different title is a different
+            // target and gets its own entry below.
+            let new_family = video_title_family(&raw_name);
+            if let Some(existing) =
+                find_video_duplicate(state, &url, &dir, &selector, audio, &new_family)
+            {
+                // IDM asks instead of silently refusing or
+                // duplicating: the caller decides (dialog confirm
+                // / "Download again") and retries with force to
+                // get a second copy.
+                return Err(format!("duplicate:{existing}"));
+            }
+        }
+        let name = unique_video_name(state, &dir, &raw_name, audio);
+        let id = format!("dl-{}", state.seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let max = effective_cap(&current_settings(state), &queue);
+        // A video that arrives while the engine itself is still
+        // downloading waits in the queue like any other not-now
+        // download — it must not be rejected for a condition the
+        // user cannot fix.
+        let engine_missing = video_engine_missing(state);
+        // a Download Later aimed at a queue WITH an enabled
+        // schedule joins that schedule instead of parking (see
+        // later_entry_queued, R5-5a): created queued below,
+        // claimed by the pump at the window
+        let joins_schedule = later_entry_queued(
+            later,
+            queue_has_schedule(&current_settings(state), &queue),
+        );
+        let should_wait = later
+            || engine_missing
+            || entry_blocks(state, &queue)
+            || (max > 0 && count_active_for(state, &queue) >= max);
+        let mk_entry = |restored_status: &str, queued_flag: bool, starting_flag: bool| {
+            Arc::new(Entry {
+                id: id.clone(),
+                name: name.clone(),
+                url: url.clone(),
+                out_path: dir.clone(),
+                category: category.clone(),
+                added: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                last_try: Mutex::new(if starting_flag {
+                    now_stamp()
+                } else {
+                    String::new()
+                }),
+                download: None,
+                video: None,
+                kind: "video".to_string(),
+                selector: selector.clone(),
+                cookies: cookies_token.clone(),
+                referer: String::new(),
+                audio,
+                restored: Mutex::new(Some(Restored {
+                    total: total_hint,
+                    done_bytes: 0,
+                    blocks: Vec::new(),
+                    resumable: true,
+                    status: restored_status.to_string(),
+                    error: String::new(),
+                })),
+                queued: AtomicBool::new(queued_flag),
+                sample: Mutex::new((Instant::now(), 0, 0.0)),
+                emitting: AtomicBool::new(false),
+                starting: AtomicBool::new(starting_flag),
+                slot_preclaimed: AtomicBool::new(false),
+                removed: AtomicBool::new(false),
+                pause_requested: AtomicBool::new(false),
+                completion: Mutex::new(String::new()),
+                queue: Mutex::new(queue.clone()),
+                login: login.clone(),
+                password: password.clone(),
+                description: Mutex::new(String::new()),
+                speed_limit: Mutex::new(0),
+            })
+        };
+        if should_wait {
+            let initial_status = if later && !joins_schedule {
+                "paused"
+            } else {
+                "queued"
+            };
+            let entry = mk_entry(initial_status, !later || joins_schedule, false);
+            state
+                .entries
+                .lock()
+                .unwrap()
+                .insert(id.clone(), entry.clone());
+            state.order.lock().unwrap().push(id.clone());
+            Plan::Wait(entry)
+        } else {
+            let stub = mk_entry("starting", false, true);
+            state
+                .entries
+                .lock()
+                .unwrap()
+                .insert(id.clone(), stub.clone());
+            state.order.lock().unwrap().push(id.clone());
+            Plan::Start(stub)
+        }
+    };
+    let stub = match plan {
+        Plan::Wait(entry) => {
+            let id = entry.id.clone();
+            let _ = app.emit("progress", payload_of(&entry));
+            persist(state);
+            return Ok(id);
+        }
+        Plan::Start(stub) => stub,
+    };
+    let id = stub.id.clone();
     let job = match video::VideoJob::start(
-        &url,
-        &dir,
-        &selector,
-        audio,
-        &name,
-        state.cookies_path(&cookies_token),
-        &login,
-        &password,
+        &stub.url,
+        &stub.out_path,
+        &stub.selector,
+        stub.audio,
+        &stub.name,
+        state.cookies_path(&stub.cookies),
+        &stub.login,
+        &stub.password,
         &state.components(),
         total_hint,
         duration_hint,
     ) {
         Ok(job) => job,
         Err(e) => {
-            // the entry was never inserted: the add failed before
-            // it became a download, so its id number goes back too
+            // the claim goes back out: the add failed before it
+            // became a download, so its row and its id number
+            // both go back
+            state.entries.lock().unwrap().remove(&id);
+            state.order.lock().unwrap().retain(|x| x != &id);
             release_entry_id(state, &id);
             return Err(e);
         }
@@ -5866,42 +6301,62 @@ fn do_add_video(
     };
     let entry = Arc::new(Entry {
         id: id.clone(),
-        name,
-        url,
-        out_path: dir,
-        category,
-        added: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        // the job above is already running: this add IS the entry's
-        // first try, stamped at its birth
+        name: stub.name.clone(),
+        url: stub.url.clone(),
+        out_path: stub.out_path.clone(),
+        category: stub.category.clone(),
+        added: stub.added.clone(),
+        // the job above is already running: this add IS the
+        // entry's first try, stamped at its birth
         last_try: Mutex::new(now_stamp()),
         download: None,
         video: Some(job),
         kind: "video".to_string(),
-        selector,
-        cookies: cookies_token,
+        selector: stub.selector.clone(),
+        cookies: stub.cookies.clone(),
         referer: String::new(),
-        audio,
+        audio: stub.audio,
         restored: Mutex::new(initial_restored),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
         emitting: AtomicBool::new(false),
         starting: AtomicBool::new(false),
-                slot_preclaimed: AtomicBool::new(false),
-        removed: AtomicBool::new(false),
+        slot_preclaimed: AtomicBool::new(false),
+        removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
-        queue: Mutex::new(queue.clone()),
-        login,
-        password,
-            description: Mutex::new(String::new()),
-            speed_limit: Mutex::new(0),
+        queue: Mutex::new(entry_queue(&stub)),
+        login: stub.login.clone(),
+        password: stub.password.clone(),
+        description: Mutex::new(String::new()),
+        speed_limit: Mutex::new(0),
     });
-    state
-        .entries
-        .lock()
-        .unwrap()
-        .insert(id.clone(), entry.clone());
-    state.order.lock().unwrap().push(id.clone());
+    {
+        // check-and-insert under the SAME lock (the video edition
+        // of the probe-delete race): a remove that landed while
+        // the job was starting must not be resurrected by the
+        // live entry going in over it
+        let mut map = state.entries.lock().unwrap();
+        let still_current = map
+            .get(&id)
+            .map(|e| Arc::ptr_eq(e, &stub))
+            .unwrap_or(false);
+        if stub.removed.load(Ordering::SeqCst) || !still_current {
+            drop(map);
+            if let Some(j) = &entry.video {
+                j.cancel();
+            }
+            return Ok(id);
+        }
+        map.insert(id.clone(), entry.clone());
+    }
+    // a pause pressed while the job was starting is honoured the
+    // moment it goes live (the HTTP path's rule)
+    if stub.pause_requested.swap(false, Ordering::SeqCst) {
+        if let Some(j) = &entry.video {
+            j.pause();
+        }
+    }
     spawn_emit_loop(app.clone(), entry);
     persist(state);
     Ok(id)
@@ -6084,19 +6539,48 @@ fn restore_saved(state: &AppState) {
             // file for inspection and block persist from writing an
             // empty list over the name until real entries exist.
             let stamp = chrono::Utc::now().timestamp();
-            let _ = std::fs::rename(
-                &path,
-                path.with_extension(format!("json.corrupt-{stamp}")),
-            );
+            let quarantine = path.with_extension(format!("json.corrupt-{stamp}"));
+            let _ = std::fs::rename(&path, &quarantine);
             DOWNLOADS_CORRUPT.store(true, Ordering::Relaxed);
+            // the quarantine must not be silent in the UI: the
+            // list starting empty is indistinguishable from a
+            // fresh install unless the app says what happened
+            *state.startup_notice.lock_ok() = Some(format!(
+                "NDM could not read its download history, so the damaged file was set aside as {}. The list starts empty; your downloaded files on disk are untouched.",
+                quarantine.display()
+            ));
             return;
         }
     };
+    let mut dropped: Vec<serde_json::Value> = Vec::new();
     let saved: Vec<SavedEntry> = raw_entries
         .into_iter()
-        .filter_map(|v| serde_json::from_value(v).ok())
-        .filter(|s: &SavedEntry| !s.id.is_empty())
+        .filter_map(|v| match serde_json::from_value::<SavedEntry>(v.clone()) {
+            Ok(s) if !s.id.is_empty() => Some(s),
+            _ => {
+                dropped.push(v);
+                None
+            }
+        })
         .collect();
+    if !dropped.is_empty() {
+        // an unparseable record is never dropped silently: the
+        // offending records are written to a backup file beside
+        // the journal first, so a one-field corruption is
+        // recoverable by hand instead of a permanent silent loss
+        let stamp = chrono::Utc::now().timestamp();
+        let backup = path.with_extension(format!("json.dropped-{stamp}"));
+        let body = serde_json::to_string_pretty(&dropped).unwrap_or_default();
+        if std::fs::write(&backup, body).is_ok() {
+            let n = dropped.len();
+            *state.startup_notice.lock_ok() = Some(format!(
+                "{n} entr{} in the download history could not be read and {} set aside in {}. The rest of the list loaded normally.",
+                if n == 1 { "y" } else { "ies" },
+                if n == 1 { "was" } else { "were" },
+                backup.display()
+            ));
+        }
+    }
     let mut max_seq = 0u64;
     for s in saved {
         // the retired catch-all category name maps to "General"
@@ -6139,7 +6623,27 @@ fn restore_saved(state: &AppState) {
         }
         let out_path = PathBuf::from(&s.out_path);
         if s.kind == "video" {
-            let finished = s.status == "finished";
+            // #15: a merge that completed before the restart is
+            // recorded in final_path. The pause-during-merge shape
+            // (status "paused", every byte present, merged file on
+            // disk at the recorded size) IS a completed download —
+            // the resume would only have finalized the kept merge.
+            // The old restore mapped status by string alone and
+            // never looked at the disk, so such an entry
+            // re-downloaded everything into a "(1)" duplicate and
+            // orphaned the finished file.
+            let recorded_final_len = if s.final_path.is_empty() {
+                None
+            } else {
+                std::fs::metadata(&s.final_path)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())
+            };
+            let merged_complete = s.status == "paused"
+                && s.total > 0
+                && matches!(recorded_final_len, Some(len) if len == s.total);
+            let finished = s.status == "finished" || merged_complete;
             let done = if finished { s.total } else { s.done_bytes.min(s.total) };
             let n = 128usize;
             let done_cells = if s.total > 0 {
@@ -6526,8 +7030,17 @@ fn settle_entry_engines(entry: &Entry) {
     }
     if let Some(job) = &entry.video {
         job.cancel();
-        for _ in 0..100 {
-            let st = job.progress.lock().unwrap().status.clone();
+        // #18: cancel() flips the status to "cancelled" at once,
+        // but an ffmpeg merge runs untracked on the job's spawn
+        // thread and can still be writing the final file — the
+        // settle must therefore wait for the job to be truly
+        // settled (is_settled now includes the spawn thread's
+        // alive flag), not for the flipped status. The cap is far
+        // longer than the HTTP one because a merge of a long video
+        // legitimately takes tens of seconds; on expiry the
+        // sweeps below still run, exactly as before.
+        for _ in 0..600 {
+            let st = job.progress.lock_ok().status.clone();
             if matches!(st.as_str(), "cancelled" | "error" | "finished") && job.is_settled() {
                 break;
             }
@@ -6661,7 +7174,7 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
         }
     }
     entry.removed.store(true, Ordering::SeqCst);
-    state.retries.lock().unwrap().remove(&entry.id);
+    state.retries.lock_ok().remove(&entry.id);
     quota_note_removed(state, entry);
     if entry.download.is_some() {
         // wait for the engine to actually stop: its shutdown writes
@@ -6670,8 +7183,8 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
         // later download of the same name could trust stale blocks)
         settle_entry_engines(entry);
     }
-    state.entries.lock().unwrap().remove(&entry.id);
-    state.order.lock().unwrap().retain(|x| x != &entry.id);
+    state.entries.lock_ok().remove(&entry.id);
+    state.order.lock_ok().retain(|x| x != &entry.id);
     // the engine's final state write can land just after the
     // cancel: the sweep keeps removing the resume state until it
     // stays gone, so no orphan survives to be trusted by a future
@@ -6684,7 +7197,7 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
         // of the download behind. (A FINISHED download never
         // reaches this sweep: the guards above return first.)
         if let Some(job) = &entry.video {
-            if let Some(fp) = job.progress.lock().unwrap().final_path.clone() {
+            if let Some(fp) = job.progress.lock_ok().final_path.clone() {
                 let _ = std::fs::remove_file(&fp);
             }
         }
@@ -7023,7 +7536,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
                 // batch used to all pass the cap check before any of
                 // them became visible to the counter
                 let must_wait = {
-                    let _gate = START_GATE.lock().unwrap();
+                    let _gate = START_GATE.lock_ok();
                     let wait = later
                         || entry_blocks(&state, &entry_queue(&stub))
                         || (max > 0 && count_active_for(&state, &entry_queue(&stub)) >= max);
@@ -7533,6 +8046,8 @@ fn main() {
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
+            persist_error: Mutex::new(None),
+            startup_notice: Mutex::new(None),
         })
         .on_page_load(|webview, payload| {
             // A4: the main window starts hidden ("visible": false
@@ -7750,27 +8265,46 @@ fn main() {
                     // quota and the simultaneous cap. The old code
                     // started retries directly, bypassing all three.
                     if !state.update_required.load(Ordering::Relaxed) {
-                        let due: Vec<String> = {
-                            let mut map = state.retries.lock().unwrap();
+                        // #4: due registrations are INSPECTED, not
+                        // drained — the attempt count stays in the
+                        // map across cycles (only the due time
+                        // moves), so the RETRY_MAX cap actually
+                        // bites and a transient error cannot retry
+                        // every ~30 s forever
+                        let due: Vec<(String, u32)> = {
+                            let map = state.retries.lock_ok();
                             let now = Instant::now();
-                            let mut due = Vec::new();
-                            map.retain(|id, (_, at)| {
-                                if *at <= now {
-                                    due.push(id.clone());
-                                    false
-                                } else {
-                                    true
-                                }
-                            });
-                            due
+                            map.iter()
+                                .filter(|(_, (_, at))| *at <= now)
+                                .map(|(id, (count, _))| (id.clone(), *count))
+                                .collect()
                         };
                         let mut any = false;
-                        for id in due {
+                        for (id, count) in due {
                             let entry = state.entries.lock().unwrap().get(&id).cloned();
-                            if let Some(e) = entry {
-                                if payload_of(&e).status == "error" {
+                            let Some(e) = entry else {
+                                state.retries.lock_ok().remove(&id);
+                                continue;
+                            };
+                            match due_retry_action(count, &payload_of(&e).status) {
+                                DueRetry::Drop => {
+                                    state.retries.lock_ok().remove(&id);
+                                }
+                                DueRetry::Requeue => {
+                                    if let Some(slot) =
+                                        state.retries.lock_ok().get_mut(&id)
+                                    {
+                                        slot.1 = Instant::now() + Duration::from_secs(30);
+                                    }
                                     e.queued.store(true, Ordering::Relaxed);
                                     any = true;
+                                }
+                                DueRetry::Keep => {
+                                    if let Some(slot) =
+                                        state.retries.lock_ok().get_mut(&id)
+                                    {
+                                        slot.1 = Instant::now() + Duration::from_secs(30);
+                                    }
                                 }
                             }
                         }
@@ -7800,7 +8334,17 @@ fn main() {
                             continue;
                         }
                         let in_win = window_open(&cfg.start, &cfg.stop, &now);
-                        let was = was_in_window.get(&cfg.name).copied().unwrap_or(false);
+                        // the FIRST observation of a queue seeds
+                        // its state from the actual schedule: the
+                        // old "unknown = was closed" default
+                        // fabricated a window-open edge in the
+                        // first ~30 s after launch, which cleared
+                        // the manual override and undid a
+                        // just-pressed "Stop Queue Now"
+                        let Some(was) = was_in_window.get(&cfg.name).copied() else {
+                            was_in_window.insert(cfg.name.clone(), in_win);
+                            continue;
+                        };
                         if in_win && !was {
                             // the window governs again; the manual
                             // override for this queue ends
@@ -7898,6 +8442,7 @@ fn main() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 let mut was_blocked = false;
+                let mut was_failing = false;
                 loop {
                     std::thread::sleep(Duration::from_secs(5));
                     // panic-isolated: this thread also carries quota
@@ -7905,6 +8450,30 @@ fn main() {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         let state = handle.state::<AppState>();
                         persist(&state);
+                        // #1: a journal that cannot be written is
+                        // surfaced in the UI as soon as it is known:
+                        // until a save succeeds again, the list on
+                        // disk is behind what the screen shows, and
+                        // the user must see that instead of learning
+                        // it from a reverted list next launch
+                        let failing = state.persist_error.lock_ok().clone();
+                        match (&failing, was_failing) {
+                            (Some(msg), false) => {
+                                was_failing = true;
+                                let _ = handle.emit(
+                                    "persist_failed",
+                                    serde_json::json!({ "message": msg }),
+                                );
+                            }
+                            (None, true) => {
+                                was_failing = false;
+                                let _ = handle.emit(
+                                    "persist_recovered",
+                                    serde_json::json!({}),
+                                );
+                            }
+                            _ => {}
+                        }
                         // download quota (IDM's Download limits): the
                         // moment the window's budget runs out,
                         // everything pauses — re-queued, so the next
@@ -8011,6 +8580,7 @@ fn main() {
             set_completion,
             refresh_url,
             take_pending_videos,
+            take_startup_notice,
             take_pending_files,
             take_pending_grabs,
             components_status,
@@ -8020,6 +8590,7 @@ fn main() {
             restart_app,
             export_downloads,
             check_update,
+            get_pending_update,
             install_update,
             discard_cookies
         ])
@@ -8097,6 +8668,8 @@ mod tests {
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
+            persist_error: Mutex::new(None),
+            startup_notice: Mutex::new(None),
         };
         save_settings(&state);
         state.settings.lock().unwrap().max_connections = 32;
@@ -8226,6 +8799,8 @@ mod tests {
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
+            persist_error: Mutex::new(None),
+            startup_notice: Mutex::new(None),
         };
 
         let entry = Arc::new(Entry {
@@ -8301,7 +8876,102 @@ mod tests {
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
+            persist_error: Mutex::new(None),
+            startup_notice: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn second_start_during_inflight_start_leaves_the_record_untouched() {
+        // D1: a slow start (a no-validator resume re-verifying
+        // sealed blocks over the wire) invites a second Resume.
+        // The second start is rejected "already starting" — that
+        // rejection must be a pure no-op: the entry keeps its true
+        // status and numbers in memory AND in downloads.json. It
+        // used to overwrite the healthy paused record with
+        // status "error", total 0, done 0 (reproduced twice in
+        // the 2.0.7 verification battery).
+        let dir = std::env::temp_dir().join(format!("ndm-d1-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        let state = state_with_data_file(data_file.clone());
+
+        // the healthy paused record from the battery:
+        // 25,165,824 of 41,943,040 bytes sealed (60%)
+        let entry = restored_entry("slow.bin", "http", 41_943_040, dir.join("slow.bin"));
+        {
+            let mut r = entry.restored.lock().unwrap();
+            let r = r.as_mut().unwrap();
+            r.status = "paused".to_string();
+            r.done_bytes = 25_165_824;
+        }
+        let entry = Arc::new(entry);
+        state
+            .entries
+            .lock()
+            .unwrap()
+            .insert("dl-1".to_string(), entry.clone());
+        state.order.lock().unwrap().push("dl-1".to_string());
+        persist(&state);
+        let before = std::fs::read_to_string(&data_file).unwrap();
+        assert!(before.contains("\"status\":\"paused\""), "journal: {before}");
+        assert!(before.contains("\"done_bytes\":25165824"), "journal: {before}");
+        assert!(before.contains("\"total\":41943040"), "journal: {before}");
+
+        // the first start claims the entry, exactly as
+        // start_engine does, and is still in flight…
+        assert!(!entry.starting.swap(true, Ordering::SeqCst));
+        // …so the entry reads "starting", with its true numbers —
+        // the wait is explained instead of looking frozen
+        let p = payload_of(&entry);
+        assert_eq!(p.status, "starting");
+        assert_eq!(p.total, 41_943_040);
+        assert_eq!(p.done_bytes, 25_165_824);
+
+        // the second start's claim fails the same way
+        // start_engine's does, producing the rejection…
+        assert!(entry.starting.swap(true, Ordering::SeqCst));
+        assert!(benign_start_rejection(ALREADY_STARTING));
+        // …and the resume path records nothing for a rejection
+        assert!(!record_start_failure(&state, &entry, ALREADY_STARTING));
+        assert!(!record_start_failure(&state, &entry, REMOVED_BEFORE_START));
+
+        // the in-memory record is untouched
+        {
+            let r = entry.restored.lock().unwrap();
+            let r = r.as_ref().unwrap();
+            assert_eq!(r.status, "paused");
+            assert_eq!(r.total, 41_943_040);
+            assert_eq!(r.done_bytes, 25_165_824);
+            assert_eq!(r.error, "");
+        }
+        // and the journal still holds the healthy numbers even
+        // after a fresh persist (any other entry's activity could
+        // trigger one while the start is in flight — it must not
+        // smuggle the rejection in)
+        persist(&state);
+        let after = std::fs::read_to_string(&data_file).unwrap();
+        assert!(!after.contains("\"status\":\"error\""), "journal: {after}");
+        assert!(after.contains("\"done_bytes\":25165824"), "journal: {after}");
+        assert!(after.contains("\"total\":41943040"), "journal: {after}");
+
+        // a GENUINE start failure still records visibly — the
+        // fix must not swallow real errors
+        entry.starting.store(false, Ordering::SeqCst);
+        assert!(record_start_failure(
+            &state,
+            &entry,
+            "probe failed: connection refused"
+        ));
+        {
+            let r = entry.restored.lock().unwrap();
+            let r = r.as_ref().unwrap();
+            assert_eq!(r.status, "error");
+            assert!(r.error.contains("connection refused"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -8515,6 +9185,8 @@ mod tests {
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
+            persist_error: Mutex::new(None),
+            startup_notice: Mutex::new(None),
         };
         let mint = |st: &AppState| st.seq.fetch_add(1, Ordering::Relaxed) + 1;
         // mint dl-2, release it → the next mint reuses 2
@@ -8568,6 +9240,8 @@ mod tests {
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
+            persist_error: Mutex::new(None),
+            startup_notice: Mutex::new(None),
         };
 
         let stub = restored_entry("f.bin", "http", 0, dir.join("f.bin"));
@@ -8915,6 +9589,272 @@ mod tests {
         assert!(slot.lock().unwrap().is_none());
         // empty slot: nothing to take
         assert!(take_probe_handoff(&slot, "https://x.test/f.bin", &auth, t0).is_none());
+    }
+
+    #[test]
+    fn window_rate_never_underflows_on_regressed_progress() {
+        // 2.0.7 #1: progress regressing between samples (a
+        // restart re-anchoring on sealed blocks, a demote) used
+        // to underflow the u64 subtraction — panic in debug,
+        // absurd rate in release, poisoned mutexes behind it
+        assert_eq!(window_rate(100, 500, 0.5), 0.0);
+        assert_eq!(window_rate(500, 500, 0.5), 0.0);
+        assert_eq!(window_rate(1500, 500, 0.5), 2000.0);
+    }
+
+    #[test]
+    fn lock_ok_recovers_a_poisoned_mutex() {
+        // 2.0.7 #1: one panic holding a shared lock must not
+        // wedge every later acquisition behind a PoisonError
+        let m = Arc::new(Mutex::new(41u32));
+        let m2 = m.clone();
+        let h = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("simulated mid-panic lock holder");
+        });
+        let _ = h.join();
+        assert!(m.lock().is_err(), "mutex should be poisoned");
+        {
+            let mut g = m.lock_ok();
+            assert_eq!(*g, 41);
+            *g = 42;
+        }
+        assert_eq!(*m.lock_ok(), 42);
+    }
+
+    #[test]
+    fn retry_cap_bites_and_counts_persist_across_cycles() {
+        // 2.0.7 #4: the scheduler decides from the PRESERVED
+        // count — under the cap an errored entry re-queues, at
+        // the cap it stays failed, an in-flight attempt keeps
+        // its registration untouched
+        assert_eq!(due_retry_action(0, "error"), DueRetry::Requeue);
+        assert_eq!(due_retry_action(RETRY_MAX - 1, "error"), DueRetry::Requeue);
+        assert_eq!(due_retry_action(RETRY_MAX, "error"), DueRetry::Drop);
+        assert_eq!(due_retry_action(3, "downloading"), DueRetry::Keep);
+        assert_eq!(due_retry_action(3, "queued"), DueRetry::Keep);
+        assert_eq!(due_retry_action(3, "finished"), DueRetry::Drop);
+        assert_eq!(due_retry_action(3, "paused"), DueRetry::Drop);
+
+        // registration increments the SAME counter every cycle
+        // and stops at the cap
+        let state = state_with_data_file(PathBuf::new());
+        let mut e = restored_entry("f.bin", "http", 100, PathBuf::from("/tmp/f.bin"));
+        *e.restored.lock().unwrap() = Some(Restored {
+            total: 100,
+            done_bytes: 10,
+            blocks: Vec::new(),
+            resumable: true,
+            status: "error".to_string(),
+            error: "connection refused".to_string(),
+        });
+        let e = Arc::new(e);
+        for _ in 0..(RETRY_MAX + 5) {
+            register_retry(&state, &e);
+        }
+        let map = state.retries.lock().unwrap();
+        assert_eq!(map.get("dl-1").map(|(c, _)| *c), Some(RETRY_MAX));
+    }
+
+    #[test]
+    fn cap_suffixed_name_recaps_after_the_suffix() {
+        // a max-length stem + " (1)" + ext must come back under
+        // the 255-byte cap, suffix and extension intact
+        let stem = "a".repeat(250);
+        let out = cap_suffixed_name(&stem, " (1)", ".bin");
+        assert!(out.len() <= 255, "len {}", out.len());
+        assert!(out.ends_with(" (1).bin"));
+        // multibyte stems truncate on a char boundary
+        let stem = "অ".repeat(100); // 300 bytes
+        let out = cap_suffixed_name(&stem, " (2)", ".mp4");
+        assert!(out.len() <= 255);
+        assert!(out.ends_with(" (2).mp4"));
+        // short names pass through untouched
+        assert_eq!(cap_suffixed_name("file", " (1)", ".bin"), "file (1).bin");
+    }
+
+    #[test]
+    fn persist_failure_is_recorded_and_tmp_is_cleaned() {
+        // 2.0.7 #1: a journal that cannot be written (here the
+        // rename target is a directory) must surface on the
+        // state — not only in an eprintln — and must not leave
+        // its .tmp behind; the next good save clears the record
+        let dir = std::env::temp_dir().join(format!("ndm-persistfail-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked = dir.join("downloads.json");
+        std::fs::create_dir_all(&blocked).unwrap(); // rename target is a dir
+
+        let state = state_with_data_file(blocked.clone());
+        let entry = Arc::new(restored_entry("f.bin", "http", 10, dir.join("f.bin")));
+        state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
+        state.order.lock().unwrap().push("dl-1".to_string());
+        persist(&state);
+        assert!(
+            state.persist_error.lock().unwrap().is_some(),
+            "the failure must be recorded on the state"
+        );
+        assert!(
+            !dir.join("downloads.json.tmp").exists(),
+            "a failed save must not litter its tmp file"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocked);
+        persist(&state);
+        assert!(state.persist_error.lock().unwrap().is_none());
+        assert!(std::fs::read_to_string(&blocked).unwrap().contains("dl-1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_merge_survives_restart_via_recorded_final_path() {
+        // 2.0.7 #15: a video paused after its merge completed
+        // persists the merged file's path; the restore sees the
+        // file on disk at the recorded size and brings the entry
+        // back FINISHED instead of re-downloading into "(1)"
+        let dir = std::env::temp_dir().join(format!("ndm-keptmerge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        let merged = dir.join("Clip.mp4");
+        std::fs::write(&merged, b"12345").unwrap();
+
+        let state = state_with_data_file(data_file.clone());
+        let mut e = restored_entry("Clip", "video", 5, dir.clone());
+        e.id = "dl-9".to_string();
+        *e.restored.lock().unwrap() = Some(Restored {
+            total: 5,
+            done_bytes: 5,
+            blocks: Vec::new(),
+            resumable: true,
+            status: "paused".to_string(),
+            error: String::new(),
+        });
+        let e = Arc::new(e);
+        state.entries.lock().unwrap().insert("dl-9".to_string(), e);
+        state.order.lock().unwrap().push("dl-9".to_string());
+        persist(&state);
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(
+            text.contains(&format!("\"final_path\":\"{}\"", merged.display())),
+            "journal must record the merged path: {text}"
+        );
+
+        let state2 = state_with_data_file(data_file.clone());
+        restore_saved(&state2);
+        let restored = state2.get("dl-9").expect("entry restored");
+        assert_eq!(payload_of(&restored).status, "finished");
+
+        // the file deleted while closed: no promotion, the
+        // entry stays honestly paused with its bytes recorded
+        let _ = std::fs::remove_file(&merged);
+        let state3 = state_with_data_file(data_file.clone());
+        restore_saved(&state3);
+        let restored = state3.get("dl-9").expect("entry restored");
+        assert_eq!(payload_of(&restored).status, "paused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_journal_quarantine_lifts_after_first_good_persist() {
+        // 2.0.7 #17 + the silent-quarantine minor: a corrupt
+        // journal is set aside WITH a notice; once the current
+        // state has been saved successfully the guard lifts, so
+        // an emptied list persists as empty (no resurrection),
+        // and the quarantined file is never overwritten
+        let dir = std::env::temp_dir().join(format!("ndm-corrupt-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        std::fs::write(&data_file, b"this is not json {{{").unwrap();
+
+        let state = state_with_data_file(data_file.clone());
+        restore_saved(&state);
+        assert!(state.entries.lock().unwrap().is_empty());
+        assert!(state.startup_notice.lock().unwrap().is_some());
+        let quarantined: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|f| f.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1);
+        assert!(!data_file.exists(), "the bad file was renamed away");
+
+        // one real entry, saved: the guard lifts with this write
+        let entry = Arc::new(restored_entry("f.bin", "http", 10, dir.join("f.bin")));
+        state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
+        state.order.lock().unwrap().push("dl-1".to_string());
+        persist(&state);
+        assert!(!DOWNLOADS_CORRUPT.load(Ordering::Relaxed));
+
+        // and now the emptied list persists as empty — the
+        // deleted entry must NOT resurrect on the next launch
+        state.entries.lock().unwrap().clear();
+        state.order.lock().unwrap().clear();
+        persist(&state);
+        assert_eq!(std::fs::read_to_string(&data_file).unwrap(), "[]");
+        assert!(quarantined[0].path().exists(), "quarantine untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unparseable_records_are_backed_up_before_being_dropped() {
+        // a one-field corruption must not be a silent permanent
+        // loss: the offending record is written to a .dropped-*
+        // backup and a startup notice names it, while the good
+        // records load normally
+        let dir = std::env::temp_dir().join(format!("ndm-dropped-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        std::fs::write(
+            &data_file,
+            r#"[{"id":"dl-1","name":"ok.bin","url":"https://example.com/ok.bin",
+                 "out_path":"/tmp/ok.bin","status":"paused","kind":"http"},
+                {"id":42,"bogus":true}]"#,
+        )
+        .unwrap();
+        let state = state_with_data_file(data_file);
+        restore_saved(&state);
+        assert!(state.get("dl-1").is_some(), "the good record loads");
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|f| f.file_name().to_string_lossy().contains(".dropped-"))
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let body = std::fs::read_to_string(backups[0].path()).unwrap();
+        assert!(body.contains("bogus"), "backup holds the record: {body}");
+        assert!(state.startup_notice.lock().unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_update_payload_mirrors_the_latched_offer() {
+        // 2.0.7 #28: the cold-start offer is PULLED from the
+        // latch, so the payload built from state must carry
+        // exactly what the fire-and-forget emit would have —
+        // and a cleared latch (#19) must pull as "current", so
+        // a withdrawn offer can never resurrect through the pull
+        let none = pending_update_payload(None, false);
+        assert_eq!(none["status"], "current");
+
+        let info: ndm::updater::ReleaseInfo = serde_json::from_value(serde_json::json!({
+            "version": "2.0.7",
+            "notes": "bug fixes",
+            "min_supported": "2.0.7",
+        }))
+        .expect("release info parses");
+        let offer = pending_update_payload(Some(&info), true);
+        assert_eq!(offer["status"], "available");
+        assert_eq!(offer["version"], "2.0.7");
+        assert_eq!(offer["notes"], "bug fixes");
+        assert_eq!(offer["mandatory"], true);
+        // the latch, not the record, carries the mandatory
+        // verdict: an optional offer of the same version pulls
+        // as optional
+        let offer = pending_update_payload(Some(&info), false);
+        assert_eq!(offer["mandatory"], false);
     }
 }
 

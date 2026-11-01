@@ -86,23 +86,18 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
     // is generous (~15 s) because the unlocked fallback can corrupt
     // BOTH lines, while a late append only delays this one.
     let lock_path = path.with_extension("lock");
-    let mut _guard: Option<std::fs::File> = None;
+    let mut guard: Option<std::fs::File> = None;
     for _ in 0..300 {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            Ok(f) => {
-                _guard = Some(f);
+        match acquire_queue_lock(&lock_path) {
+            Some(f) => {
+                guard = Some(f);
                 break;
             }
-            Err(_) => {
-                // a lock older than 30 s cannot belong to a live
-                // hand-off (the append it guards takes milliseconds):
-                // its owner died mid-handover, and without recovery
-                // EVERY later hand-off would first burn the full spin
-                // and then append unlocked, forever
+            None => {
+                // a DEAD owner's lock is reaped as soon as it is
+                // recognised (see lock_is_stale), so a crashed
+                // hand-off costs the next one well under a second —
+                // only a LIVE owner's lock is waited on
                 if lock_is_stale(&lock_path) {
                     let _ = std::fs::remove_file(&lock_path);
                 }
@@ -110,34 +105,77 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
             }
         }
     }
-    if _guard.is_none() && lock_is_stale(&lock_path) {
+    if guard.is_none() && lock_is_stale(&lock_path) {
         // one last recovery attempt after the spin before falling
         // back to the unlocked append
         let _ = std::fs::remove_file(&lock_path);
-        if let Ok(f) = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock_path)
-        {
-            _guard = Some(f);
-        }
+        guard = acquire_queue_lock(&lock_path);
     }
     let result = (|| {
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         file.write_all(line.as_bytes())
     })();
-    if _guard.is_some() {
+    if let Some(f) = guard.take() {
+        // the handle is dropped BEFORE the lock file is removed:
+        // on Windows a file cannot be deleted while a handle to it
+        // is open, so removing first left the lock behind and every
+        // later hand-off paid the dead-lock price for it
+        drop(f);
         let _ = std::fs::remove_file(&lock_path);
     }
     result
 }
 
-/// A queue lock older than 30 s is debris from a host process that
-/// was killed between creating it and removing it.
+/// Create the queue lock, recording this process's pid inside it so
+/// later hosts can tell a live owner from a dead one instantly
+/// instead of guessing from the file's age.
+fn acquire_queue_lock(lock_path: &std::path::Path) -> Option<std::fs::File> {
+    use std::io::Write as _;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+        .ok()?;
+    let _ = f.write_all(std::process::id().to_string().as_bytes());
+    Some(f)
+}
+
+/// Whether this pid currently names a live process.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    // no cheap liveness probe on this platform: assume alive and
+    // let the age backstop below reap true debris
+    true
+}
+
+/// A queue lock is stale when its owner is gone. The owner records
+/// its pid in the file (see acquire_queue_lock): a pid that no
+/// longer names a live process is debris from a host killed
+/// mid-hand-off and is reaped immediately — the old age-only rule
+/// (30 s) made every later hand-off burn the full 15 s spin first.
+/// Locks with no readable pid (written by an older host, or caught
+/// in the instant between creation and the pid write) get a short
+/// grace period, then the same treatment; the 30 s age backstop
+/// covers a recorded pid that can no longer be probed.
 fn lock_is_stale(lock_path: &std::path::Path) -> bool {
-    std::fs::metadata(lock_path)
+    let age = std::fs::metadata(lock_path)
         .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map(|d| d.as_secs() > 30).unwrap_or(false))
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    if let Ok(content) = std::fs::read_to_string(lock_path) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            if pid != std::process::id() && !process_alive(pid) {
+                return true;
+            }
+            return age.map(|d| d.as_secs() > 30).unwrap_or(false);
+        }
+    }
+    age.map(|d| d >= std::time::Duration::from_millis(400))
         .unwrap_or(false)
 }
 
@@ -198,6 +236,11 @@ fn cookie_header_from_netscape(text: &str, url: &str) -> Option<String> {
         .unwrap_or(hostport)
         .to_ascii_lowercase();
     let path = path.split(['?', '#']).next().unwrap_or("/");
+    let is_https = url.starts_with("https://");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let mut pairs = Vec::new();
     for line in text.lines() {
         let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
@@ -212,6 +255,18 @@ fn cookie_header_from_netscape(text: &str, url: &str) -> Option<String> {
                 !dom.is_empty() && (host == dom || host.ends_with(&format!(".{dom}")));
             if !domain_match || !path.starts_with(f[2]) {
                 continue;
+            }
+            // a Secure cookie must never travel to an http:// target,
+            // and an expired one (expiry field, seconds since the
+            // epoch; 0 = session cookie) must not be sent at all —
+            // the browser itself would withhold both
+            if f[3].eq_ignore_ascii_case("true") && !is_https {
+                continue;
+            }
+            if let Ok(expiry) = f[4].trim().parse::<i64>() {
+                if expiry > 0 && expiry <= now {
+                    continue;
+                }
             }
             pairs.push(format!("{}={}", f[5], f[6]));
         }
@@ -776,10 +831,107 @@ fn read_message(input: &mut impl Read) -> io::Result<Option<Result<Value, String
 
 fn write_reply(output: &mut impl Write, reply: &Value) -> io::Result<()> {
     let body = reply.to_string();
+    // Chrome kills the native-messaging channel when a single
+    // message exceeds 1 MiB, taking every other in-flight request
+    // with it (finding #11): an oversized reply (a probe whose
+    // thumbnail slipped past its own cap) is replaced by a small
+    // error reply the extension can surface, so the channel lives.
+    let body = if body.len() > MAX_MESSAGE_BYTES as usize {
+        json!({ "ok": false, "error": "reply too large" }).to_string()
+    } else {
+        body
+    };
     let len = (body.len() as u32).to_le_bytes();
     output.write_all(&len)?;
     output.write_all(body.as_bytes())?;
     output.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame_body(written: &[u8]) -> Value {
+        let len = u32::from_le_bytes(written[0..4].try_into().unwrap()) as usize;
+        assert_eq!(written.len(), 4 + len, "frame must be exactly one message");
+        serde_json::from_slice(&written[4..]).unwrap()
+    }
+
+    #[test]
+    fn oversized_reply_is_replaced_by_a_small_error() {
+        // finding #11 backstop: a reply over Chrome's 1 MiB channel
+        // cap must go out as a small {ok:false} instead of killing
+        // the channel for every other request
+        let big = json!({ "ok": true, "info": { "thumbnail": "x".repeat(2 * 1024 * 1024) } });
+        let mut out: Vec<u8> = Vec::new();
+        write_reply(&mut out, &big).unwrap();
+        assert!(out.len() < 1024, "replacement reply must be tiny: {} bytes", out.len());
+        let v = frame_body(&out);
+        assert_eq!(v["ok"], json!(false));
+        // and a normal reply passes through untouched
+        let small = json!({ "ok": true, "pong": true });
+        let mut out: Vec<u8> = Vec::new();
+        write_reply(&mut out, &small).unwrap();
+        assert_eq!(frame_body(&out), small);
+    }
+
+    #[test]
+    fn cookie_conversion_honours_secure_and_expiry() {
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let jar = [
+            format!("example.com\tTRUE\t/\tFALSE\t{future}\tplain\tv1"),
+            format!("example.com\tTRUE\t/\tTRUE\t{future}\tsecure\tv2"),
+            "example.com\tTRUE\t/\tFALSE\t1000000000\texpired\tv3".to_string(),
+            format!("example.com\tTRUE\t/\tFALSE\t0\tsession\tv4"),
+        ]
+        .join("\n");
+        let http = cookie_header_from_netscape(&jar, "http://example.com/f.bin")
+            .expect("some cookies must survive for http");
+        assert!(http.contains("plain=v1"), "http jar: {http}");
+        assert!(http.contains("session=v4"), "session cookies are kept: {http}");
+        assert!(!http.contains("secure=v2"), "Secure must never go to http://: {http}");
+        assert!(!http.contains("expired=v3"), "expired must be dropped: {http}");
+        let https = cookie_header_from_netscape(&jar, "https://example.com/f.bin")
+            .expect("some cookies must survive for https");
+        assert!(https.contains("secure=v2"), "Secure is fine on https: {https}");
+        assert!(!https.contains("expired=v3"), "expired dropped on https too: {https}");
+    }
+
+    #[test]
+    fn dead_owner_lock_is_stale_live_owner_lock_is_not() {
+        let dir = std::env::temp_dir().join(format!("ndm-host-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("incoming.lock");
+        // a lock recording a pid that cannot be alive: debris,
+        // reaped immediately (well under the old 30 s age rule)
+        std::fs::write(&lock, "4194304").unwrap();
+        assert!(lock_is_stale(&lock), "dead owner's lock must be stale at once");
+        // a lock recording OUR live pid: a live hand-off, waited on
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        assert!(!lock_is_stale(&lock), "live owner's lock must not be stale");
+        // a fresh pid-less lock (legacy, or the instant before the
+        // owner writes its pid): still inside the grace window
+        std::fs::write(&lock, "").unwrap();
+        assert!(!lock_is_stale(&lock), "fresh legacy lock must get its grace window");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_inbound_length_is_invalid_data() {
+        // the COSMETIC finding's mechanism: main() exits nonzero
+        // exactly for InvalidData framing errors — make sure a
+        // >1 MiB length prefix produces that kind, not a read error
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&2_000_000u32.to_le_bytes());
+        framed.extend_from_slice(b"{}");
+        let err = read_message(&mut &framed[..]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 }
 
 fn main() {
@@ -794,6 +946,13 @@ fn main() {
             Ok(None) => break,
             Err(e) => {
                 eprintln!("ndm-host: framing error, exiting: {e}");
+                // an invalid length prefix (e.g. >1 MiB inbound) is
+                // a protocol violation, not a clean close: exit
+                // nonzero so the failure is visible instead of a
+                // silent code-0 channel death
+                if e.kind() == io::ErrorKind::InvalidData {
+                    std::process::exit(2);
+                }
                 break;
             }
         };

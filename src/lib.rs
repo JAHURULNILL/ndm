@@ -189,11 +189,15 @@ fn strip_js_comments(body: &str) -> String {
 /// guessed address.
 pub fn resolve_pac_proxy(pac_url: &str) -> String {
     let agent = ureq::AgentBuilder::new()
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
         .timeout(Duration::from_secs(4))
         .build();
     let Ok(resp) = agent.get(pac_url).call() else {
         return String::new();
     };
+    if response_encoding(&resp).is_some() {
+        return String::new();
+    }
     let Ok(body) = resp.into_string() else {
         return String::new();
     };
@@ -228,30 +232,65 @@ pub fn resolve_pac_proxy(pac_url: &str) -> String {
 /// same slot algorithm as the global limiter, but scoped to one
 /// download's Shared state. Both throttles apply — a download obeys
 /// its own limit AND the global one.
+/// Wait until a pacing slot in slices of at most 50 ms, re-checking
+/// the halt flags and the CURRENT limit on every slice (finding #9:
+/// the bare `thread::sleep` this replaces could park one worker for
+/// the whole slot — at 1 KB/s a 512 KiB charge is ~8 minutes, and
+/// the sleeps of 16 workers stack into hours before a pause, cancel
+/// or stop is even noticed). A limit raised mid-wait shortens the
+/// remaining wait proportionally; a limit cleared ends it at once;
+/// setting the flags ends it at once (the caller's loop then
+/// settles the pause/cancel through the normal paths).
+fn pace_wait(shared: &Shared, slot: Instant, charged_rate: u64, rate_now: impl Fn() -> u64) {
+    let mut wait_left = slot.saturating_duration_since(Instant::now());
+    let mut last_rate = charged_rate;
+    while !wait_left.is_zero() {
+        if shared.failed.load(Ordering::Relaxed)
+            || shared.control.cancelled.load(Ordering::Relaxed)
+            || shared.control.paused.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let rate = rate_now();
+        if rate == 0 {
+            return;
+        }
+        if rate != last_rate && last_rate > 0 {
+            wait_left = Duration::from_secs_f64(
+                wait_left.as_secs_f64() * last_rate as f64 / rate as f64,
+            );
+            last_rate = rate;
+        }
+        let step = wait_left.min(Duration::from_millis(50));
+        std::thread::sleep(step);
+        wait_left -= step;
+    }
+}
+
 fn throttle_own(shared: &Shared, n: u64, since: Instant) {
     let rate = shared.own_limit.load(Ordering::Relaxed);
     if rate == 0 || n == 0 {
         return;
     }
-    let sleep_for = {
+    let slot = {
         let mut st = plock(&shared.own_limit_state);
         let now = Instant::now();
         let slot = (*st).unwrap_or(now).max(since);
         let cost = Duration::from_secs_f64(n as f64 / rate as f64);
         *st = Some(slot + cost);
-        slot.saturating_duration_since(now)
+        slot
     };
-    if !sleep_for.is_zero() {
-        std::thread::sleep(sleep_for);
-    }
+    pace_wait(shared, slot, rate, || {
+        shared.own_limit.load(Ordering::Relaxed)
+    });
 }
 
-fn throttle_global(n: u64, since: Instant) {
+fn throttle_global(shared: &Shared, n: u64, since: Instant) {
     let rate = LIMIT_RATE.load(Ordering::Relaxed);
     if rate == 0 || n == 0 {
         return;
     }
-    let sleep_for = {
+    let slot = {
         let mut st = plock(&LIMIT_STATE);
         let now = Instant::now();
         // credit the time the bytes spent in flight: if the pacing queue has
@@ -259,11 +298,9 @@ fn throttle_global(n: u64, since: Instant) {
         let slot = (*st).unwrap_or(now).max(since);
         let cost = Duration::from_secs_f64(n as f64 / rate as f64);
         *st = Some(slot + cost);
-        slot.saturating_duration_since(now)
+        slot
     };
-    if !sleep_for.is_zero() {
-        std::thread::sleep(sleep_for);
-    }
+    pace_wait(shared, slot, rate, || LIMIT_RATE.load(Ordering::Relaxed));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -291,6 +328,13 @@ impl Status {
 pub struct Progress {
     pub total: u64,
     pub done_bytes: u64,
+    /// bytes in fully completed ("sealed") blocks only — unlike
+    /// `done_bytes`, which also counts what workers have written
+    /// toward their current unfinished blocks, this never claims a
+    /// byte a restart would have to re-fetch (finding #7: persisted
+    /// progress must be the sealed figure, or a restart visibly
+    /// regresses the bar to the last sealed block boundary)
+    pub sealed_done_bytes: u64,
     pub fetched_session: u64,
     pub speed_bps: f64,
     pub conns: usize,
@@ -398,6 +442,13 @@ struct Shared {
     /// response, so a momentary idle blip must not be able to shred
     /// every run at once
     last_split: Mutex<Option<Instant>>,
+    /// the most recent journal (resume-state) save failure, if any
+    /// (finding #8a: save_state used to swallow every error, so a
+    /// download whose journal could never be written — an unwritable
+    /// folder, an over-long journal name — ran on with no resume
+    /// protection and no signal anywhere). Cleared by the next
+    /// successful save.
+    last_journal_error: Mutex<Option<String>>,
     /// set by the engine's last writer once the terminal status is
     /// settled AND the final resume-state save has landed on disk.
     /// The supervisor settles the status FIRST and only then syncs
@@ -572,28 +623,40 @@ fn save_state(shared: &Shared, force: bool) {
     // a sharing violation, and the save that matters most — the
     // supervisor's final save, immediately followed by deleting the
     // state file — is exactly the one that must not silently fail.
-    let write_ok = match File::create(&tmp) {
-        Ok(f) => {
-            let ok = serde_json::to_writer(&f, &snapshot).is_ok();
-            let sync_ok = !force || f.sync_all().is_ok();
-            ok && sync_ok
+    //
+    // Every save syncs the journal file (and, after the rename, its
+    // directory): the periodic-save comment in the worker promises a
+    // crash or power loss loses at most the in-flight block, which is
+    // only true if the journal bytes are on stable storage, not just
+    // in the page cache. A failure anywhere is RECORDED on the job
+    // (finding #8a) instead of swallowed — a journal that can never
+    // be written means this download has no resume protection, and
+    // that must be visible, not silent.
+    let save_result: io::Result<()> = (|| {
+        {
+            let f = File::create(&tmp)?;
+            serde_json::to_writer(&f, &snapshot).map_err(io::Error::from)?;
+            f.sync_all()?;
         } // f drops here — the handle is closed before the rename
-        Err(_) => false,
-    };
-    let mut saved = false;
-    if write_ok {
-        saved = std::fs::rename(&tmp, &shared.state_path).is_ok();
-    }
-    if saved {
-        if force {
-            if let Some(dir) = shared.state_path.parent() {
-                if let Ok(d) = File::open(dir) {
-                    let _ = d.sync_all();
-                }
+        std::fs::rename(&tmp, &shared.state_path)?;
+        if let Some(dir) = shared.state_path.parent() {
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
             }
         }
-        shared.since_save.store(0, Ordering::Relaxed);
-        *last = Instant::now();
+        Ok(())
+    })();
+    match save_result {
+        Ok(()) => {
+            *plock(&shared.last_journal_error) = None;
+            shared.since_save.store(0, Ordering::Relaxed);
+            *last = Instant::now();
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            *plock(&shared.last_journal_error) =
+                Some(format!("could not save resume state: {e}"));
+        }
     }
 }
 
@@ -682,7 +745,7 @@ fn extract_suggested_name(resp: &ureq::Response, original_url: &str) -> Option<S
     query_file_name(original_url)
 }
 
-fn sanitize_suggested_name(raw: &str) -> String {
+pub fn sanitize_suggested_name(raw: &str) -> String {
     let tail = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
     let cleaned: String = tail
         .chars()
@@ -751,8 +814,61 @@ fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
     req
 }
 
+/// The host part of a URL, lower-cased, without any port — the key
+/// credential scoping compares (a CDN mirror on another host is a
+/// different origin even when it serves the same file).
+fn host_key(url: &str) -> String {
+    url_host(url)
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// `apply_auth` for a request whose target may differ from the URL
+/// the credentials were captured for (finding #13): Cookie and
+/// Authorization are credentials for ONE origin, so when the target
+/// host is not the origin host they are dropped, never replayed to
+/// the other host. The Referer is not a credential and still
+/// applies. (Redirects inside ureq are covered separately: every
+/// agent builder in this crate sets
+/// `redirect_auth_headers(RedirectAuthHeaders::Never)`, and ureq
+/// additionally strips Cookie on any redirect hop.)
+fn apply_auth_scoped(
+    req: ureq::Request,
+    auth: &Auth,
+    target_url: &str,
+    origin_url: &str,
+) -> ureq::Request {
+    if host_key(target_url) == host_key(origin_url) {
+        return apply_auth(req, auth);
+    }
+    let mut req = req;
+    if let Some(r) = &auth.referer {
+        req = req.set("Referer", r);
+    }
+    req
+}
+
+/// The response's Content-Encoding when it is a real encoding —
+/// every transfer path in this crate requests `identity`, and ureq
+/// is built without an auto-decode feature, so a server that answers
+/// with gzip/deflate anyway would have its compressed bytes saved
+/// as the finished file (finding #3). Callers must reject a response
+/// this flags: decode-or-fail is not an option without a decoder,
+/// so failing cleanly is the only non-corrupting outcome.
+pub(crate) fn response_encoding(resp: &ureq::Response) -> Option<String> {
+    let enc = resp.header("Content-Encoding")?.trim().to_ascii_lowercase();
+    if enc.is_empty() || enc == "identity" {
+        None
+    } else {
+        Some(enc)
+    }
+}
+
 fn build_agent_for(url: &str) -> ureq::Agent {
-    apply_proxy_for(ureq::AgentBuilder::new(), url)
+    apply_proxy_for(ureq::AgentBuilder::new()
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never), url)
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(30))
@@ -763,7 +879,8 @@ fn build_agent_for(url: &str) -> ureq::Agent {
 }
 
 fn build_agent() -> ureq::Agent {
-    apply_proxy(ureq::AgentBuilder::new())
+    apply_proxy(ureq::AgentBuilder::new()
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never))
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(30))
@@ -784,7 +901,8 @@ pub fn probe_with_auth(url: &str, auth: &Auth) -> Result<Probe, String> {
 /// Probing must not hang a download start for minutes: a dedicated agent
 /// with a short timeout, separate from the transfer agent.
 fn probe_agent_for(url: &str) -> ureq::Agent {
-    apply_proxy_for(ureq::AgentBuilder::new(), url)
+    apply_proxy_for(ureq::AgentBuilder::new()
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never), url)
         .timeout(Duration::from_secs(15))
         .user_agent(BROWSER_UA)
         .build()
@@ -797,6 +915,12 @@ fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     let (start, end) = range.split_once('-')?;
     let start_num: u64 = start.trim().parse().ok()?;
     let end_num: u64 = end.trim().parse().ok()?;
+    // an inverted range (end before start) is not a range at all:
+    // trusting it underflows every length computed from it downstream
+    // (finding #14)
+    if end_num < start_num {
+        return None;
+    }
     let total_num: Option<u64> = total.trim().parse().ok();
     Some((start_num, end_num, total_num))
 }
@@ -804,14 +928,27 @@ fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
 /// Confirm with a real 1-byte request that the server honours Range —
 /// some servers advertise `Accept-Ranges: bytes` but answer 200 to actual
 /// range requests; trusting the header alone bricks those downloads.
-fn verify_range(agent: &ureq::Agent, url: &str, total: u64, header_claim: bool, auth: &Auth) -> bool {
-    match apply_auth(agent.get(url), auth)
+fn verify_range(
+    agent: &ureq::Agent,
+    url: &str,
+    total: u64,
+    header_claim: bool,
+    auth: &Auth,
+    origin_url: &str,
+) -> bool {
+    // `url` is the HEAD's post-redirect address: if that is another
+    // host than the one the credentials belong to, they are scoped
+    // out (finding #13)
+    match apply_auth_scoped(agent.get(url), auth, url, origin_url)
         .set("Range", "bytes=0-0")
         .set("Accept-Encoding", "identity")
         .call()
     {
         Ok(resp) => {
             if resp.status() != 206 {
+                return false;
+            }
+            if response_encoding(&resp).is_some() {
                 return false;
             }
             // the answer must be exactly the byte we asked for, from a
@@ -867,7 +1004,6 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
 
 fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, ProbeFail> {
     let mut head_suggested: Option<String> = None;
-    let mut head_final_url: Option<String> = None;
     if let Ok(resp) = apply_auth(agent.head(url), auth).set("Accept-Encoding", "identity").call() {
         let resolved = resp.get_url().to_string();
         let etag = resp.header("ETag").map(|x| x.to_string());
@@ -877,12 +1013,16 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
             .header("Content-Length")
             .and_then(|v| v.parse::<u64>().ok())
         {
-            if total > 0 {
+            // a HEAD that answers with an encoding despite the
+            // identity request reports the ENCODED length: never
+            // trust it — fall through to the range probe, which
+            // checks its own response the same way (finding #3)
+            if total > 0 && response_encoding(&resp).is_none() {
                 let header_claim = resp
                     .header("Accept-Ranges")
                     .map(|v| v.eq_ignore_ascii_case("bytes"))
                     .unwrap_or(false);
-                let range_ok = verify_range(agent, &resolved, total, header_claim, auth);
+                let range_ok = verify_range(agent, &resolved, total, header_claim, auth, url);
                 return Ok(Probe {
                     total,
                     range_ok,
@@ -895,7 +1035,6 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
             }
         }
         head_suggested = suggested_name;
-        head_final_url = Some(resolved);
     }
     let resp = match apply_auth(agent.get(url), auth)
         .set("Range", "bytes=0-0")
@@ -904,15 +1043,30 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
     {
         Ok(r) => r,
         Err(ureq::Error::Status(416, _)) => {
-            return Ok(Probe {
-                total: 0,
-                range_ok: false,
-                unknown_size: false,
-                etag: None,
-                last_modified: None,
-                suggested_name: head_suggested,
-                final_url: head_final_url.unwrap_or_else(|| url.to_string()),
-            });
+            // A 416 to `bytes=0-0` proves only that THIS range was
+            // refused — it was once read as "the file is empty", and
+            // the caller then truncated the target and reported a
+            // 0-byte Finished (finding #2). Ask once more with a
+            // plain GET: a genuinely empty file answers 200 with a
+            // zero length (the handling below reports it as such), a
+            // real file answers with its size, and a server that
+            // refuses the plain request too is a clean error — the
+            // target is never touched on a guess.
+            match apply_auth(agent.get(url), auth)
+                .set("Accept-Encoding", "identity")
+                .call()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = format!(
+                        "probe failed: server refused the range probe (416) and the plain request: {e}"
+                    );
+                    return Err(match e {
+                        ureq::Error::Status(..) => ProbeFail::Definitive(msg),
+                        ureq::Error::Transport(_) => ProbeFail::Transient(msg),
+                    });
+                }
+            }
         }
         Err(e) => {
             // an HTTP status is the server's definitive answer;
@@ -925,6 +1079,11 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
             });
         }
     };
+    if let Some(enc) = response_encoding(&resp) {
+        return Err(ProbeFail::Definitive(format!(
+            "probe: server answered with Content-Encoding: {enc} despite an identity request"
+        )));
+    }
     let resolved = resp.get_url().to_string();
     let suggested_name = extract_suggested_name(&resp, url).or(head_suggested);
     if resp.status() == 206 {
@@ -1043,7 +1202,8 @@ fn download_block_run(
     } else {
         url.to_string()
     };
-    let mut req = apply_auth(agent.get(&req_url), &shared.auth)
+    let origin_url = plock(&shared.state).url.clone();
+    let mut req = apply_auth_scoped(agent.get(&req_url), &shared.auth, &req_url, &origin_url)
         .set("Accept-Encoding", "identity");
     if !is_gvideo {
         req = req.set("Range", &format!("bytes={req_start}-{end}"));
@@ -1058,6 +1218,14 @@ fn download_block_run(
             BlockError::Retry(format!("http: {e}"))
         }
     })?;
+    if let Some(enc) = response_encoding(&resp) {
+        // encoded bytes written at file offsets would assemble a
+        // corrupt "finished" file; the server was asked for identity
+        // and this will not change between retries (finding #3)
+        return Err(BlockError::Permanent(format!(
+            "server answered with Content-Encoding: {enc} despite an identity request"
+        )));
+    }
     let status = resp.status();
     // the end of THIS response — a server may legally answer a
     // shorter range than the run requested; the run's own `end`
@@ -1222,7 +1390,7 @@ fn download_block_run(
             };
             cap_block = split_point(first_unwritten, b_end_excl);
         }
-        throttle_global(n as u64, read_at);
+        throttle_global(&shared, n as u64, read_at);
         throttle_own(shared, n as u64, read_at);
     }
     if let Some(split) = cap_block {
@@ -1589,6 +1757,13 @@ impl Download {
         };
         Progress {
             total: self.total,
+            sealed_done_bytes: if status == Status::Finished {
+                self.total
+            } else if self.resumable {
+                plock(&self.shared.state).done_bytes()
+            } else {
+                0
+            },
             done_bytes: if status == Status::Finished && self.total > 0 {
                 self.total
             } else if self.resumable {
@@ -1655,10 +1830,21 @@ impl Download {
     /// IDM's per-download Speed Limiter tab. Applies immediately to a
     /// running download and composes with the global limit.
     pub fn set_limit(&self, bytes_per_sec: u64) {
-        self.shared.own_limit.store(bytes_per_sec, Ordering::Relaxed);
-        if bytes_per_sec == 0 {
+        let old = self.shared.own_limit.swap(bytes_per_sec, Ordering::Relaxed);
+        // a changed limit starts a fresh pacing clock, exactly like
+        // the global setter — keeping the old clock made a raised
+        // limit wait out slots reserved at the previous rate
+        if bytes_per_sec != old {
             *plock(&self.shared.own_limit_state) = None;
         }
+    }
+
+    /// The most recent resume-state (journal) save failure for this
+    /// download, if any — the surface for finding #8a's recorded
+    /// errors (the app persists this alongside the entry so a
+    /// download with no working journal is visible, not silent).
+    pub fn last_journal_error(&self) -> Option<String> {
+        plock(&self.shared.last_journal_error).clone()
     }
 
     pub fn is_terminal(&self) -> bool {
@@ -1701,6 +1887,7 @@ fn verify_block_bytes(
     agent: &ureq::Agent,
     url: &str,
     auth: &Auth,
+    origin_url: &str,
     out: &Path,
     start: u64,
     end: u64,
@@ -1710,15 +1897,22 @@ fn verify_block_bytes(
     if want == 0 {
         return true;
     }
-    let Ok(resp) = apply_auth(agent.get(url), auth)
+    let Ok(resp) = apply_auth_scoped(agent.get(url), auth, url, origin_url)
         .set("Accept-Encoding", "identity")
         .set("Range", &format!("bytes={start}-{}", end - 1))
         .call()
     else {
         return false;
     };
-    if resp.status() != 206 {
+    if resp.status() != 206 || response_encoding(&resp).is_some() {
         return false;
+    }
+    // the answer must be the range that was asked for — a server
+    // streaming from another offset would "verify" the wrong bytes
+    // (parse_content_range also rejects an inverted end < start)
+    match resp.header("Content-Range").and_then(parse_content_range) {
+        Some((s, e, _)) if s == start && e == end - 1 => {}
+        _ => return false,
     }
     let mut remote = Vec::with_capacity(want);
     if resp
@@ -1738,6 +1932,59 @@ fn verify_block_bytes(
     }
     let mut local = vec![0u8; want];
     f.read_exact(&mut local).is_ok() && local == remote
+}
+
+/// Process-wide registry of output paths a live download is
+/// writing (finding #10): two downloads started on the same path —
+/// a double-clicked catch, a queue race — used to interleave writes
+/// into the same file and the same journal, corrupting both while
+/// each reported progress. Registration fails fast instead; the
+/// guard is held by the download's supervisor thread and released
+/// when it settles, on every exit path.
+static IN_FLIGHT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+struct InFlightGuard(PathBuf);
+
+impl InFlightGuard {
+    fn register(out: &Path) -> Result<Self, String> {
+        // the same file reached by different relative spellings is
+        // the same path: normalise lexically against the cwd
+        let key = if out.is_absolute() {
+            out.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(out))
+                .unwrap_or_else(|_| out.to_path_buf())
+        };
+        let key: PathBuf = {
+            let mut parts: Vec<std::path::Component> = Vec::new();
+            for c in key.components() {
+                match c {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        parts.pop();
+                    }
+                    other => parts.push(other),
+                }
+            }
+            parts.iter().collect()
+        };
+        let mut registry = plock(&IN_FLIGHT);
+        if registry.contains(&key) {
+            return Err(format!(
+                "another download is already writing {}",
+                out.display()
+            ));
+        }
+        registry.push(key.clone());
+        Ok(Self(key))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        plock(&IN_FLIGHT).retain(|p| p != &self.0);
+    }
 }
 
 pub fn start(
@@ -1794,6 +2041,10 @@ fn start_impl(
     // an absurd block size is clamped, not trusted (overflow bait)
     let block_size = block_size.min(64 * 1024 * 1024);
     let max_conn = max_conn.clamp(1, 64);
+    // one live writer per output path (finding #10): register
+    // before any probing or file I/O so a collision fails fast,
+    // and hand the guard to whichever thread settles this download
+    let in_flight = InFlightGuard::register(out)?;
     let agent = build_agent_for(url);
     let probed = match pre_probed {
         Some(p) => p,
@@ -1813,7 +2064,7 @@ fn start_impl(
     }
 
     if !probed.range_ok {
-        return start_single_stream(url, out, probed, control, state_path, auth);
+        return start_single_stream(url, out, probed, control, state_path, auth, in_flight);
     }
 
     let mut existing_state = std::fs::read(&state_path)
@@ -1847,18 +2098,40 @@ fn start_impl(
     // filter on size alone — and a same-size replacement file would
     // be spliced with the old blocks and reported Finished. When
     // neither validator pair is usable, prove the splice first:
-    // fetch the first completed block fresh and byte-compare it
-    // against the partial on disk; anything but an exact match
+    // byte-compare a sample of the completed blocks against fresh
+    // range GETs — the first, the last and a deterministic spread
+    // between them (all of them when there are only a few, which is
+    // the common case). Checking only the first block, as this once
+    // did, lets a replacement that differs anywhere later splice
+    // through. Anything but an exact match on every sampled block
     // discards the state and starts over.
     if let Some(s) = &existing_state {
         let validators_usable = (s.etag.is_some() && probed.etag.is_some())
             || (s.last_modified.is_some() && probed.last_modified.is_some());
         if !validators_usable {
-            if let Some(first) = s.done.iter().position(|&b| b == 1) {
+            let done_idx: Vec<usize> = s
+                .done
+                .iter()
+                .enumerate()
+                .filter(|(_, &b)| b == 1)
+                .map(|(i, _)| i)
+                .collect();
+            if !done_idx.is_empty() {
+                let mut picks: Vec<usize> = Vec::new();
+                for k in 0..=7usize {
+                    let idx = done_idx[(done_idx.len() - 1) * k / 7];
+                    if !picks.contains(&idx) {
+                        picks.push(idx);
+                    }
+                }
                 let bs = s.block_size;
-                let start = first as u64 * bs;
-                let end = (((first as u64) + 1) * bs).min(s.total);
-                if !verify_block_bytes(&agent, &probed.final_url, auth, out, start, end) {
+                let total = s.total;
+                let all_match = picks.iter().all(|&b| {
+                    let start = b as u64 * bs;
+                    let end = ((b as u64 + 1) * bs).min(total);
+                    verify_block_bytes(&agent, &probed.final_url, auth, url, out, start, end)
+                });
+                if !all_match {
                     existing_state = None;
                 }
             }
@@ -1954,6 +2227,7 @@ fn start_impl(
         requeue: Mutex::new(Vec::new()),
         waiting_workers: AtomicUsize::new(0),
         last_split: Mutex::new(None),
+        last_journal_error: Mutex::new(None),
         settled: AtomicBool::new(false),
         auth: auth.clone(),
     });
@@ -2037,6 +2311,9 @@ fn start_impl(
             // landed: removal paths waiting on is_settled may now
             // sweep the state file without racing this thread (R4)
             s.settled.store(true, Ordering::SeqCst);
+            // the path is free for a future download only now that
+            // this one has fully settled (finding #10)
+            drop(in_flight);
         });
     }
     // status tracker: keeps Paused/Downloading fresh while running
@@ -2099,6 +2376,7 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         requeue: Mutex::new(Vec::new()),
         waiting_workers: AtomicUsize::new(0),
         last_split: Mutex::new(None),
+        last_journal_error: Mutex::new(None),
         settled: AtomicBool::new(true),
         auth: Auth::default(),
     });
@@ -2118,6 +2396,7 @@ fn start_single_stream(
     control: Arc<Control>,
     state_path: PathBuf,
     auth: &Auth,
+    in_flight: InFlightGuard,
 ) -> Result<Arc<Download>, String> {
     // fallback for servers without Range support: no resume, no acceleration
     let shared = Arc::new(Shared {
@@ -2152,6 +2431,7 @@ fn start_single_stream(
         requeue: Mutex::new(Vec::new()),
         waiting_workers: AtomicUsize::new(0),
         last_split: Mutex::new(None),
+        last_journal_error: Mutex::new(None),
         settled: AtomicBool::new(false),
         auth: auth.clone(),
     });
@@ -2174,6 +2454,11 @@ fn start_single_stream(
                 .set("Accept-Encoding", "identity")
                 .call()
                 .map_err(|e| format!("http: {e}"))?;
+            if let Some(enc) = response_encoding(&resp) {
+                return Err(format!(
+                    "server answered with Content-Encoding: {enc} despite an identity request"
+                ));
+            }
             let mut reader = resp.into_reader();
             let f = File::create(&out).map_err(|e| format!("create: {e}"))?;
             let mut buf = vec![0u8; 512 * 1024];
@@ -2233,7 +2518,7 @@ fn start_single_stream(
                 if let Some(cb) = shared.conn_bytes.first() {
                     cb.fetch_add(n as u64, Ordering::Relaxed);
                 }
-                throttle_global(n as u64, read_at);
+                throttle_global(&shared, n as u64, read_at);
                 throttle_own(&shared, n as u64, read_at);
             }
             // a clean early EOF must not pose as a finished file
@@ -2301,6 +2586,7 @@ fn start_single_stream(
         // settled contract is uniform: the terminal status above
         // is the last write, so removal paths may proceed (R4)
         shared.settled.store(true, Ordering::SeqCst);
+        drop(in_flight);
     });
     Ok(download)
 }
@@ -2339,7 +2625,7 @@ pub fn peek_state(url: &str, out: &Path) -> Option<Peeked> {
     })
 }
 
-pub fn state_path_for(out: &Path) -> PathBuf {
+fn legacy_state_path_for(out: &Path) -> PathBuf {
     let ext = out
         .extension()
         .map(|e| e.to_string_lossy().to_string())
@@ -2349,6 +2635,43 @@ pub fn state_path_for(out: &Path) -> PathBuf {
     } else {
         out.with_extension(format!("{ext}.ndm.json"))
     }
+}
+
+pub fn state_path_for(out: &Path) -> PathBuf {
+    let legacy = legacy_state_path_for(out);
+    // a journal an earlier version already wrote keeps its name:
+    // resume compatibility is checked before any renaming applies
+    if legacy.exists() {
+        return legacy;
+    }
+    let legacy_name = legacy
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if legacy_name.len() <= 255 {
+        return legacy;
+    }
+    // Finding #8b: "<name>.ndm.json" pushes output names of ~247+
+    // bytes past the 255-byte filesystem limit, so those downloads
+    // could never journal at all (every save failed, silently).
+    // Derive a bounded name instead: as much of the original stem
+    // as fits, plus a short stable hash of the full journal name so
+    // two different long names that share a prefix still get
+    // different journals. ~82 Bengali characters (3 bytes each)
+    // land here.
+    let mut hasher = Sha256::new();
+    hasher.update(legacy_name.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    let suffix = format!(".{}.ndm.json", &hash[..12]);
+    // 4 bytes of the 255 stay in reserve: save_state's scratch name
+    // replaces the ".json" tail with ".json.tmp" (+4), and it must
+    // fit the same limit or the save fails exactly like before
+    let budget = (255usize - 4).saturating_sub(suffix.len());
+    let mut end = legacy_name.len().min(budget);
+    while end > 0 && !legacy_name.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.with_file_name(format!("{}{}", &legacy_name[..end], suffix))
 }
 
 pub fn sha256_of(path: &Path) -> io::Result<String> {
@@ -2392,7 +2715,8 @@ pub struct GrabPage {
 const MAX_GRAB_ITEMS: usize = 300;
 
 fn grab_agent_for(url: &str, timeout_secs: u64) -> ureq::Agent {
-    apply_proxy_for(ureq::AgentBuilder::new(), url)
+    apply_proxy_for(ureq::AgentBuilder::new()
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never), url)
         .timeout(Duration::from_secs(timeout_secs))
         .user_agent(BROWSER_UA)
         .build()
@@ -2821,17 +3145,22 @@ fn percent_decode(s: &str) -> String {
 
 fn probe_size(agent: &ureq::Agent, url: &str) -> Option<u64> {
     if let Ok(resp) = agent.head(url).set("Accept-Encoding", "identity").call() {
-        if let Some(len) = resp
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-        {
-            if len > 0 {
-                return Some(len);
+        if response_encoding(&resp).is_none() {
+            if let Some(len) = resp
+                .header("Content-Length")
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                if len > 0 {
+                    return Some(len);
+                }
             }
         }
     }
     // fall back to a 1-byte range request and read the total from Content-Range
     if let Ok(resp) = agent.get(url).set("Range", "bytes=0-0").set("Accept-Encoding", "identity").call() {
+        if response_encoding(&resp).is_some() {
+            return None;
+        }
         if let Some(cr) = resp.header("Content-Range") {
             if let Some(total) = cr.rsplit('/').next().and_then(|v| v.parse::<u64>().ok()) {
                 return Some(total);
@@ -2856,6 +3185,11 @@ pub fn grab_page(url: &str) -> Result<GrabPage, String> {
         .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| format!("could not fetch the page: {e}"))?;
+    if let Some(enc) = response_encoding(&resp) {
+        return Err(format!(
+            "the page was served with Content-Encoding: {enc} despite an identity request"
+        ));
+    }
     let final_url = resp.get_url().to_string();
     let mut body = Vec::new();
     {
@@ -3061,6 +3395,9 @@ fn content_type_ext(ctype: &str) -> String {
 
 fn fetch_page(agent: &ureq::Agent, url: &str) -> Option<PageFetch> {
     let resp = agent.get(url).set("Accept-Encoding", "identity").call().ok()?;
+    if response_encoding(&resp).is_some() {
+        return None;
+    }
     let final_url = resp.get_url().to_string();
     let ctype = resp
         .header("Content-Type")
@@ -4437,3 +4774,589 @@ mod tests {
     }
 }
 
+
+// ---------- 2.0.7 deep-hunt batch (engine): findings #2, #3, #7,
+// #8, #9, #10, #13, #14 + engine minors ----------
+
+#[cfg(test)]
+mod audit207_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn pattern_body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
+    }
+
+    fn wait_terminal(dl: &Download, deadline: Duration) -> Option<Status> {
+        let t0 = Instant::now();
+        loop {
+            if dl.is_terminal() {
+                return Some(dl.status());
+            }
+            if t0.elapsed() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_settled(dl: &Download, deadline: Duration) {
+        let t0 = Instant::now();
+        while !dl.is_settled() {
+            assert!(t0.elapsed() < deadline, "download never settled");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    struct Req {
+        method: String,
+        path: String,
+        range: Option<String>,
+        headers: Vec<(String, String)>,
+    }
+
+    impl Req {
+        fn header(&self, name: &str) -> Option<String> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// A loopback server whose response is fully decided by the
+    /// handler closure: it receives the parsed request and returns
+    /// the complete raw HTTP response.
+    fn test_server<F>(handler: F) -> u16
+    where
+        F: Fn(&Req) -> Vec<u8> + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = Arc::new(handler);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let handler = handler.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("/").to_string();
+                    let mut headers = Vec::new();
+                    let mut range = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                if let Some((k, v)) = h.split_once(':') {
+                                    let v = v.trim().to_string();
+                                    if k.trim().eq_ignore_ascii_case("range") {
+                                        range = Some(v.clone());
+                                    }
+                                    headers.push((k.trim().to_string(), v));
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let req = Req { method, path, range, headers };
+                    let resp = handler(&req);
+                    let _ = s.write_all(&resp);
+                });
+            }
+        });
+        port
+    }
+
+    fn http_resp(status: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {status}\r\n").into_bytes();
+        for (k, v) in headers {
+            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"Connection: close\r\n\r\n");
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A proper range server; every GET answer is delayed by `delay`
+    /// so tests can act while a download is genuinely in flight.
+    fn delayed_range_server(body: Vec<u8>, delay: Duration) -> u16 {
+        let body = Arc::new(body);
+        test_server(move |req| {
+            let total = body.len() as u64;
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            std::thread::sleep(delay);
+            if let Some(r) = &req.range {
+                let r = r.trim().strip_prefix("bytes=").unwrap_or(r);
+                let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+                let a: u64 = a.parse().unwrap_or(0);
+                let b: u64 = if b.is_empty() { total - 1 } else { b.parse().unwrap_or(total - 1) };
+                let end = b.min(total - 1);
+                let slice = &body[a as usize..=end as usize];
+                return http_resp(
+                    "206 Partial Content",
+                    &[
+                        ("Content-Range", format!("bytes {a}-{end}/{total}")),
+                        ("Content-Length", slice.len().to_string()),
+                    ],
+                    slice,
+                );
+            }
+            http_resp("200 OK", &[("Content-Length", total.to_string())], &body)
+        })
+    }
+
+    // --- #14: inverted Content-Range is not a range ---
+
+    #[test]
+    fn content_range_with_end_before_start_is_rejected() {
+        assert_eq!(parse_content_range("bytes 500-499/1000"), None);
+        assert_eq!(parse_content_range("bytes 5-3/100"), None);
+        assert_eq!(
+            parse_content_range("bytes 499-500/1000"),
+            Some((499, 500, Some(1000)))
+        );
+    }
+
+    // --- #2: 416 must never become a 0-byte Finished ---
+
+    #[test]
+    fn range_416_refusal_is_a_clean_error_and_the_target_is_untouched() {
+        let port = test_server(|req| {
+            if req.method == "HEAD" {
+                return http_resp("405 Method Not Allowed", &[("Content-Length", "0".to_string())], &[]);
+            }
+            http_resp(
+                "416 Range Not Satisfiable",
+                &[("Content-Range", "bytes */0".to_string()), ("Content-Length", "0".to_string())],
+                &[],
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let err = probe(&url).expect_err("a server refusing every request must fail the probe");
+        assert!(err.contains("416"), "unexpected error: {err}");
+
+        let out = std::env::temp_dir().join(format!("ndm-207-416-{}.bin", std::process::id()));
+        std::fs::write(&out, b"PRE-EXISTING CONTENT").unwrap();
+        let r = start(&url, &out, 2, 256 * 1024);
+        assert!(r.is_err(), "start must fail cleanly, got a download handle");
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"PRE-EXISTING CONTENT",
+            "the target must never be truncated on a 416 guess"
+        );
+        assert!(!state_path_for(&out).exists());
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn range_416_with_a_plain_get_fallback_downloads_the_real_file() {
+        let body = pattern_body(200_000);
+        let body2 = body.clone();
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp("405 Method Not Allowed", &[("Content-Length", "0".to_string())], &[]);
+            }
+            if req.range.is_some() {
+                return http_resp(
+                    "416 Range Not Satisfiable",
+                    &[("Content-Range", "bytes */200000".to_string()), ("Content-Length", "0".to_string())],
+                    &[],
+                );
+            }
+            http_resp("200 OK", &[("Content-Length", body2.len().to_string())], &body2)
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let p = probe(&url).expect("plain-GET fallback must probe the real file");
+        assert_eq!(p.total, 200_000);
+        assert!(!p.range_ok);
+
+        let out = std::env::temp_dir().join(format!("ndm-207-416fb-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- #3: Content-Encoding must never be saved as the file ---
+
+    #[test]
+    fn gzip_probe_answers_are_rejected() {
+        let port = test_server(|req| {
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", "1234".to_string()),
+                        ("Content-Encoding", "gzip".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            http_resp(
+                "206 Partial Content",
+                &[
+                    ("Content-Range", "bytes 0-0/200000".to_string()),
+                    ("Content-Length", "1".to_string()),
+                    ("Content-Encoding", "gzip".to_string()),
+                ],
+                &[42],
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let err = probe(&url).expect_err("an encoded probe answer must fail");
+        assert!(err.contains("Content-Encoding"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn gzip_block_answers_fail_the_download_cleanly() {
+        let body = pattern_body(1024 * 1024);
+        let body2 = body.clone();
+        let port = test_server(move |req| {
+            let total = body2.len() as u64;
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            let r = req.range.clone().unwrap_or_default();
+            if r == "bytes=0-0" {
+                return http_resp(
+                    "206 Partial Content",
+                    &[
+                        ("Content-Range", format!("bytes 0-0/{total}")),
+                        ("Content-Length", "1".to_string()),
+                    ],
+                    &body2[0..1],
+                );
+            }
+            // every real block: a valid-looking range answer whose
+            // body is labelled gzip — the engine must refuse it, not
+            // write it at the block's offset
+            let r = r.trim().strip_prefix("bytes=").unwrap_or(&r).to_string();
+            let (a, b) = r.split_once('-').unwrap_or(("0", "0"));
+            let a: u64 = a.parse().unwrap_or(0);
+            let b: u64 = b.parse().unwrap_or(0);
+            let garbage = vec![0x1fu8; (b - a + 1) as usize];
+            http_resp(
+                "206 Partial Content",
+                &[
+                    ("Content-Range", format!("bytes {a}-{b}/{total}")),
+                    ("Content-Length", garbage.len().to_string()),
+                    ("Content-Encoding", "gzip".to_string()),
+                ],
+                &garbage,
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = std::env::temp_dir().join(format!("ndm-207-gzip-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(
+            wait_terminal(&dl, Duration::from_secs(60)),
+            Some(Status::Error),
+            "encoded blocks must end in a clean error, got {:?}",
+            dl.status()
+        );
+        let p = dl.progress();
+        assert!(
+            p.error.as_deref().unwrap_or("").contains("Content-Encoding"),
+            "error must name the cause: {:?}",
+            p.error
+        );
+        wait_settled(&dl, Duration::from_secs(10));
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    // --- #13: credentials never cross hosts ---
+
+    #[test]
+    fn cross_host_redirect_and_resolve_drop_cookie_and_authorization() {
+        let body = pattern_body(4096);
+        let body2 = body.clone();
+        let seen: Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let port = test_server(move |req| {
+            seen2.lock().unwrap().push((
+                req.path.clone(),
+                req.header("Cookie"),
+                req.header("Authorization"),
+            ));
+            let total = body2.len() as u64;
+            if req.path == "/start" {
+                // same server, OTHER host name: 127.0.0.1 -> localhost
+                let host = req.header("Host").unwrap_or_default();
+                let port = host.rsplit(':').next().unwrap_or("").to_string();
+                return http_resp(
+                    "302 Found",
+                    &[("Location", format!("http://localhost:{port}/landing"))],
+                    &[],
+                );
+            }
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if let Some(r) = &req.range {
+                let r = r.trim().strip_prefix("bytes=").unwrap_or(r);
+                let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+                let a: u64 = a.parse().unwrap_or(0);
+                let b: u64 = if b.is_empty() { total - 1 } else { b.parse().unwrap_or(total - 1) };
+                let end = b.min(total - 1);
+                let slice = &body2[a as usize..=end as usize];
+                return http_resp(
+                    "206 Partial Content",
+                    &[
+                        ("Content-Range", format!("bytes {a}-{end}/{total}")),
+                        ("Content-Length", slice.len().to_string()),
+                    ],
+                    slice,
+                );
+            }
+            http_resp("200 OK", &[("Content-Length", total.to_string())], &body2)
+        });
+        let url = format!("http://127.0.0.1:{port}/start");
+        let auth = Auth {
+            cookie: Some("session=secret".to_string()),
+            referer: Some("http://127.0.0.1/page".to_string()),
+            authorization: Some("Basic abc".to_string()),
+        };
+        let _ = probe_with_auth(&url, &auth);
+        let seen = seen.lock().unwrap();
+        let start_reqs: Vec<_> = seen.iter().filter(|(p, _, _)| p == "/start").collect();
+        assert!(!start_reqs.is_empty(), "the origin must have been asked");
+        assert!(
+            start_reqs.iter().all(|(_, c, a)| c.as_deref() == Some("session=secret")
+                && a.as_deref() == Some("Basic abc")),
+            "the origin host must receive its credentials: {start_reqs:?}"
+        );
+        let landing: Vec<_> = seen.iter().filter(|(p, _, _)| p == "/landing").collect();
+        assert!(!landing.is_empty(), "the redirect must have been followed");
+        assert!(
+            landing.iter().all(|(_, c, a)| c.is_none() && a.is_none()),
+            "no credential may reach the other host: {landing:?}"
+        );
+    }
+
+    // --- #8b: bounded journal names ---
+
+    #[test]
+    fn state_path_for_bounds_long_names_and_keeps_legacy() {
+        let dir = std::env::temp_dir().join(format!("ndm-207-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 82 Bengali characters = 246 bytes, + ".bin": the legacy
+        // journal name would be 259 bytes — over the 255 limit
+        let name = format!("{}.bin", "অ".repeat(82));
+        let out = dir.join(&name);
+        let sp = state_path_for(&out);
+        let journal_name = sp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            journal_name.len() <= 255,
+            "journal name must fit the filesystem limit: {} bytes",
+            journal_name.len()
+        );
+        assert_eq!(sp, state_path_for(&out), "bounded name must be stable");
+        let other = dir.join(format!("{}.bin", "আ".repeat(82)));
+        assert_ne!(sp, state_path_for(&other), "different long names need different journals");
+        // names within the limit keep the legacy journal name
+        // untouched (the legacy file of a >255-byte name can never
+        // exist — that impossibility is the bug being fixed)
+        let short = dir.join("short.bin");
+        assert_eq!(state_path_for(&short), legacy_state_path_for(&short));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_bengali_name_journals_and_resumes() {
+        let body = pattern_body(2 * 1024 * 1024);
+        let port = delayed_range_server(body.clone(), Duration::from_millis(150));
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let dir = std::env::temp_dir().join(format!("ndm-207-bn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join(format!("{}.bin", "অ".repeat(82)));
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        let t0 = Instant::now();
+        while dl.progress().sealed_done_bytes == 0 {
+            assert!(t0.elapsed() < Duration::from_secs(30), "no block ever sealed");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        dl.control.cancel();
+        wait_settled(&dl, Duration::from_secs(30));
+        let sealed_at_cut = dl.progress().sealed_done_bytes;
+        drop(dl);
+        let journal = state_path_for(&out);
+        assert!(journal.exists(), "the long name must still journal");
+        let raw = std::fs::read(&journal).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let credited = v["done"].as_array().unwrap().iter().filter(|b| **b == 1).count() as u64;
+        assert!(credited >= 1, "journal must credit the sealed blocks");
+        assert_eq!(
+            sealed_at_cut,
+            credited * 256 * 1024,
+            "sealed_done_bytes must equal exactly what the journal credits"
+        );
+        let dl2 = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl2, Duration::from_secs(60)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert!(!journal.exists(), "finished download removes its journal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- #8a: journal save failures are recorded ---
+
+    #[test]
+    fn journal_save_failure_is_recorded_on_the_download() {
+        let control = Arc::new(Control {
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        });
+        let dl = finished_empty_download(
+            control,
+            PathBuf::from("/tmp/ndm-207-no-such-dir/state.ndm.json"),
+        );
+        assert!(dl.last_journal_error().is_none());
+        save_state(&dl.shared, true);
+        let err = dl.last_journal_error().expect("the failed save must be recorded");
+        assert!(err.contains("resume state"), "unexpected record: {err}");
+    }
+
+    // --- #9: pacing waits are sliced, halt- and limit-aware ---
+
+    #[test]
+    fn pace_wait_obeys_halt_and_a_cleared_limit() {
+        let control = Arc::new(Control {
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        });
+        let dl = finished_empty_download(control, PathBuf::from("/tmp/ndm-207-pace.ndm.json"));
+        // a cleared limit ends the wait at once
+        let t0 = Instant::now();
+        pace_wait(&dl.shared, Instant::now() + Duration::from_secs(30), 1000, || 0);
+        assert!(t0.elapsed() < Duration::from_millis(500), "cleared limit must end the wait");
+        // a pause ends the wait at once
+        dl.control.pause();
+        let t0 = Instant::now();
+        pace_wait(&dl.shared, Instant::now() + Duration::from_secs(30), 1000, || 1000);
+        assert!(t0.elapsed() < Duration::from_millis(500), "pause must interrupt the wait");
+        dl.control.resume();
+        // an ordinary short wait still waits
+        let t0 = Instant::now();
+        pace_wait(&dl.shared, Instant::now() + Duration::from_millis(200), 1000, || 1000);
+        assert!(t0.elapsed() >= Duration::from_millis(150), "the slot must be honoured");
+    }
+
+    // --- MINOR: per-download set_limit resets the pacing clock ---
+
+    #[test]
+    fn set_limit_change_resets_the_pacing_clock() {
+        let control = Arc::new(Control {
+            paused: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        });
+        let dl = finished_empty_download(control, PathBuf::from("/tmp/ndm-207-limit.ndm.json"));
+        dl.shared.own_limit.store(500, Ordering::Relaxed);
+        *plock(&dl.shared.own_limit_state) = Some(Instant::now());
+        dl.set_limit(500);
+        assert!(
+            plock(&dl.shared.own_limit_state).is_some(),
+            "an unchanged limit keeps its clock"
+        );
+        dl.set_limit(900);
+        assert!(
+            plock(&dl.shared.own_limit_state).is_none(),
+            "a changed limit must reset the pacing clock"
+        );
+    }
+
+    // --- #10: one live writer per output path ---
+
+    #[test]
+    fn in_flight_registry_rejects_duplicates_and_releases() {
+        let dir = std::env::temp_dir().join(format!("ndm-207-reg-{}", std::process::id()));
+        let out = dir.join("f.bin");
+        let g = InFlightGuard::register(&out).unwrap();
+        assert!(InFlightGuard::register(&out).is_err());
+        // the same file via a different spelling is the same path
+        let alt = dir.join("sub/../f.bin");
+        assert!(InFlightGuard::register(&alt).is_err());
+        drop(g);
+        let _g2 = InFlightGuard::register(&out).unwrap();
+    }
+
+    #[test]
+    fn second_start_on_the_same_path_fails_fast() {
+        let body = pattern_body(8 * 1024 * 1024);
+        let port = delayed_range_server(body.clone(), Duration::from_millis(200));
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = std::env::temp_dir().join(format!("ndm-207-dupe-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        let err = start(&url, &out, 4, 256 * 1024)
+            .err()
+            .expect("a second live start on the same path must fail");
+        assert!(err.contains("already writing"), "unexpected error: {err}");
+        dl.control.cancel();
+        wait_settled(&dl, Duration::from_secs(30));
+        drop(dl);
+        // after the first download settles, the path is free again
+        let dl2 = start(&url, &out, 4, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl2, Duration::from_secs(90)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- #7: sealed_done_bytes on a finished download ---
+
+    #[test]
+    fn sealed_done_bytes_reaches_total_on_finish() {
+        let dl = finished_empty_download(
+            Arc::new(Control {
+                paused: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+            }),
+            PathBuf::from("/tmp/ndm-207-sealed.ndm.json"),
+        );
+        let p = dl.progress();
+        assert_eq!(p.sealed_done_bytes, p.total);
+    }
+}

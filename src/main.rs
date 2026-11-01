@@ -132,6 +132,14 @@ fn main() {
             break;
         }
     }
+    // is_terminal flips when the status settles, BEFORE the
+    // supervisor's final journal save lands — exiting on it alone
+    // could cut that save off and overstate what a resume would
+    // find. Wait for the settled flag: the supervisor sets it only
+    // after the final save, on every outcome.
+    while !dl.is_settled() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let p = dl.progress();
     match p.status {
         Status::Finished => {
