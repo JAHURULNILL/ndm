@@ -54,7 +54,7 @@
   !define OUTFILE "NDM_${VERSION}_x64-setup.exe"
 !endif
 !ifndef ICON
-  !define ICON "${__FILEDIR__}\..\src-tauri\icons\icon.ico"
+  !define ICON "..\src-tauri\icons\icon.ico"
 !endif
 !define APPNAME "Nill Download Manager"
 !define REGKEY "Software\Nill Download Manager"
@@ -148,7 +148,7 @@ Section "Install"
   ; the installer. Its exit code is ignored by design.
   InitPluginsDir
   SetOutPath "$PLUGINSDIR"
-  File "${__FILEDIR__}/webview2-setup.ps1"
+  File "webview2-setup.ps1"
   nsExec::ExecToLog /TIMEOUT=1650000 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$PLUGINSDIR\webview2-setup.ps1"'
   Pop $0
   SetOutPath "$INSTDIR"
