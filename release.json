@@ -1,12 +1,12 @@
 {
- "deb_sha256": "4a45bcd7bbbdc2295366594122d85804610dc84f7601010087a326eae6b63e98",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.6/NDM_2.0.6_amd64.deb",
- "ext_sha256": "ca39d68ba6584f320bb735752ab5ffcfd467cf7dac3fa241a73ce6645cee98ad",
- "min_supported": "2.0.6",
- "notes": "Nill Download Manager 2.0.6 fixes the rough edges found in a full review of the download flow. Asking for a video that is already downloaded now says so, in place, with Download again and Show in NDM — and shows the real state, including Retry, when the earlier copy failed. File downloads (ISOs, archives, programs) now get the same progress card videos always had, with the same pause and cancel. A video's total size is locked once its parts are measured, so the percentage no longer jumps mid-download, and the card now shows real phases — Preparing, then Receiving data, then Merging video + audio — instead of guessing. Duplicate 60fps labels are gone, estimated sizes are marked with a ~, the audio option no longer claims MP3 when the file is M4A, and Download all no longer counts files you already have as new downloads. Completion popups no longer stack up when several downloads finish in a row. The app also opens without the white flash, and update notes display in full.",
- "version": "2.0.6",
- "win_setup_sha256": "9df04e74d074f3c86cd9e6075ce29da6d7f1c4d8914010c1e81acd98fcf54caa",
- "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.6/NDM_2.0.6_x64-setup.exe",
- "win_sha256": "a5550eea28e2594c002331ec5884f49bc5df7e3def482d52e4e24d5be464a3d9",
- "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.6/NDM_2.0.6_Windows_Portable.zip"
+ "version": "2.0.7",
+ "min_supported": "2.0.7",
+ "notes": "Nill Download Manager 2.0.7 is a reliability release — every issue from a full audit of the engine, the app and the browser extension, fixed. Downloads can no longer be lost or misreported. A full disk now surfaces as an honest error instead of taking the app down; servers that refuse range requests or answer with encoded bodies produce a clean retry or a clean error, never a fake Finished file; automatic retries stop at their limit instead of running forever. Pausing and restarting keeps exactly the bytes that are safely on disk — long Bengali filenames included — and a finished merge survives a restart instead of downloading everything again into a duplicate. Pressing Start a second time while a download is still starting changes nothing. The browser hand-off now follows the rule professional download managers use: the browser copy is paused first and removed only once NDM has confirmed it owns the download; if anything fails, the browser download simply resumes — a download always exists somewhere. Queue limits hold on every start path, the update offer can no longer be missed on a cold start, and a required-update state clears itself if the feed is corrected. 2.0.7 is a required update for older versions.",
+ "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.7/NDM_2.0.7_amd64.deb",
+ "deb_sha256": "c43573d9b3ebe75abcc82968d5d3cabe09a0ed67572c857f8ec98b2612f04353",
+ "ext_sha256": "3f8659747a4dabcc2cb65a36e27576df1dbc7f43d665ee0912b39091bd7d7f31",
+ "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.7/NDM_2.0.7_Windows_Portable.zip",
+ "win_sha256": "7df695378c53767c0df9ade143c0a347415f8026514dcd2a6a09af360f499860",
+ "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.7/NDM_2.0.7_x64-setup.exe",
+ "win_setup_sha256": "40d1a237326ccfcadf105ee91740debf6703826c36981bfecf25e2877c5383c6"
 }
