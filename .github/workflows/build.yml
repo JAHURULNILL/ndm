@@ -74,6 +74,11 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
+  env:
+        # Belt-and-braces with the .cargo/config.toml files: guarantee
+        # +crt-static reaches every rustc invocation in this job.
+        RUSTFLAGS: "-C target-feature=+crt-static"
+  
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -102,6 +107,10 @@ jobs:
           New-Item -ItemType Directory -Force $dir | Out-Null
           Copy-Item src-tauri/target/release/ndm-app.exe $dir/
           Copy-Item target/release/ndm-host.exe $dir/
+          # ndm-app.exe links the WebView2 loader DLL (patched
+          # webview2-com-sys) - it must sit beside the exe, in the
+          # portable ZIP and, via SRCROOT, in the NSIS installer.
+          Copy-Item src-tauri/vendor/webview2-com-sys/x64/WebView2Loader.dll $dir/
           Copy-Item extension $dir/extension -Recurse
           Compress-Archive $dir "NDM_${v}_Windows_Portable.zip"
       - name: Smoke — host handshake (gate) + app launch (report)
