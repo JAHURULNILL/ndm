@@ -556,12 +556,21 @@ mod tests {
     #[test]
     fn download_extracts_a_verified_nested_binary() {
         // the ffmpeg shape end-to-end: a zip whose binary is nested
-        // under a versioned folder lands at dir/<name>
+        // under a versioned folder lands at dir/<name>. The entry
+        // must carry the platform's installed name — test-tool.exe
+        // on Windows, where the real archives likewise ship
+        // ffmpeg.exe / deno.exe; a bare "test-tool" entry is a
+        // fixture only a non-Windows lookup could ever find.
         let dir = temp_dir("dl-zip");
-        let zip_path = make_zip(
-            &dir,
-            &[("pkg-1.0/bin/test-tool", b"zipped-binary")],
+        let entry = format!(
+            "pkg-1.0/bin/{}",
+            if cfg!(target_os = "windows") {
+                "test-tool.exe"
+            } else {
+                "test-tool"
+            }
         );
+        let zip_path = make_zip(&dir, &[(&entry, b"zipped-binary")]);
         let zip_bytes = std::fs::read(&zip_path).unwrap();
         let spec = ComponentSpec {
             name: "test-tool",
