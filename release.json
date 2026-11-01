@@ -1,12 +1,1 @@
-{
- "deb_sha256": "b3993f9863c92ea2bef90ab468c89ee109786a0c916d9a8e23678278e5859634",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_amd64.deb",
- "ext_sha256": "7badbf7187b391404c11c24e5ea62a8acbf9fd19ddfc00a152d0d7ff6f968309",
- "min_supported": "1.0.0",
- "notes": "Nill Download Manager 2.0.5 is a compatibility fix for older Windows. The app and its browser-bridge program now carry their C runtime with them instead of borrowing it from the system, so they start on Windows 7 and 8 machines where that runtime was never installed \u2014 previously the app closed instantly with a missing-DLL error there. The installer also looks after the WebView2 runtime the app window is drawn with. It is part of Windows 10 and 11, but on Windows 7, 8 and 8.1 the installer now sets up the last WebView2 version that runs on those systems \u2014 a pinned copy of Microsoft's own 109.0.1518.78 installer, checked against its SHA-256 before it runs \u2014 downloaded once during setup and installed silently in the background, with nothing for the user to click. Machines that already have both runtimes are completely unaffected, and the package sizes stay in the same small class. Everything else is unchanged.",
- "version": "2.0.5",
- "win_setup_sha256": "",
- "win_setup_url": "",
- "win_sha256": "",
- "win_url": ""
-}
+{"deb_sha256":"5da2f9e3ef90bf910063ed929c85eea0ec604821ae2ff711f22a36be0d9dae4a","deb_url":"https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_amd64.deb","ext_sha256":"72ccef3ad04cd01c1a3be9e3a728481c9ea80a371b784db0b67259df93c1c354","min_supported":"1.0.0","notes":"Windows compatibility work: the installer now sets up the last compatible WebView2 automatically on machines that lack it, and the browser bridge carries its own runtime. The main app's Windows 7/8 runtime fix follows in 2.0.6.","version":"2.0.5","win_setup_sha256":"dfbd892f0d166ad443f3f5b7e6fd3ce2470759d9403fe95a432a8a8665ca9743","win_setup_url":"https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_x64-setup.exe","win_sha256":"6a64f3b5039a761d98bca559382adb6f524c3fa28485abefadd58d90720e1a12","win_url":"https://github.com/JAHURULNILL/ndm/releases/download/v2.0.5/NDM_2.0.5_Windows_Portable.zip"}
