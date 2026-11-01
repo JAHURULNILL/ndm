@@ -72,6 +72,26 @@ pub fn global_connections() -> usize {
     MAX_CONN.load(Ordering::Relaxed) as usize
 }
 
+/// The connection split for a video+audio stream pair, returned as
+/// (video, audio). Hosts like googlevideo cap throughput PER
+/// CONNECTION, and in a pair the video stream carries ~90% of the
+/// bytes — the old even split (4 + 4 at the default 8) measured the
+/// video stream 3.1× slower than giving it the connections
+/// (Finding 2 of the speed investigation). The video stream now
+/// gets `max_conn - 2` and the audio stream 2: the audio is small
+/// and finishes early either way. Small counts stay near-even —
+/// neither stream may drop below 1, and at max_conn ≤ 4 halving was
+/// never the bottleneck: 1 → (1, 1), 2 → (1, 1), 3 → (2, 1),
+/// 4 → (2, 2), then 5 → (3, 2), 8 → (6, 2), 32 → (30, 2).
+pub fn video_pair_connections(max_conn: usize) -> (usize, usize) {
+    let max_conn = max_conn.max(1);
+    if max_conn >= 5 {
+        (max_conn - 2, 2)
+    } else {
+        ((max_conn + 1) / 2, (max_conn / 2).max(1))
+    }
+}
+
 static PROXY_URL: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 
 /// The user's optional outbound proxy ("http://host:port", "socks5://…"),
@@ -366,6 +386,18 @@ struct Shared {
     /// pick them up again — a range leaves the pool only by being
     /// downloaded or by the whole download settling
     requeue: Mutex<Vec<(usize, usize)>>,
+    /// workers parked in the claim wait right now because nothing
+    /// was claimable — the signal that lets a busy worker split the
+    /// unstarted tail of its claim instead of leaving peers idle
+    /// while its own connection crawls (Finding 1: with no
+    /// work-stealing, the finish time equalled the slowest claimed
+    /// run — 3.3× worse than the aggregate bound on uneven lanes)
+    waiting_workers: AtomicUsize,
+    /// when the last tail split was executed. Splits are
+    /// rate-limited pool-wide: each one abandons an in-flight
+    /// response, so a momentary idle blip must not be able to shred
+    /// every run at once
+    last_split: Mutex<Option<Instant>>,
     /// set by the engine's last writer once the terminal status is
     /// settled AND the final resume-state save has landed on disk.
     /// The supervisor settles the status FIRST and only then syncs
@@ -418,6 +450,63 @@ fn fail_if_stalled(shared: &Shared, total_blocks: usize) -> bool {
     true
 }
 
+/// Work-stealing split shape (Finding 1). When a peer is idle, a
+/// busy owner whose run still has at least SPLIT_KEEP_BLOCKS +
+/// SPLIT_MIN_STEAL unstarted blocks releases everything past the
+/// first SPLIT_KEEP_BLOCKS of them back to the pool: the owner
+/// keeps enough to stay busy until the released tail is picked up,
+/// the released part is at least SPLIT_MIN_STEAL blocks, and a run
+/// whose tail is smaller than the sum — a run already nearly done —
+/// is never split.
+const SPLIT_KEEP_BLOCKS: usize = 2;
+const SPLIT_MIN_STEAL: usize = 2;
+
+/// Pool-wide minimum spacing between executed splits.
+const SPLIT_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// The split point for a run whose first unwritten block is
+/// `first_unwritten` and whose end (exclusive) is `end`: the owner
+/// keeps [first_unwritten, split) and releases [split, end).
+/// `None` when the unstarted tail is too small to split. Pure
+/// arithmetic — the gating (an idle peer, the cooldown) lives in
+/// `split_allowed`; both must pass before a split is armed.
+fn split_point(first_unwritten: usize, end: usize) -> Option<usize> {
+    let tail = end.checked_sub(first_unwritten)?;
+    if tail < SPLIT_KEEP_BLOCKS + SPLIT_MIN_STEAL {
+        return None;
+    }
+    Some(first_unwritten + SPLIT_KEEP_BLOCKS)
+}
+
+/// Whether a tail split may be armed right now: a peer must
+/// actually be waiting for work (splitting into an empty room only
+/// fragments the claim and abandons a healthy response), and the
+/// pool-wide cooldown must have elapsed.
+fn split_allowed(shared: &Shared) -> bool {
+    if shared.waiting_workers.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    match *plock(&shared.last_split) {
+        Some(t) => t.elapsed() >= SPLIT_COOLDOWN,
+        None => true,
+    }
+}
+
+/// Counts a worker as waiting-for-work for exactly the scope that
+/// holds it (same pattern as ActiveWorkerGuard).
+struct WaiterGuard<'a>(&'a AtomicUsize);
+impl<'a> WaiterGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// One attempt to claim work: a fresh contiguous range so each
 /// worker keeps its TCP window saturated, or — once the fresh
 /// range is exhausted — a range another worker handed back after
@@ -437,7 +526,27 @@ fn try_claim(shared: &Shared, total_blocks: usize) -> Option<(usize, usize)> {
         }
         // raced past the end — fall through to the pool
     }
-    plock(&shared.requeue).pop()
+    let mut pool = plock(&shared.requeue);
+    let (s, e) = pool.pop()?;
+    // A handed-back range is shared with the workers currently
+    // waiting: the first claimant takes a fair slice and leaves the
+    // rest in the pool, instead of one worker swallowing a range
+    // the whole pool could be chewing. The released tail of a slow
+    // run is exactly such a range — Finding 1's redistribution
+    // depends on it spreading across the idle workers at once, not
+    // cascading claim by claim.
+    let waiting = shared.waiting_workers.load(Ordering::Relaxed);
+    let len = e - s;
+    let take = if waiting > 0 {
+        (len / (waiting + 1)).max(1)
+    } else {
+        len
+    };
+    if take < len {
+        pool.push((s + take, e));
+        return Some((s, s + take));
+    }
+    Some((s, e))
 }
 
 fn save_state(shared: &Shared, force: bool) {
@@ -506,6 +615,7 @@ fn remove_file_bounded(path: &Path) {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct Probe {
     pub total: u64,
     pub range_ok: bool,
@@ -719,7 +829,43 @@ fn verify_range(agent: &ureq::Agent, url: &str, total: u64, header_claim: bool, 
     }
 }
 
+/// Why a single probe attempt failed. The distinction drives the
+/// retry policy in `probe_with`: a transport failure means the
+/// server never actually answered (a hiccup — EAGAIN, a reset, a
+/// TLS cut), so another attempt can succeed; a definitive answer
+/// (an HTTP status like 404/403, a range reply that is malformed
+/// or from the wrong offset) will not change by asking again, so
+/// retrying it would only delay the error the user must see.
+enum ProbeFail {
+    Transient(String),
+    Definitive(String),
+}
+
+/// Attempts per probe: the initial try plus two retries, with a
+/// short backoff (300 ms, then 900 ms) — at most 1.2 s of added
+/// delay, and only on the path where attempts are actually failing
+/// transiently. Success and definitive answers return immediately,
+/// exactly as the single-attempt probe did.
+const PROBE_ATTEMPTS: usize = 3;
+
 fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, String> {
+    let mut attempt = 0usize;
+    loop {
+        match probe_once(agent, url, auth) {
+            Ok(p) => return Ok(p),
+            Err(ProbeFail::Definitive(m)) => return Err(m),
+            Err(ProbeFail::Transient(m)) => {
+                attempt += 1;
+                if attempt >= PROBE_ATTEMPTS {
+                    return Err(m);
+                }
+                std::thread::sleep(Duration::from_millis(if attempt == 1 { 300 } else { 900 }));
+            }
+        }
+    }
+}
+
+fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, ProbeFail> {
     let mut head_suggested: Option<String> = None;
     let mut head_final_url: Option<String> = None;
     if let Ok(resp) = apply_auth(agent.head(url), auth).set("Accept-Encoding", "identity").call() {
@@ -768,7 +914,16 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
                 final_url: head_final_url.unwrap_or_else(|| url.to_string()),
             });
         }
-        Err(e) => return Err(format!("probe failed: {e}")),
+        Err(e) => {
+            // an HTTP status is the server's definitive answer;
+            // anything else is transport trouble the server never
+            // saw — the retry policy treats them differently
+            let msg = format!("probe failed: {e}");
+            return Err(match e {
+                ureq::Error::Status(..) => ProbeFail::Definitive(msg),
+                ureq::Error::Transport(_) => ProbeFail::Transient(msg),
+            });
+        }
     };
     let resolved = resp.get_url().to_string();
     let suggested_name = extract_suggested_name(&resp, url).or(head_suggested);
@@ -776,11 +931,13 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
         let (s, _e, total_opt) = resp
             .header("Content-Range")
             .and_then(parse_content_range)
-            .ok_or("probe: no usable Content-Range")?;
+            .ok_or_else(|| {
+                ProbeFail::Definitive("probe: no usable Content-Range".to_string())
+            })?;
         if s != 0 {
-            return Err(
+            return Err(ProbeFail::Definitive(
                 "probe: server answered a range request from the wrong offset".to_string(),
-            );
+            ));
         }
         let (total, range_ok, unknown_size) = match total_opt {
             Some(t) => (t, true, false),
@@ -839,6 +996,11 @@ enum BlockError {
     Permanent(String),
     Paused,
     Cancelled,
+    /// the run reached a work-stealing split boundary: this worker
+    /// stops here on purpose, mid-response, so its claim's
+    /// unstarted tail can be handed to idle peers. Not an error —
+    /// carries the block the claim now ends at
+    Yielded(usize),
 }
 
 struct ActiveWorkerGuard<'a>(&'a AtomicUsize);
@@ -950,6 +1112,15 @@ fn download_block_run(
 
     let mut reader = resp.into_reader();
     let mut buf = vec![0u8; 512 * 1024];
+    // work-stealing cap: once armed (see the check in the loop),
+    // this run stops at a block boundary ahead of the first
+    // unwritten block and the worker hands the rest of its claim
+    // to the pool. The boundary is never behind the write cursor,
+    // so no byte already requested-or-written changes owner: this
+    // connection simply stops reading there, and the tail blocks —
+    // which this run has not written a single byte of — are
+    // fetched fresh by whoever claims them
+    let mut cap_block: Option<usize> = None;
     loop {
         if shared.control.cancelled.load(Ordering::Relaxed) {
             return Err(BlockError::Cancelled);
@@ -957,7 +1128,13 @@ fn download_block_run(
         if shared.control.paused.load(Ordering::Relaxed) {
             return Err(BlockError::Paused);
         }
-        let remaining = resp_end + 1 - *pos;
+        let remaining = match cap_block {
+            Some(b) => {
+                let cap_byte = ((b as u64) * block_size).min(total);
+                (resp_end + 1 - *pos).min(cap_byte.saturating_sub(*pos))
+            }
+            None => resp_end + 1 - *pos,
+        };
         if remaining == 0 {
             break;
         }
@@ -1030,8 +1207,31 @@ fn download_block_run(
         } else {
             shared.partial[worker_id].store(0, Ordering::Relaxed);
         }
+        // Arm the work-stealing cap (Finding 1): a peer is idle
+        // while this run still has a splittable tail of unstarted
+        // blocks. The first unwritten block is the block cursor,
+        // or one past it when the cursor block already holds bytes
+        // — the split point sits SPLIT_KEEP_BLOCKS beyond it, so
+        // the boundary this run stops at is always ahead of every
+        // byte written so far.
+        if cap_block.is_none() && split_allowed(shared) {
+            let first_unwritten = if *pos > (*cur_block as u64) * block_size {
+                *cur_block + 1
+            } else {
+                *cur_block
+            };
+            cap_block = split_point(first_unwritten, b_end_excl);
+        }
         throttle_global(n as u64, read_at);
         throttle_own(shared, n as u64, read_at);
+    }
+    if let Some(split) = cap_block {
+        let cap_byte = ((split as u64) * block_size).min(total);
+        if *pos == cap_byte && *pos < resp_end + 1 {
+            // stopped exactly at the armed boundary, with response
+            // bytes still unread: a deliberate yield, not a short run
+            return Err(BlockError::Yielded(split));
+        }
     }
     if *pos != resp_end + 1 {
         return Err(BlockError::Retry(format!(
@@ -1110,31 +1310,57 @@ fn worker(
         // 800 MB download froze at 67% for minutes, state file
         // bit-identical, until a fresh start revived it). Wait for
         // work instead; only a terminal condition ends a worker.
-        let (claim_start, claim_end) = loop {
-            if let Some(range) = try_claim(&shared, total_blocks) {
-                break range;
-            }
-            if shared.failed.load(Ordering::Relaxed)
-                || shared.control.cancelled.load(Ordering::Relaxed)
-                || shared.done_count.load(Ordering::Relaxed) >= total_blocks
-            {
-                return;
-            }
-            if shared.control.paused.load(Ordering::Relaxed) {
-                if !wait_while_paused(&shared) {
+        let (claim_start, mut claim_end) = {
+            // while nothing is claimable this worker counts as
+            // waiting: that count is the signal busy workers split
+            // their unstarted tails for (Finding 1)
+            let mut waiter: Option<WaiterGuard> = None;
+            loop {
+                if let Some(range) = try_claim(&shared, total_blocks) {
+                    break range;
+                }
+                if waiter.is_none() {
+                    waiter = Some(WaiterGuard::new(&shared.waiting_workers));
+                }
+                if shared.failed.load(Ordering::Relaxed)
+                    || shared.control.cancelled.load(Ordering::Relaxed)
+                    || shared.done_count.load(Ordering::Relaxed) >= total_blocks
+                {
                     return;
                 }
-                continue;
+                if shared.control.paused.load(Ordering::Relaxed) {
+                    if !wait_while_paused(&shared) {
+                        return;
+                    }
+                    continue;
+                }
+                if fail_if_stalled(&shared, total_blocks) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
-            if fail_if_stalled(&shared, total_blocks) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
         };
 
         // Process any undone sub-runs inside [claim_start, claim_end)
         let mut cursor = claim_start;
         while cursor < claim_end {
+            // Between sub-runs the same split check as inside a run:
+            // a fragmented claim's later sub-runs are unstarted work
+            // an idle peer could be doing. The owner executes the
+            // split itself — it is the only writer of its claim
+            // boundary, so no cross-worker negotiation exists: the
+            // released tail simply re-enters the pool as a requeue
+            // range, under the same bitmap truth as any hand-back.
+            if split_allowed(&shared) {
+                if let Some(split) = split_point(cursor, claim_end) {
+                    plock(&shared.requeue).push((split, claim_end));
+                    claim_end = split;
+                    *plock(&shared.last_split) = Some(Instant::now());
+                    if cursor >= claim_end {
+                        break;
+                    }
+                }
+            }
             let (b_first, b_last) = {
                 let st = plock(&shared.state);
                 while cursor < claim_end && st.done[cursor] == 1 {
@@ -1203,6 +1429,27 @@ fn worker(
                         // must not move, or a server capping responses
                         // at 512 KiB would burn the retry budget on a
                         // multi-megabyte run and fail the download.
+                    }
+                    Err(BlockError::Yielded(split)) => {
+                        // The run stopped at its armed split boundary:
+                        // hand this claim's whole unstarted tail —
+                        // [split, claim_end), which includes the rest
+                        // of this sub-run — to the pool, and end the
+                        // claim here. The owner executes the split
+                        // itself, so the bitmap stays the single truth
+                        // and no block is ever owned by two workers.
+                        // Not a failure: no attempt counted, no error
+                        // recorded, the stall policy untouched.
+                        shared.partial[id].store(0, Ordering::Relaxed);
+                        if cur_block < b_last {
+                            shared.block_state[cur_block].store(0, Ordering::Relaxed);
+                        }
+                        if split < claim_end {
+                            plock(&shared.requeue).push((split, claim_end));
+                            claim_end = split;
+                            *plock(&shared.last_split) = Some(Instant::now());
+                        }
+                        break;
                     }
                     Err(BlockError::Paused) => {
                         if cur_block < b_last {
@@ -1499,7 +1746,7 @@ pub fn start(
     max_conn: usize,
     block_size: u64,
 ) -> Result<Arc<Download>, String> {
-    start_impl(url, out, max_conn, block_size, &Auth::default())
+    start_impl(url, out, max_conn, block_size, &Auth::default(), None)
 }
 
 /// Start a download that repeats the browser session headers in
@@ -1512,7 +1759,25 @@ pub fn start_with_auth(
     block_size: u64,
     auth: Auth,
 ) -> Result<Arc<Download>, String> {
-    start_impl(url, out, max_conn, block_size, &auth)
+    start_impl(url, out, max_conn, block_size, &auth, None)
+}
+
+/// Start with a probe the caller has JUST made for this exact URL
+/// (Finding 4: every start used to probe twice — once by the caller
+/// to describe the file, once again inside `start_impl` — two HEADs
+/// and two verify GETs per start, seconds of latency on slow DNS).
+/// Only a fresh probe of the same URL with no state change in
+/// between may be passed; callers that probed earlier (a dialog the
+/// user sat on) must pass `None` and let the start re-probe.
+pub fn start_with_auth_preprobed(
+    url: &str,
+    out: &Path,
+    max_conn: usize,
+    block_size: u64,
+    auth: Auth,
+    probed: Option<Probe>,
+) -> Result<Arc<Download>, String> {
+    start_impl(url, out, max_conn, block_size, &auth, probed)
 }
 
 fn start_impl(
@@ -1521,6 +1786,7 @@ fn start_impl(
     max_conn: usize,
     block_size: u64,
     auth: &Auth,
+    pre_probed: Option<Probe>,
 ) -> Result<Arc<Download>, String> {
     if block_size == 0 {
         return Err("block size must be positive".to_string());
@@ -1529,7 +1795,10 @@ fn start_impl(
     let block_size = block_size.min(64 * 1024 * 1024);
     let max_conn = max_conn.clamp(1, 64);
     let agent = build_agent_for(url);
-    let probed = probe_with(&probe_agent_for(url), url, auth)?;
+    let probed = match pre_probed {
+        Some(p) => p,
+        None => probe_with(&probe_agent_for(url), url, auth)?,
+    };
     let state_path = state_path_for(out);
 
     let control = Arc::new(Control {
@@ -1683,6 +1952,8 @@ fn start_impl(
         own_limit_state: Mutex::new(None),
         last_progress: Mutex::new(Instant::now()),
         requeue: Mutex::new(Vec::new()),
+        waiting_workers: AtomicUsize::new(0),
+        last_split: Mutex::new(None),
         settled: AtomicBool::new(false),
         auth: auth.clone(),
     });
@@ -1826,6 +2097,8 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         own_limit_state: Mutex::new(None),
         last_progress: Mutex::new(Instant::now()),
         requeue: Mutex::new(Vec::new()),
+        waiting_workers: AtomicUsize::new(0),
+        last_split: Mutex::new(None),
         settled: AtomicBool::new(true),
         auth: Auth::default(),
     });
@@ -1877,6 +2150,8 @@ fn start_single_stream(
         own_limit_state: Mutex::new(None),
         last_progress: Mutex::new(Instant::now()),
         requeue: Mutex::new(Vec::new()),
+        waiting_workers: AtomicUsize::new(0),
+        last_split: Mutex::new(None),
         settled: AtomicBool::new(false),
         auth: auth.clone(),
     });
@@ -3595,6 +3870,570 @@ mod tests {
             sanitize_suggested_name("../../bad:file*name?.txt"),
             "bad_file_name_.txt"
         );
+    }
+
+    // ---------- 2.0.4: video pair split (Finding 2) ----------
+
+    #[test]
+    fn video_pair_connections_weights_the_video_stream() {
+        assert_eq!(video_pair_connections(1), (1, 1));
+        assert_eq!(video_pair_connections(2), (1, 1));
+        assert_eq!(video_pair_connections(3), (2, 1));
+        assert_eq!(video_pair_connections(4), (2, 2));
+        assert_eq!(video_pair_connections(5), (3, 2));
+        assert_eq!(video_pair_connections(8), (6, 2));
+        assert_eq!(video_pair_connections(16), (14, 2));
+        assert_eq!(video_pair_connections(32), (30, 2));
+        for mc in 1..=32usize {
+            let (v, a) = video_pair_connections(mc);
+            assert!(v >= 1 && a >= 1, "mc={mc}: neither stream may starve");
+            assert!(v >= a, "mc={mc}: video never gets less than audio");
+            if mc >= 2 {
+                assert_eq!(v + a, mc, "mc={mc}: the pair uses the full count");
+            }
+        }
+        // a zero setting must not produce a zero share either
+        assert_eq!(video_pair_connections(0), (1, 1));
+    }
+
+    // ---------- 2.0.4: probe retry (Finding 4) ----------
+
+    /// A probe target that hangs up on the first `drop_first`
+    /// accepted connections without sending a single byte (a pure
+    /// transport failure), then serves as a normal range server.
+    /// Returns the port and the live connection counter, so tests
+    /// can prove how many attempts the probe actually made.
+    fn probe_flaky_server(body: Vec<u8>, drop_first: usize) -> (u16, Arc<AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                if counter.fetch_add(1, Ordering::Relaxed) < drop_first {
+                    drop(s); // hang up: no HTTP answer ever arrives
+                    continue;
+                }
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = range.unwrap_or((0, total - 1));
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = s.write_all(slice);
+                });
+            }
+        });
+        (port, conns)
+    }
+
+    #[test]
+    fn probe_retries_transient_transport_failures() {
+        // the first four connections die without an answer (two full
+        // probe passes: HEAD + GET each); the third pass must land —
+        // before the retry, the first pass's failure WAS the result
+        // and the download start died on the spot (Finding 4)
+        let body = pattern_body(2 * 1024 * 1024);
+        let (port, conns) = probe_flaky_server(body.clone(), 4);
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let p = probe(&url).expect("probe must survive transient failures");
+        assert_eq!(p.total, body.len() as u64);
+        assert!(p.range_ok);
+        assert!(
+            conns.load(Ordering::Relaxed) >= 5,
+            "expected the retries to make fresh connections, saw {}",
+            conns.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn probe_does_not_retry_a_definitive_answer() {
+        // a server that answers 404 to everything: the probe must
+        // fail after ONE pass (HEAD + GET = 2 connections) — a
+        // definitive answer retried is just a slower error
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let counter = conns.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                counter.fetch_add(1, Ordering::Relaxed);
+                std::thread::spawn(move || {
+                    // read the request first: answering into an
+                    // unread socket can RST the reply away and turn
+                    // a clean 404 into a transport error client-side
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) if line == "\r\n" || line == "\n" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = s.write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/gone.bin");
+        let err = probe(&url).expect_err("a 404 probe must fail");
+        assert!(err.contains("404"), "unexpected error text: {err}");
+        assert_eq!(
+            conns.load(Ordering::Relaxed),
+            2,
+            "a definitive answer must not be retried"
+        );
+    }
+
+    // ---------- 2.0.4: work-stealing (Finding 1) ----------
+
+    #[test]
+    fn split_point_keeps_a_working_share_and_never_splits_a_nearly_done_run() {
+        // tail = end - first_unwritten; a split needs tail >=
+        // KEEP(2) + MIN_STEAL(2) = 4 unstarted blocks
+        assert_eq!(split_point(0, 3), None);
+        assert_eq!(split_point(10, 13), None);
+        assert_eq!(split_point(5, 5), None);
+        assert_eq!(split_point(9, 4), None, "inverted range must not split (or panic)");
+        assert_eq!(split_point(0, 4), Some(2), "releases exactly the minimum");
+        assert_eq!(split_point(10, 14), Some(12));
+        assert_eq!(split_point(0, 200), Some(2), "the owner keeps only its working share");
+        for end in 0..300usize {
+            if let Some(sp) = split_point(7, end) {
+                assert!(sp > 7 && sp < end);
+                assert_eq!(sp - 7, SPLIT_KEEP_BLOCKS);
+                assert!(end - sp >= SPLIT_MIN_STEAL);
+            }
+        }
+    }
+
+    /// The Finding 1 scenario as an in-process server: a GET whose
+    /// range starts at byte 0 and spans more than 1 MiB trickles at
+    /// `slow_bps`; every other response goes at full loopback speed.
+    /// (The byte-0 run is whichever worker claimed it first — the
+    /// slow lane is a property of the range, not of a worker.)
+    fn het_range_server(body: Vec<u8>, slow_bps: u64) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = range.unwrap_or((0, total - 1));
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let slow = rs == 0 && slice.len() > 1024 * 1024;
+                    for piece in slice.chunks(64 * 1024) {
+                        if s.write_all(piece).is_err() {
+                            return;
+                        }
+                        if slow {
+                            std::thread::sleep(Duration::from_secs_f64(
+                                piece.len() as f64 / slow_bps as f64,
+                            ));
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn slow_run_tail_is_stolen_by_idle_workers() {
+        // 48 blocks, 4 workers, 12-block claims. The byte-0 claim
+        // crawls at 1 MiB/s: un-stolen, the finish would take ~12 s
+        // (that claim alone) while the other workers idle after
+        // their fast claims. With stealing, the slow worker keeps
+        // only its split share and the idle workers take the tail.
+        // (The claim is deliberately long: the split window is the
+        // first blocks of the slow run, and a short claim lets a
+        // loaded test machine close that window before any peer
+        // goes idle — the engine is not what races there.)
+        let body = pattern_body(48 * 1024 * 1024);
+        let port = het_range_server(body.clone(), 1024 * 1024);
+        let url = format!("http://127.0.0.1:{port}/big.bin");
+        let out = std::env::temp_dir().join(format!("ndm-steal-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 4, 1024 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        let elapsed = t0.elapsed();
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl.status());
+        assert_eq!(std::fs::read(&out).unwrap(), body, "content must be byte-identical");
+        let p = dl.progress();
+        // coverage exactness: a well-behaved server + no errors
+        // means every byte is fetched exactly once — a range two
+        // workers both wrote would inflate this count
+        assert_eq!(
+            p.fetched_session,
+            body.len() as u64,
+            "fetched must equal the file size exactly"
+        );
+        assert_eq!(
+            p.conn_bytes.iter().sum::<u64>(),
+            body.len() as u64,
+            "per-connection bytes must add up to the file, no more"
+        );
+        // redistribution really happened — proven structurally, not
+        // by who ended slow: fresh claims are exactly 12 MiB each
+        // and this server never fails a run, so the ONLY way any
+        // worker ends above a full claim is by taking split-off
+        // work, and the only way one ends below it is by yielding.
+        // (A yielded worker may legitimately re-claim pool shares
+        // afterwards, so no fixed small share is asserted for it.)
+        let min_share = p.conn_bytes.iter().min().copied().unwrap_or(0);
+        let max_share = p.conn_bytes.iter().max().copied().unwrap_or(0);
+        assert!(
+            min_share < 12 * 1024 * 1024 && max_share > 12 * 1024 * 1024,
+            "no redistribution in conn_bytes: {:?}",
+            p.conn_bytes
+        );
+        assert!(
+            elapsed < Duration::from_millis(6000),
+            "finish {elapsed:?} must beat the ~12 s un-stolen slow-lane time"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn steal_then_cancel_and_resume_stays_byte_identical() {
+        // The journal-consistency gate for stealing: a download
+        // whose claims were split mid-flight is cut dead, then a
+        // fresh start resumes from the saved journal. The resumed
+        // session must fetch precisely the blocks the journal had
+        // not credited — none twice, none skipped — and the final
+        // file must be byte-identical.
+        let body = pattern_body(24 * 1024 * 1024);
+        let port = het_range_server(body.clone(), 1024 * 1024);
+        let url = format!("http://127.0.0.1:{port}/big.bin");
+        let out = std::env::temp_dir().join(format!("ndm-steal-resume-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 1024 * 1024).unwrap();
+        // let several blocks land (the fast lanes finish theirs in
+        // well under a second), then cut the download dead
+        let t0 = Instant::now();
+        while dl.progress().done_bytes < 5 * 1024 * 1024 {
+            assert!(t0.elapsed() < Duration::from_secs(30), "no early progress");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        dl.control.cancel();
+        let t0 = Instant::now();
+        while !dl.is_settled() {
+            assert!(t0.elapsed() < Duration::from_secs(30), "engine never settled");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(dl);
+        // the journal is the contract for the resume: count what it
+        // credits, then hold the resumed session to exactly the rest
+        let raw = std::fs::read(state_path_for(&out)).expect("journal must survive the cut");
+        let journal: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let done_blocks = journal["done"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| **b == 1)
+            .count() as u64;
+        assert!(
+            done_blocks >= 1 && done_blocks < 24,
+            "journal credits {done_blocks} blocks — the cut did not land mid-download"
+        );
+        let t1 = Instant::now();
+        let dl2 = start(&url, &out, 4, 1024 * 1024).unwrap();
+        let st = wait_terminal(&dl2, Duration::from_secs(60));
+        let elapsed2 = t1.elapsed();
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl2.status());
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            body,
+            "resumed content must be byte-identical"
+        );
+        assert_eq!(
+            dl2.progress().fetched_session,
+            (24 - done_blocks) * 1024 * 1024,
+            "resumed session must fetch exactly the uncredited blocks"
+        );
+        assert!(
+            elapsed2 < Duration::from_secs(10),
+            "resumed finish {elapsed2:?} — stealing must still work after a resume"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Change 4 (2.0.4, probe-once): a start handed the dialog's
+    /// already-obtained probe must put NO probe traffic on the wire
+    /// — the server log shows worker range GETs only, no HEAD and
+    /// no 1-byte verify GET — while a plain start probes as before.
+    /// This is the wire-level proof behind the app's probe handoff.
+    #[test]
+    fn preprobed_start_issues_no_probe_requests() {
+        use std::io::{BufRead, BufReader, Write};
+        // deterministic payload
+        let mut body = vec![0u8; 300_000];
+        for (i, b) in body.iter_mut().enumerate() {
+            *b = ((i * 31 + 7) % 251) as u8;
+        }
+        let body = Arc::new(body);
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        {
+            let body = body.clone();
+            let log = log.clone();
+            std::thread::spawn(move || {
+                for conn in listener.incoming() {
+                    let Ok(mut s) = conn else { continue };
+                    let body = body.clone();
+                    let log = log.clone();
+                    std::thread::spawn(move || {
+                        let mut rd = BufReader::new(match s.try_clone() {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        });
+                        loop {
+                            let mut line = String::new();
+                            match rd.read_line(&mut line) {
+                                Ok(0) | Err(_) => return,
+                                _ => {}
+                            }
+                            let line = line.trim_end().to_string();
+                            // consume headers
+                            let mut range: Option<(u64, u64)> = None;
+                            loop {
+                                let mut h = String::new();
+                                match rd.read_line(&mut h) {
+                                    Ok(0) | Err(_) => return,
+                                    _ => {}
+                                }
+                                let h = h.trim_end();
+                                if h.is_empty() {
+                                    break;
+                                }
+                                if let Some(v) =
+                                    h.to_ascii_lowercase().strip_prefix("range: bytes=")
+                                {
+                                    let mut it = v.splitn(2, '-');
+                                    if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                                        if let (Ok(a), Ok(b)) =
+                                            (a.parse::<u64>(), b.parse::<u64>())
+                                        {
+                                            range = Some((a, b));
+                                        }
+                                    }
+                                }
+                            }
+                            log.lock().unwrap().push(format!("{line} range={range:?}"));
+                            let total = body.len() as u64;
+                            let resp = if line.starts_with("HEAD") {
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                                )
+                                .into_bytes()
+                            } else if let Some((a, b)) = range {
+                                let b = b.min(total - 1);
+                                let slice = &body[a as usize..=b as usize];
+                                let mut r = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    slice.len()
+                                )
+                                .into_bytes();
+                                r.extend_from_slice(slice);
+                                r
+                            } else {
+                                let mut r = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+                                )
+                                .into_bytes();
+                                r.extend_from_slice(&body);
+                                r
+                            };
+                            if s.write_all(&resp).is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+        let url = format!("http://{addr}/file.bin");
+        let auth = Auth::default();
+        // the dialog's probe: exactly one probe round on the wire
+        let probe = probe_with_auth(&url, &auth).unwrap();
+        {
+            let log = log.lock().unwrap();
+            assert_eq!(
+                log.iter().filter(|l| l.starts_with("HEAD")).count(),
+                1,
+                "dialog probe = one HEAD: {log:?}"
+            );
+            assert_eq!(
+                log.iter()
+                    .filter(|l| l.starts_with("GET") && l.contains("file.bin"))
+                    .count(),
+                1,
+                "dialog probe = one verify GET: {log:?}"
+            );
+        }
+        // the handed start: workers only, NO second probe round
+        log.lock().unwrap().clear();
+        let dir = std::env::temp_dir().join(format!("ndm-preprobe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("a.bin");
+        let dl = start_with_auth_preprobed(
+            &url,
+            &out,
+            4,
+            64 * 1024,
+            auth.clone(),
+            Some(probe.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            wait_terminal(&dl, Duration::from_secs(30)),
+            Some(Status::Finished)
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), *body, "content identical");
+        {
+            let log = log.lock().unwrap();
+            assert!(
+                !log.iter().any(|l| l.starts_with("HEAD")),
+                "handed start must not re-probe (HEAD seen): {log:?}"
+            );
+            assert!(
+                log.iter().all(|l| l.starts_with("GET")),
+                "handed start issues worker GETs only: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|l| l.contains("range=Some((0, 0))")),
+                "handed start must not re-run the 1-byte verify GET: {log:?}"
+            );
+            assert!(!log.is_empty(), "workers did fetch");
+        }
+        // control: a plain start probes again, as before
+        log.lock().unwrap().clear();
+        let out2 = dir.join("b.bin");
+        let dl2 = start_with_auth(&url, &out2, 4, 64 * 1024, auth).unwrap();
+        assert_eq!(
+            wait_terminal(&dl2, Duration::from_secs(30)),
+            Some(Status::Finished)
+        );
+        {
+            let log = log.lock().unwrap();
+            assert_eq!(
+                log.iter().filter(|l| l.starts_with("HEAD")).count(),
+                1,
+                "plain start still probes: {log:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

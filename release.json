@@ -1,12 +1,12 @@
 {
- "deb_sha256": "caa46cc0abe3b3267d697200cdb5f0e1036b657b9747e9fb5f87f296878d6e45",
- "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_amd64.deb",
- "ext_sha256": "8548d19302bd0ffeb1c9346b64d9fbcab16a99bb4fbdc3a79d806a0e83860965",
+ "deb_sha256": "3697913f8b471fee441bc749a55f9dd22fa67e6a2655b6883573ccacc8e0bcf1",
+ "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.4/NDM_2.0.4_amd64.deb",
+ "ext_sha256": "0dd586b26d5ccf19d7cc47002953d3481af89712c7460bf0c9f5c9ff34aa71e2",
  "min_supported": "1.0.0",
- "notes": "The Windows downloads shrink to the size class Linux has always had: the installer is now about 5 MB and the portable ZIP about 6 MB, down from 101.5 MB and 134 MB. The video components (yt-dlp, deno, ffmpeg) are no longer bundled; on first launch the app downloads them once, in the background, verifying SHA-256 hashes pinned in the app. Upgraders from 2.0.2 keep their existing components \u2014 nothing is re-downloaded. Two smaller changes ride along: row selection with Ctrl/Shift is now reliable on WebKit setups that drop modifier state from click events, and the list's right-click menu gains Select All and Delete All, for clearing the list with the mouse alone. Everything else is unchanged.",
- "version": "2.0.3",
- "win_setup_sha256": "e4e12cb8735943dd71912d577b1516e0396bcc8775a6733962b933c72e0a9130",
- "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_x64-setup.exe",
- "win_sha256": "118ff2714f31e8cf03a9568ea2b2daa729b6a6889423c12e0f47ae588ab61fba",
- "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.3/NDM_2.0.3_Windows_Portable.zip"
+ "notes": "Nill Download Manager 2.0.4 is a speed release, and the packages stay in the same small size class as 2.0.3. Downloads now use dynamic segmentation: when one connection slows down, the connections that finish early take over the unstarted remainder of its segment instead of waiting, so a single slow connection no longer sets the pace for the whole file. Video downloads no longer split their connections evenly between picture and sound \u2014 the video stream, which carries most of the bytes, gets all but two of them, which matters on sites that cap the speed of each connection. Downloads also start sooner: starting one used to probe the server twice and now probes once, a brief network hiccup during that probe is retried instead of failing the start, and the video picker opens with its quality list already resolved in the background. The download list gains a checkbox column \u2014 tick any mix of rows with the mouse alone and delete them together. Everything else is unchanged.",
+ "version": "2.0.4",
+ "win_setup_sha256": "",
+ "win_setup_url": "",
+ "win_sha256": "",
+ "win_url": ""
 }

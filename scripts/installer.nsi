@@ -34,7 +34,7 @@
 ;            /DOUTFILE=<NDM_<x.y.z>_x64-setup.exe> scripts\installer.nsi
 
 !ifndef VERSION
-  !define VERSION "2.0.3"
+  !define VERSION "2.0.4"
 !endif
 !ifndef SRCROOT
   !define SRCROOT "NDM-Windows-Portable"

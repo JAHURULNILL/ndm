@@ -1237,6 +1237,77 @@ struct AppState {
     /// downloads stay blocked until the update is installed
     update_required: AtomicBool,
     update_busy: AtomicBool,
+    /// Change 4 (2.0.4, probe-once): the Add dialog's most recent
+    /// file probe, kept briefly so the Start that follows can
+    /// consume it instead of probing the same URL a second time
+    /// (START-LATENCY.md R1). Single slot, take-once, short TTL —
+    /// see take_probe_handoff for the match rules.
+    probe_handoff: Mutex<Option<ProbeHandoff>>,
+}
+
+/// A dialog probe result awaiting its Start. The handoff is valid
+/// only for the exact URL and auth context it was probed with, and
+/// only briefly: signed URLs and server state move on, so anything
+/// older than the TTL is re-probed instead of trusted.
+struct ProbeHandoff {
+    url: String,
+    auth_sig: u64,
+    at: Instant,
+    probe: ndm::Probe,
+}
+
+const PROBE_HANDOFF_TTL: Duration = Duration::from_secs(45);
+
+/// Content signature of the auth context a probe ran under (the
+/// same FNV-1a style as the video resolution cache's signatures):
+/// the handoff may only be consumed by a start that would
+/// authenticate byte-identically.
+fn auth_signature(auth: &ndm::Auth) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    feed(auth.cookie.as_deref().unwrap_or("").as_bytes());
+    feed(&[0xff]);
+    feed(auth.referer.as_deref().unwrap_or("").as_bytes());
+    feed(&[0xff]);
+    feed(auth.authorization.as_deref().unwrap_or("").as_bytes());
+    h
+}
+
+/// Take the stored dialog probe for `url` + `auth` if it is still
+/// fresh. Consumed only on an exact match (same URL, same auth
+/// signature, age within the TTL); a stale entry is dropped, a
+/// mismatched one is left for the start it belongs to. Anything
+/// else returns None and the caller probes fresh — today's
+/// behaviour, so a missed handoff costs nothing but the saving.
+fn take_probe_handoff(
+    slot: &Mutex<Option<ProbeHandoff>>,
+    url: &str,
+    auth: &ndm::Auth,
+    now: Instant,
+) -> Option<ndm::Probe> {
+    let mut slot = slot.lock().unwrap();
+    let stale = slot
+        .as_ref()
+        .map(|h| now.duration_since(h.at) > PROBE_HANDOFF_TTL)
+        .unwrap_or(false);
+    if stale {
+        *slot = None;
+        return None;
+    }
+    let matches = slot
+        .as_ref()
+        .map(|h| h.url == url && h.auth_sig == auth_signature(auth))
+        .unwrap_or(false);
+    if matches {
+        slot.take().map(|h| h.probe)
+    } else {
+        None
+    }
 }
 
 impl AppState {
@@ -2426,8 +2497,24 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
     // swap_live carries it onto the live entry; a failed start keeps
     // it on the stub beside the error it records.
     stamp_last_try(stub);
+    // Change 4 (2.0.4, probe-once): a fresh Add-dialog probe of this
+    // exact URL under this exact auth is consumed instead of
+    // probing a second time; anything else (no dialog probe, stale,
+    // different auth) falls back to the start's own probe inside
+    // start_with_auth_preprobed.
+    let preprobed = {
+        let state = app.state::<AppState>();
+        take_probe_handoff(&state.probe_handoff, &url, &auth, Instant::now())
+    };
     let dl = match tauri::async_runtime::spawn_blocking(move || {
-        ndm::start_with_auth(&url, &out_path, max_conn, ndm::DEFAULT_BLOCK, auth)
+        ndm::start_with_auth_preprobed(
+            &url,
+            &out_path,
+            max_conn,
+            ndm::DEFAULT_BLOCK,
+            auth,
+            preprobed,
+        )
     })
     .await
     {
@@ -5348,6 +5435,10 @@ async fn probe_file(
         referer,
         authorization,
     };
+    // Change 4 (2.0.4): remember this probe for the Start that
+    // follows (probe-once handoff) — signature taken over the auth
+    // exactly as probed, before the value moves into the probe call
+    let auth_sig = auth_signature(&auth);
     let u2 = url_trimmed.clone();
     let probe = tauri::async_runtime::spawn_blocking(move || ndm::probe_with_auth(&u2, &auth))
         .await
@@ -5355,6 +5446,12 @@ async fn probe_file(
         // a definitive server answer is reported as what it is,
         // not as a reachability failure (N-07)
         .map_err(|e| plain_server_error(&e))?;
+    *state.probe_handoff.lock().unwrap() = Some(ProbeHandoff {
+        url: url_trimmed.clone(),
+        auth_sig,
+        at: Instant::now(),
+        probe: probe.clone(),
+    });
     let suggested = probe
         .suggested_name
         .unwrap_or_else(|| file_name_for(&url_trimmed));
@@ -5388,11 +5485,41 @@ async fn probe_video(
 ) -> Result<video::VideoInfo, String> {
     let components = state.components();
     let cookies = state.cookies_path(cookies.as_deref().unwrap_or(""));
-    tauri::async_runtime::spawn_blocking(move || {
-        video::probe(&url, &components, cookies.as_deref())
+    // the job a Download click creates carries the trimmed URL
+    // (submitVideo trims), so probe and seed under that same string
+    let url = url.trim().to_string();
+    let info = tauri::async_runtime::spawn_blocking({
+        let url = url.clone();
+        let components = components.clone();
+        let cookies = cookies.clone();
+        move || video::probe(&url, &components, cookies.as_deref())
     })
-        .await
-        .map_err(|e| format!("internal join error: {e}"))?
+    .await
+    .map_err(|e| format!("internal join error: {e}"))??;
+    // Change 5 (2.0.4): seed the resolution cache for the picker's
+    // preselected (and best) rows in the background, keyed exactly
+    // as the coming job will key it — same site login the job will
+    // carry, same cookie file — so the Download click hits the
+    // cache instead of paying a second yt-dlp resolve. Fire and
+    // forget: the picker must never wait on the seeding.
+    {
+        let settings = current_settings(&state);
+        let (login, password) = site_login_for(&settings, &url).unwrap_or_default();
+        let options = info.options.clone();
+        let pref = settings.video_quality.clone();
+        std::thread::spawn(move || {
+            video::seed_picker_resolutions(
+                &url,
+                &options,
+                &pref,
+                cookies,
+                &login,
+                &password,
+                &components,
+            );
+        });
+    }
+    Ok(info)
 }
 
 fn unique_video_name(state: &AppState, dir: &Path, raw_title: &str, audio: bool) -> String {
@@ -7375,6 +7502,7 @@ fn main() {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            probe_handoff: Mutex::new(None),
         })
         .on_window_event(|window, event| {
             // N-12: closing the main window IS the user leaving —
@@ -7906,6 +8034,7 @@ mod tests {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
         };
@@ -8034,6 +8163,7 @@ mod tests {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
         };
@@ -8108,6 +8238,7 @@ mod tests {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
         }
@@ -8321,6 +8452,7 @@ mod tests {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
         };
@@ -8373,6 +8505,7 @@ mod tests {
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
             update_busy: AtomicBool::new(false),
+            probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
         };
@@ -8654,6 +8787,74 @@ mod tests {
         assert_eq!(video_entry_family("Title (Director's Cut)"), "Title (Director's Cut)");
         assert_eq!(video_title_family("Title (Director's Cut)"), "Title (Director's Cut)");
         assert_eq!(split_copy_suffix("A (1) (2)"), "A (1)");
+    }
+
+    /// Change 4 (2.0.4, probe-once): the dialog-probe handoff is
+    /// consumed exactly once, only for the same URL under the same
+    /// auth, and only inside its TTL; every other shape falls back
+    /// to a fresh probe.
+    #[test]
+    fn probe_handoff_match_rules() {
+        let auth = ndm::Auth {
+            cookie: Some("sid=1".into()),
+            referer: None,
+            authorization: None,
+        };
+        let probe = ndm::Probe {
+            total: 1234,
+            range_ok: true,
+            unknown_size: false,
+            final_url: "https://x.test/f.bin".into(),
+            suggested_name: None,
+            etag: None,
+            last_modified: None,
+        };
+        let t0 = Instant::now();
+        let slot: Mutex<Option<ProbeHandoff>> = Mutex::new(Some(ProbeHandoff {
+            url: "https://x.test/f.bin".into(),
+            auth_sig: auth_signature(&auth),
+            at: t0,
+            probe: probe.clone(),
+        }));
+        // wrong URL: no take, and the handoff survives for its own start
+        assert!(take_probe_handoff(&slot, "https://x.test/other", &auth, t0).is_none());
+        assert!(slot.lock().unwrap().is_some());
+        // wrong auth (a credential changed after the dialog probe)
+        let auth2 = ndm::Auth {
+            cookie: Some("sid=2".into()),
+            ..auth.clone()
+        };
+        assert!(take_probe_handoff(&slot, "https://x.test/f.bin", &auth2, t0).is_none());
+        assert!(slot.lock().unwrap().is_some());
+        // exact match inside the TTL: taken, with the probed facts intact
+        let got = take_probe_handoff(
+            &slot,
+            "https://x.test/f.bin",
+            &auth,
+            t0 + Duration::from_secs(10),
+        )
+        .expect("fresh matching handoff must be consumed");
+        assert_eq!(got.total, 1234);
+        assert!(got.range_ok);
+        // take-once: a second start probes fresh
+        assert!(take_probe_handoff(&slot, "https://x.test/f.bin", &auth, t0).is_none());
+        // stale beyond the TTL: refused AND dropped
+        *slot.lock().unwrap() = Some(ProbeHandoff {
+            url: "https://x.test/f.bin".into(),
+            auth_sig: auth_signature(&auth),
+            at: t0,
+            probe,
+        });
+        assert!(take_probe_handoff(
+            &slot,
+            "https://x.test/f.bin",
+            &auth,
+            t0 + PROBE_HANDOFF_TTL + Duration::from_secs(1),
+        )
+        .is_none());
+        assert!(slot.lock().unwrap().is_none());
+        // empty slot: nothing to take
+        assert!(take_probe_handoff(&slot, "https://x.test/f.bin", &auth, t0).is_none());
     }
 }
 

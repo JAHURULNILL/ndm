@@ -451,12 +451,47 @@ function saveColumnCfg() {
 }
 function visibleColumns() { return columnCfg.filter(c => c.visible); }
 
+/* The selection checkbox column leads the grid. It is NOT one of
+   the configurable columns: it is always there, always 28px, and
+   its state is the same selectedIds set every other selection
+   path (Ctrl/Shift+click, Ctrl+A, the menus) reads and writes —
+   the boxes exist so a partial batch can be marked with the
+   mouse alone, no modifier keys involved. */
+let headCheckEl = null;
+
 function applyColumns() {
   const cg = $('colGroup');
   const hr = $('headRow');
   if (!cg || !hr) return;
   cg.innerHTML = '';
   hr.innerHTML = '';
+  const ccol = document.createElement('col');
+  ccol.style.width = '28px';
+  cg.appendChild(ccol);
+  const cth = document.createElement('th');
+  cth.className = 'c-check';
+  headCheckEl = document.createElement('input');
+  headCheckEl.type = 'checkbox';
+  headCheckEl.className = 'rowcheck';
+  headCheckEl.title = 'Select all';
+  // the browser hands us the post-click state: ticked (from none
+  // or from the indeterminate middle state) means "all", unticked
+  // means "none" — the same two ends Ctrl+A and a plain click
+  // already move between
+  // a real mouse click carries detail >= 1; a keyboard toggle
+  // (Space on the focused box) reports detail 0. After a MOUSE
+  // toggle the box blurs (see the row checkbox for why); a
+  // keyboard toggle keeps focus so Space can repeat.
+  headCheckEl.addEventListener('click', e => {
+    if (e.detail > 0) headCheckEl.dataset.mouse = '1';
+  });
+  headCheckEl.addEventListener('change', () => {
+    if (headCheckEl.checked) selectAllVisible();
+    else select(null, false);
+    if (headCheckEl.dataset.mouse) { delete headCheckEl.dataset.mouse; headCheckEl.blur(); }
+  });
+  cth.appendChild(headCheckEl);
+  hr.appendChild(cth);
   for (const c of visibleColumns()) {
     const col = document.createElement('col');
     if (c.width > 0) col.style.width = c.width + 'px';
@@ -490,7 +525,8 @@ function updateSortIndicators() {
   const hr = $('headRow');
   if (!hr) return;
   const cols = visibleColumns();
-  [...hr.children].forEach((th, i) => {
+  // hr.children[0] is the checkbox header cell, not a column
+  [...hr.children].slice(1).forEach((th, i) => {
     const c = cols[i];
     if (!c) return;
     const def = COLUMN_DEFS.find(d => d.id === c.id) || {};
@@ -709,9 +745,19 @@ function updateRowCells(tr, d) {
     ? (d.total - d.done_bytes) / d.speed_bps : null;
   // status is interpolated into HTML — pin it to the known vocabulary
   const st = KNOWN_STATUS.includes(d.status) ? d.status : 'error';
+  // the row's checkbox mirrors the multi-selection set exactly:
+  // ticked ⟺ the id is in selectedIds. The primary row's cursor
+  // highlight is an older, separate concept (at startup the first
+  // row is the cursor without joining the set) and deliberately
+  // does NOT tick the box — the box means "in the batch", nothing
+  // else. One DOM write, only on change.
+  if (tr._check) {
+    const want = selectedIds.has(d.id);
+    if (tr._check.checked !== want) tr._check.checked = want;
+  }
   const cols = visibleColumns();
   for (let i = 0; i < cols.length; i++) {
-    const td = tr.children[i];
+    const td = tr.children[i + 1]; // children[0] is the checkbox cell
     if (!td) break;
     const colId = cols[i].id;
     const html = cellHtml(colId, d, st, left);
@@ -754,11 +800,41 @@ function updateRowCells(tr, d) {
 
 function buildRow(d) {
   const tr = document.createElement('tr');
+  // leading checkbox cell: ticking it is exactly a Ctrl+click on
+  // the row (toggleSelect) — the mouse-only path into the same
+  // selection set. Its own clicks must not fall through to the
+  // row handlers below (a plain row click would first replace
+  // the selection, and the toggle would then undo the tick).
+  const ctd = document.createElement('td');
+  ctd.className = 'checkcell';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.className = 'rowcheck';
+  cb.addEventListener('click', e => {
+    e.stopPropagation();
+    if (e.detail > 0) cb.dataset.mouse = '1'; // mouse, not Space
+  });
+  cb.addEventListener('dblclick', e => e.stopPropagation());
+  cb.addEventListener('change', () => {
+    toggleSelect(d.id);
+    // Mouse users: hand focus back to the window after a tick.
+    // With focus parked on the checkbox input, this WebKit drops
+    // the first click on a toolbar button (verified live in the
+    // rig: tick boxes -> toolbar Delete ignored until the list
+    // body was clicked once). Blurring after a MOUSE toggle
+    // removes that dead first click; a keyboard toggle
+    // (detail 0) keeps focus so Space can tick/untick repeatedly.
+    if (cb.dataset.mouse) { delete cb.dataset.mouse; cb.blur(); }
+  });
+  ctd.appendChild(cb);
+  tr.appendChild(ctd);
+  tr._check = cb;
   for (const _c of visibleColumns()) tr.appendChild(document.createElement('td'));
   // Single-click ONLY selects the row in the full-height table (like IDM);
   // Ctrl+click toggles one row, Shift+click extends a range — the
   // multi-selection batch actions (Delete above all) act on
   tr.addEventListener('click', e => {
+    if (e.target.closest('.checkcell')) return; // the box speaks for itself
     // ctrlHeld backs up e.ctrlKey: this WebKit can deliver the
     // click without the modifier even while Ctrl is physically
     // down, and a Ctrl+click then silently REPLACED the selection
@@ -771,7 +847,10 @@ function buildRow(d) {
   // Double-click opens the Download Status / Properties dialog —
   // IDM never opens the file itself from the list; opening lives
   // on the dialog and in the context menu
-  tr.addEventListener('dblclick', () => select(d.id, true));
+  tr.addEventListener('dblclick', e => {
+    if (e.target.closest('.checkcell')) return;
+    select(d.id, true);
+  });
   // Right-click: IDM's per-download context menu. Right-clicking a row
   // outside the selection selects just it; right-clicking inside a
   // multi-selection keeps the whole selection (IDM does the same)
@@ -865,6 +944,16 @@ function render() {
       const tr = rowEls.get(d.id);
       if (tr) updateRowCells(tr, d);
     }
+  }
+  // the header checkbox mirrors the visible selection: ticked
+  // when every visible row is in the set, indeterminate in the
+  // middle state, disabled when there is nothing to select
+  if (headCheckEl) {
+    let ticked = 0;
+    for (const d of list) if (selectedIds.has(d.id)) ticked++;
+    headCheckEl.checked = list.length > 0 && ticked === list.length;
+    headCheckEl.indeterminate = ticked > 0 && ticked < list.length;
+    headCheckEl.disabled = list.length === 0;
   }
   // IDM's empty list is a blank white list — no placeholder
   // text in any filter (the element stays only as a toggle)

@@ -1077,6 +1077,83 @@ pub fn warm_resolution(
     }
 }
 
+/// Which picker rows the seeding below warms: the row the picker
+/// PRESELECTS for the user's quality preference (mirroring the
+/// picker's own pickQualityIndex: "best" → the first row, "audio"
+/// → the audio row, a height → that height's row or the first row
+/// at/below it), plus the first row when it differs (the best
+/// quality is always one click away). Bounded at two so opening a
+/// picker never fans out into a yt-dlp storm; a pick outside the
+/// warmed set simply resolves on click, exactly as before.
+fn picker_warm_indices(options: &[ndm::video_probe::QualityOption], quality_pref: &str) -> Vec<usize> {
+    if options.is_empty() {
+        return Vec::new();
+    }
+    let preselect = if quality_pref == "audio" {
+        options.iter().position(|o| o.audio).unwrap_or(0)
+    } else if quality_pref == "best" || quality_pref.is_empty() {
+        0
+    } else if let Ok(target) = quality_pref.parse::<u64>() {
+        options
+            .iter()
+            .position(|o| !o.audio && o.label.starts_with(quality_pref))
+            .or_else(|| {
+                options
+                    .iter()
+                    .position(|o| !o.audio && o.height > 0 && o.height <= target)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let mut idx = vec![preselect];
+    if preselect != 0 {
+        idx.push(0);
+    }
+    idx
+}
+
+/// Change 5 (2.0.4): seed the resolution cache from the in-app
+/// picker's probe, so the Download click that follows does not pay
+/// a second full yt-dlp resolve (START-LATENCY.md R2: the picker
+/// probe costs one resolve, the click used to cost another
+/// ~13–15 s).
+///
+/// Why a warm resolve and not a derivation from the picker's `-J`
+/// dump: every picker selector is a yt-dlp filter/fallback
+/// EXPRESSION (`bv*[height=720][vcodec^=avc][ext=mp4]+ba[ext=m4a]/…`),
+/// never a concrete format id, so the streams a selector yields
+/// exist only by running yt-dlp's own selection — reimplementing
+/// it here would be a fork that can silently pick different
+/// streams than the job's own resolve. This seeding instead runs
+/// the EXISTING warm_resolution (identical keying, identical
+/// resolve) in the background while the user reads the picker;
+/// the warmed entries are byte-for-byte what the click's own
+/// resolve would have produced, and anything not warmed (or
+/// expired) behaves exactly as before.
+pub fn seed_picker_resolutions(
+    url: &str,
+    options: &[ndm::video_probe::QualityOption],
+    quality_pref: &str,
+    cookies: Option<PathBuf>,
+    login: &str,
+    password: &str,
+    components_dir: &Path,
+) {
+    for i in picker_warm_indices(options, quality_pref) {
+        let o = &options[i];
+        warm_resolution(
+            url,
+            &o.selector,
+            o.audio,
+            cookies.clone(),
+            login,
+            password,
+            components_dir,
+        );
+    }
+}
+
 impl VideoJob {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
@@ -1274,10 +1351,32 @@ impl VideoJob {
         let final_path = self.dir.join(format!("{stem}.{final_ext}"));
 
         let max_conn = ndm::global_connections().clamp(1, 32);
-        let per_stream_conn = if streams.len() > 1 {
-            (max_conn / 2).max(1)
-        } else {
-            max_conn
+        // Finding 2 (speed investigation): in a video+audio pair the
+        // video stream carries ~90% of the bytes, and googlevideo-class
+        // hosts cap throughput per connection — the old even split
+        // (4 + 4 at the default 8) starved exactly the stream that
+        // needed the connections. The pair now splits weighted via
+        // ndm::video_pair_connections (video max_conn − 2, audio 2,
+        // near-even at small counts). The video stream is the one not
+        // carrying the audio track (an audio-only format always
+        // reports an acodec); a pair where both streams carry audio
+        // (a combined stream plus a separate track) treats the first
+        // as primary. A single stream keeps the full count, and
+        // 3+-stream sets (exotic) keep the old even split.
+        let primary = streams.iter().position(|s| !s.has_audio).unwrap_or(0);
+        let stream_conn = |i: usize| -> usize {
+            if streams.len() == 2 {
+                let (video_conn, audio_conn) = ndm::video_pair_connections(max_conn);
+                if i == primary {
+                    video_conn
+                } else {
+                    audio_conn
+                }
+            } else if streams.len() > 1 {
+                (max_conn / streams.len()).max(1)
+            } else {
+                max_conn
+            }
         };
 
         let mut part_paths: Vec<PathBuf> = Vec::new();
@@ -1291,7 +1390,7 @@ impl VideoJob {
                 referer: st.referer.clone(),
                 authorization: None,
             };
-            match ndm::start_with_auth(&st.url, &part, per_stream_conn, ndm::DEFAULT_BLOCK, auth) {
+            match ndm::start_with_auth(&st.url, &part, stream_conn(i), ndm::DEFAULT_BLOCK, auth) {
                 Ok(dl) => {
                     let lim = self.limit();
                     if lim > 0 {
@@ -2593,6 +2692,112 @@ mod tests {
             .is_none(),
             "an entry older than the TTL must never be served"
         );
+    }
+
+    fn picker_option(
+        selector: &str,
+        label: &str,
+        audio: bool,
+        height: u64,
+    ) -> ndm::video_probe::QualityOption {
+        ndm::video_probe::QualityOption {
+            selector: selector.to_string(),
+            label: label.to_string(),
+            ext: "MP4".to_string(),
+            note: String::new(),
+            size_bytes: 0,
+            size_text: String::new(),
+            audio,
+            height,
+        }
+    }
+
+    /// Change 5 (2.0.4): the picker seeding warms the preselected
+    /// row (mirroring the picker's own preselect rules) plus the
+    /// best row — never the whole list.
+    #[test]
+    fn picker_warm_indices_follow_the_picker_preselect() {
+        let options = vec![
+            picker_option("SEL720", "720p", false, 720),
+            picker_option("SEL360", "360p", false, 360),
+            picker_option("SELA", "Audio Only (M4A)", true, 0),
+        ];
+        assert_eq!(picker_warm_indices(&options, "best"), vec![0]);
+        assert_eq!(picker_warm_indices(&options, "720"), vec![0]);
+        assert_eq!(picker_warm_indices(&options, "360"), vec![1, 0]);
+        assert_eq!(picker_warm_indices(&options, "audio"), vec![2, 0]);
+        // a preference with no matching row falls back to the best row
+        assert_eq!(picker_warm_indices(&options, "2160"), vec![0]);
+        assert!(picker_warm_indices(&[], "best").is_empty());
+    }
+
+    /// Change 5 (2.0.4): with a counting stub yt-dlp, seeding the
+    /// picker runs exactly ONE resolve (the preselected row); the
+    /// Download click's key then hits the cache with NO further
+    /// yt-dlp run; an unwarmed row stays uncached; and once the
+    /// entry ages past the TTL the resolve runs again.
+    #[cfg(unix)]
+    #[test]
+    fn picker_seed_warms_cache_so_the_click_resolves_nothing() {
+        let dir =
+            std::env::temp_dir().join(format!("ndm-seed-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let count_file = dir.join("count.txt");
+        let json = "{\"title\":\"Stub Video\",\"duration\":100,\"requested_formats\":[{\"format_id\":\"136\",\"url\":\"https://cdn.example/v720.mp4\",\"ext\":\"mp4\",\"protocol\":\"https\",\"vcodec\":\"avc1.640028\",\"acodec\":\"none\",\"tbr\":1000},{\"format_id\":\"140\",\"url\":\"https://cdn.example/a.m4a\",\"ext\":\"m4a\",\"protocol\":\"https\",\"vcodec\":\"none\",\"acodec\":\"mp4a.40.2\",\"tbr\":128}]}";
+        let script = format!(
+            "#!/bin/sh\necho x >> \"{}\"\nprintf '%s\\n' '{}'\n",
+            count_file.display(),
+            json
+        );
+        let stub = dir.join("yt-dlp");
+        std::fs::write(&stub, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let runs = || -> usize {
+            std::fs::read_to_string(&count_file)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let url = "https://picker-seed.example/watch?v=seed1";
+        let options = vec![
+            picker_option("SEL720", "720p", false, 720),
+            picker_option("SEL360", "360p", false, 360),
+            picker_option("SELA", "Audio Only (M4A)", true, 0),
+        ];
+        // the key exactly as the Download click's job will build it
+        let job_key = |sel: &str| ResolutionKey {
+            url: url.to_string(),
+            sel: sel.to_string(),
+            audio: false,
+            login: String::new(),
+            password_sig: password_signature(""),
+            cookies_sig: cookies_signature(None),
+            proxy: ndm::global_proxy(),
+        };
+        seed_picker_resolutions(url, &options, "best", None, "", "", &dir);
+        assert_eq!(runs(), 1, "seeding resolves only the preselected row");
+        // the Download click's own key: fresh hit, no second run
+        let click_key = job_key("SEL720");
+        let hit = resolution_cache_get(&click_key, Instant::now())
+            .expect("the click must find the seeded resolution");
+        assert_eq!(hit.streams.len(), 2);
+        assert_eq!(runs(), 1, "the click itself runs no yt-dlp");
+        // an unwarmed row was NOT seeded
+        assert!(resolution_cache_get(&job_key("SEL360"), Instant::now()).is_none());
+        // after the TTL the entry is dead and a resolve runs again
+        assert!(resolution_cache_get(
+            &click_key,
+            Instant::now() + RESOLUTION_TTL + std::time::Duration::from_secs(1),
+        )
+        .is_none());
+        let probe = resolve_streams_core(url, "SEL720", false, None, "", "", &stub, &dir)
+            .expect("re-resolve after expiry must succeed");
+        assert!(probe.resolved.is_some());
+        assert_eq!(runs(), 2, "an expired entry re-resolves exactly once");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -275,6 +275,13 @@ body {
 .grid td.name .ficon { display: inline-flex; width: 16px; height: 16px; vertical-align: -3px; margin-right: 5px; }
 .grid td.name .ficon svg { width: 16px; height: 16px; display: block; }
 .grid td.qcell { text-align: center; }
+/* selection checkbox column: slim, centred on the row's text
+   line. The box itself is the native control tinted with the
+   app blue (accent-color), so it reads as a system checkbox in
+   both themes and needs no dark-theme variant. */
+.grid th.c-check, .grid td.checkcell { text-align: center; padding-left: 2px; padding-right: 2px; }
+.grid .rowcheck { width: 13px; height: 13px; margin: 0; vertical-align: middle; accent-color: var(--blue); cursor: pointer; }
+.grid .rowcheck:disabled { cursor: default; opacity: .45; }
 .grid tbody tr { cursor: default; }
 .grid tbody tr:hover { background: var(--row-hover); }
 .grid tbody tr.selected { background: linear-gradient(to bottom, var(--sel-hi), var(--sel-lo)); }

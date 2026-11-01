@@ -85,7 +85,17 @@ fn main() {
     }
 
     let t0 = Instant::now();
-    let dl = match ndm::start(&url, &out, max_conn, block_size) {
+    // the probe above was made for this exact URL a moment ago, with
+    // no state change in between: hand it to the start instead of
+    // paying for a second identical probe inside the engine
+    let dl = match ndm::start_with_auth_preprobed(
+        &url,
+        &out,
+        max_conn,
+        block_size,
+        ndm::Auth::default(),
+        Some(probed.clone()),
+    ) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("[ndm] {e}");
