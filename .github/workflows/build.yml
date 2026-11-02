@@ -45,10 +45,16 @@ jobs:
         run: |
           cargo build --release
           cargo build --release --manifest-path src-tauri/Cargo.toml
+      - name: Test lib on Linux
+        run: cargo test --release
+      - name: Test app on Linux
+        run: cargo test --release --manifest-path src-tauri/Cargo.toml
       - name: Package (.deb + portable tarball)
         run: |
           bash scripts/package-deb.sh
           bash scripts/package-portable.sh
+      - name: Extension version matches app version
+        run: python3 -c "import json,sys; e=json.load(open('extension/manifest.json'))['version']; t=json.load(open('src-tauri/tauri.conf.json'))['version']; print(f'extension {e} vs app {t}'); sys.exit(0 if e == t else 'extension/manifest.json version != src-tauri/tauri.conf.json version')"
       - uses: actions/upload-artifact@v4
         with:
           name: ndm-linux
@@ -56,8 +62,6 @@ jobs:
             NDM_*_amd64.deb
             NDM_*_Linux_Portable.tar.xz
             ndm-extension-*.zip
-            - name: Extension version matches app version
-                    run: python3 -c "import json,sys; e=json.load(open('extension/manifest.json'))['version']; t=json.load(open('src-tauri/tauri.conf.json'))['version']; print(f'extension {e} vs app {t}'); sys.exit(0 if e == t else 'extension/manifest.json version != src-tauri/tauri.conf.json version')"
       - name: Build extension ZIP (for the release upload)
         if: github.event_name == 'workflow_dispatch'
         run: |
