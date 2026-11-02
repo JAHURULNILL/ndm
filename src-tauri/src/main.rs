@@ -1820,7 +1820,9 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         done_bytes,
         speed_bps: rate,
         conns,
-        status,
+        // Clone: `status` is borrowed again below — the final_path
+        // block's finished-check and the trailing detail_of call.
+        status: status.clone(),
         blocks,
         category: entry.category.clone(),
         added: entry.added.clone(),
