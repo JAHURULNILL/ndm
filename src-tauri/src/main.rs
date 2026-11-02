@@ -10724,6 +10724,7 @@ mod tests {
             suggested_name: None,
             etag: None,
             last_modified: None,
+            ignore_encoding_header: false,
         };
         let t0 = Instant::now();
         let slot: Mutex<Option<ProbeHandoff>> = Mutex::new(Some(ProbeHandoff {
