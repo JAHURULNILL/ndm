@@ -2520,6 +2520,87 @@ mod os_file_lock {
     }
 }
 
+/// Janitorial sweep of stale `.ndm.lock` litter in `dir`
+/// (non-recursive), returning how many files were removed.
+///
+/// On Unix the lock FILE is deliberately never unlinked by
+/// `InFlightGuard::drop` (deleting it while a contender holds the
+/// deleted inode open would split the flock — see the Drop impl),
+/// so every finished download leaves a permanent 0-byte
+/// `<name>.ndm.lock` behind. This sweep is the race-safe
+/// counterpart: a lock file is removed only when its flock can be
+/// acquired (no live download holds it) AND the opened handle
+/// still names the same inode/dev as a fresh metadata lookup of
+/// the path (the path was not replaced between open and delete).
+/// Dropping the handle then releases the flock on the now
+/// unlinked inode, which no future contender can open. Every
+/// error is a silent skip: the sweep is janitorial and must never
+/// fail a download.
+#[cfg(unix)]
+pub fn sweep_stale_locks(dir: &Path) -> usize {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut swept = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let bytes = name.as_bytes();
+        if bytes.len() < 9 || &bytes[bytes.len() - 9..] != b".ndm.lock" {
+            continue;
+        }
+        let path = entry.path();
+        // never create: a path that vanished since the listing is
+        // already gone, and creating it just to delete it would be
+        // litter of our own.
+        let f = match OpenOptions::new().write(true).truncate(false).open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        if !os_file_lock::try_acquire(&f) {
+            // a live download holds this lock — leave it alone.
+            continue;
+        }
+        // identity re-check: the inode we flocked must still be
+        // the inode the path names, or the path was replaced
+        // under us and deleting it could remove a fresh lock.
+        let opened = match f.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let fresh = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if opened.ino() != fresh.ino() || opened.dev() != fresh.dev() {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            swept += 1;
+        }
+        // dropping `f` here releases the flock.
+    }
+    swept
+}
+
+/// Non-Unix counterpart: conservative no-op. There the Drop impl
+/// already unlinks the lock file, so litter can only come from a
+/// crash — and on those platforms the exclusively-created file IS
+/// the lock (the `claim_os_lock` fallback arm has no flock to
+/// probe and no pid-liveness check to prove an existing file
+/// stale), so deleting one from a sweep could remove a live
+/// owner's lock. Leave crash litter rather than split a lock.
+#[cfg(not(unix))]
+pub fn sweep_stale_locks(_dir: &Path) -> usize {
+    0
+}
+
 struct InFlightGuard {
     key: PathBuf,
     /// the held-open lock file (Unix: flocked; other platforms:
@@ -2534,6 +2615,18 @@ impl InFlightGuard {
         let mut os_str = key.clone().into_os_string();
         os_str.push(".ndm.lock");
         let lock_path = PathBuf::from(os_str);
+        // self-clean this folder's stale lock litter before
+        // claiming (N2): every start sweeps the stale `.ndm.lock`
+        // files left by finished downloads — including a previous
+        // run's. Running BEFORE the claim is what makes sweeping
+        // this download's own stale lock safe: it is removed
+        // unlocked and then recreated fresh by the claim below,
+        // while a live contender's lock is never touched (the
+        // sweep can only delete locks it can flock). One read_dir
+        // per start is the whole cost.
+        if let Some(parent) = lock_path.parent() {
+            let _ = sweep_stale_locks(parent);
+        }
         {
             let mut registry = plock(&IN_FLIGHT);
             if registry.contains(&key) {
@@ -3123,6 +3216,23 @@ fn single_error_is_permanent(e: &str) -> bool {
         || e.contains("status code 410")
 }
 
+/// Newly written bytes that reset the single-stream stall clock:
+/// smaller trickles do not count as progress, or a server sending
+/// a byte just inside every read timeout would run forever.
+const STALL_PROGRESS_BYTES: u64 = 256 * 1024;
+
+/// Record single-stream progress against the stall clock: the
+/// clock resets only once STALL_PROGRESS_BYTES of new bytes have
+/// been written since the watermark. Returns true when it reset.
+fn note_stall_progress(pos: u64, watermark: &mut u64, clock: &mut Instant) -> bool {
+    if pos.saturating_sub(*watermark) < STALL_PROGRESS_BYTES {
+        return false;
+    }
+    *watermark = pos;
+    *clock = Instant::now();
+    true
+}
+
 fn start_single_stream(
     url: &str,
     out: &Path,
@@ -3239,6 +3349,8 @@ fn start_single_stream(
             // byte count freezes the moment the halt lands, with
             // stream and file still in sync (battery19 t1/t6).
             let mut held = 0usize;
+            let mut stall_watermark = 0u64;
+            let mut stall_clock = Instant::now();
             loop {
                 if shared.control.cancelled.load(Ordering::Relaxed) {
                     set_status(&shared, Status::Cancelled);
@@ -3251,6 +3363,16 @@ fn start_single_stream(
                         return Ok(());
                     }
                     set_status(&shared, Status::Downloading);
+                    // a pause waits on the user, not the network:
+                    // the stall clock restarts from the resume
+                    stall_watermark = pos;
+                    stall_clock = Instant::now();
+                }
+                if stall_clock.elapsed() > STALL_LIMIT {
+                    return Err(format!(
+                        "no progress for {}s — the server stopped sending data",
+                        STALL_LIMIT.as_secs()
+                    ));
                 }
                 if held == 0 {
                     // pacing reserves BEFORE the read, exactly as
@@ -3285,6 +3407,9 @@ fn start_single_stream(
                 held = 0;
                 write_at(&f, &buf[..n], pos).map_err(|e| format!("write: {e}"))?;
                 pos += n as u64;
+                if note_stall_progress(pos, &mut stall_watermark, &mut stall_clock) {
+                    *plock(&shared.last_progress) = stall_clock;
+                }
                 // the server is sending MORE than the probed size (a
                 // HEAD/GET disagreement): stop now instead of writing
                 // the whole over-long body and reporting it backwards
@@ -4180,6 +4305,10 @@ pub struct GrabSite {
 
 const MAX_GRAB_PAGES: usize = 60;
 const MAX_SITE_ITEMS: usize = 1000;
+/// Judgment bound on the whole crawl: the per-page caps alone
+/// allow ~60 pages × 25 s, so the crawl as a whole stops at
+/// 600 s and returns what it gathered, as the probe phase does.
+const GRAB_CRAWL_LIMIT: Duration = Duration::from_secs(600);
 
 fn url_host(url: &str) -> String {
     let after = url.split("://").nth(1).unwrap_or("");
@@ -4392,9 +4521,10 @@ pub fn grab_site(start_url: &str, opts: &GrabOptions) -> Result<GrabSite, String
     let mut title = String::new();
     let mut title_taken = false;
     let mut pages_visited = 0usize;
+    let crawl_deadline = Instant::now() + GRAB_CRAWL_LIMIT;
 
     while let Some((page_url, d_same, d_other)) = queue.pop_front() {
-        if pages_visited >= MAX_GRAB_PAGES {
+        if pages_visited >= MAX_GRAB_PAGES || Instant::now() >= crawl_deadline {
             break;
         }
         let (final_url, html) = match fetch_page(&agent, &page_url) {
@@ -6203,6 +6333,58 @@ mod audit207_tests {
         let _g2 = InFlightGuard::register(&out).unwrap();
     }
 
+    // --- N2: stale `.ndm.lock` sweep ---
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_stale_locks_removes_an_unlocked_lock_file() {
+        let dir = std::env::temp_dir().join(format!("ndm-207-sweep-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("x.bin.ndm.lock");
+        std::fs::write(&lock, b"").unwrap();
+        assert_eq!(sweep_stale_locks(&dir), 1);
+        assert!(!lock.exists(), "an unlocked stale lock file must be swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_stale_locks_keeps_a_lock_held_by_a_live_guard() {
+        let dir = std::env::temp_dir().join(format!("ndm-207-sweep-b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("f.bin");
+        let g = InFlightGuard::register(&out).unwrap();
+        let lock = dir.join("f.bin.ndm.lock");
+        assert!(lock.exists(), "the live guard's lock file must exist");
+        assert_eq!(sweep_stale_locks(&dir), 0);
+        assert!(lock.exists(), "a flocked lock file must survive the sweep");
+        drop(g);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sweep_stale_locks_leaves_other_files_untouched() {
+        let dir = std::env::temp_dir().join(format!("ndm-207-sweep-c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = [
+            dir.join("keep.bin"),
+            dir.join("keep.ndm.json"),
+            dir.join("other.lock"),
+            dir.join("x.ndm.lock.bak"),
+        ];
+        for p in &keep {
+            std::fs::write(p, b"data").unwrap();
+        }
+        assert_eq!(sweep_stale_locks(&dir), 0);
+        for p in &keep {
+            assert!(p.exists(), "non-lock file {} must be untouched", p.display());
+            assert_eq!(std::fs::read(p).unwrap(), b"data");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn second_start_on_the_same_path_fails_fast() {
         let body = pattern_body(8 * 1024 * 1024);
@@ -7168,6 +7350,33 @@ mod audit208_tests {
         assert!(single_error_is_permanent("http: http://x/f: status code 410"));
         assert!(!single_error_is_permanent("read: response body closed before all bytes were read"));
         assert!(!single_error_is_permanent("short download: got 3 of 9 bytes"));
+    }
+
+    #[test]
+    fn single_stall_clock_resets_only_per_256kib_written() {
+        let old = Instant::now() - Duration::from_secs(60);
+        let mut watermark = 0u64;
+        let mut clock = old;
+        // a trickle below the threshold leaves the old clock alone
+        assert!(!note_stall_progress(
+            STALL_PROGRESS_BYTES - 1,
+            &mut watermark,
+            &mut clock
+        ));
+        assert_eq!(watermark, 0);
+        assert_eq!(clock, old);
+        // reaching the threshold resets both watermark and clock
+        assert!(note_stall_progress(
+            STALL_PROGRESS_BYTES,
+            &mut watermark,
+            &mut clock
+        ));
+        assert_eq!(watermark, STALL_PROGRESS_BYTES);
+        assert!(clock.elapsed() <= STALL_LIMIT);
+        // the stall error itself is retryable, not permanent
+        assert!(!single_error_is_permanent(
+            "no progress for 30s — the server stopped sending data"
+        ));
     }
 
     // --- item 6 (DIAG c): the lying Content-Encoding header ---

@@ -659,7 +659,23 @@ impl NdmProgTracker {
     /// tracked file has reported finished (208B: the [Merger]
     /// branch's licence to claim "merging" / done == total).
     fn all_finished(&self) -> bool {
-        !self.files.is_empty() && self.files.values().all(|f| f.finished)
+        if self.files.is_empty() {
+            return false;
+        }
+        // The "" bucket holds nameless reports (an NA filename);
+        // in Fragment mode it can never prove itself finished, so
+        // when any named file is tracked it must not veto the
+        // licence the named files have earned. A run whose ONLY
+        // bucket is "" keeps the plain rule — there the nameless
+        // finished report is the only evidence there is.
+        if self.files.keys().any(|k| !k.is_empty()) {
+            return self
+                .files
+                .iter()
+                .filter(|(k, _)| !k.is_empty())
+                .all(|(_, f)| f.finished);
+        }
+        self.files.values().all(|f| f.finished)
     }
 }
 
@@ -1260,6 +1276,10 @@ fn password_signature(password: &str) -> u64 {
 /// flyout-open warm resolve (see warm_resolution).
 const RESOLUTION_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 const RESOLUTION_CACHE_CAP: usize = 64;
+/// Wall-clock bound for one resolve: the picker probe already
+/// budgets 45 s for yt-dlp to read a page, and a challenged resolve
+/// must not hold a job in "starting" past that same budget.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 
 static RESOLUTION_CACHE: Mutex<Vec<(ResolutionKey, Instant, Resolution)>> =
     Mutex::new(Vec::new());
@@ -1394,17 +1414,50 @@ fn resolve_streams_core(
     args.push("--".into());
     args.push(url.to_string());
 
-    let out = tool_cmd(ytdlp)
+    let mut child = tool_cmd(ytdlp)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    let mut out_pipe = child.stdout.take()?;
+    // Drain stdout on a thread, as the picker probe does: polling
+    // try_wait without draining would let a large -j dump fill the
+    // pipe and stall the child until the deadline.
+    let out_thread = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut v = Vec::new();
+        let _ = out_pipe.read_to_end(&mut v);
+        v
+    });
+    let deadline = Instant::now() + RESOLVE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // None is the engine-miss path: the yt-dlp
+                    // fallback still downloads, so a timed-out
+                    // resolve never loses the download.
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let stdout = out_thread.join().unwrap_or_default();
+    if !status.success() {
         return None;
     }
-    let line = String::from_utf8_lossy(&out.stdout)
+    let line = String::from_utf8_lossy(&stdout)
         .lines()
         .find(|l| l.trim_start().starts_with('{'))?
         .to_string();
@@ -4364,6 +4417,25 @@ At least one output file must be specified";
         assert_eq!(tr.done(), 1000);
         assert_eq!(tr.total(), 1000);
         assert_eq!(tr.parts_sum(), 1000);
+    }
+
+    /// An NA-filename report lands in the "" bucket; in Fragment
+    /// mode that bucket cannot prove itself finished, so it must
+    /// not veto all_finished once a named file has finished —
+    /// but a run with ONLY the "" bucket keeps the plain rule.
+    #[test]
+    fn ndmprog_empty_key_bucket_does_not_veto_named_finish() {
+        let mut tr = NdmProgTracker::default();
+        // "" bucket, Fragment mode, unfinished (1 of 6 fragments in)
+        tr.apply(parse_ndmprog("500|1000|NA|3000000|0|6|downloading|NA"));
+        tr.apply(parse_ndmprog(
+            "2000|2000|NA|NA|NA|NA|finished|/dl/clip.mp4",
+        ));
+        assert!(tr.all_finished());
+        // sole "" bucket, still unfinished: not finished
+        let mut anon = NdmProgTracker::default();
+        anon.apply(parse_ndmprog("500|1000|NA|3000000|0|6|downloading|NA"));
+        assert!(!anon.all_finished());
     }
 
     /// M-15 finish line: the W5-4 case end to end — the merged
