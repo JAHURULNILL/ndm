@@ -155,6 +155,156 @@ pub fn specs() -> Vec<ComponentSpec> {
     Vec::new()
 }
 
+/// The last yt-dlp release whose official Windows binaries still
+/// run on Windows 7/8/8.1. The next release (2026.10.26, the pin in
+/// the table above) switched its Windows builds to the newest
+/// Python and its release notes state the binaries "now require
+/// Windows 10 or later" — Win8 support was dropped there, so on an
+/// older Windows the modern pin would download, verify and install
+/// perfectly and then fail every single run. Hash taken from the
+/// 2026.10.21 release's own SHA2-256SUMS file.
+#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+fn ytdlp_legacy_win_x64() -> ComponentSpec {
+    ComponentSpec {
+        name: "yt-dlp",
+        asset: "yt-dlp.exe",
+        url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp.exe",
+        sha256: "33121d192d706e62f684a06f80918e3f3a8ba52ac3a65213b6951c39c7d9f555",
+        zipped: false,
+    }
+}
+
+/// Windows 10 is where the modern yt-dlp pin starts working;
+/// below it the legacy pin above is the newest yt-dlp that runs.
+#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+fn use_legacy_ytdlp(windows_major: u32) -> bool {
+    windows_major < 10
+}
+
+/// The running Windows' major version (6 = Vista/7/8 era, 10 =
+/// Windows 10/11), read with RtlGetVersion: GetVersionEx reports
+/// 6.2 to any process whose manifest declares no supportedOS —
+/// which includes this app — so the usual version APIs cannot be
+/// trusted to make the pin decision above.
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+fn windows_major_version() -> Option<u32> {
+    #[repr(C)]
+    struct OsVersionInfoW {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        csd: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn RtlGetVersion(info: *mut OsVersionInfoW) -> i32;
+    }
+    let mut info = OsVersionInfoW {
+        size: 0,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform: 0,
+        csd: [0; 128],
+    };
+    info.size = std::mem::size_of::<OsVersionInfoW>() as u32;
+    if unsafe { RtlGetVersion(&mut info) } == 0 && info.major > 0 {
+        Some(info.major)
+    } else {
+        None
+    }
+}
+
+/// The fetch table for THIS machine: `specs()`, except that on
+/// pre-Windows-10 x86_64 Windows the yt-dlp entry is swapped for
+/// the last release that still runs there. Anything that fetches
+/// components or reports them missing must use this rather than
+/// `specs()` — otherwise an old-Windows machine fetches a yt-dlp
+/// that can never start. When the OS version cannot be determined
+/// the modern pin stays: the failure mode is the pre-fix
+/// behaviour, not something worse. (No legacy swap exists for
+/// ARM64 because there is no pre-10 64-bit ARM Windows.)
+#[cfg_attr(
+    not(all(target_os = "windows", target_arch = "x86_64")),
+    allow(unused_mut)
+)]
+pub fn effective_specs() -> Vec<ComponentSpec> {
+    let mut table = specs();
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        if let Some(major) = windows_major_version() {
+            if use_legacy_ytdlp(major) {
+                for spec in table.iter_mut() {
+                    if spec.name == "yt-dlp" {
+                        *spec = ytdlp_legacy_win_x64();
+                    }
+                }
+            }
+        }
+    }
+    table
+}
+
+/// One of the app-local UCRT files the app ships beside its own
+/// executable: ucrtbase.dll itself or one of the api-ms-win-crt-*
+/// forwarder stubs that resolve to it.
+#[cfg(any(target_os = "windows", test))]
+fn is_ucrt_companion(file_name: &str) -> bool {
+    let n = file_name.to_ascii_lowercase();
+    n == "ucrtbase.dll" || (n.starts_with("api-ms-win-crt-") && n.ends_with(".dll"))
+}
+
+/// Copy the UCRT companions from `src_dir` into `dst_dir`, skipping
+/// any already there. Returns how many files were copied.
+#[cfg(any(target_os = "windows", test))]
+fn copy_ucrt_companions(src_dir: &Path, dst_dir: &Path) -> std::io::Result<usize> {
+    let mut copied = 0;
+    for entry in std::fs::read_dir(src_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !is_ucrt_companion(&name) {
+            continue;
+        }
+        let target = dst_dir.join(&name);
+        if target.exists() {
+            continue;
+        }
+        std::fs::create_dir_all(dst_dir)?;
+        std::fs::copy(entry.path(), &target)?;
+        copied += 1;
+    }
+    Ok(copied)
+}
+
+/// Make sure the components folder carries the UCRT set that the
+/// fetched Windows binaries need. ffmpeg.exe imports the
+/// api-ms-win-crt-* contracts, which a stock Windows 7/8 machine
+/// cannot resolve (that is exactly why the app itself ships the
+/// set app-locally) — but app-local resolution only covers the
+/// folder the executable lives in, and the components live in a
+/// different one, so without this mirror ffmpeg would fail to
+/// start on such a machine with a missing-DLL error the moment a
+/// video download reached the merge. Mirrors only what is missing;
+/// on Windows 10+ (UCRT in-box) and non-Windows hosts the copies
+/// are simply never used. Returns how many files were copied.
+pub fn ensure_ucrt_companions(components_dir: &Path) -> std::io::Result<usize> {
+    #[cfg(target_os = "windows")]
+    {
+        let exe = std::env::current_exe()?;
+        let Some(src_dir) = exe.parent() else {
+            return Ok(0);
+        };
+        copy_ucrt_companions(src_dir, components_dir)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = components_dir;
+        Ok(0)
+    }
+}
+
 /// The file name the binary is installed under in the components
 /// dir — and, for zipped components, the entry name inside the
 /// archive. `find_tool` appends `.exe` on Windows, so the installed
@@ -319,8 +469,12 @@ pub fn download_component(
         }
         let _ = std::fs::remove_file(&part);
     } else {
-        std::fs::rename(&part, &final_path)
-            .map_err(|e| format!("cannot install {}: {e}", spec.name))?;
+        // like every earlier failure path in this function, a
+        // failed install rename must not leak the .part (W1 F10)
+        if let Err(e) = std::fs::rename(&part, &final_path) {
+            let _ = std::fs::remove_file(&part);
+            return Err(format!("cannot install {}: {e}", spec.name));
+        }
     }
     #[cfg(unix)]
     {
@@ -362,12 +516,32 @@ fn extract_binary(zip_path: &Path, name: &str, out: &Path) -> Result<(), String>
         .by_name(&entry_name)
         .map_err(|_| format!("the archive does not contain {name}"))?;
     let tmp = out.with_extension("extracting");
-    {
-        let mut dst = std::fs::File::create(&tmp)
+    write_extracted(&mut entry, &tmp, out, name)
+}
+
+/// Stream one extracted entry to the temp file beside `out` and
+/// rename it into place. Every failure path removes the temp file:
+/// a failed copy used to leave the `.extracting` file behind,
+/// contradicting the cleanup this module promises (W1 F10).
+fn write_extracted(
+    entry: &mut impl Read,
+    tmp: &Path,
+    out: &Path,
+    name: &str,
+) -> Result<(), String> {
+    let copied = (|| {
+        let mut dst = std::fs::File::create(tmp)
             .map_err(|e| format!("cannot extract {name}: {e}"))?;
-        std::io::copy(&mut entry, &mut dst).map_err(|e| format!("cannot extract {name}: {e}"))?;
+        std::io::copy(entry, &mut dst).map_err(|e| format!("cannot extract {name}: {e}"))
+    })();
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(tmp);
+        return Err(e);
     }
-    std::fs::rename(&tmp, out).map_err(|e| format!("cannot install {name}: {e}"))?;
+    if let Err(e) = std::fs::rename(tmp, out) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(format!("cannot install {name}: {e}"));
+    }
     Ok(())
 }
 
@@ -596,6 +770,77 @@ mod tests {
     }
 
     #[test]
+    fn download_rename_failure_removes_part() {
+        // W1 F10: the install target pre-created as a directory
+        // makes the final rename fail — the .part must still be
+        // cleaned up, like on every other failure path
+        let dir = temp_dir("dl-rename-fail");
+        let body = b"pretend yt-dlp binary".to_vec();
+        let spec = ComponentSpec {
+            name: "test-tool",
+            asset: "test-tool.bin",
+            url: Box::leak(serve_once(body.clone()).into_boxed_str()),
+            sha256: Box::leak(sha256_hex(&body).into_boxed_str()),
+            zipped: false,
+        };
+        std::fs::create_dir_all(dir.join(installed_name(&spec))).unwrap();
+        let err = download_component(&spec, &dir, &|_| {}).unwrap_err();
+        assert!(err.contains("cannot install"), "unexpected error: {err}");
+        assert!(
+            !dir.join(".test-tool.bin.part").exists(),
+            "a failed install rename must not leak the .part file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader that yields a few bytes, then fails — the shape of
+    /// a corrupt archive entry dying mid-copy.
+    struct FailAfterFirstRead(bool);
+
+    impl Read for FailAfterFirstRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "entry died mid-copy",
+                ));
+            }
+            self.0 = true;
+            buf[..4].copy_from_slice(b"part");
+            Ok(4)
+        }
+    }
+
+    #[test]
+    fn extract_copy_failure_removes_extracting_temp() {
+        // W1 F10: a failed io::copy must not leak the .extracting temp
+        let dir = temp_dir("extract-copy-fail");
+        let out = dir.join("tool");
+        let tmp = out.with_extension("extracting");
+        let err = write_extracted(&mut FailAfterFirstRead(false), &tmp, &out, "tool")
+            .unwrap_err();
+        assert!(err.contains("cannot extract"), "unexpected error: {err}");
+        assert!(!tmp.exists(), "a failed copy must not leak the .extracting temp");
+        assert!(!out.exists(), "a failed copy must not install anything");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_rename_failure_removes_extracting_temp() {
+        // the same cleanup on extract_binary's install step: the
+        // destination pre-created as a directory makes rename fail
+        let dir = temp_dir("extract-rename-fail");
+        let zip = make_zip(&dir, &[("tool", b"binary")]);
+        let out = dir.join("tool");
+        std::fs::create_dir_all(&out).unwrap();
+        let tmp = out.with_extension("extracting");
+        let err = extract_binary(&zip, "tool", &out).unwrap_err();
+        assert!(err.contains("cannot install"), "unexpected error: {err}");
+        assert!(!tmp.exists(), "a failed install rename must not leak the .extracting temp");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn download_extracts_a_verified_nested_binary() {
         // the ffmpeg shape end-to-end: a zip whose binary is nested
         // under a versioned folder lands at dir/<name>. The entry
@@ -624,5 +869,80 @@ mod tests {
         let installed = download_component(&spec, &dir, &|_| {}).unwrap();
         assert_eq!(std::fs::read(&installed).unwrap(), b"zipped-binary");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pre-Windows-10 fallback pin must be as well-formed as
+    /// any table entry — it is verified against its hash on real
+    /// machines exactly like the modern pin is.
+    #[test]
+    fn legacy_ytdlp_pin_is_well_formed() {
+        let s = ytdlp_legacy_win_x64();
+        assert_eq!(s.name, "yt-dlp");
+        assert_eq!(s.asset, "yt-dlp.exe");
+        assert!(!s.zipped);
+        assert_eq!(s.sha256.len(), 64);
+        assert!(
+            s.sha256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "pinned hash must be lowercase hex"
+        );
+        assert!(s.url.starts_with("https://"));
+        assert!(s.url.ends_with(s.asset));
+    }
+
+    /// The legacy pin takes over strictly below Windows 10 — the
+    /// release it replaces (2026.10.26) is the first whose Windows
+    /// binaries require Windows 10.
+    #[test]
+    fn legacy_ytdlp_selected_below_windows_10_only() {
+        assert!(use_legacy_ytdlp(5));
+        assert!(use_legacy_ytdlp(6));
+        assert!(!use_legacy_ytdlp(10));
+        assert!(!use_legacy_ytdlp(11));
+    }
+
+    /// Off pre-10 x86_64 Windows the effective table must be the
+    /// plain table, entry for entry — the swap may never leak
+    /// onto a platform it was not meant for.
+    #[test]
+    fn effective_specs_match_specs_here() {
+        let plain = specs();
+        let effective = effective_specs();
+        assert_eq!(plain.len(), effective.len());
+        for (a, b) in plain.iter().zip(effective.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.url, b.url);
+            assert_eq!(a.sha256, b.sha256);
+        }
+    }
+
+    /// Only the CRT companions are mirrored into the components
+    /// folder — core api-set stubs and unrelated files stay out —
+    /// and a file already present (e.g. a newer OS copy) is never
+    /// overwritten.
+    #[test]
+    fn ucrt_companions_copy_only_missing_crt_files() {
+        let base = temp_dir("ucrt");
+        let src = base.join("app");
+        let dst = base.join("components");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("ucrtbase.dll"), b"ucrt").unwrap();
+        std::fs::write(src.join("api-ms-win-crt-runtime-l1-1-0.dll"), b"stub").unwrap();
+        std::fs::write(src.join("API-MS-Win-CRT-Heap-l1-1-0.dll"), b"stub2").unwrap();
+        std::fs::write(src.join("api-ms-win-core-file-l1-1-0.dll"), b"core").unwrap();
+        std::fs::write(src.join("ndm-app.exe"), b"app").unwrap();
+        std::fs::write(dst.join("ucrtbase.dll"), b"keep-me").unwrap();
+        let copied = copy_ucrt_companions(&src, &dst).unwrap();
+        assert_eq!(copied, 2);
+        assert_eq!(std::fs::read(dst.join("ucrtbase.dll")).unwrap(), b"keep-me");
+        assert!(dst.join("api-ms-win-crt-runtime-l1-1-0.dll").exists());
+        assert!(dst.join("API-MS-Win-CRT-Heap-l1-1-0.dll").exists());
+        assert!(!dst.join("api-ms-win-core-file-l1-1-0.dll").exists());
+        assert!(!dst.join("ndm-app.exe").exists());
+        // a second pass finds nothing left to do
+        assert_eq!(copy_ucrt_companions(&src, &dst).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

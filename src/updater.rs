@@ -73,6 +73,27 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
+/// Fetch one manifest URL's body as text. A response carrying a
+/// real Content-Encoding is rejected (W1 F11): the update paths
+/// request `identity` and ureq here does not decode, so a gzipped
+/// manifest would otherwise be parsed as garbage — or, worse on
+/// the download path, saved as the package — instead of failing
+/// cleanly like every other transfer path in the crate.
+fn fetch_manifest_body(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+    let resp = agent
+        .get(url)
+        .set("Accept-Encoding", "identity")
+        .call()
+        .map_err(|e| format!("update check failed: {e}"))?;
+    if let Some(enc) = crate::response_encoding(&resp) {
+        return Err(format!(
+            "update check failed: server answered with Content-Encoding: {enc}"
+        ));
+    }
+    resp.into_string()
+        .map_err(|e| format!("update check failed: {e}"))
+}
+
 pub fn fetch_release() -> Result<ReleaseInfo, String> {
     // The env override exists for local update-flow tests; a release
     // build must only ever trust the pinned manifest addresses.
@@ -89,11 +110,7 @@ pub fn fetch_release() -> Result<ReleaseInfo, String> {
     let agent = crate::build_agent();
     let mut last_err = String::new();
     for url in &urls {
-        let fetched = agent
-            .get(url)
-            .call()
-            .map_err(|e| format!("update check failed: {e}"))
-            .and_then(|r| r.into_string().map_err(|e| format!("update check failed: {e}")));
+        let fetched = fetch_manifest_body(&agent, url);
         match fetched {
             Ok(body) => match serde_json::from_str(&body) {
                 Ok(info) => return Ok(info),
@@ -103,6 +120,31 @@ pub fn fetch_release() -> Result<ReleaseInfo, String> {
         }
     }
     Err(last_err)
+}
+
+/// Absolute ceiling on one update package when the server gives
+/// no trustworthy expected size, enforced WHILE streaming (W1
+/// F11): the SHA-256 is only checked after the whole body lands,
+/// so without a cap a broken or hostile source could fill the
+/// disk before the hash ever gets a say — the exact hole the
+/// components 256 MiB cap closed for the engine fetch. Real
+/// update packages are tens of MiB; 2 GiB is generous headroom,
+/// not a limit a genuine release can brush against.
+pub const MAX_UPDATE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The mid-stream abort threshold for an update download whose
+/// expected size is `expected_total` (the response's
+/// Content-Length; 0 when the server did not send one, e.g. a
+/// chunked body). With an expected size the cap is that size plus
+/// a margin — the larger of 1 MiB or 10% — so a body that keeps
+/// streaming well past what it announced is cut off; without one,
+/// the absolute `ceiling` applies.
+fn download_cap(expected_total: u64, ceiling: u64) -> u64 {
+    if expected_total > 0 {
+        expected_total.saturating_add((expected_total / 10).max(1024 * 1024))
+    } else {
+        ceiling
+    }
 }
 
 /// Download `url` to `dest`, verifying the SHA-256 against the
@@ -118,18 +160,41 @@ pub fn download_file(
     sha256_expected: &str,
     on_progress: &dyn Fn(u64, u64),
 ) -> Result<(), String> {
+    download_file_with_ceiling(url, dest, sha256_expected, on_progress, MAX_UPDATE_BYTES)
+}
+
+fn download_file_with_ceiling(
+    url: &str,
+    dest: &Path,
+    sha256_expected: &str,
+    on_progress: &dyn Fn(u64, u64),
+    ceiling: u64,
+) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create folder: {e}"))?;
     }
     let agent = crate::build_agent();
     let resp = agent
         .get(url)
+        .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| format!("download failed: {e}"))?;
+    if let Some(enc) = crate::response_encoding(&resp) {
+        return Err(format!(
+            "download failed: server answered with Content-Encoding: {enc}"
+        ));
+    }
     let total: u64 = resp
         .header("Content-Length")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    if total > ceiling {
+        return Err(format!(
+            "the update package is larger than the {} MiB size cap — the download was refused",
+            ceiling / (1024 * 1024)
+        ));
+    }
+    let cap = download_cap(total, ceiling);
     let tmp = dest.with_extension("part");
     let mut reader = resp.into_reader();
     let mut file = std::fs::File::create(&tmp).map_err(|e| format!("cannot write file: {e}"))?;
@@ -146,6 +211,14 @@ pub fn download_file(
                     break Err(format!("cannot write file: {e}"));
                 }
                 downloaded += n as u64;
+                if downloaded > cap {
+                    // the error path below removes the .part file:
+                    // an aborted over-cap download leaves nothing
+                    break Err(format!(
+                        "the update exceeded the size cap for this download ({} bytes) — the download was aborted and discarded",
+                        cap
+                    ));
+                }
                 if downloaded - last >= 256 * 1024 {
                     last = downloaded;
                     on_progress(downloaded, total);
@@ -226,5 +299,148 @@ pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<Vec<std::path::Pa
 pub fn count_hit(counter: &str) -> bool {
     let url = format!("{COUNT_BASE}/hit/{COUNT_NS}/{counter}");
     crate::build_agent().get(&url).call().is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ndm-test-updater-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let mut h = Sha256::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
+    }
+
+    /// Serve one raw HTTP response (head + body, exactly as given)
+    /// on a loopback port and return the URL.
+    fn serve_raw(response: Vec<u8>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = sock.write_all(&response);
+            let _ = sock.flush();
+        });
+        format!("http://127.0.0.1:{port}/pkg")
+    }
+
+    fn serve_plain(body: &[u8], extra_headers: &str) -> String {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n",
+            body.len()
+        );
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(body);
+        serve_raw(raw)
+    }
+
+    fn serve_chunked(body: &[u8]) -> String {
+        let mut raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+            .to_vec();
+        for chunk in body.chunks(64 * 1024) {
+            raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            raw.extend_from_slice(chunk);
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+        serve_raw(raw)
+    }
+
+    #[test]
+    fn download_cap_math() {
+        // no expected size -> the absolute ceiling decides
+        assert_eq!(download_cap(0, MAX_UPDATE_BYTES), MAX_UPDATE_BYTES);
+        assert_eq!(download_cap(0, 1_234), 1_234);
+        // expected size -> expected + the larger of 1 MiB / 10%
+        assert_eq!(download_cap(1_000, MAX_UPDATE_BYTES), 1_000 + 1024 * 1024);
+        assert_eq!(
+            download_cap(100 * 1024 * 1024, MAX_UPDATE_BYTES),
+            110 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn download_installs_a_small_verified_package() {
+        let dir = temp_dir("ok");
+        let dest = dir.join("pkg.bin");
+        let body = b"genuine update package".to_vec();
+        let url = serve_plain(&body, "");
+        download_file(&url, &dest, &sha256_hex(&body), &|_, _| {}).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_rejects_an_encoded_response() {
+        // W1 F11: a gzip-labelled body must fail cleanly before a
+        // single byte is written, not be saved as the package
+        let dir = temp_dir("enc");
+        let dest = dir.join("pkg.bin");
+        let body = b"not really a package".to_vec();
+        let url = serve_plain(&body, "Content-Encoding: gzip\r\n");
+        let err = download_file(&url, &dest, &sha256_hex(&body), &|_, _| {}).unwrap_err();
+        assert!(err.contains("Content-Encoding"), "unexpected error: {err}");
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("part").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn download_aborts_a_chunked_body_past_the_cap_and_cleans_up() {
+        // W1 F11: a chunked body has no Content-Length to pre-flight,
+        // so the cap must bite MID-STREAM — a 2 MiB body against a
+        // 1 MiB ceiling is aborted and its .part removed, instead of
+        // being consumed in full before the hash check (the small
+        // ceiling stands in for the 2 GiB production one)
+        let dir = temp_dir("cap");
+        let dest = dir.join("pkg.bin");
+        let body = vec![b'x'; 2 * 1024 * 1024];
+        let url = serve_chunked(&body);
+        let err = download_file_with_ceiling(
+            &url,
+            &dest,
+            &sha256_hex(&body),
+            &|_, _| {},
+            1024 * 1024,
+        )
+        .unwrap_err();
+        assert!(err.contains("size cap"), "unexpected error: {err}");
+        assert!(!dest.exists(), "an aborted download must not install");
+        assert!(
+            !dest.with_extension("part").exists(),
+            "an aborted download must not leak its .part file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fetch_manifest_body_rejects_an_encoded_response() {
+        // W1 F11: fetch_release's body fetch must reject a real
+        // Content-Encoding instead of parsing compressed bytes
+        let agent = crate::build_agent();
+        let body = br#"{"version":"9.9.9"}"#;
+        let url = serve_plain(body, "Content-Encoding: gzip\r\n");
+        let err = fetch_manifest_body(&agent, &url).unwrap_err();
+        assert!(err.contains("Content-Encoding"), "unexpected error: {err}");
+        // the same body unencoded passes through untouched
+        let url = serve_plain(body, "");
+        let text = fetch_manifest_body(&agent, &url).unwrap();
+        assert_eq!(text.as_bytes(), body);
+    }
 }
 

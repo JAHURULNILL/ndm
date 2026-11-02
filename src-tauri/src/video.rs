@@ -162,12 +162,14 @@ fn probe_duration_secs(path: &Path, components_dir: &Path) -> Option<f64> {
 /// R3-EXT-01), and the size half never applies to audio jobs,
 /// whose transcodes legitimately change size (only their duration
 /// is checked).
-fn contradiction_verdict(
-    expect_size: u64,
+/// The duration half of the W-2 contradiction check, on its own:
+/// a produced file running half the expected length or less (or
+/// twice it) contradicts the probed page video. Shared by
+/// `contradiction_verdict` and the M-15-aware finish line in
+/// `VideoJob::finish_contradiction`.
+fn duration_contradiction(
     expect_duration: f64,
-    produced_size: u64,
     produced_duration: Option<f64>,
-    audio: bool,
 ) -> Option<String> {
     if expect_duration >= 1.0 {
         if let Some(d) = produced_duration {
@@ -180,12 +182,422 @@ fn contradiction_verdict(
             }
         }
     }
+    None
+}
+
+fn contradiction_verdict(
+    expect_size: u64,
+    expect_duration: f64,
+    produced_size: u64,
+    produced_duration: Option<f64>,
+    audio: bool,
+) -> Option<String> {
+    if let Some(msg) = duration_contradiction(expect_duration, produced_duration) {
+        return Some(msg);
+    }
     if !audio && expect_size > 0 && produced_size > 0 && produced_size.saturating_mul(4) < expect_size {
         return Some(format!(
             "the downloaded file is {produced_size} bytes but the quality you picked was about {expect_size} bytes — the wrong stream may have been delivered; please retry"
         ));
     }
     None
+}
+
+/// M-15 finish-line size judgement. The old finish line compared
+/// the merged file against `expect_size` alone — and `expect_size`
+/// can itself be a poisoned figure (a journal total written by the
+/// pre-fix fragment accounting, restored into the job on resume),
+/// which branded byte-perfect merges as "the wrong stream". The
+/// trustworthy baselines, in order:
+///
+/// 1. `parts_sum` — the bytes THIS run actually downloaded (the
+///    tracker's per-file exact totals). A merged file in
+///    [parts/4, parts×4] IS what was downloaded; no expectation,
+///    exact or estimated, can overrule that.
+/// 2. `format_size` when EXACT (the selected formats' `filesize`
+///    sum from the probe): judged with the same 4× rule.
+/// 3. `format_size` as an ESTIMATE (`filesize_approx`): an
+///    estimate must never brand a byte-valid file an error — when
+///    the produced file passes stream/duration sanity
+///    (`sanity_ok`), the size half is waived entirely.
+/// 4. The legacy rule against `expect_size`, for jobs with no
+///    better baseline.
+fn completion_size_error(
+    expect_size: u64,
+    format_size: Option<u64>,
+    format_exact: bool,
+    parts_sum: u64,
+    produced_len: u64,
+    sanity_ok: bool,
+) -> Option<String> {
+    if produced_len == 0 {
+        return None;
+    }
+    if parts_sum > 0
+        && produced_len.saturating_mul(4) >= parts_sum
+        && produced_len <= parts_sum.saturating_mul(4)
+    {
+        return None;
+    }
+    if let Some(f) = format_size {
+        if format_exact {
+            if produced_len.saturating_mul(4) < f {
+                return Some(format!(
+                    "the downloaded file is {produced_len} bytes but the quality you picked was about {f} bytes — the wrong stream may have been delivered; please retry"
+                ));
+            }
+            return None;
+        }
+        if sanity_ok {
+            return None;
+        }
+    }
+    if expect_size > 0 && produced_len.saturating_mul(4) < expect_size {
+        return Some(format!(
+            "the downloaded file is {produced_len} bytes but the quality you picked was about {expect_size} bytes — the wrong stream may have been delivered; please retry"
+        ));
+    }
+    None
+}
+
+/// M-4 adoption gate for a final file found on disk (a kept merge
+/// recorded by a previous run, or a complete file already sitting
+/// at the job's expected final path): adopt only when an expected
+/// size is known and the file's length is in the same order as
+/// that expectation. A merged file is legitimately a little
+/// larger than the downloaded parts (container overhead — the
+/// hunt's 155,201,613-byte merge of 154,471,113 bytes of parts),
+/// so exact equality is too strict; a file half the expected size
+/// or less, or over twice it, is a different file and must not be
+/// adopted on size trust alone. The finalize that follows still
+/// runs the stream/duration guards before anything is published.
+fn adoptable_final(len: u64, expected: u64) -> bool {
+    expected > 0
+        && len > 0
+        && (len as u128) * 2 >= expected as u128
+        && (len as u128) <= (expected as u128) * 2
+}
+
+/// One parsed NDMPROG line (see the --progress-template the
+/// yt-dlp fallback is launched with). Every field is optional:
+/// yt-dlp renders a missing progress key as "NA", and which keys
+/// exist depends on the downloader — a plain HTTP file reports an
+/// exact `total_bytes` and no fragment fields; a fragment (DASH/
+/// HLS) file reports `fragment_index`/`fragment_count` plus a
+/// `total_bytes_estimate`, and its exact total only on the final
+/// 'finished' report for the file.
+#[derive(Clone, Debug, Default)]
+struct NdmProgReport {
+    downloaded: Option<u64>,
+    total: Option<u64>,
+    estimate: Option<u64>,
+    speed: Option<f64>,
+    frag_index: Option<u64>,
+    frag_count: Option<u64>,
+    finished: bool,
+    file: String,
+}
+
+/// Parse the part after "NDMPROG:". Field order is the template's:
+/// downloaded|total|estimate|speed|frag_index|frag_count|status|
+/// filename — the filename comes LAST and is rejoined verbatim,
+/// because a title may itself contain '|'. Legacy 4-field lines
+/// (the pre-M-15 template) still parse: the missing fields simply
+/// stay None and the report lands in the anonymous file bucket.
+fn parse_ndmprog(rest: &str) -> NdmProgReport {
+    let mut it = rest.splitn(8, '|');
+    let num = |s: Option<&str>| -> Option<u64> {
+        s.and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v as u64)
+    };
+    let downloaded = num(it.next());
+    let total = num(it.next()).filter(|t| *t > 0);
+    let estimate = num(it.next()).filter(|t| *t > 0);
+    let speed = it
+        .next()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let frag_index = num(it.next());
+    let frag_count = num(it.next()).filter(|t| *t > 0);
+    let status = it.next().unwrap_or("").trim().to_string();
+    let file = it.next().unwrap_or("").trim().to_string();
+    NdmProgReport {
+        downloaded,
+        total,
+        estimate,
+        speed,
+        frag_index,
+        frag_count,
+        finished: status == "finished",
+        file: if file == "NA" { String::new() } else { file },
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FragMode {
+    /// No fragment report seen yet for this file.
+    Unknown,
+    /// The file's reports carry a file-level AGGREGATE
+    /// downloaded_bytes (yt-dlp's fragment state dict): the
+    /// latest report IS the file's progress, and summing reports
+    /// would count the same bytes again and again.
+    Aggregate,
+    /// The file's reports are PER-FRAGMENT cumulatives (each
+    /// carries its fragment's own total): progress lives in the
+    /// per-fragment slots and is summed over them.
+    Fragment,
+}
+
+/// Per-file NDMPROG accounting (M-15). The pre-fix parser kept a
+/// single (base, current) pair for the WHOLE yt-dlp run: with
+/// several files (video + audio) reporting into one stream and
+/// fragment estimates spiking under --concurrent-fragments, every
+/// drop of the reported counter folded the current (possibly
+/// spiked) total into `base` — the journal total snowballed to
+/// ~37× the real size, nondeterministically, and the finish line
+/// then branded the perfect merge an error. This tracker keys
+/// every report by its FILE and, inside a fragment file, by
+/// fragment identity — it only ever stores the LATEST report per
+/// key and sums those, never a running sum of cumulative reports.
+#[derive(Default)]
+struct NdmFileTrack {
+    mode: FragMode,
+    /// per-fragment latest (downloaded, total) — Fragment mode
+    slots: HashMap<u64, (u64, Option<u64>)>,
+    /// largest aggregate downloaded_bytes seen — Aggregate mode
+    agg_done: u64,
+    exact_total: Option<u64>,
+    /// smallest QUALIFIED estimate reported (see apply): the
+    /// finished: the estimate formula divides the bytes so far by
+    /// (finished + 1), so with 8 fragments in flight and none
+    /// finished it overshoots wildly; those early spikes must
+    /// never stick (the old parser's monotonic-max total did
+    /// exactly that)
+    estimate_qualified_min: Option<u64>,
+    frag_count: Option<u64>,
+    finished: bool,
+    speed: f64,
+}
+
+impl Default for FragMode {
+    fn default() -> Self {
+        FragMode::Unknown
+    }
+}
+
+impl NdmFileTrack {
+    fn apply(&mut self, r: &NdmProgReport) {
+        if let Some(c) = r.frag_count {
+            self.frag_count = Some(c);
+        }
+        // Mode is decided by the first DOWNLOADING fragment
+        // report: one that also carries the fragment's own total
+        // is a per-fragment report; one without is the aggregate
+        // state dict. (The file's 'finished' report carries an
+        // exact file total in the aggregate world and decides
+        // nothing.)
+        if r.frag_index.is_some() && self.mode == FragMode::Unknown {
+            if !r.finished {
+                self.mode = if r.total.is_some() {
+                    FragMode::Fragment
+                } else {
+                    FragMode::Aggregate
+                };
+            } else if r.frag_count.map(|c| c > 1).unwrap_or(false) {
+                // a fragment's own 'finished' report arriving
+                // before any downloading report was sampled (a
+                // tiny init segment can complete that fast): it
+                // must land in its slot, not be mistaken for the
+                // whole file's exact total
+                self.mode = FragMode::Fragment;
+            }
+        }
+        if let Some(d) = r.downloaded {
+            self.agg_done = self.agg_done.max(d);
+        }
+        match self.mode {
+            FragMode::Fragment => {
+                if let Some(idx) = r.frag_index {
+                    let slot = self.slots.entry(idx).or_insert((0, None));
+                    if r.finished {
+                        // this fragment is complete: its total is
+                        // its size, and it downloaded all of it
+                        if let Some(t) = r.total.or(r.downloaded) {
+                            *slot = (t, Some(t));
+                        }
+                    } else {
+                        if let Some(d) = r.downloaded {
+                            slot.0 = d;
+                        }
+                        if r.total.is_some() {
+                            slot.1 = r.total;
+                        }
+                    }
+                }
+                if r.finished {
+                    // the file is complete once every fragment's
+                    // slot is fully downloaded (its own reports
+                    // reached its total); the slots then sum to
+                    // the file's exact size
+                    if let Some(c) = self.frag_count {
+                        let done_slots = self
+                            .slots
+                            .values()
+                            .filter(|(d, t)| t.map(|t| *d >= t).unwrap_or(false))
+                            .count() as u64;
+                        if done_slots >= c {
+                            self.finished = true;
+                            self.exact_total =
+                                Some(self.slots.values().map(|(d, _)| *d).sum());
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Some(t) = r.total {
+                    self.exact_total = Some(t);
+                }
+                if r.finished {
+                    self.finished = true;
+                    if let Some(t) = r.total {
+                        self.agg_done = self.agg_done.max(t);
+                    } else if let Some(d) = r.downloaded {
+                        self.agg_done = self.agg_done.max(d);
+                    }
+                }
+            }
+        }
+        if let Some(e) = r.estimate {
+            // qualified = safe to show as a total: either the
+            // file is not fragmented at all (a plain estimate,
+            // which has no spike formula behind it), or at least
+            // one fragment has finished, which tames the fragment
+            // formula's denominator
+            if r.frag_index.map(|i| i >= 1).unwrap_or(true) {
+                self.estimate_qualified_min = Some(
+                    self.estimate_qualified_min
+                        .map(|m: u64| m.min(e))
+                        .unwrap_or(e),
+                );
+            }
+        }
+        if let Some(s) = r.speed {
+            self.speed = s;
+        }
+    }
+
+    fn done(&self) -> u64 {
+        if self.finished {
+            if let Some(t) = self.exact_total {
+                return t;
+            }
+        }
+        match self.mode {
+            FragMode::Fragment => self.slots.values().map(|(d, _)| *d).sum(),
+            _ => self.agg_done,
+        }
+    }
+
+    fn total(&self) -> u64 {
+        if let Some(t) = self.exact_total {
+            return t.max(self.done());
+        }
+        let est = match self.mode {
+            FragMode::Fragment => {
+                // sum of the fragments' own totals; fragments
+                // whose total is not yet known are estimated at
+                // the mean of the known ones
+                let known: Vec<u64> = self.slots.values().filter_map(|(_, t)| *t).collect();
+                if known.is_empty() {
+                    None
+                } else {
+                    let mean = known.iter().sum::<u64>() / known.len() as u64;
+                    let count = self
+                        .frag_count
+                        .map(|c| c.max(self.slots.len() as u64))
+                        .unwrap_or(self.slots.len() as u64);
+                    let mut sum = 0u64;
+                    for i in 0..count {
+                        sum = sum.saturating_add(
+                            self.slots
+                                .get(&i)
+                                .and_then(|(_, t)| *t)
+                                .unwrap_or(mean),
+                        );
+                    }
+                    Some(sum)
+                }
+            }
+            // only QUALIFIED estimates may stand as a total (see
+            // estimate_qualified_min): an unqualified fragment
+            // estimate is the M-15 spike itself, and showing the
+            // downloaded count as the total for the first moments
+            // of a fragment download is strictly safer than
+            // showing a figure 37× too large
+            _ => self.estimate_qualified_min,
+        };
+        est.map(|e| e.max(self.done())).unwrap_or_else(|| self.done())
+    }
+
+    /// The file's final size once its download is over: the exact
+    /// total when one was reported, else everything it reported
+    /// downloading. The finish line's parts sum is built from this.
+    fn final_size(&self) -> u64 {
+        self.exact_total.unwrap_or_else(|| self.done())
+    }
+}
+
+/// Whole-run NDMPROG accounting: the per-file tracks plus the
+/// format-level size learned from the probe (the selected
+/// formats' `filesize`/`filesize_approx`), which outranks every
+/// fragment estimate as the run's total.
+#[derive(Default)]
+struct NdmProgTracker {
+    files: HashMap<String, NdmFileTrack>,
+    format_total: Option<u64>,
+    format_exact: bool,
+}
+
+impl NdmProgTracker {
+    fn set_format_total(&mut self, total: Option<u64>, exact: bool) {
+        self.format_total = total.filter(|t| *t > 0);
+        self.format_exact = exact;
+    }
+
+    fn apply(&mut self, r: NdmProgReport) {
+        self.files.entry(r.file.clone()).or_default().apply(&r);
+    }
+
+    fn done(&self) -> u64 {
+        self.files.values().map(|f| f.done()).sum()
+    }
+
+    fn total(&self) -> u64 {
+        let done = self.done();
+        if let Some(f) = self.format_total {
+            return f.max(done);
+        }
+        self.files
+            .values()
+            .map(|f| f.total())
+            .sum::<u64>()
+            .max(done)
+    }
+
+    fn speed(&self) -> f64 {
+        self.files
+            .values()
+            .filter(|f| !f.finished)
+            .map(|f| f.speed)
+            .sum()
+    }
+
+    /// Sum of the files' final sizes — what this run actually
+    /// downloaded, the finish line's trustworthy baseline.
+    fn parts_sum(&self) -> u64 {
+        self.files.values().map(|f| f.final_size()).sum()
+    }
 }
 
 /// Estimate a media file's true media payload in bytes from its
@@ -280,6 +692,44 @@ fn formats_media_bytes(duration_secs: f64, formats: &[&serde_json::Value]) -> Op
     }
     let bytes = (total_kbps * 1000.0 / 8.0 * duration_secs) as u64;
     (bytes > 0).then_some(bytes)
+}
+
+/// The selected formats' combined size from the probe info, for
+/// the yt-dlp fallback's accounting (M-15): the sum of `filesize`
+/// when EVERY selected format reports one (exact, true), else the
+/// sum of `filesize`/`filesize_approx` when every format reports
+/// at least one of them (estimate, false), else (None, false).
+/// A format-level figure — even an approximate one — outranks
+/// fragment estimates, whose formula overshoots wildly while the
+/// first fragments are still in flight.
+fn formats_filesize(formats: &[&serde_json::Value]) -> (Option<u64>, bool) {
+    if formats.is_empty() {
+        return (None, false);
+    }
+    let field = |f: &serde_json::Value, k: &str| -> Option<u64> {
+        f[k].as_u64().filter(|n| *n > 0)
+    };
+    if formats.iter().all(|f| field(f, "filesize").is_some()) {
+        return (
+            Some(formats.iter().filter_map(|f| field(f, "filesize")).sum()),
+            true,
+        );
+    }
+    if formats
+        .iter()
+        .all(|f| field(f, "filesize").or_else(|| field(f, "filesize_approx")).is_some())
+    {
+        return (
+            Some(
+                formats
+                    .iter()
+                    .filter_map(|f| field(f, "filesize").or_else(|| field(f, "filesize_approx")))
+                    .sum(),
+            ),
+            false,
+        );
+    }
+    (None, false)
 }
 
 /// (name -> (len, mtime)) for every file in `dir`, taken just before a
@@ -641,6 +1091,30 @@ pub struct VideoJob {
     /// output file, kept on disk and recorded here, which the next
     /// resume finalizes instead of re-downloading everything
     merged_final: Mutex<Option<PathBuf>>,
+    /// M-15: the selected formats' combined size from the probe
+    /// info (`filesize` sum when exact, else `filesize_approx`),
+    /// learned at resolution time. The yt-dlp fallback's
+    /// accounting prefers it over fragment estimates, and the
+    /// finish line judges the merged file against it — exact
+    /// figures with the usual tolerance, estimates never as a
+    /// hard error (see completion_size_error)
+    format_size: Mutex<Option<u64>>,
+    format_size_exact: Mutex<bool>,
+    /// the bytes this run actually downloaded (the parts sum):
+    /// set by the engine path from its locked total when the
+    /// merge starts, and by the yt-dlp path from the tracker's
+    /// per-file final sizes when the child exits. The finish
+    /// line's trustworthy baseline (see completion_size_error)
+    downloaded_total: Mutex<u64>,
+    /// M-4: a completed final file a PREVIOUS run left on disk,
+    /// handed in at construction (the journal's recorded
+    /// final_path, via start_with_recorded_final, or a complete
+    /// file found at this job's expected final path when the job
+    /// was built). Step 0 of the spawn thread tries to finalize
+    /// (adopt) it instead of re-downloading every part; a
+    /// candidate that fails the finalize guards is NOT an error —
+    /// the job falls through to a normal download
+    recorded_final: Option<PathBuf>,
     /// what the user was shown and chose at add time: the picked
     /// option's probed size in bytes and the page video's probed
     /// duration in seconds (0 = unknown). The finish line
@@ -682,6 +1156,10 @@ struct Resolution {
     expect_audio: bool,
     expected_media: Option<u64>,
     pair_audio_url: Option<String>,
+    /// M-15: the selected formats' combined probe size and
+    /// whether it is exact (see formats_filesize)
+    format_size: Option<u64>,
+    format_size_exact: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -766,6 +1244,8 @@ struct ResolutionProbe {
     expect_audio: bool,
     pair_audio_url: Option<String>,
     expected_media: Option<u64>,
+    format_size: Option<u64>,
+    format_size_exact: bool,
     resolved: Option<(String, Vec<DirectStream>)>,
 }
 
@@ -926,11 +1406,18 @@ fn resolve_streams_core(
             }
         }
     }
+    // M-15: the selected formats' combined probe size — learned
+    // for EVERY outcome below, including the ineligible ones:
+    // the yt-dlp fallback downloads this same selection, and its
+    // accounting prefers this figure over fragment estimates.
+    let (format_size, format_size_exact) = formats_filesize(&formats);
     if formats.is_empty() || formats.len() > 2 {
         return Some(ResolutionProbe {
             expect_audio: any_audio,
             pair_audio_url,
             expected_media: None,
+            format_size,
+            format_size_exact,
             resolved: None,
         });
     }
@@ -952,6 +1439,8 @@ fn resolve_streams_core(
                 expect_audio: any_audio,
                 pair_audio_url,
                 expected_media,
+                format_size,
+                format_size_exact,
                 resolved: None,
             });
         }
@@ -961,6 +1450,8 @@ fn resolve_streams_core(
                 expect_audio: any_audio,
                 pair_audio_url,
                 expected_media,
+                format_size,
+                format_size_exact,
                 resolved: None,
             });
         }
@@ -970,6 +1461,8 @@ fn resolve_streams_core(
                 expect_audio: any_audio,
                 pair_audio_url,
                 expected_media,
+                format_size,
+                format_size_exact,
                 resolved: None,
             });
         }
@@ -1030,6 +1523,8 @@ fn resolve_streams_core(
             expect_audio: any_audio,
             pair_audio_url,
             expected_media,
+            format_size,
+            format_size_exact,
             resolved: None,
         });
     }
@@ -1037,6 +1532,8 @@ fn resolve_streams_core(
         expect_audio: any_audio,
         pair_audio_url,
         expected_media,
+        format_size,
+        format_size_exact,
         resolved: Some((resolved_title, streams)),
     })
 }
@@ -1092,6 +1589,8 @@ pub fn warm_resolution(
                 expect_audio: probe.expect_audio,
                 expected_media: probe.expected_media,
                 pair_audio_url: probe.pair_audio_url,
+                format_size: probe.format_size,
+                format_size_exact: probe.format_size_exact,
             },
             Instant::now(),
         );
@@ -1204,6 +1703,99 @@ impl VideoJob {
         expect_size: u64,
         expect_duration: f64,
     ) -> Result<Arc<VideoJob>, String> {
+        Self::start_impl(
+            url,
+            dir,
+            selector,
+            audio,
+            title,
+            cookies,
+            login,
+            password,
+            components_dir,
+            expect_size,
+            expect_duration,
+            None,
+        )
+    }
+
+    /// M-4: start a job for an entry whose previous run may have
+    /// completed a merge that was never finalized (the app quit
+    /// during the merge). `recorded_final` is the journal's
+    /// recorded final_path; when the file is still on disk at a
+    /// size consistent with `expect_size`, step 0 of the spawn
+    /// thread finalizes (adopts) it instead of re-downloading
+    /// every part from zero.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_recorded_final(
+        url: &str,
+        dir: &Path,
+        selector: &str,
+        audio: bool,
+        title: &str,
+        cookies: Option<PathBuf>,
+        login: &str,
+        password: &str,
+        components_dir: &Path,
+        expect_size: u64,
+        expect_duration: f64,
+        recorded_final: Option<PathBuf>,
+    ) -> Result<Arc<VideoJob>, String> {
+        Self::start_impl(
+            url,
+            dir,
+            selector,
+            audio,
+            title,
+            cookies,
+            login,
+            password,
+            components_dir,
+            expect_size,
+            expect_duration,
+            recorded_final,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_impl(
+        url: &str,
+        dir: &Path,
+        selector: &str,
+        audio: bool,
+        title: &str,
+        cookies: Option<PathBuf>,
+        login: &str,
+        password: &str,
+        components_dir: &Path,
+        expect_size: u64,
+        expect_duration: f64,
+        recorded_final: Option<PathBuf>,
+    ) -> Result<Arc<VideoJob>, String> {
+        // M-4: no recorded path handed in — a complete file
+        // already sitting at this job's expected final path (its
+        // title stem in the save folder) at a size consistent
+        // with the expectation is the same kept-merge shape:
+        // remember it as an adoption candidate for step 0. (The
+        // stem is uniquified BELOW precisely because that file
+        // exists; the candidate keeps the original path.)
+        let recorded_final = recorded_final.or_else(|| {
+            if expect_size == 0 {
+                return None;
+            }
+            let s = safe_filename_stem(title);
+            if s.is_empty() {
+                return None;
+            }
+            own_media_exts(audio).iter().find_map(|ext| {
+                let cand = dir.join(format!("{s}.{ext}"));
+                let len = std::fs::metadata(&cand)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|m| m.len())?;
+                adoptable_final(len, expect_size).then_some(cand)
+            })
+        });
         let initial_stem = {
             let s = safe_filename_stem(title);
             if s.is_empty() {
@@ -1242,6 +1834,10 @@ impl VideoJob {
             login: login.to_string(),
             password: password.to_string(),
             merged_final: Mutex::new(None),
+            format_size: Mutex::new(None),
+            format_size_exact: Mutex::new(false),
+            downloaded_total: Mutex::new(0),
+            recorded_final,
             expect_size,
             expect_duration,
         });
@@ -1314,6 +1910,8 @@ impl VideoJob {
         *self.expect_audio.lock().unwrap() = probe.expect_audio;
         *self.pair_audio_url.lock().unwrap() = probe.pair_audio_url.clone();
         *self.expected_media.lock().unwrap() = probe.expected_media;
+        *self.format_size.lock().unwrap() = probe.format_size;
+        *self.format_size_exact.lock().unwrap() = probe.format_size_exact;
         probe.resolved
     }
 
@@ -1339,6 +1937,8 @@ impl VideoJob {
                 *self.expect_audio.lock().unwrap() = res.expect_audio;
                 *self.expected_media.lock().unwrap() = res.expected_media;
                 *self.pair_audio_url.lock().unwrap() = res.pair_audio_url.clone();
+                *self.format_size.lock().unwrap() = res.format_size;
+                *self.format_size_exact.lock().unwrap() = res.format_size_exact;
                 (res.title, res.streams)
             }
             None => {
@@ -1354,6 +1954,8 @@ impl VideoJob {
                         expect_audio: *self.expect_audio.lock().unwrap(),
                         expected_media: *self.expected_media.lock().unwrap(),
                         pair_audio_url: self.pair_audio_url.lock().unwrap().clone(),
+                        format_size: *self.format_size.lock().unwrap(),
+                        format_size_exact: *self.format_size_exact.lock().unwrap(),
                     },
                     Instant::now(),
                 );
@@ -1581,6 +2183,17 @@ impl VideoJob {
             p.status = "merging".to_string();
             p.speed_bps = 0.0;
             p.conns = 0;
+            // M-4: the merged output path is known NOW, before
+            // ffmpeg runs — record it at merge START, so the
+            // journal (persisted every ~2 s) carries status
+            // "merging" WITH the final_path. If the app quits
+            // mid-merge, the orphaned ffmpeg still completes the
+            // file, and the recorded path is what lets a later
+            // run adopt that completed merge instead of
+            // re-downloading every part
+            p.final_path = Some(final_path.clone());
+            // the finish line's parts sum: the parts' locked total
+            *self.downloaded_total.lock().unwrap() = p.done;
         }
 
         // The finish-line guard's baseline for this merge: the
@@ -1664,6 +2277,23 @@ impl VideoJob {
         }
         ff_args.push(final_path.display().to_string());
 
+        // M-4: the stream parts and their state files are deleted
+        // ONLY once the finalize below has fully completed (a
+        // terminal verdict). They used to be deleted the moment
+        // ffmpeg returned — before ensure_audio ran — so quitting
+        // anywhere in the merge→finalize window left a complete
+        // merged file whose parts were gone, and the next run
+        // could only re-download. While the job is anywhere short
+        // of a terminal state (paused mid-merge, cancelled,
+        // merge failed → fallback), the parts survive and a
+        // resume re-uses them.
+        let delete_parts = || {
+            for part in &part_paths {
+                let _ = std::fs::remove_file(part);
+                let _ = std::fs::remove_file(ndm::state_path_for(part));
+            }
+        };
+
         let merge_ok = tool_cmd(ffmpeg)
             .args(&ff_args)
             .stdin(Stdio::null())
@@ -1673,11 +2303,6 @@ impl VideoJob {
             .map(|s| s.success())
             .unwrap_or(false)
             && final_path.is_file();
-
-        for p in &part_paths {
-            let _ = std::fs::remove_file(p);
-            let _ = std::fs::remove_file(ndm::state_path_for(p));
-        }
 
         // A cancel that landed DURING the merge (which can take
         // seconds) must win over the merge result: publishing
@@ -1815,6 +2440,11 @@ impl VideoJob {
                         p.final_path = Some(verified);
                     }
                     drop(p);
+                    // the finalize has fully completed (finished
+                    // or a terminal verdict): the parts' work is
+                    // done, they go now — and not a moment before
+                    // (M-4)
+                    delete_parts();
                     if finished_now {
                         // a finished job leaves no working files
                         // behind — including a previous attempt's
@@ -1833,6 +2463,8 @@ impl VideoJob {
                     p.speed_bps = 0.0;
                     p.conns = 0;
                     p.final_path = Some(final_path);
+                    drop(p);
+                    delete_parts();
                     true
                 }
             }
@@ -1845,26 +2477,78 @@ impl VideoJob {
     /// it against this job's add-time expectations (see
     /// `contradiction_verdict`). Skips itself entirely when nothing
     /// was probed at add time.
+    ///
+    /// M-15: the SIZE half no longer trusts `expect_size` alone —
+    /// that figure can itself be a poisoned journal total (written
+    /// by the pre-fix fragment accounting and restored into the
+    /// job), which branded byte-perfect merges as errors. It is
+    /// judged by `completion_size_error` against the trustworthy
+    /// baselines: the bytes this run actually downloaded
+    /// (downloaded_total) and the probe's format-level size
+    /// (format_size). The DURATION half is unchanged — a delivered
+    /// file running a plainly different length is still an error,
+    /// however its size adds up.
     fn finish_contradiction(
         &self,
         produced: &Path,
         produced_len: u64,
         components_dir: &Path,
     ) -> Option<String> {
-        if self.expect_size == 0 && self.expect_duration <= 0.0 {
+        let format_size = *self.format_size.lock().unwrap();
+        let parts_sum = *self.downloaded_total.lock().unwrap();
+        if self.expect_size == 0
+            && self.expect_duration <= 0.0
+            && format_size.is_none()
+            && parts_sum == 0
+        {
             return None;
+        }
+        if self.audio {
+            // audio jobs: size is never judged (R2-EXT-02), only
+            // duration — exactly the old verdict's audio behaviour
+            let produced_duration = if self.expect_duration > 0.0 {
+                probe_duration_secs(produced, components_dir)
+            } else {
+                None
+            };
+            return contradiction_verdict(
+                self.expect_size,
+                self.expect_duration,
+                produced_len,
+                produced_duration,
+                true,
+            );
         }
         let produced_duration = if self.expect_duration > 0.0 {
             probe_duration_secs(produced, components_dir)
         } else {
             None
         };
-        contradiction_verdict(
+        if let Some(msg) = duration_contradiction(self.expect_duration, produced_duration) {
+            return Some(msg);
+        }
+        // sanity for the estimate-waiver: the file probes as the
+        // media it should be (video present, sound present when
+        // the source offered it) and its duration does not
+        // contradict the page's (checked just above; an
+        // unprobeable duration does not block the waiver — the
+        // stream check is the byte-validity evidence)
+        let duration_ok = self.expect_duration < 1.0
+            || produced_duration
+                .map(|d| d >= 0.5 && d >= self.expect_duration * 0.5 && d <= self.expect_duration * 2.0)
+                .unwrap_or(true);
+        let streams_ok = probe_streams(produced, components_dir)
+            .map(|(v, a)| {
+                v && (a || !*self.expect_audio.lock().unwrap())
+            })
+            .unwrap_or(false);
+        completion_size_error(
             self.expect_size,
-            self.expect_duration,
+            format_size,
+            *self.format_size_exact.lock().unwrap(),
+            parts_sum,
             produced_len,
-            produced_duration,
-            self.audio,
+            streams_ok && duration_ok,
         )
     }
 
@@ -2043,6 +2727,136 @@ impl VideoJob {
         Ok(final_path.to_path_buf())
     }
 
+    /// Finalize a merged file that already exists on disk — this
+    /// job's own kept merge (a pause landed during the merge) or
+    /// an adopted completed final from a previous session (M-4).
+    /// Verifies the sound, runs the finish-line guards and
+    /// publishes the verdict. Returns true when this file settles
+    /// the job's outcome (finished, error, or a stop that landed
+    /// during the check). With `publish_error == false` (an
+    /// adopted candidate — a file this run did not produce), a
+    /// guard rejection instead returns false and publishes
+    /// nothing: the caller falls through to a normal download,
+    /// because a wrong candidate must not become this entry's
+    /// error and the download the user asked for should still run.
+    fn finalize_kept_merge(
+        self: &Arc<Self>,
+        merged: &Path,
+        components_dir: &Path,
+        publish_error: bool,
+    ) -> bool {
+        // the recorded total here IS the kept merge's own size
+        // (set when the pause landed), so it is no baseline at
+        // all; the guard judges the file against the selected
+        // streams' media payload learned when the producing run
+        // resolved them — unknown (e.g. the merge came from a run
+        // whose resolution reported no bitrates) means the guard
+        // skips this finalize (R3-EXT-01). For the finish line's
+        // parts sum, an on-disk merge stands in as its own parts:
+        // it is the whole download, already assembled
+        let downloaded = self.progress.lock().unwrap().total;
+        if let Ok(m) = merged.metadata() {
+            *self.downloaded_total.lock().unwrap() = m.len();
+        }
+        let expected_media = *self.expected_media.lock().unwrap();
+        // the audio check below is part of the finalize window:
+        // report it as "merging", not "starting"
+        self.progress.lock().unwrap().status = "merging".to_string();
+        let audio_result = self.ensure_audio(merged, components_dir);
+        // a stop that landed DURING the audio check wins over the
+        // kept merge's verdict, exactly as in the fresh-merge
+        // finalize (R2-EXT-05)
+        if let Some(flag) = self.stop_flag.lock().unwrap().clone() {
+            if flag == "cancelled" {
+                // the kept file stays on disk (it predates this
+                // run); only the status is the job's to publish
+                let mut p = self.progress.lock().unwrap();
+                p.status = "cancelled".to_string();
+                p.speed_bps = 0.0;
+                p.conns = 0;
+                return true;
+            }
+            if flag == "paused" {
+                *self.merged_final.lock().unwrap() = Some(merged.to_path_buf());
+                let mut p = self.progress.lock().unwrap();
+                p.status = "paused".to_string();
+                p.speed_bps = 0.0;
+                p.conns = 0;
+                p.final_path = Some(merged.to_path_buf());
+                return true;
+            }
+        }
+        let mut published_finish = false;
+        match audio_result {
+            Ok(verified) => {
+                let flen = verified.metadata().map(|m| m.len()).unwrap_or(0);
+                // audio jobs exempt (R2-EXT-02), as in the
+                // fresh-merge finalize
+                let shrink = if flen > 0 && !self.audio {
+                    drastic_shrink(expected_media, downloaded, flen)
+                } else {
+                    None
+                };
+                // W-2: same add-time contradiction check as the
+                // fresh-merge finalize
+                let verdict = match shrink {
+                    Some(msg) => Some(msg),
+                    None => self.finish_contradiction(&verified, flen, components_dir),
+                };
+                if let Some(msg) = verdict {
+                    if !publish_error {
+                        return false;
+                    }
+                    let mut p = self.progress.lock().unwrap();
+                    p.status = "error".to_string();
+                    p.error = Some(msg);
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                    p.final_path = Some(verified);
+                } else {
+                    let mut p = self.progress.lock().unwrap();
+                    if flen > 0 {
+                        p.total = flen;
+                        p.done = flen;
+                    }
+                    p.status = "finished".to_string();
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                    p.final_path = Some(verified);
+                    published_finish = true;
+                }
+            }
+            Err(msg) => {
+                if !publish_error {
+                    return false;
+                }
+                let mut p = self.progress.lock().unwrap();
+                p.status = "error".to_string();
+                p.error = Some(msg);
+                p.speed_bps = 0.0;
+                p.conns = 0;
+                p.final_path = Some(merged.to_path_buf());
+            }
+        }
+        if published_finish {
+            // a finished job leaves no working files behind,
+            // whichever engine produced them (R4 side
+            // observation). Sweep by the MERGED file's stem: for
+            // an adopted merge that is the stem the producing run
+            // worked under, which can differ from this job's
+            // (uniquified) chosen stem
+            if let Some(stem) = merged
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+            {
+                if !stem.is_empty() {
+                    sweep_job_temps(&self.dir, &stem);
+                }
+            }
+        }
+        true
+    }
+
     fn spawn(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
         let ytdlp = find_tool("yt-dlp", components_dir)
             .ok_or("yt-dlp not found — the video component is not installed yet")?;
@@ -2100,107 +2914,43 @@ impl VideoJob {
         std::thread::spawn(move || {
             // clears `alive` on every exit path of this thread (A3)
             let _alive_guard = AliveGuard(job.clone());
-            // 0. A previous run merged the file but was paused before
-            // it could be finalized: verify and publish that merge
-            // instead of downloading everything again.
+            // 0. A previous run merged the file but was stopped
+            // before it could be finalized: verify and publish
+            // that merge instead of downloading everything again.
+            // Two sources: this job's own kept merge (in memory —
+            // a pause landed during the merge), and a completed
+            // final a previous SESSION left on disk (M-4: the app
+            // quit during the merge, the orphaned ffmpeg finished
+            // the file, and no finalize ever ran). The second
+            // arrives via `recorded_final` (the journal's recorded
+            // path, or a complete file found at the expected final
+            // path when this job was built) and is adopted only
+            // when its size is consistent with the expectation —
+            // and even then only if the finalize guards accept
+            // it; a rejected candidate falls through to a normal
+            // download, untouched.
             let kept_merge = job.merged_final.lock().unwrap().take();
             if let Some(merged) = kept_merge {
                 if merged.is_file() {
-                    // the recorded total here IS the kept merge's
-                    // own size (set when the pause landed), so it is
-                    // no baseline at all; the guard judges the file
-                    // against the selected streams' media payload
-                    // learned when the producing run resolved them —
-                    // unknown (e.g. the merge came from a run whose
-                    // resolution reported no bitrates) means the
-                    // guard skips this finalize (R3-EXT-01)
-                    let downloaded = job.progress.lock().unwrap().total;
-                    let expected_media = *job.expected_media.lock().unwrap();
-                    // the audio check below is part of the finalize
-                    // window: report it as "merging", not "starting"
-                    job.progress.lock().unwrap().status = "merging".to_string();
-                    let audio_result = job.ensure_audio(&merged, &comp_dir);
-                    // a stop that landed DURING the audio check wins
-                    // over the kept merge's verdict, exactly as in
-                    // the fresh-merge finalize (R2-EXT-05)
-                    if let Some(flag) = job.stop_flag.lock().unwrap().clone() {
-                        if flag == "cancelled" {
-                            // the kept file stays on disk (it
-                            // predates this run); only the status is
-                            // the job's to publish
-                            let mut p = job.progress.lock().unwrap();
-                            p.status = "cancelled".to_string();
-                            p.speed_bps = 0.0;
-                            p.conns = 0;
-                            return;
-                        }
-                        if flag == "paused" {
-                            *job.merged_final.lock().unwrap() = Some(merged.clone());
-                            let mut p = job.progress.lock().unwrap();
-                            p.status = "paused".to_string();
-                            p.speed_bps = 0.0;
-                            p.conns = 0;
-                            p.final_path = Some(merged);
-                            return;
-                        }
-                    }
-                    let mut published_finish = false;
-                    match audio_result {
-                        Ok(verified) => {
-                            let flen = verified.metadata().map(|m| m.len()).unwrap_or(0);
-                            // audio jobs exempt (R2-EXT-02), as in
-                            // the fresh-merge finalize
-                            let shrink = if flen > 0 && !job.audio {
-                                drastic_shrink(expected_media, downloaded, flen)
-                            } else {
-                                None
-                            };
-                            // W-2: same add-time contradiction
-                            // check as the fresh-merge finalize
-                            let verdict = match shrink {
-                                Some(msg) => Some(msg),
-                                None => job.finish_contradiction(&verified, flen, &comp_dir),
-                            };
-                            let mut p = job.progress.lock().unwrap();
-                            if let Some(msg) = verdict {
-                                p.status = "error".to_string();
-                                p.error = Some(msg);
-                                p.speed_bps = 0.0;
-                                p.conns = 0;
-                                p.final_path = Some(verified);
-                            } else {
-                                if flen > 0 {
-                                    p.total = flen;
-                                    p.done = flen;
-                                }
-                                p.status = "finished".to_string();
-                                p.speed_bps = 0.0;
-                                p.conns = 0;
-                                p.final_path = Some(verified);
-                                published_finish = true;
-                            }
-                        }
-                        Err(msg) => {
-                            let mut p = job.progress.lock().unwrap();
-                            p.status = "error".to_string();
-                            p.error = Some(msg);
-                            p.speed_bps = 0.0;
-                            p.conns = 0;
-                            p.final_path = Some(merged);
-                        }
-                    }
-                    if published_finish {
-                        // a finished job leaves no working files
-                        // behind, whichever engine produced them
-                        // (R4 side observation)
-                        if let Some(stem) = job.chosen_stem.lock().unwrap().clone() {
-                            sweep_job_temps(&job.dir, &stem);
-                        }
-                    }
+                    job.finalize_kept_merge(&merged, &comp_dir, true);
                     return;
                 }
-                // the kept file vanished meanwhile: fall through and
-                // download normally
+                // the kept file vanished meanwhile: fall through
+                // and download normally
+            }
+            if let Some(recorded) = job.recorded_final.clone() {
+                let size_ok = std::fs::metadata(&recorded)
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|m| adoptable_final(m.len(), job.expect_size))
+                    .unwrap_or(false);
+                if size_ok && job.finalize_kept_merge(&recorded, &comp_dir, false) {
+                    return;
+                }
+                // not adoptable, or the guards rejected it:
+                // download normally (the fresh attempt starts at
+                // "starting" again, as after any fallback)
+                job.progress.lock().unwrap().status = "starting".to_string();
             }
             // 1. Try parallel multi-connection Rust engine download first
             if job.run_parallel_engine(&ytdlp, &ffmpeg, &comp_dir, &sel, my_gen) {
@@ -2268,7 +3018,13 @@ impl VideoJob {
             }
             args.push("--progress-template".into());
             args.push(
-                "NDMPROG:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s"
+                // M-15: the template also carries the fragment
+                // index/count, the report status and the file the
+                // report belongs to — the accounting keys every
+                // report by (file, fragment) and never sums
+                // cumulative counters across reports (see
+                // NdmProgTracker)
+                "NDMPROG:%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.speed)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(progress.status)s|%(progress.filename)s"
                     .into(),
             );
             let stem = job.resolve_or_lock_stem("");
@@ -2337,78 +3093,59 @@ impl VideoJob {
             } else {
                 None
             };
-            let mut base: u64 = 0;
-            let mut cur_done: u64 = 0;
-            let mut cur_total: u64 = 0;
-            // A1: has the CURRENT file reported an exact
-            // total_bytes yet? Once it has, its total_bytes_estimate
-            // lines must never move the total again (the estimate
-            // keeps arriving and used to overwrite the exact figure
-            // — one source of the total changing size mid-download)
-            let mut cur_exact = false;
+            // M-15: per-(file, fragment) accounting for the whole
+            // run. The format-level size learned at resolve time
+            // (when the resolve ran) outranks every fragment
+            // estimate as the run's total
+            let mut tracker = NdmProgTracker::default();
+            tracker.set_format_total(
+                *job.format_size.lock().unwrap(),
+                *job.format_size_exact.lock().unwrap(),
+            );
             let mut detected_final: Option<PathBuf> = None;
 
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 if let Some(rest) = line.strip_prefix("NDMPROG:") {
-                    let parts: Vec<&str> = rest.split('|').collect();
-                    let parse = |i: usize| -> Option<f64> {
-                        parts.get(i).and_then(|s| s.trim().parse::<f64>().ok())
-                    };
+                    tracker.apply(parse_ndmprog(rest));
                     let mut p = job.progress.lock().unwrap();
                     p.conns = frags;
-                    if let Some(d) = parse(0) {
-                        let d = d as u64;
-                        if cur_done > 262_144 && d + 262_144 < cur_done {
-                            base += if cur_total > 0 { cur_total } else { cur_done };
-                            cur_total = 0;
-                            cur_exact = false;
-                        }
-                        cur_done = d;
-                        let new_done = base + cur_done;
-                        if new_done != p.done {
-                            p.last_progress_at = Instant::now();
-                        }
-                        p.done = new_done;
-                        // A2: the first real bytes end "starting"
-                        if p.done > 0 && p.status == "starting" {
-                            p.status = "downloading".to_string();
-                        }
+                    let new_done = tracker.done();
+                    if new_done != p.done {
+                        p.last_progress_at = Instant::now();
                     }
-                    // A1: exact total_bytes wins for the current
-                    // file from the first time it appears; the
-                    // estimate is used only until then. The reported
-                    // total never decreases mid-download (an early
-                    // over-estimate stays until the finalize replaces
-                    // total and done together with the merged length)
-                    let exact = parse(1).filter(|&t| t > 0.0);
-                    let estimate = parse(2).filter(|&t| t > 0.0);
-                    let reported = match exact {
-                        Some(e) => {
-                            cur_exact = true;
-                            Some(e)
-                        }
-                        None if !cur_exact => estimate,
-                        None => None,
-                    };
-                    if let Some(t) = reported {
-                        cur_total = t as u64;
-                        let new_total = base + cur_total;
-                        if new_total > p.total {
-                            p.total = new_total;
-                        }
+                    p.done = new_done;
+                    // A2: the first real bytes end "starting"
+                    if p.done > 0 && p.status == "starting" {
+                        p.status = "downloading".to_string();
                     }
-                    if let Some(sp) = parse(3) {
-                        p.speed_bps = sp;
+                    // the tracker's total is the honest figure —
+                    // per-file exact totals, the format-level size,
+                    // or a fragment estimate that is allowed to
+                    // come DOWN as it refines (the pre-fix parser
+                    // only ever let the total grow, which locked
+                    // the early concurrent-fragment estimate spike
+                    // in for the whole download)
+                    let new_total = tracker.total();
+                    if new_total > 0 {
+                        p.total = new_total;
                     }
+                    p.speed_bps = tracker.speed();
                 } else {
                     if let Some(fp) = parse_output_path_line(&line) {
-                        detected_final = Some(fp);
+                        detected_final = Some(fp.clone());
                         // yt-dlp has named a file it is writing:
                         // the download proper has begun (A2)
                         let mut p = job.progress.lock().unwrap();
                         if p.status == "starting" {
                             p.status = "downloading".to_string();
+                        }
+                        // M-4: a [Merger] line names the merged
+                        // output — record it as the final path the
+                        // moment the merge starts, so the journal
+                        // carries it through the merge window
+                        if line.contains("[Merger]") && p.final_path.is_none() {
+                            p.final_path = Some(fp);
                         }
                     }
                     if line.contains("[Merger]") || line.contains("[ExtractAudio]") {
@@ -2444,6 +3181,15 @@ impl VideoJob {
                 let _ = h.join();
             }
             let succeeded = status.map(|s| s.success()).unwrap_or(false);
+            if succeeded && tracker.parts_sum() > 0 {
+                // M-15: the finish line judges the merged file
+                // against what this run actually downloaded — the
+                // tracker's per-file final sizes — never against a
+                // fragment estimate; the reported total settles at
+                // the same true figure
+                *job.downloaded_total.lock().unwrap() = tracker.parts_sum();
+                job.progress.lock().unwrap().total = tracker.parts_sum();
+            }
             // A pause/cancel that landed while yt-dlp was finishing
             // wins over the success report: the user stopped this job,
             // so its files stay partial and resumable.
@@ -2781,6 +3527,8 @@ mod tests {
             expect_audio: true,
             expected_media: Some(1234),
             pair_audio_url: None,
+            format_size: Some(5678),
+            format_size_exact: true,
         }
     }
 
@@ -3205,6 +3953,277 @@ At least one output file must be specified";
         assert!(contradiction_verdict(0, 2400.0, 3_000_000, Some(6.0), true).is_some());
     }
 
+    /// M-15: synthetic NDMPROG reports in the per-fragment shape —
+    /// 8 fragments of one file downloading CONCURRENTLY, their
+    /// cumulative reports interleaved round-robin. The pre-fix
+    /// parser folded these into a base+current sum and reported
+    /// many times the real size; the tracker keys by (file,
+    /// fragment) and must stay at the real total throughout.
+    #[test]
+    fn ndmprog_eight_concurrent_fragments_stay_at_real_size() {
+        // fragment sizes in bytes (sum 18,000,000)
+        let sizes: [u64; 8] = [
+            3_000_000, 1_000_000, 2_000_000, 4_000_000, 1_000_000, 2_000_000, 3_000_000,
+            2_000_000,
+        ];
+        let real: u64 = sizes.iter().sum();
+        let mut tr = NdmProgTracker::default();
+        // three reporting rounds: each fragment reports 1/3, 2/3,
+        // then all of its cumulative bytes, interleaved
+        for round in 1..=3u64 {
+            for (f, sz) in sizes.iter().enumerate() {
+                let d = sz * round / 3;
+                let line = format!(
+                    "{d}|{sz}|NA|500000|{f}|8|downloading|/dl/vid.f137.mp4"
+                );
+                tr.apply(parse_ndmprog(&line));
+                // not-yet-reported fragments are extrapolated
+                // from the mean of the known ones, which can
+                // transiently overshoot a little (bounded well
+                // under 1.5×) — never the old ~37×
+                assert!(
+                    tr.total() <= real * 3 / 2,
+                    "total {} ballooned past the real {real}",
+                    tr.total()
+                );
+                assert!(tr.done() <= real);
+                if round == 1 && f == sizes.len() - 1 {
+                    // every fragment has reported once: all
+                    // fragment totals are known, so the total is
+                    // already exact
+                    assert_eq!(tr.total(), real);
+                }
+            }
+        }
+        for (f, sz) in sizes.iter().enumerate() {
+            let line = format!("{sz}|{sz}|NA|NA|{f}|8|finished|/dl/vid.f137.mp4");
+            tr.apply(parse_ndmprog(&line));
+        }
+        assert_eq!(tr.done(), real);
+        assert_eq!(tr.total(), real);
+        assert_eq!(tr.parts_sum(), real);
+    }
+
+    /// M-15 control: the 6-fragment sequential shape that already
+    /// worked before the fix must keep working — fragments report
+    /// and finish one at a time.
+    #[test]
+    fn ndmprog_six_fragment_control_stays_exact() {
+        let mut tr = NdmProgTracker::default();
+        let frag = 1_000_000u64;
+        for f in 0..6u64 {
+            for d in [250_000, 500_000, 750_000, frag] {
+                let line = format!(
+                    "{d}|{frag}|NA|800000|{f}|6|downloading|/dl/clip.f0.mp4"
+                );
+                tr.apply(parse_ndmprog(&line));
+                assert!(tr.total() <= 6 * frag, "total overshot: {}", tr.total());
+            }
+            let line = format!("{frag}|{frag}|NA|NA|{f}|6|finished|/dl/clip.f0.mp4");
+            tr.apply(parse_ndmprog(&line));
+            assert_eq!(tr.done(), (f + 1) * frag);
+        }
+        assert_eq!(tr.total(), 6 * frag);
+        assert_eq!(tr.parts_sum(), 6 * frag);
+    }
+
+    /// M-15, the hunt's live shape: yt-dlp's AGGREGATE fragment
+    /// state (per-file cumulative downloaded_bytes, NO per-report
+    /// total, a total_bytes_estimate whose formula spikes while
+    /// the first of 49 fragments are still in flight), with the
+    /// video and audio files' reports interleaved. Real parts:
+    /// 150,220,105 + 4,251,008 = 154,471,113 bytes. The old
+    /// parser's journal read 5,707,844,548 total / 5,686,229,871
+    /// done for this download.
+    #[test]
+    fn ndmprog_aggregate_fragments_never_inflate() {
+        let mut tr = NdmProgTracker::default();
+        let real = 154_471_113u64;
+        let report = |d: u64, est: u64, idx: u64, count: u64, file: &str| {
+            format!("{d}|NA|{est}|3000000|{idx}|{count}|downloading|{file}")
+        };
+        // the spike: 8 fragments in flight, none finished — the
+        // estimate formula divides ~24 MB by (0 + 1) and scales
+        // by 49
+        tr.apply(parse_ndmprog(&report(
+            24_000_000,
+            1_176_000_000,
+            0,
+            49,
+            "/dl/manifest.f0.mp4",
+        )));
+        assert!(
+            tr.total() <= real,
+            "the early estimate spike must not become the total (got {})",
+            tr.total()
+        );
+        // fragments start finishing; the estimate converges
+        tr.apply(parse_ndmprog(&report(
+            60_000_000,
+            183_000_000,
+            12,
+            49,
+            "/dl/manifest.f0.mp4",
+        )));
+        tr.apply(parse_ndmprog(&report(
+            120_000_000,
+            155_000_000,
+            30,
+            49,
+            "/dl/manifest.f0.mp4",
+        )));
+        // the audio file reports into the same stream
+        tr.apply(parse_ndmprog(&report(
+            2_000_000,
+            4_400_000,
+            1,
+            3,
+            "/dl/manifest.f1.m4a",
+        )));
+        assert!(tr.total() <= 160_000_000, "total drifted: {}", tr.total());
+        assert!(tr.done() <= real);
+        // both files finish with exact totals
+        tr.apply(parse_ndmprog(
+            "150220105|150220105|NA|NA|NA|NA|finished|/dl/manifest.f0.mp4",
+        ));
+        tr.apply(parse_ndmprog(
+            "4251008|4251008|NA|NA|NA|NA|finished|/dl/manifest.f1.m4a",
+        ));
+        assert_eq!(tr.done(), real);
+        assert_eq!(tr.total(), real);
+        assert_eq!(tr.parts_sum(), real);
+    }
+
+    /// M-15: a format-level size from the probe outranks fragment
+    /// estimates for the whole run.
+    #[test]
+    fn ndmprog_format_total_outranks_estimates() {
+        let mut tr = NdmProgTracker::default();
+        tr.set_format_total(Some(154_471_113), false);
+        tr.apply(parse_ndmprog(
+            "24000000|NA|1176000000|3000000|0|49|downloading|/dl/manifest.f0.mp4",
+        ));
+        assert_eq!(tr.total(), 154_471_113);
+        assert_eq!(tr.done(), 24_000_000);
+    }
+
+    /// Legacy 4-field NDMPROG lines (the pre-M-15 template) still
+    /// parse into a sane single-file accounting.
+    #[test]
+    fn ndmprog_legacy_lines_still_parse() {
+        let r = parse_ndmprog("500|NA|NA|NA");
+        assert_eq!(r.downloaded, Some(500));
+        let mut tr = NdmProgTracker::default();
+        tr.apply(parse_ndmprog("500|1000|NA|2000"));
+        tr.apply(parse_ndmprog("1000|1000|NA|NA|NA|NA|finished|"));
+        assert_eq!(tr.done(), 1000);
+        assert_eq!(tr.total(), 1000);
+        assert_eq!(tr.parts_sum(), 1000);
+    }
+
+    /// M-15 finish line: the W5-4 case end to end — the merged
+    /// file is byte-valid, the add-time expectation is a poisoned
+    /// 5.7 GB journal figure, and the run's own parts sum proves
+    /// the file is exactly what was downloaded. No error.
+    #[test]
+    fn completion_size_error_trusts_parts_over_poisoned_expectation() {
+        // W5-4 verbatim numbers
+        assert!(completion_size_error(
+            5_707_844_548,
+            None,
+            false,
+            154_471_113,
+            155_201_613,
+            true,
+        )
+        .is_none());
+        // a parts mismatch ALONE is not an error either (R3: a
+        // padded container legitimately remuxes down to a small
+        // fraction of its bytes) — the stub-merge guard is
+        // drastic_shrink against the media payload, upstream
+        assert!(completion_size_error(0, None, false, 154_471_113, 2_342_828, true)
+            .is_none());
+        // an EXACT format size is a trustworthy expectation
+        assert!(completion_size_error(0, Some(154_471_113), true, 0, 155_201_613, true)
+            .is_none());
+        assert!(completion_size_error(0, Some(154_471_113), true, 0, 2_342_828, true)
+            .is_some());
+        // an ESTIMATE-only format size never brands a sane file…
+        assert!(completion_size_error(
+            5_707_844_548,
+            Some(160_000_000),
+            false,
+            0,
+            155_201_613,
+            true,
+        )
+        .is_none());
+        // …but without stream/duration sanity the legacy rule
+        // still applies to it
+        assert!(completion_size_error(
+            5_707_844_548,
+            Some(160_000_000),
+            false,
+            0,
+            155_201_613,
+            false,
+        )
+        .is_some());
+        // the legacy rule is unchanged when nothing better exists
+        assert!(completion_size_error(100_663_296, None, false, 0, 2_342_828, true)
+            .is_some());
+        assert!(completion_size_error(100_663_296, None, false, 0, 98_000_000, true)
+            .is_none());
+        assert!(completion_size_error(0, None, false, 0, 0, true).is_none());
+    }
+
+    /// M-4: the adoption gate for a completed final found on disk.
+    #[test]
+    fn adoptable_final_requires_a_consistent_size() {
+        // the hunt's kept merge: 155,201,613-byte file against the
+        // journal's 154,471,113-byte download total (container
+        // overhead makes the merge slightly LARGER than its parts)
+        assert!(adoptable_final(155_201_613, 154_471_113));
+        assert!(adoptable_final(154_471_113, 154_471_113));
+        // an unknown expectation adopts nothing
+        assert!(!adoptable_final(155_201_613, 0));
+        assert!(!adoptable_final(0, 154_471_113));
+        // a plainly different file is not adopted on size trust
+        assert!(!adoptable_final(10_000_000, 154_471_113));
+        assert!(!adoptable_final(400_000_000, 154_471_113));
+        // a poisoned (inflated) expectation adopts nothing either —
+        // the job falls back to downloading, the safe direction
+        assert!(!adoptable_final(155_201_613, 5_707_844_548));
+    }
+
+    #[test]
+    fn formats_filesize_prefers_exact_then_approx() {
+        let v = serde_json::json!({"formats": [
+            {"filesize": 150_220_105},
+            {"filesize": 4_251_008}
+        ]});
+        let formats: Vec<&serde_json::Value> =
+            v["formats"].as_array().unwrap().iter().collect();
+        assert_eq!(formats_filesize(&formats), (Some(154_471_113), true));
+        // one exact + one approx → the sum is an estimate
+        let v2 = serde_json::json!({"formats": [
+            {"filesize": 150_220_105},
+            {"filesize_approx": 4_300_000}
+        ]});
+        let formats2: Vec<&serde_json::Value> =
+            v2["formats"].as_array().unwrap().iter().collect();
+        assert_eq!(formats_filesize(&formats2), (Some(154_520_105), false));
+        // a format with neither → unknown, never a partial sum
+        let v3 = serde_json::json!({"formats": [
+            {"filesize": 150_220_105},
+            {"ext": "m4a"}
+        ]});
+        let formats3: Vec<&serde_json::Value> =
+            v3["formats"].as_array().unwrap().iter().collect();
+        assert_eq!(formats_filesize(&formats3), (None, false));
+        assert_eq!(formats_filesize(&[]), (None, false));
+    }
+
     #[test]
     fn direct_format_wins_over_playlist_variants() {
         // the W-2 fixture's shape: a direct <video> file plus a
@@ -3284,6 +4303,10 @@ At least one output file must be specified";
             login: String::new(),
             password: String::new(),
             merged_final: Mutex::new(None),
+            format_size: Mutex::new(None),
+            format_size_exact: Mutex::new(false),
+            downloaded_total: Mutex::new(0),
+            recorded_final: None,
             expect_size: 0,
             expect_duration: 0.0,
         }

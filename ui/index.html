@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Nill Download Manager 2.0.7</title>
+<title>Nill Download Manager 2.0.8</title>
 <script>
   // apply the saved theme before first paint (default: light)
   try {
@@ -168,6 +168,12 @@
          of learning it from a reverted list next launch; hidden
          again when a save succeeds (persist_recovered) -->
     <div id="persistBanner" class="quota-banner hidden"></div>
+    <!-- EXT (2.0.8): the extension-update-pending banner — shown
+         once per bundled version on the backend's
+         ext_update_notice event, when a browser is still running
+         an older extension than the app ships; the Dismiss button
+         is built by app.js alongside the text -->
+    <div id="extBanner" class="quota-banner hidden"></div>
     <div class="grid-wrap">
     <table class="grid">
       <colgroup id="colGroup"></colgroup>
@@ -190,54 +196,83 @@
     <div class="modal-head"><span id="dTitle">Download Status</span> <span id="dModalClose">×</span></div>
     <div class="detail-tabs"><span class="tab active" id="tabStatus">Download status</span><span class="tab" id="tabLimiter">Speed Limiter</span><span class="tab" id="tabCompletion">Options on completion</span></div>
     <div class="detail-body" id="panelStatus">
+      <!-- PROGRESS-DIALOG-SPEC §1.1: the URL is its own line above
+           the six fields (full URL as tooltip); the bar carries NO
+           percent text — the percent lives in the title and the
+           Downloaded field -->
+      <div class="d-url" id="dUrl">—</div>
       <dl class="kv">
-        <dt>URL:</dt><dd id="dUrl">—</dd>
-        <dt>Status:</dt><dd id="dStatus">—</dd>
-        <dt>File size:</dt><dd id="dSize">—</dd>
-        <dt>Downloaded:</dt><dd id="dDone">—</dd>
-        <dt>Transfer rate:</dt><dd id="dRate">—</dd>
-        <dt>Time left:</dt><dd id="dLeft">—</dd>
-        <dt>Resume capability:</dt><dd id="dResume">—</dd>
-        <dt>Save to:</dt><dd id="dSaveTo">—</dd>
-        <dt>Referer:</dt><dd id="dReferer">—</dd>
+        <dt>Status</dt><dd id="dStatus">—</dd>
+        <dt>File size</dt><dd id="dSize">—</dd>
+        <dt>Downloaded</dt><dd id="dDone">—</dd>
+        <dt>Transfer rate</dt><dd id="dRate">—</dd>
+        <dt>Time left</dt><dd id="dLeft">—</dd>
+        <dt>Resume capability</dt><dd id="dResume">—</dd>
       </dl>
-      <div class="opt-row"><span>Description</span><input id="dDesc" type="text" placeholder="(your note for this download)" spellcheck="false"></div>
-      <div class="bar"><div id="dBarFill"></div><span id="dBarText">0.0%</span></div>
-      <div class="seg-label">Download progress by connection:</div>
-      <canvas id="segMap" width="760" height="86"></canvas>
-      <div id="dConns" class="d-conns"></div>
-      <div class="opt-row"><span>Queue</span><select id="dQueueSel"></select></div>
+      <div class="bar"><div id="dBarFill"></div></div>
+      <!-- the collapsible details region (§1.2/G4): caption +
+           strip + connections table + the NDM properties group,
+           which moved BELOW the table (§1.1) — hidden wholesale
+           by the "<< Hide details" toggle -->
+      <div id="dDetails">
+        <div class="seg-label" id="dSegLabel">Start positions and download progress by connections</div>
+        <canvas id="segMap" width="760" height="86"></canvas>
+        <div id="dConns" class="d-conns"></div>
+        <div class="d-props">
+          <dl class="kv">
+            <dt>Save to</dt><dd id="dSaveTo">—</dd>
+            <dt>Referer</dt><dd id="dReferer">—</dd>
+          </dl>
+          <div class="opt-row"><span>Description</span><input id="dDesc" type="text" placeholder="(your note for this download)" spellcheck="false"></div>
+          <div class="opt-row"><span>Queue</span><select id="dQueueSel"></select></div>
+        </div>
+      </div>
     </div>
     <div class="detail-body hidden" id="panelCompletion">
+      <!-- G2/spec §2.3: INDEPENDENT checkboxes over the entry's
+           completion-action set — actions combine (open the file
+           AND show the dialog). "Hang up modem" is deliberately
+           absent: NDM has no modem subsystem, so the control
+           would be fake. -->
       <p class="comp-note">When the selected download finishes:</p>
-      <label class="comp-opt"><input type="radio" name="compAct" value=""> Do nothing</label>
-      <label class="comp-opt"><input type="radio" name="compAct" value="open_file"> Open the file</label>
-      <label class="comp-opt"><input type="radio" name="compAct" value="open_folder"> Open the folder</label>
-      <label class="comp-opt"><input type="radio" name="compAct" value="turn_off_pc"> Turn off the computer</label>
-      <label class="comp-opt"><input type="radio" name="compAct" value="restart_pc"> Restart the computer</label>
-      <p class="comp-note dim">Applies to the selected download only, and is remembered across restarts.</p>
+      <label class="comp-opt"><input type="checkbox" id="cShowComplete"> Show "Download complete" dialog</label>
+      <label class="comp-opt"><input type="checkbox" id="cOpenFile"> Open the file when done</label>
+      <label class="comp-opt"><input type="checkbox" id="cOpenFolder"> Open the folder when done</label>
+      <label class="comp-opt"><input type="checkbox" id="cExitApp"> Exit NDM when done</label>
+      <label class="comp-opt"><input type="checkbox" id="cPower"> Turn off the computer when done</label>
+      <div class="comp-power-choice">
+        <label><input type="radio" name="compPower" value="turn_off_pc" checked> Shut down</label>
+        <label><input type="radio" name="compPower" value="restart_pc"> Restart</label>
+      </div>
+      <p class="comp-note dim">Applies to the selected download only, and is remembered across restarts. The options can be combined.</p>
     </div>
     <div class="detail-body hidden" id="panelLimiter">
+      <!-- G9/spec §2.2: integer KB/s, apply-on-change — no Apply
+           button; toggling the checkbox or committing the value
+           calls set_entry_limit at once -->
       <p class="comp-note">Speed Limiter for <b>this download only</b> (IDM sets the limit per download; the global limit lives in Options):</p>
       <label class="comp-opt">
         <input type="checkbox" id="dLimitOn"> Use Speed Limiter for this download
       </label>
       <div style="margin: 12px 0; display: flex; align-items: center; gap: 8px;">
         <label for="dLimitVal">Maximum download speed:</label>
-        <input type="number" id="dLimitVal" min="0.1" step="0.5" max="1000" style="width: 80px; padding: 4px;" value="2">
-        <span>MB/s</span>
+        <input type="number" id="dLimitVal" min="1" step="1" style="width: 90px; padding: 4px;" value="512">
+        <span>KB/s</span>
       </div>
-      <div class="detail-btns" style="margin-top: 14px;">
-        <button id="dLimitApply" class="tool primary">Apply</button>
-      </div>
+      <p class="comp-note dim hidden" id="dLimitGlobalNote"></p>
       <p class="comp-note dim" style="margin-top: 12px;">Applies immediately to the running download and is remembered across restarts.</p>
     </div>
     <!-- the action row belongs to the DIALOG, not to the Status
          tab: it used to live inside that panel, so switching to
-         the Speed Limiter tab made Pause/Hide/Open vanish (N-04) -->
+         the Speed Limiter tab made Pause/Hide/Open vanish (N-04).
+         Spec §1.1: exactly the Hide-details toggle on the left and
+         Resume / Pause / Cancel on the right — Open and Open
+         Folder live in the Download Complete dialog and the row
+         context menu, Refresh URL in its own dialog. -->
     <div class="detail-btns">
-      <button id="dPause">Pause</button><button id="dResumeBtn">Resume</button>
-      <button id="dHide">Hide</button><button id="dOpen">Open</button><button id="dOpenFolder">Open Folder</button><button id="dRefresh">↻ Refresh URL</button>
+      <button id="dToggleDetails">&lt;&lt; Hide details</button>
+      <span class="d-btn-spacer"></span>
+      <button id="dResumeBtn">Resume</button><button id="dPause">Pause</button><button id="dCancelBtn">Cancel</button>
     </div>
   </div>
 </div>
@@ -387,6 +422,14 @@
     <div class="opt-row"><span>Max simultaneous downloads</span><input id="oSimul" type="number" min="0" max="10"></div>
     <div class="opt-note">0 = unlimited simultaneous downloads.</div>
     <label class="opt-check"><input id="oCompleteDlg" type="checkbox"> Show the "Download complete" dialog</label>
+    <div class="opt-row"><span>Download progress dialog</span>
+      <select id="oProgressView">
+        <option value="show">Show</option>
+        <option value="minimized">Minimized</option>
+        <option value="never">Don't show</option>
+      </select>
+    </div>
+    <div class="opt-note">How the per-download progress dialog opens when a download starts in the app (downloads caught from the browser keep their in-page card).</div>
     <label class="opt-check"><input id="oSounds" type="checkbox"> Play a sound when a download completes or fails</label>
     <div class="opt-note" style="font-weight:600;color:inherit">When all downloads finish</div>
     <div class="opt-row"><span>Computer power action</span>
@@ -450,6 +493,9 @@
     <div class="opt-row"><span>Programs folder</span><input id="oCatPrograms" type="text" placeholder="~/Downloads" spellcheck="false"></div>
     <div class="opt-row"><span>Programs types</span><textarea id="oCatExtPrograms" class="cat-types" rows="2" spellcheck="false"></textarea></div>
     <div class="opt-row"><span>General folder</span><input id="oCatGeneral" type="text" placeholder="~/Downloads" spellcheck="false"></div>
+    <div class="opt-note" style="font-weight:600;color:inherit;margin-top:14px">Manage categories — rename or delete the categories you created. The built-in categories above cannot be renamed or deleted. Deleting a category moves its downloads to General.</div>
+    <div id="oCatManage" class="login-list"></div>
+    <div id="oCatStatus" class="v-status error hidden"></div>
     </div>
     <div id="oStatus" class="v-status error hidden" style="margin-top:10px"></div>
     <div class="modal-btns">
@@ -626,7 +672,7 @@
     <label>New URL for the same file
       <input id="rUrl" type="text" placeholder="https://…fresh link…" spellcheck="false">
     </label>
-    <p class="comp-note">Download addresses often expire. Paste a fresh one for the <b>same file</b> — the download restarts from the new address.</p>
+    <p class="comp-note">Download addresses often expire. Paste a fresh one for the <b>same file</b>: if the new address serves the same file, the download continues from its current progress; if it serves a different file, the download starts over. Which of the two applies is decided when the download next starts.</p>
     <div class="modal-btns">
       <button id="rSave" class="tool primary">Refresh</button>
       <button id="rCancel" class="tool">Cancel</button>

@@ -45,10 +45,11 @@
   // The open modal's own dismiss logic. Every close path —
   // backdrop, pill ×, SPA navigation, modal replacement — must go
   // through it, never the raw teardown alone, so the modal can
-  // settle its speculative state ( timers, polls, an in-flight
-  // start) as it closes. Dismiss semantics are IDM's: closing a
-  // dialog NEVER discards a download that has started — only the
-  // file dialog's labelled Cancel button does that (R3-EXT-02).
+  // settle its own state as it closes (the file dialog releases
+  // an unsettled browser-download takeover, so the browser copy
+  // resumes). Since DIAG Report 2 nothing starts speculatively:
+  // a dismiss never discards a download, because none was
+  // started — downloads begin only on an explicit button click.
   let activeModalDismiss = null;
 
   function dismissActiveModal() {
@@ -464,6 +465,22 @@
 
   function probeCacheSet(key, info, warm) {
     if (!key || !info) return;
+    // m-15 (F7): a WARM (cookie-less) flight landing after a REAL
+    // entry must not downgrade that entry's provenance — the real
+    // answer keeps its stamp until it expires, so a later real
+    // fetch is never satisfied by the weaker warm result.
+    const prev = probeMeta.get(key);
+    if (
+      warm &&
+      prev &&
+      !prev.warm &&
+      Date.now() - prev.ts <= PROBE_TTL_MS
+    ) {
+      return;
+    }
+    // LRU: re-insert so the key takes the newest position.
+    localProbeCache.delete(key);
+    probeMeta.delete(key);
     localProbeCache.set(key, info);
     probeMeta.set(key, { ts: Date.now(), warm: !!warm });
     while (localProbeCache.size > PROBE_CACHE_MAX) {
@@ -485,6 +502,15 @@
       }
       if (forReal && m.warm) return null;
     }
+    // m-15 (F7): a hit refreshes the entry's LRU position —
+    // eviction must drop the least-recently-USED entry, not the
+    // least-recently-stored one.
+    localProbeCache.delete(key);
+    localProbeCache.set(key, info);
+    if (m) {
+      probeMeta.delete(key);
+      probeMeta.set(key, m);
+    }
     return info;
   }
   /* Entries this page started from the video flyout, keyed
@@ -501,7 +527,7 @@
   function canonicalVideoKey(urlStr) {
     try {
       const u = new URL(urlStr || location.href);
-      if (u.hostname.includes('youtube.com')) {
+      if (/(^|\.)youtube\.com$/.test(u.hostname)) {
         const v = u.searchParams.get('v');
         if (v) return `https://www.youtube.com/watch?v=${v}`;
         if (u.pathname.startsWith('/shorts/')) {
@@ -787,7 +813,15 @@
     // embedded-player frame. The picker then targets THAT URL:
     // probing or downloading the current page's own video for a
     // link the user right-clicked was the bug.
-    const explicitUrl = linkUrl ? String(linkUrl) : '';
+    // M-8 (F4): a relayed srcUrl whose element lives in ANOTHER
+    // frame (no srcAnchor matched here) is itself the target —
+    // probe THAT media URL directly instead of re-searching this
+    // frame's DOM and landing on the wrong video.
+    const explicitUrl = linkUrl
+      ? String(linkUrl)
+      : srcUrl && !srcAnchor
+        ? String(srcUrl)
+        : '';
     const currentAnchor = explicitUrl ? null : (srcAnchor || anchor || pickAnchor());
     const rawTargetUrl = explicitUrl || (await resolveVideoUrl(currentAnchor));
     const targetUrl = canonicalVideoKey(rawTargetUrl);
@@ -3384,6 +3418,57 @@
     let currentBytes = Number(opts && opts.totalBytes) || 0;
     let currentCat = categoryForName(initialName);
 
+    /* #5 takeover settlement — set up FIRST, before any await:
+       when the background's downloads layer handed this dialog a
+       browser download, that copy is PAUSED in the browser until
+       this dialog settles it exactly once: confirmTakeover (a
+       start landed in the app → the background disposes of the
+       browser copy) or releaseTakeover (the dialog closes with
+       nothing started → the background resumes the browser
+       copy). The download exists somewhere at all times.
+       Click-path dialogs have no browserItemId and both helpers
+       are no-ops there. Setup precedes the storage await so a
+       dialog superseded during that await (F3) — or a page that
+       goes away under it — still settles its takeover instead
+       of orphaning the paused copy. */
+    const takeoverId =
+      opts && opts.browserItemId != null ? opts.browserItemId : null;
+    let takeoverSettled = false;
+    function confirmTakeover() {
+      if (takeoverId == null || takeoverSettled) return;
+      takeoverSettled = true;
+      window.removeEventListener('pagehide', onTakeoverPageHide);
+      try {
+        chrome.runtime
+          .sendMessage({ action: 'ndm-takeover-confirm', itemId: takeoverId })
+          .catch(() => {});
+      } catch (e) {}
+    }
+    function releaseTakeover() {
+      if (takeoverId == null || takeoverSettled) return;
+      takeoverSettled = true;
+      window.removeEventListener('pagehide', onTakeoverPageHide);
+      try {
+        chrome.runtime
+          .sendMessage({ action: 'ndm-takeover-release', itemId: takeoverId })
+          .catch(() => {});
+      } catch (e) {}
+    }
+    /* C-1 (content side): if the page goes away with the dialog
+       still open and unsettled — navigation, tab close — the
+       paused browser copy must not be stranded: release it so
+       the browser resumes its own download. A bfcache freeze
+       (e.persisted) is NOT a departure: the page (and dialog)
+       may come back, so the takeover stays held. The video
+       picker never registers this — it holds no takeover. */
+    function onTakeoverPageHide(e) {
+      if (e && e.persisted) return;
+      releaseTakeover();
+    }
+    if (takeoverId != null) {
+      window.addEventListener('pagehide', onTakeoverPageHide);
+    }
+
     let savedDir = '~/Downloads';
     try {
       const st = await chrome.storage.local.get({ ndmSaveDir: '~/Downloads' });
@@ -3395,7 +3480,13 @@
     // token now, and building anyway would stack a second
     // backdrop the teardown no longer knows about, orphaning
     // the first. The video picker's post-await guard, mirrored.
-    if (myToken !== activeProbeToken) return;
+    // F3 (M-9): a superseded open must also SETTLE its takeover
+    // before dying — the paused browser copy cannot be left
+    // waiting on a dialog that will never exist.
+    if (myToken !== activeProbeToken) {
+      releaseTakeover();
+      return false;
+    }
 
     const backdrop = document.createElement('div');
     backdrop.className = 'ndm-modal-backdrop';
@@ -3451,6 +3542,14 @@
     modalEl = backdrop;
     syncHostParent();
     panelHost.style.display = 'block';
+    // F3 (M-9): the shell is open — a caller waiting on this open
+    // (the background's dialog path) is answered NOW with the
+    // real outcome, mirroring the video picker's EX-m12, so it
+    // can take its direct-send fallback when the open was
+    // stillborn instead of trusting an unconditional ok.
+    if (opts && typeof opts.onOpen === 'function') {
+      try { opts.onOpen(); } catch (e) {}
+    }
     // EX-m5: focus the backdrop so Esc/Enter work without a first
     // click inside the dialog (its keydown listener lives here).
     backdrop.tabIndex = -1;
@@ -3490,28 +3589,21 @@
       }
     });
 
-    // Dismiss gestures (×, Esc, backdrop click) are IDM dismissals:
-    // they close the dialog and KEEP a started download running
-    // (dismissDialog). Only the labelled Cancel button destroys —
-    // it alone calls dismissAsCancel (R3-EXT-02).
+    // Every dismiss gesture (×, Esc, backdrop click, Cancel)
+    // means the same thing now (DIAG Report 2): nothing is
+    // started speculatively, so a dismiss simply closes the
+    // dialog and releases an unsettled takeover back to the
+    // browser, whose paused copy resumes. Downloads start only
+    // from the two labelled buttons below.
     btnClose.addEventListener('click', () => dismissDialog());
-    btnCancel.addEventListener('click', () => dismissAsCancel());
+    btnCancel.addEventListener('click', () => dismissDialog());
     activeModalDismiss = dismissDialog;
     backdrop.addEventListener('click', e => {
       if (e.target === backdrop) dismissDialog();
     });
 
     btnApp.addEventListener('click', async () => {
-      if (spec.inflight) return;
-      if (spec.id) {
-        // the download is already running in the app (it started
-        // while this dialog was open): just show the app
-        dismissAsKeep();
-        try {
-          await chrome.runtime.sendMessage({ action: 'ndm-show-app' });
-        } catch (e) {}
-        return;
-      }
+      if (sending || closed) return;
       btnApp.disabled = true;
       btnApp.textContent = 'Opening NDM…';
       try {
@@ -3524,6 +3616,7 @@
         });
         if (resp && resp.ok) {
           confirmTakeover();
+          closed = true;
           closeBrowserModal();
         } else {
           btnApp.disabled = false;
@@ -3536,7 +3629,8 @@
     });
 
     async function triggerFileDownload(later) {
-      spec.started = true; // the classic path replaces the speculative one
+      if (sending || closed) return;
+      sending = true;
       const chosenDir = dirIn.value.trim() || '~/Downloads';
       const chosenName = nameIn.value.trim() || initialName;
       const szLabel = currentBytes > 0 ? fmtBytes(currentBytes) : '';
@@ -3553,18 +3647,13 @@
       try {
         resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
-          kind: 'file_direct',
+          kind: later ? 'file' : 'file_direct',
           url: targetUrl,
           pageUrl: pageReferrer,
           title: chosenName,
           dir: chosenDir,
           later: !!later,
           total: currentBytes,
-          // A classic send after the speculative one failed or
-          // timed out is a deliberate retry: force (#24) makes
-          // it a fresh native call instead of a join onto the
-          // earlier send of the same file.
-          force: !!spec.failed,
         });
         ok = !!(resp && resp.ok);
       } catch (e) {
@@ -3573,12 +3662,13 @@
 
       if (ok) {
         confirmTakeover();
+        closed = true;
         closeBrowserModal();
         if (!later && resp && resp.id) {
-          // E2: a classic-path "Download Now" start lands in the
-          // same progress card as a speculative one. (A "later"
-          // start is queued in the app on purpose — the toast
-          // below stays its confirmation.)
+          // E2: a "Download Now" start lands in the flyout's
+          // progress card, like a video start. (A "later" start
+          // is queued in the app on purpose — the toast below
+          // stays its confirmation.)
           openEntryProgressCard(resp.id, chosenName, targetUrl);
         } else if (resp && resp.dupe) {
           // IDM asks about duplicates; the silent path just points
@@ -3588,342 +3678,37 @@
           showBrowserToast(chosenName, catEl.textContent || 'File', szLabel, later);
         }
       } else {
+        sending = false;
         statusEl.style.display = 'block';
         statusEl.className = 'ndm-m-status err';
         statusEl.textContent = (resp && resp.error) || 'NDM could not be started. Make sure the NDM desktop app is installed.';
         btnStart.disabled = false;
         btnLater.disabled = false;
         btnStart.textContent = '⬇ Download Now';
+        btnLater.textContent = 'Download Later';
       }
     }
 
-    /* ── IDM's File Info behavior: the download starts while this
-       dialog is open. Start = keep it downloading, Download Later =
-       pause it inside the app, Cancel = discard it completely (the
-       click is consumed; the browser never takes the file). If the
-       speculative start fails, the buttons fall back to the classic
-       send-on-click behavior. ── */
-    const spec = {
-      started: false, // a start (speculative or classic) was kicked off
-      inflight: false, // the speculative send has not answered yet
-      id: null, // the app entry this dialog is bound to
-      owned: false, // this dialog created the entry
-      dupe: false, // the entry already existed (not ours to discard)
-      failed: false, // speculative start failed → classic buttons
-      pending: null, // 'keep' | 'later' | 'cancel' clicked mid-flight
-      timer: null, // the 4 s probe-hang fallback start
-      closed: false,
-      pollTimer: null, // retired in-dialog poll handle (stopSpecPoll guard)
-    };
+    /* ── Classic send-on-click flow (DIAG Report 2): NOTHING is
+       sent while this dialog is open — the speculative
+       auto-start is gone. Download Now / Download Later send
+       exactly once, when clicked; every dismiss gesture sends
+       nothing and releases an unsettled takeover back to the
+       browser, whose paused copy resumes. The probe below is
+       display-only (size / resumability / suggested name). ── */
+    let closed = false;
+    let sending = false;
 
-    /* #5 takeover settlement: when the background's downloads
-       layer handed this dialog a browser download, that copy is
-       PAUSED in the browser — never cancelled, never erased —
-       until this dialog settles it exactly once:
-       confirmTakeover (a start landed in the app → the
-       background erases the browser copy) or releaseTakeover
-       (the dialog closes with nothing started → the background
-       resumes the browser copy). The download exists somewhere
-       at all times. Click-path dialogs have no browserItemId
-       and both helpers are no-ops there. */
-    const takeoverId =
-      opts && opts.browserItemId != null ? opts.browserItemId : null;
-    let takeoverSettled = false;
-    function confirmTakeover() {
-      if (takeoverId == null || takeoverSettled) return;
-      takeoverSettled = true;
-      try {
-        chrome.runtime
-          .sendMessage({ action: 'ndm-takeover-confirm', itemId: takeoverId })
-          .catch(() => {});
-      } catch (e) {}
-    }
-    function releaseTakeover() {
-      if (takeoverId == null || takeoverSettled) return;
-      takeoverSettled = true;
-      try {
-        chrome.runtime
-          .sendMessage({ action: 'ndm-takeover-release', itemId: takeoverId })
-          .catch(() => {});
-      } catch (e) {}
-    }
-
-    function specNote(text) {
-      statusEl.style.display = 'block';
-      statusEl.className = 'ndm-m-status';
-      statusEl.textContent = text;
-    }
-
-    async function specControl(action) {
-      if (!spec.id) return;
-      try {
-        await chrome.runtime.sendMessage({ action, entry: spec.id });
-      } catch (e) {}
-    }
-
-    function stopSpecPoll() {
-      if (spec.pollTimer) {
-        clearInterval(spec.pollTimer);
-        spec.pollTimer = null;
-      }
-    }
-
-    /* The in-dialog progress poll (startSpecPoll) is gone:
-       E2 closes this dialog the moment a start lands and hands
-       the entry to the flyout's progress card, which polls it
-       from there. The one thing the poll still fed — learning
-       that the entry had finished — now happens as a one-shot
-       poll inside dismissAsCancel, the only path that needs it. */
-
-    function dismissAsKeep() {
-      spec.closed = true;
-      stopSpecPoll();
-      closeBrowserModal();
-      showBrowserToast(
-        nameIn.value.trim() || initialName,
-        catEl.textContent || 'File',
-        currentBytes > 0 ? fmtBytes(currentBytes) : '',
-        false
-      );
-    }
-
-    async function dismissAsLater() {
-      spec.closed = true;
-      stopSpecPoll();
-      closeBrowserModal();
-      if (spec.owned) await specControl('ndm-pause-entry');
-      showBrowserToast(
-        nameIn.value.trim() || initialName,
-        catEl.textContent || 'File',
-        currentBytes > 0 ? fmtBytes(currentBytes) : '',
-        true
-      );
-    }
-
-    async function dismissAsCancel() {
-      if (spec.closed) return;
-      // A FINISHED entry is never discarded by closing this
-      // dialog (F-EXT-12): Esc/× after completion is a plain
-      // close that KEEPS the entry — the discard path applies
-      // only while the download is unfinished (and the backend
-      // now refuses to discard finished entries too). The old
-      // in-dialog poll used to learn "finished" into
-      // spec.finished; with that poll gone (E2 moved progress
-      // to the flyout card), ask ONCE, here, before any cancel
-      // is sent — a tiny file can finish while the start ack
-      // was still in flight.
-      if (spec.owned && spec.id) {
-        let st = '';
-        try {
-          const r = await chrome.runtime.sendMessage({
-            action: 'ndm-entry-progress',
-            id: spec.id,
-          });
-          if (r && r.ok) st = String(r.status || '');
-        } catch (e) {}
-        if (spec.closed) return; // closed by another path meanwhile
-        if (st === 'finished') {
-          spec.closed = true;
-          if (spec.timer) clearTimeout(spec.timer);
-          stopSpecPoll();
-          closeBrowserModal();
-          return;
-        }
-      }
-      spec.closed = true;
-      if (spec.timer) clearTimeout(spec.timer);
-      stopSpecPoll();
-      if (spec.owned && spec.id) {
-        specControl('ndm-cancel-entry');
-      } else if (spec.inflight) {
-        spec.pending = 'cancel';
-      }
-      // The dialog's own Cancel releases the browser download
-      // back too (#5): if a takeover copy is still paused and
-      // unsettled, it resumes in the browser. (When an entry
-      // was started and confirmed above, this is a no-op — the
-      // app copy is the one being discarded.)
+    function dismissDialog() {
+      if (closed) return;
+      closed = true;
       releaseTakeover();
       closeBrowserModal();
     }
 
-    /* The dismiss gestures (Esc / × / backdrop click) and the
-       modal-teardown paths (activeModalDismiss), per R3-EXT-02:
-       IDM's progress dialog never kills the download when it is
-       merely closed. If this dialog's download has started, a
-       dismiss means "keep downloading" — the dialog closes, the
-       entry keeps downloading in the app, and the toast says so.
-       If the start is still in flight, the
-       pending decision becomes 'keep' so the landing start is let
-       to download. Before anything has started (or when the entry
-       is not ours), a dismiss is a plain close — and the pending
-       start timer is cleared so nothing starts behind the user's
-       back. Destruction lives ONLY on the Cancel button above. */
-    function dismissDialog() {
-      if (spec.closed) return;
-      if (spec.owned && spec.id) {
-        dismissAsKeep();
-        return;
-      }
-      if (spec.inflight) {
-        spec.pending = 'keep';
-      }
-      spec.closed = true;
-      if (spec.timer) clearTimeout(spec.timer);
-      stopSpecPoll();
-      // Nothing started and nothing in flight: a takeover's
-      // paused browser copy goes back to the browser (#5). An
-      // in-flight start settles itself in specStart instead.
-      if (!spec.inflight) releaseTakeover();
-      closeBrowserModal();
-    }
 
-    async function specStart() {
-      if (spec.started || spec.closed || myToken !== activeProbeToken) return;
-      spec.started = true;
-      spec.inflight = true;
-      // lock the fields the entry is about to be created from: on a
-      // cold app start the ack can take seconds, and edits typed in
-      // that window used to be silently discarded (the entry kept
-      // the pre-edit name/folder while the dialog showed the edits)
-      nameIn.disabled = true;
-      dirIn.disabled = true;
-      btnApp.disabled = true;
-      const chosenDir = dirIn.value.trim() || '~/Downloads';
-      const chosenName = nameIn.value.trim() || initialName;
-      let resp = null;
-      try {
-        resp = await chrome.runtime.sendMessage({
-          action: 'ndm-download',
-          kind: 'file_direct',
-          url: targetUrl,
-          pageUrl: pageReferrer,
-          title: chosenName,
-          dir: chosenDir,
-          later: false,
-          total: currentBytes,
-        });
-      } catch (e) {}
-      spec.inflight = false;
-      btnApp.disabled = false;
-      const gone = spec.closed || myToken !== activeProbeToken;
-      // #5 settlement for the speculative start: any ok answer
-      // (entry id, duplicate, or the queued/unknown-ok mapping)
-      // means the app owns the download — confirm so the paused
-      // browser copy is erased. A failed start with the dialog
-      // already gone releases the browser copy back at once; a
-      // failed start with the dialog still open leaves it
-      // paused for the classic retry, and the eventual close
-      // releases it then.
-      if (resp && resp.ok) confirmTakeover();
-      else if (gone) releaseTakeover();
-      if (resp && resp.ok && resp.id) {
-        spec.id = resp.id;
-        spec.dupe = !!resp.dupe;
-        spec.owned = !resp.dupe;
-        if (gone) {
-          // the user decided while the start was in flight
-          if (spec.pending === 'cancel' && spec.owned) {
-            specControl('ndm-cancel-entry');
-          } else if (spec.pending === 'later' && spec.owned) {
-            specControl('ndm-pause-entry');
-          }
-          return;
-        }
-        if (spec.pending === 'cancel') {
-          dismissAsCancel();
-          return;
-        }
-        if (spec.pending === 'later') {
-          dismissAsLater();
-          return;
-        }
-        // E2/E3: the download has started — this dialog's work
-        // is done. It closes and the entry moves to the flyout's
-        // progress card (the same card a video start lands in:
-        // bar / rate / pause / cancel), which polls it from
-        // here. The dialog no longer stays open past the start,
-        // so its buttons never need a second meaning: the old
-        // post-start relabelling ("Download Later" → "⏸ Pause
-        // in NDM", "Download Now" → "✓ Keep downloading") and
-        // the in-dialog progress poll are gone with the states
-        // that needed them. A duplicate's entry is tracked the
-        // same way — it is the entry that is downloading.
-        spec.closed = true;
-        stopSpecPoll();
-        if (spec.timer) clearTimeout(spec.timer);
-        closeBrowserModal();
-        openEntryProgressCard(spec.id, chosenName, targetUrl);
-        return;
-      } else if (resp && resp.ok && !gone) {
-        // Ok but no entry id (the host's queued ack): the app
-        // owns the download — the takeover was confirmed above —
-        // there is just nothing to track in a progress card.
-        // Close with an honest unconfirmed toast instead of
-        // falling into the failure state, whose classic retry
-        // would send a second copy of a landed download.
-        spec.closed = true;
-        stopSpecPoll();
-        if (spec.timer) clearTimeout(spec.timer);
-        closeBrowserModal();
-        showBrowserToast(
-          chosenName,
-          'Started in NDM — unconfirmed',
-          currentBytes > 0 ? fmtBytes(currentBytes) : '',
-          false,
-          '⬇ Downloading in NDM'
-        );
-        return;
-      } else if (!gone) {
-        spec.failed = true;
-        // the speculative start failed → classic send-on-click:
-        // the fields must be editable again
-        nameIn.disabled = false;
-        dirIn.disabled = false;
-        // E3: say so, visibly — silence left the user pressing
-        // buttons whose fallback meaning they had no way to know.
-        specNote("Couldn't start in NDM — use Download Now");
-      }
-    }
-
-    btnStart.addEventListener('click', () => {
-      if (spec.dupe) {
-        spec.closed = true;
-        closeBrowserModal();
-      } else if (spec.owned) {
-        dismissAsKeep();
-      } else if (spec.inflight) {
-        spec.pending = 'keep';
-        btnStart.disabled = true;
-        btnLater.disabled = true;
-        btnStart.textContent = 'Starting in NDM…';
-      } else {
-        triggerFileDownload(false);
-      }
-    });
-    btnLater.addEventListener('click', () => {
-      if (spec.dupe) {
-        spec.closed = true;
-        closeBrowserModal();
-      } else if (spec.owned) {
-        dismissAsLater();
-      } else if (spec.inflight) {
-        spec.pending = 'later';
-        btnStart.disabled = true;
-        btnLater.disabled = true;
-        btnLater.textContent = 'Queueing in NDM…';
-      } else {
-        triggerFileDownload(true);
-      }
-    });
-
-    // if the probe hangs, start anyway with what the page gave us —
-    // but never after this dialog is gone: the timer used to outlive
-    // raw closes and start a "ghost" download seconds later
-    spec.timer = setTimeout(() => {
-      if (spec.closed || myToken !== activeProbeToken || !backdrop.isConnected) return;
-      specStart();
-    }, 4000);
+    btnStart.addEventListener('click', () => triggerFileDownload(false));
+    btnLater.addEventListener('click', () => triggerFileDownload(true));
 
     // Probe exact file size, resumability & Content-Disposition filename in background
     try {
@@ -3940,17 +3725,11 @@
         } else {
           sizeEl.textContent = 'Stream / Unknown size';
         }
-        if (res.suggested_name && !userEditedName && (!spec.started || spec.failed)) {
-          // !spec.started, not !spec.id: once a speculative send is
-          // in flight the entry is being created with the name the
-          // dialog already had — a late probe must not rename the
-          // field under it (screen and disk would disagree). A
-          // FAILED speculative start created no entry, so the
-          // classic send that follows still reads this field and
-          // the correction is both safe and wanted. (A live entry
-          // cannot be renamed from here: the host protocol has no
-          // rename message — the query-string hint in
-          // defaultFileNameFromUrl is what keeps the common case
+        if (res.suggested_name && !userEditedName) {
+          // Display-only (DIAG Report 2): nothing has been sent
+          // yet, so the probe's better name simply corrects the
+          // field the eventual click will read. (The query-string
+          // hint in defaultFileNameFromUrl keeps the common case
           // right from the start.)
           nameIn.value = res.suggested_name;
           catEl.textContent = res.category || categoryForName(res.suggested_name);
@@ -3968,9 +3747,9 @@
         if (currentBytes <= 0) sizeEl.textContent = 'Ready to download';
       }
     }
-    // the probe has settled (or failed): start the download now,
-    // while the dialog stays open — IDM's File Info behavior
-    specStart();
+    // The probe has settled (or failed) — and that is all it
+    // does now: NO auto-start (DIAG Report 2). The download
+    // starts only when the user clicks Download Now / Later.
   }
 
   function escapeHtml(s) {
@@ -5231,8 +5010,11 @@
       // Top frame only (EX-M1): a broadcast open used to build a
       // panel + speculative download in EVERY frame, iframes
       // included. (Callers also target frameId 0 now; this guard
-      // is the content side of the same contract.)
-      if (window.self !== window.top) {
+      // is the content side of the same contract.) ONE exception
+      // (M-8/F4): a relayDirect open is the background explicitly
+      // targeting the frame the user clicked because frame 0 had
+      // no listener — that frame opens the picker itself.
+      if (window.self !== window.top && !msg.relayDirect) {
         return false;
       }
       dismissed = false;
@@ -5259,6 +5041,18 @@
         return false;
       }
       dismissed = false;
+      // Answer from the ACTUAL open outcome (F3/M-9), like the
+      // video handler: ok:true only once the dialog shell is
+      // really open (onOpen); a stillborn open (superseded
+      // during its storage await) answers false so the
+      // background takes its direct-send fallback. The old
+      // unconditional ok:true stranded exactly that case.
+      let answered = false;
+      const answer = ok => {
+        if (answered) return;
+        answered = true;
+        try { sendResponse({ ok }); } catch (e) {}
+      };
       openBrowserFileModal({
         url: msg.url || '',
         filename: msg.filename || '',
@@ -5266,9 +5060,11 @@
         referrer: msg.referrer || location.href,
         // #5: the paused browser download this dialog settles
         browserItemId: msg.browserItemId != null ? msg.browserItemId : null,
-      });
-      sendResponse({ ok: true });
-      return false;
+        onOpen: () => answer(true),
+      })
+        .then(() => answer(false))
+        .catch(() => answer(false));
+      return true;
     }
   });
 

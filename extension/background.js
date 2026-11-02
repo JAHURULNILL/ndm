@@ -45,7 +45,13 @@ const VIDEO_HOST_PATTERNS = [
   /(^|\.)facebook\.com\/.*(\/videos\/|\/watch|\/reel\/|\/share\/(r|v)\/|watch\/?\?v=)/,
   /(^|\.)fb\.watch\//,
   /(^|\.)vimeo\.com\/\d+/,
+  // Embedded-player shapes (F4): player.vimeo.com/video/<id> and
+  // dailymotion.com/embed/video/<id> carry the id behind a path
+  // segment, so the plain patterns above never named them — an
+  // iframe pill relay from those frames arrived targetless.
+  /(^|\.)vimeo\.com\/video\/\d+/,
   /(^|\.)dailymotion\.com\/video\//,
+  /(^|\.)dailymotion\.com\/embed\/video\//,
   /(^|\.)instagram\.com\/(reel|p|tv)\//,
   /(^|\.)tiktok\.com\/(@[^/]+\/video\/|t\/)/,
   /(^|\.)(twitter|x)\.com\/[^/]+\/status\/\d+/,
@@ -300,14 +306,15 @@ const tabHasMedia = new Map(); // tabId -> bool (effective, see below)
 /* Media state is reported per FRAME (content.js runs in all
    frames), so the raw reports are keyed tab+frame (#21): an
    embedded player's frame must not overwrite the top frame's
-   report. The TOP frame is authoritative for the popup/menu;
-   other frames count only while the top frame has reported
-   nothing. tabHasMedia above carries the derived value. */
+   report in the per-frame map, which stays keyed for targeting.
+   The DERIVED value, however, is an OR across frames (F5): a
+   page whose only player lives in an embedded iframe HAS media
+   for menu/popup purposes, even though its top frame truthfully
+   reports none. The old top-frame authority hid exactly those
+   pages. tabHasMedia above carries the derived value. */
 const tabFrameMedia = new Map(); // `${tabId}:${frameId}` -> bool
 
 function effectiveTabMedia(tabId) {
-  const top = tabFrameMedia.get(tabId + ':0');
-  if (top !== undefined) return top;
   for (const [k, v] of tabFrameMedia) {
     if (k.startsWith(tabId + ':') && v) return true;
   }
@@ -442,8 +449,14 @@ function setHostStatus(status) {
 /* Sends of the same kind+URL share one in-flight request: after a
    timeout the underlying native request can STILL create the entry,
    and a caller that blindly re-sent used to end up with a second
-   copy downloading alongside the timed-out first one. */
+   copy downloading alongside the timed-out first one.
+   Each send carries a GENERATION (F6): a native reply that lands
+   after the 25 s timeout belongs to a dead generation — it must
+   not delete the map entry a RETRY has since installed under the
+   same key, and it must not rewrite the shared host status. */
 const inflightSends = new Map();
+const inflightGens = new Map(); // key -> generation of the live send
+let sendGeneration = 0;
 
 function sendToNdm(message) {
   // Direct kinds carry the user's actual choices: a retry with a
@@ -463,22 +476,34 @@ function sendToNdm(message) {
     return inflightSends.get(key);
   }
   const msg = { type: 'download', ...message };
+  const myGen = ++sendGeneration;
   let answered = false;
   const promise = new Promise(resolve => {
     const finish = v => {
-      // the in-flight entry always clears when the native call
-      // settles — even after a timeout already answered the caller
-      inflightSends.delete(key);
+      // Clear the in-flight entry ONLY if it is still THIS send's
+      // (F6): after a timeout the entry was already cleared and a
+      // retry may have installed its own under the same key — a
+      // stale finish must not delete the retry's entry and defeat
+      // the dedupe.
+      if (inflightGens.get(key) === myGen) {
+        inflightGens.delete(key);
+        inflightSends.delete(key);
+      }
       if (answered) return;
       answered = true;
       resolve(v);
     };
     try {
       chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
+        // A reply arriving after the timeout already answered the
+        // caller is STALE (F6): it settles nothing, deletes only
+        // its own generation's entry (finish, above), and must
+        // not rewrite the current host status.
+        const stale = answered;
         if (chrome.runtime.lastError) {
           const text = chrome.runtime.lastError.message || '';
           const missing = /not found|No such native/i.test(text);
-          setHostStatus(missing ? 'host-missing' : 'fail');
+          if (!stale) setHostStatus(missing ? 'host-missing' : 'fail');
           console.warn('NDM host error:', text);
           finish({
             ok: false,
@@ -489,7 +514,7 @@ function sendToNdm(message) {
           return;
         }
         const ok = !!(response && response.ok);
-        setHostStatus(ok ? 'ok' : 'fail');
+        if (!stale) setHostStatus(ok ? 'ok' : 'fail');
         if (!ok) console.warn('NDM host rejected the download:', response);
         if (ok && response.queued === true) {
           // The host's ack wait timed out and it answered with the
@@ -534,17 +559,26 @@ function sendToNdm(message) {
       // handling is the backstop.
       if (!answered) {
         answered = true;
-        inflightSends.delete(key);
+        // This send's own entry — the generation check inside
+        // finish() applies here too for symmetry, but the timeout
+        // IS this generation's settlement, so clear directly.
+        if (inflightGens.get(key) === myGen) {
+          inflightGens.delete(key);
+          inflightSends.delete(key);
+        }
         resolve({ ok: false, unknown: true, error: 'NDM is still starting — the request was not re-sent.' });
       }
     }, 25000);
   });
-  if (message.url) inflightSends.set(key, promise);
+  if (message.url) {
+    inflightSends.set(key, promise);
+    inflightGens.set(key, myGen);
+  }
   return promise;
 }
 
-/* Pause or discard one existing entry (the browser dialog's Later /
-   Cancel now that downloads start while the dialog is open).
+/* Pause, resume or discard one existing app entry (the progress
+   card's and flyout's entry controls).
    `extra` merges additional fields into the native message — the
    Speed Limiter control carries its limit_bps this way. */
 function sendControl(type, entry, extra) {
@@ -706,7 +740,7 @@ function pingHostAndRecord() {
     };
     setTimeout(() => done(false, 'fail'), 5000);
     try {
-      chrome.runtime.sendNativeMessage(HOST_NAME, { type: 'ping' }, response => {
+      chrome.runtime.sendNativeMessage(HOST_NAME, { type: 'ping', ext_version: chrome.runtime.getManifest().version }, response => {
         const err = chrome.runtime.lastError;
         if (err) {
           const missing = /not found|No such native/i.test(err.message || '');
@@ -783,6 +817,21 @@ function notifyMenuSendResult(res) {
       message:
         (res && res.error) ||
         'Could not reach the NDM app. Open NDM and try again.',
+    });
+  } catch (e) {}
+}
+
+/* The iframe pill relay's failure surface (F4): a click whose
+   picker could not be opened in ANY frame must not vanish
+   silently — the #26 rule, applied to the relay path. */
+function notifyRelayFailure() {
+  try {
+    chrome.notifications.create({
+      type: 'basic',
+      iconUrl: 'icon128.png',
+      title: 'NDM could not open the video picker',
+      message:
+        'The page would not let NDM open its picker for that video. Try the NDM button in the browser toolbar on the page itself.',
     });
   } catch (e) {}
 }
@@ -950,10 +999,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'ndm-media-state') {
     const tabId = sender && sender.tab ? sender.tab.id : null;
     if (tabId != null) {
-      // Keyed by tab+frame (#21): the top frame is
-      // authoritative for popup/menu; a sub-frame's report only
-      // counts while the top frame has reported nothing. A
-      // sniffed stream remains independent evidence.
+      // Keyed by tab+frame (#21) for targeting; the derived
+      // tab value is an OR across frames (F5), so an iframe-only
+      // player still raises the tab's media state. A sniffed
+      // stream remains independent evidence.
       const frameId = sender && sender.frameId != null ? sender.frameId : 0;
       tabFrameMedia.set(tabId + ':' + frameId, !!message.hasMedia);
       tabHasMedia.set(
@@ -968,9 +1017,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === 'ndm-takeover-confirm') {
     // The in-page dialog's start landed in the app: NDM owns
-    // the download now, so the paused browser copy is erased
-    // (#5). Untracked ids (backstop already resumed them) are
-    // ignored — a resumed copy is the user's again.
+    // the download now, so the paused browser copy is disposed
+    // of (#5, F2). Untracked ids (backstop already resumed
+    // them) are ignored — a resumed copy is the user's again.
+    // confirmTakeover is async now (it settles from persisted
+    // state, F1) — fire-and-forget is fine, the response does
+    // not depend on it.
     confirmTakeover(Number(message.itemId));
     sendResponse({ ok: true });
     return false;
@@ -985,25 +1037,101 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'ndm-relay-open-video') {
-    // A sub-frame's pill was clicked (#27): the picker may only
-    // open in the TOP frame, so relay the request there. A
-    // frame whose own URL is a video page (an embedded player)
-    // passes that URL as the link to resolve; otherwise the
-    // clicked element's src goes along, mirroring MENU_VIDEO.
+    // A sub-frame's pill was clicked (#27): the picker prefers
+    // the TOP frame, so relay the request there, carrying the
+    // CLICKED embed's identity (F4): a frame whose own URL is a
+    // video page (an embedded player — YouTube /embed/, Vimeo
+    // player.…/video/, Dailymotion /embed/video/) passes that
+    // URL as the link to resolve; otherwise the clicked
+    // element's src goes along, mirroring MENU_VIDEO, and the
+    // top-frame picker probes THAT URL rather than re-deriving
+    // a target from its own DOM. A blob/MSE embed on a page the
+    // classifier does not know still names its own frame URL —
+    // a better probe target than the unrelated top page.
+    // Failure is never silent (the #26 rule): if frame 0 has no
+    // listener, the picker is offered to the CLICKED frame
+    // itself, and if that fails too the user gets a notification.
     const tabId = sender && sender.tab ? sender.tab.id : null;
-    if (tabId != null) {
-      const frameUrl = (sender && sender.url) || message.pageUrl || '';
-      const payload = { action: 'ndm-open-video-modal' };
-      if (frameUrl && isVideoPageUrl(frameUrl)) payload.linkUrl = frameUrl;
-      else if (message.srcUrl) payload.srcUrl = message.srcUrl;
-      try {
-        chrome.tabs
-          .sendMessage(tabId, payload, { frameId: 0 })
-          .catch(() => {});
-      } catch (e) {}
+    const frameId = sender && sender.frameId != null ? sender.frameId : null;
+    if (tabId == null) {
+      sendResponse({ ok: false });
+      return false;
     }
-    sendResponse({ ok: true });
-    return false;
+    const frameUrl = (sender && sender.url) || message.pageUrl || '';
+    const tabUrl = (sender && sender.tab && sender.tab.url) || '';
+    const payload = { action: 'ndm-open-video-modal' };
+    if (frameUrl && isVideoPageUrl(frameUrl)) payload.linkUrl = frameUrl;
+    else if (message.srcUrl) payload.srcUrl = message.srcUrl;
+    else if (frameUrl && /^https?:\/\//i.test(frameUrl) && frameUrl !== tabUrl) {
+      payload.linkUrl = frameUrl;
+    }
+    (async () => {
+      let opened = false;
+      try {
+        const res = await chrome.tabs.sendMessage(tabId, payload, { frameId: 0 });
+        opened = !!(res && res.ok);
+      } catch (e) {}
+      if (!opened && frameId != null && frameId !== 0) {
+        try {
+          const res = await chrome.tabs.sendMessage(
+            tabId,
+            { ...payload, relayDirect: true },
+            { frameId }
+          );
+          opened = !!(res && res.ok);
+        } catch (e) {}
+      }
+      if (!opened) notifyRelayFailure();
+      sendResponse({ ok: opened });
+    })();
+    return true;
+  }
+
+  if (message.action === 'ndm-query-media-all') {
+    // The popup's freshest-source check, done right (F5): ask
+    // EVERY frame of the tab whether it has media and OR the
+    // answers — asking frame 0 only reported an iframe-only
+    // player page as media-less. Frame ids come from the
+    // per-frame report map (plus 0, always). The background's
+    // own derived record answers first when it already knows.
+    const tabId =
+      message.tabId != null
+        ? message.tabId
+        : sender && sender.tab
+          ? sender.tab.id
+          : null;
+    (async () => {
+      if (tabId == null) {
+        sendResponse({ hasMedia: false });
+        return;
+      }
+      if (tabHasMedia.get(tabId) === true || tabStreamList(tabId).length > 0) {
+        sendResponse({ hasMedia: true });
+        return;
+      }
+      const frameIds = new Set([0]);
+      for (const k of tabFrameMedia.keys()) {
+        if (k.startsWith(tabId + ':')) {
+          const fid = Number(k.slice(String(tabId).length + 1));
+          if (Number.isFinite(fid)) frameIds.add(fid);
+        }
+      }
+      let has = false;
+      await Promise.all(
+        [...frameIds].map(async fid => {
+          try {
+            const r = await chrome.tabs.sendMessage(
+              tabId,
+              { action: 'ndm-query-media' },
+              { frameId: fid }
+            );
+            if (r && r.hasMedia) has = true;
+          } catch (e) {}
+        })
+      );
+      sendResponse({ hasMedia: has });
+    })();
+    return true;
   }
 
   if (message.action === 'ndm-host-ping') {
@@ -1272,6 +1400,86 @@ function eraseBrowserItem(id) {
   } catch (e) {}
 }
 
+/* Read one download item's current state (null when it is gone
+   or the query failed). */
+function downloadItemState(id) {
+  return new Promise(resolve => {
+    try {
+      chrome.downloads.search({ id }, items => {
+        void chrome.runtime.lastError;
+        resolve(items && items.length ? items[0] : null);
+      });
+    } catch (e) {
+      resolve(null);
+    }
+  });
+}
+
+/* Pause an item and VERIFY where it landed (F2): the old
+   fire-and-forget pause() lost its race against fast downloads,
+   and the dialog then opened against an already-completed item.
+   Returns the item as observed after the pause (one short
+   re-check covers a pause that lands a beat late), or null. */
+async function pauseAndVerify(id) {
+  try {
+    await new Promise(res => {
+      try {
+        chrome.downloads.pause(id, () => {
+          void chrome.runtime.lastError;
+          res();
+        });
+      } catch (e) {
+        res();
+      }
+    });
+  } catch (e) {}
+  let it = await downloadItemState(id);
+  if (it && it.state === 'in_progress' && !it.paused) {
+    await new Promise(r => setTimeout(r, 150));
+    it = (await downloadItemState(id)) || it;
+  }
+  return it;
+}
+
+/* Dispose of a browser copy NDM has confirmed it owns (F2).
+   erase() alone never deletes any file — per the downloads API
+   it only clears the history record. The order that actually
+   removes the bytes depends on the item's state:
+   - COMPLETE item: removeFile() deletes its file (it works
+     only on completed items), then erase() clears history.
+   - Anything else (paused / in progress): cancel() stops it
+     AND deletes the partial .crdownload, then erase() clears
+     history. */
+async function disposeBrowserItem(id) {
+  const it = await downloadItemState(id);
+  try {
+    if (it && it.state === 'complete') {
+      await new Promise(res => {
+        try {
+          chrome.downloads.removeFile(id, () => {
+            void chrome.runtime.lastError;
+            res();
+          });
+        } catch (e) {
+          res();
+        }
+      });
+    } else {
+      await new Promise(res => {
+        try {
+          chrome.downloads.cancel(id, () => {
+            void chrome.runtime.lastError;
+            res();
+          });
+        } catch (e) {
+          res();
+        }
+      });
+    }
+  } catch (e) {}
+  eraseBrowserItem(id);
+}
+
 /* The tab that started a download: matched by referrer, with
    the active tab as fallback (the same targeting the dialog
    placement below uses). */
@@ -1344,38 +1552,159 @@ function notifyTakeoverProblem(name) {
   } catch (e) {}
 }
 
-/* ── Takeover bookkeeping (#5) ────────────────────────────────
+/* ── Takeover bookkeeping (#5, F1) ────────────────────────────
    IDM's order, and the user's standing rule: the browser
-   download is PAUSED at intercept, erased ONLY after the app
-   confirms it owns the download, and RESUMED on any failure,
-   dismiss or timeout — the user's download exists somewhere at
-   all times. The in-page dialog settles its hand-off through
-   the ndm-takeover-confirm / ndm-takeover-release messages;
-   the direct-send path below settles its own; a backstop timer
-   resumes anything never settled (a dialog abandoned open, a
-   content script that died) rather than leaving the browser
-   copy paused forever. */
+   download is PAUSED at intercept, disposed of ONLY after the
+   app confirms it owns the download, and RESUMED on any
+   failure, dismiss or timeout — the user's download exists
+   somewhere at all times. The in-page dialog settles its
+   hand-off through the ndm-takeover-confirm /
+   ndm-takeover-release messages; the direct-send path below
+   settles its own; a backstop resumes anything never settled
+   (a dialog abandoned open, a content script that died)
+   rather than leaving the browser copy paused forever.
+   F1: the backstop used to be ONLY an in-memory setTimeout in
+   an in-memory Map — an MV3 worker death (idle timeout,
+   browser update, crash) killed both, stranding the paused
+   copy forever, and confirm/release after the restart were
+   silent no-ops against the empty Map. Now every hold is
+   PERSISTED (chrome.storage.local) and the backstop is ALSO a
+   chrome.alarms one-shot, which survives worker death; every
+   worker start rehydrates the Map from storage, re-arms what
+   is still pending, and releases at once anything whose
+   deadline passed while the worker was dead. Settle-once
+   semantics are unchanged: the first settle wins, later
+   confirm/release calls for the same item are no-ops. */
 const TAKEOVER_HOLD_MS = 10 * 60 * 1000;
-const pendingTakeovers = new Map(); // download id -> { timer }
+const TAKEOVER_STORE_KEY = 'ndmPendingTakeovers';
+const TAKEOVER_ALARM_PREFIX = 'ndm-takeover-';
+const pendingTakeovers = new Map(); // download id -> { timer, deadline, tabId, dialog }
 
-function holdTakeover(itemId) {
-  const timer = setTimeout(() => releaseTakeover(itemId), TAKEOVER_HOLD_MS);
-  pendingTakeovers.set(itemId, { timer });
+/* Persist writes are chained and snapshot the Map lazily, so a
+   write enqueued before a rehydrate/merge still persists the
+   merged state, never a stale partial one. */
+let takeoverPersistChain = Promise.resolve();
+function persistTakeovers() {
+  takeoverPersistChain = takeoverPersistChain.then(() => {
+    const arr = [...pendingTakeovers.entries()].map(([itemId, p]) => ({
+      itemId,
+      tabId: p.tabId != null ? p.tabId : null,
+      deadline: p.deadline,
+      dialog: !!p.dialog,
+    }));
+    try {
+      const r = chrome.storage.local.set({ [TAKEOVER_STORE_KEY]: arr });
+      if (r && typeof r.catch === 'function') return r.catch(() => {});
+    } catch (e) {}
+    return undefined;
+  });
+  return takeoverPersistChain;
 }
 
-function confirmTakeover(itemId) {
-  const p = pendingTakeovers.get(itemId);
-  if (!p) return;
-  clearTimeout(p.timer);
-  pendingTakeovers.delete(itemId);
-  eraseBrowserItem(itemId);
+function armTakeoverBackstop(itemId, entry) {
+  const remaining = entry.deadline - Date.now();
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.timer = setTimeout(() => releaseTakeover(itemId), Math.max(0, remaining));
+  try {
+    if (chrome.alarms && chrome.alarms.create) {
+      chrome.alarms.create(TAKEOVER_ALARM_PREFIX + itemId, { when: entry.deadline });
+    }
+  } catch (e) {}
 }
 
-function releaseTakeover(itemId) {
+function holdTakeover(itemId, meta) {
+  if (pendingTakeovers.has(itemId)) return;
+  const entry = {
+    timer: null,
+    deadline: Date.now() + TAKEOVER_HOLD_MS,
+    tabId: meta && meta.tabId != null ? meta.tabId : null,
+    dialog: !!(meta && meta.dialog),
+  };
+  pendingTakeovers.set(itemId, entry);
+  armTakeoverBackstop(itemId, entry);
+  persistTakeovers();
+}
+
+/* Record that a dialog in a known tab owns this takeover now
+   (the hold is armed before the dialog target is known). */
+function noteTakeoverDialog(itemId, tabId) {
   const p = pendingTakeovers.get(itemId);
   if (!p) return;
-  clearTimeout(p.timer);
+  p.dialog = true;
+  if (tabId != null) p.tabId = tabId;
+  persistTakeovers();
+}
+
+/* Worker startup: rehydrate pending takeovers from storage.
+   Entries whose deadline is still ahead get their timer +
+   alarm re-armed; an entry whose deadline passed while no
+   worker was alive is released promptly — its browser copy has
+   already waited too long. Runs once per worker lifetime; the
+   settle functions await it, so a confirm/release that wakes a
+   fresh worker acts on the persisted state, not an empty Map. */
+const takeoversReady = (async () => {
+  try {
+    const v = await chrome.storage.local.get({ [TAKEOVER_STORE_KEY]: [] });
+    const arr = Array.isArray(v[TAKEOVER_STORE_KEY]) ? v[TAKEOVER_STORE_KEY] : [];
+    const now = Date.now();
+    for (const e of arr) {
+      const itemId = Number(e && e.itemId);
+      if (!Number.isFinite(itemId) || pendingTakeovers.has(itemId)) continue;
+      const entry = {
+        timer: null,
+        deadline: Number(e && e.deadline) || 0,
+        tabId: e && e.tabId != null ? e.tabId : null,
+        dialog: !!(e && e.dialog),
+      };
+      pendingTakeovers.set(itemId, entry);
+      if (entry.deadline <= now) {
+        setTimeout(() => releaseTakeover(itemId), 0);
+      } else {
+        armTakeoverBackstop(itemId, entry);
+      }
+    }
+    persistTakeovers();
+  } catch (e) {}
+})();
+
+if (chrome.alarms && chrome.alarms.onAlarm) {
+  chrome.alarms.onAlarm.addListener(alarm => {
+    if (!alarm || typeof alarm.name !== 'string') return;
+    if (!alarm.name.startsWith(TAKEOVER_ALARM_PREFIX)) return;
+    const itemId = Number(alarm.name.slice(TAKEOVER_ALARM_PREFIX.length));
+    if (Number.isFinite(itemId)) releaseTakeover(itemId);
+  });
+}
+
+/* Claim a pending takeover for settlement: removes it from the
+   Map, the store and the alarm schedule exactly once. Returns
+   the entry, or null when the item is not pending (never held,
+   or already settled — the settle-once rule). */
+function takePendingTakeover(itemId) {
+  const p = pendingTakeovers.get(itemId);
+  if (!p) return null;
+  if (p.timer) clearTimeout(p.timer);
   pendingTakeovers.delete(itemId);
+  try {
+    if (chrome.alarms && chrome.alarms.clear) {
+      chrome.alarms.clear(TAKEOVER_ALARM_PREFIX + itemId);
+    }
+  } catch (e) {}
+  persistTakeovers();
+  return p;
+}
+
+async function confirmTakeover(itemId) {
+  await takeoversReady;
+  const p = takePendingTakeover(itemId);
+  if (!p) return;
+  await disposeBrowserItem(itemId);
+}
+
+async function releaseTakeover(itemId) {
+  await takeoversReady;
+  const p = takePendingTakeover(itemId);
+  if (!p) return;
   try {
     chrome.downloads.resume(itemId, () => {
       void chrome.runtime.lastError;
@@ -1409,11 +1738,15 @@ async function handleInterceptedDownload(item, suggestedFilename) {
   // erased the moment the dialog OPENED — the dialog answers
   // before its own start settles, so a failed start plus a
   // dismiss left the download existing nowhere.
-  try {
-    chrome.downloads.pause(item.id, () => {
-      void chrome.runtime.lastError;
-    });
-  } catch (e) {}
+  // F2: pause DETERMINISTICALLY — await it and read the item
+  // back. A fast download can complete before a fire-and-forget
+  // pause() lands; the browser then already owns the finished
+  // file outright, and offering an app download of it would
+  // produce a silent double download. In that case there is
+  // nothing to take over: no hold, no dialog — the browser copy
+  // simply stays the user's completed download.
+  const afterPause = await pauseAndVerify(item.id);
+  if (afterPause && afterPause.state === 'complete') return;
   holdTakeover(item.id);
 
   const url = item.finalUrl || item.url || '';
@@ -1454,6 +1787,7 @@ async function handleInterceptedDownload(item, suggestedFilename) {
       // browser copy — confirm when its start lands in the app,
       // release on dismiss / Cancel / failed start. Nothing is
       // erased at open any more (that was the #5 regression).
+      noteTakeoverDialog(item.id, targetTab.id);
       return;
     }
   }
@@ -1572,5 +1906,36 @@ try {
         chrome.tabs.sendMessage(t.id, { action: 'ndm-ping' }).catch(() => {});
       } catch (e) {}
     }
+  });
+} catch (e) {}
+
+/* The manifest declares page-hook.js as a MAIN-world content
+   script, but the content_scripts 'world' key only exists in
+   Chrome 111+. On the browsers a Windows 7/8 machine can run
+   (Chrome/Brave 109 and older) the unknown key is ignored and the
+   hook lands in the isolated world, where it cannot see the
+   page's player globals — the YouTube picker's instant cache
+   warm-up silently never happens there (downloads still work via
+   the host-probe fallback). Re-inject the hook into the page's
+   real MAIN world once a YouTube tab finishes loading. Chrome
+   111+ already ran the manifest copy in MAIN, and the hook's own
+   __ndmPageHookLoaded guard turns this into a no-op there;
+   chrome.scripting with world 'MAIN' exists since Chrome 95, and
+   the errors are swallowed for tabs without host permission and
+   for browsers without the API (Firefox). */
+try {
+  chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+    if (!info || info.status !== 'complete') return;
+    const url = (tab && tab.url) || '';
+    if (!/^https?:\/\/([^/]+\.)?youtube\.com\//.test(url)) return;
+    try {
+      chrome.scripting
+        .executeScript({
+          target: { tabId },
+          world: 'MAIN',
+          files: ['page-hook.js'],
+        })
+        .catch(() => {});
+    } catch (e) {}
   });
 } catch (e) {}

@@ -100,6 +100,32 @@ const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
 // keeps the plain capitalized word ('downloading' included)
 const STATUS_TEXT = { starting: 'Starting…', merging: 'Merging…' };
 const statusText = s => STATUS_TEXT[s] || cap(s);
+/* the progress dialog's Status field follows the spec §3
+   status-text table, which is NOT the list's vocabulary: an
+   active transfer reads "Receiving data…" whatever the kind,
+   and an error entry shows the error message itself (IDM
+   surfaces errors in the Status line) */
+function detailStatusText(d) {
+  if (d.status === 'error') return d.error || 'Error';
+  switch (d.status) {
+    case 'queued': return 'Queued';
+    case 'starting': return 'Starting…';
+    case 'downloading': return 'Receiving data…';
+    case 'merging': return 'Merging…';
+    case 'paused': return 'Paused';
+    case 'finished': return 'Finished';
+    case 'cancelled': return 'Cancelled';
+    default: return statusText(d.status || '');
+  }
+}
+/* video entries: the progress payload carries no kind field —
+   a video job is recognised by its yt-dlp resume marker (the
+   payload's only kind-specific value today); an explicit kind,
+   if a future payload carries one, wins */
+const isVideoEntry = d => !!d && (d.kind === 'video'
+  || d.resume_capability === 'Yes (yt-dlp resume)');
+/* the dialog's rate format (G6): the list's "/sec" shape */
+const fmtDetailRate = b => (b > 0 ? fmtSize(b) + '/sec' : '—');
 
 /* ---------- DOM refs ---------- */
 const $ = id => document.getElementById(id);
@@ -116,6 +142,7 @@ const DEFAULT_SETTINGS = {
   site_logins: [], power_when_done: '', power_force: false, grab_projects: [],
   category_dirs: {}, category_exts: {}, conn_exceptions: [], exit_when_done: false,
   sound_events: true, show_complete_dialog: true,
+  progress_dialog_view: 'show',
   queues: [{ name: 'Main download queue', use_schedule: false, start: '22:00', stop: '06:00', exit_when_done: false, power_when_done: '', max_simultaneous: 0 }],
   quota_mb: 0, quota_hours: 5, clipboard_monitor: false,
 };
@@ -996,43 +1023,50 @@ function renderDetail() {
     if ($('dSaveTo')) $('dSaveTo').textContent = '—';
     if ($('dReferer')) $('dReferer').textContent = '—';
     if ($('dDesc') && document.activeElement !== $('dDesc')) $('dDesc').value = '';
-    $('dBarFill').style.width = '0%'; $('dBarText').textContent = '0.0%';
+    $('dBarFill').style.width = '0%';
     if ($('dPause')) $('dPause').disabled = true;
     if ($('dResumeBtn')) $('dResumeBtn').disabled = true;
-    $('dOpen').disabled = $('dOpenFolder').disabled = $('dRefresh').disabled = true;
-    drawSegMap('', '');
+    if ($('dCancelBtn')) $('dCancelBtn').disabled = true;
+    drawSegMap(null);
     return;
   }
   if ($('dTitle')) {
-    // a finished download is 100% by definition — a 0-byte file
-    // used to title itself "0%", looking broken when it was done
-    const pctTxt = d.total > 0 ? pctOf(d).toFixed(0)
-      : (d.status === 'finished' ? '100' : '0');
-    $('dTitle').textContent = d.name
-      ? `${pctTxt}% — ${d.name}`
-      : 'Download Status';
+    // spec §1.1/G6: "{pct}% {name}" — integer percent, FLOOR
+    // (the IDM photo shows 0% at 0.90% downloaded), one space,
+    // no dash. While the total is unknown and nothing has
+    // arrived yet the title is the filename alone; a finished
+    // download reads "100% …" (a 0-byte file is 100% by
+    // definition, not the broken-looking "0%" it used to show)
+    if (d.name && d.total > 0) {
+      $('dTitle').textContent = `${Math.floor(pctOf(d))}% ${d.name}`;
+    } else if (d.name && d.status === 'finished') {
+      $('dTitle').textContent = `100% ${d.name}`;
+    } else {
+      $('dTitle').textContent = d.name || 'Download Status';
+    }
   }
   const isFinished = d.status === 'finished';
   const isDownloading = d.status === 'downloading';
+  // spec §1.4 enablement matrix: merging locks all three (a merge
+  // is not interruptible from here); starting allows Cancel only
+  // (it lands on the start claim's pause-requested path); error
+  // keeps Resume (retry) but no Cancel; finished locks all three
   if ($('dPause')) $('dPause').disabled = !isDownloading;
-  if ($('dResumeBtn')) $('dResumeBtn').disabled = isFinished || isDownloading;
-  // Open hands the backend a file — IDM enables it only once the
-  // file is complete, not merely "not queued" (a paused/downloading
-  // entry would open a partial file)
-  $('dOpen').disabled = $('dOpenFolder').disabled = d.status !== 'finished';
-  $('dRefresh').disabled = isDownloading || isFinished;
-  // sync the completion radios from the entry — but never while
-  // the user is interacting with them: a progress tick landing
-  // between mousedown and click would flip the checked radio back
-  // and the click would land on the wrong option
+  if ($('dResumeBtn')) $('dResumeBtn').disabled =
+    !(d.status === 'queued' || d.status === 'paused' || d.status === 'error' || d.status === 'cancelled');
+  if ($('dCancelBtn')) $('dCancelBtn').disabled =
+    !(isDownloading || d.status === 'starting' || d.status === 'queued' || d.status === 'paused');
+  // sync the completion checkboxes from the entry — but never
+  // while the user is interacting with them: a progress tick
+  // landing between mousedown and click would flip a checkbox
+  // back and the click would land on the wrong option. The
+  // show-complete box resolves override ?? set membership ??
+  // global setting, in that priority (spec §2.3/G2).
   {
     const ae = document.activeElement;
-    const touching = ae && ae.name === 'compAct';
-    if (!touching) {
-      document.querySelectorAll('input[name="compAct"]').forEach(r => {
-        r.checked = r.value === (d.completion || '');
-      });
-    }
+    const panel = $('panelCompletion');
+    const touching = ae && panel && panel.contains(ae);
+    if (!touching) syncCompletionPanel(d);
   }
   // the Speed Limiter tab gets the same treatment while it is the
   // visible tab — it used to keep showing the previously viewed
@@ -1044,15 +1078,22 @@ function renderDetail() {
     syncLimiterPanel();
   }
   $('dUrl').textContent = d.url;
-  $('dStatus').textContent = statusText(d.status) + (d.error ? ' — ' + d.error : '');
+  $('dUrl').title = d.url || '';
+  $('dStatus').textContent = detailStatusText(d);
   $('dSize').textContent = d.total > 0 || d.status === 'finished' ? fmtSize(d.total) : 'Unknown';
+  // G6: the Downloaded percent is 2-decimal (was 1)
   $('dDone').textContent = d.total > 0
-    ? `${fmtSize(d.done_bytes)} (${pctOf(d).toFixed(1)}%)`
+    ? `${fmtSize(d.done_bytes)} (${pctOf(d).toFixed(2)}%)`
     : `${fmtSize(d.done_bytes)} (size unknown)`;
-  $('dRate').textContent = d.status === 'downloading' ? fmtRate(d.speed_bps) : '—';
+  // G6: the dialog's rate unit is "/sec" (was "/s")
+  $('dRate').textContent = d.status === 'downloading' ? fmtDetailRate(d.speed_bps) : '—';
   $('dLeft').textContent = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
     ? fmtListLeft((d.total - d.done_bytes) / d.speed_bps) : '—';
-  $('dResume').textContent = d.resume_capability || '—';
+  // G6: Resume capability is a plain Yes/No in THIS dialog (the
+  // payload's longer strings stay untouched for other consumers);
+  // video entries are resumable by construction (spec §3)
+  $('dResume').textContent = isVideoEntry(d) ? 'Yes'
+    : (d.resume_capability ? (String(d.resume_capability).startsWith('Yes') ? 'Yes' : 'No') : '—');
   if ($('dSaveTo')) $('dSaveTo').textContent = d.save_to || '—';
   if ($('dReferer')) $('dReferer').textContent = d.referer || '—';
   // the description is an editable field — never clobber it while
@@ -1060,15 +1101,39 @@ function renderDetail() {
   if ($('dDesc') && document.activeElement !== $('dDesc')) {
     $('dDesc').value = d.description || '';
   }
-  // per-connection table (IDM shows one row per connection)
+  // per-connection table (spec §1.1: a real 3-column table —
+  // N. / Downloaded / Info; the Info column is G1's per-worker
+  // phase). Rows: workers with bytes > 0, plus active workers
+  // while downloading (the established filter).
+  // G8: video entries have no real connections — the table is
+  // hidden and the caption drops "by connections" rather than
+  // implying data that does not exist.
+  const video = isVideoEntry(d);
+  const segLabel = $('dSegLabel');
+  if (segLabel) segLabel.textContent = video
+    ? 'Download progress'
+    : 'Start positions and download progress by connections';
   const dc = $('dConns');
   if (dc) {
-    const rows = (d.conns_detail || [])
-      .map((b, i) => ({ b, i }))
-      .filter(x => x.b > 0 || (d.status === 'downloading' && x.i < (d.conns || 0)));
-    dc.innerHTML = rows.length
-      ? rows.map(x => `<div class="d-conn-row"><span>Connection ${x.i + 1}</span><span>${fmtSize(x.b)} downloaded</span></div>`).join('')
-      : '';
+    if (video) {
+      dc.innerHTML = '';
+      dc.classList.add('hidden');
+    } else {
+      dc.classList.remove('hidden');
+      const states = d.conns_state || [];
+      const infoFor = i => {
+        const s = states[i];
+        return s === 1 ? 'Send GET…' : s === 2 ? 'Receiving data…' : 'Waiting…';
+      };
+      const rows = (d.conns_detail || [])
+        .map((b, i) => ({ b, i }))
+        .filter(x => x.b > 0 || (d.status === 'downloading' && x.i < (d.conns || 0)));
+      dc.innerHTML = rows.length
+        ? '<table class="d-conn-table"><thead><tr><th>N.</th><th>Downloaded</th><th>Info</th></tr></thead><tbody>'
+          + rows.map(x => `<tr><td>${x.i + 1}</td><td>${fmtSize(x.b)}</td><td>${infoFor(x.i)}</td></tr>`).join('')
+          + '</tbody></table>'
+        : '';
+    }
   }
   // queue assignment (moving queues is IDM's "Add to queue")
   const dq = $('dQueueSel');
@@ -1077,22 +1142,33 @@ function renderDetail() {
   }
   const ind = d.status === 'downloading' && d.total === 0;
   $('dBarFill').classList.toggle('ind', ind);
+  // G6: the bar is a plain fill — no percent text inside it
   $('dBarFill').style.width = ind ? '' : (d.total > 0 ? pctOf(d).toFixed(1) : (isFinished ? 100 : 0)) + '%';
-  $('dBarText').textContent = d.total > 0 ? pctOf(d).toFixed(1) + '%'
-    : (d.status === 'downloading' ? fmtSize(d.done_bytes) : (isFinished ? '100%' : '—'));
-  drawSegMap(d.blocks || '', d.status);
+  drawSegMap(d);
 }
 
-/* Segment map: one cell per block char — '1' done, '2' active (pulsing), else pending.
-   Colors come from the active theme's CSS variables. */
-function drawSegMap(blocks, status) {
-  const cv = $('segMap'), ctx = cv.getContext('2d');
+/* Segment strip (G5/spec §1.1): contiguous cells left→right =
+   file start→end, wrapping to a second row only when the cell
+   count forces it (>512). '1' = full fill; '2' = fractional fill
+   (the owning connection's in-flight bytes over the block size,
+   G1's conns_partial/conns_block); '0' = empty track. A start
+   tick is drawn under each active connection's current block.
+   (The √n grid this replaces scattered the file's order across
+   a block map; IDM's strip is linear, and so is this.) Colors
+   come from the active theme's CSS variables. */
+function drawSegMap(d) {
+  const cv = $('segMap');
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
   // assigning canvas.width (even the same value) resets the bitmap
   // and forces a full repaint — only do it when the size changed
   const W = cv.clientWidth || 760;
   if (cv.width !== W) cv.width = W;
   const H = cv.height;
   ctx.clearRect(0, 0, W, H);
+  if (!d) return;
+  const blocks = d.blocks || '';
+  const status = d.status || '';
   if (!blocks && status !== 'finished') return;
   const css = getComputedStyle(document.documentElement);
   const cDone = css.getPropertyValue('--seg-done').trim() || '#3f9de0';
@@ -1100,22 +1176,62 @@ function drawSegMap(blocks, status) {
   const cActive2 = css.getPropertyValue('--seg-active2').trim() || '#c79a1d';
   const cPending = css.getPropertyValue('--seg-pending').trim() || '#c9d2da';
   const n = Math.min(blocks ? blocks.length : 128, 1024);
-  const cols = Math.ceil(Math.sqrt(n * (W / H))) || 1;
-  const rows = Math.ceil(n / cols) || 1;
-  const totalCells = cols * rows;
-  const cw = W / cols, ch = H / rows, gap = Math.min(2, cw * 0.18);
-  for (let i = 0; i < totalCells; i++) {
-    const x = (i % cols) * cw, y = Math.floor(i / cols) * ch;
-    if (status === 'finished') {
-      ctx.fillStyle = cDone;
-    } else {
-      const blockIdx = Math.floor((i / totalCells) * n);
-      const c = blocks ? blocks[blockIdx] : '0';
-      if (c === '1') ctx.fillStyle = cDone;
-      else if (c === '2') ctx.fillStyle = pulse % 2 ? cActive : cActive2;
-      else ctx.fillStyle = cPending;
+  if (!n) return;
+  const rowsN = n > 512 ? 2 : 1;
+  const cols = Math.ceil(n / rowsN);
+  const cw = W / cols, ch = H / rowsN, gap = Math.min(2, cw * 0.18);
+  // fractional fill for an active ('2') cell: which connection
+  // owns this block (G1 conns_block), and how much of the block
+  // it already holds (conns_partial over the block size). The
+  // payload's blocks are ≤1024 cells over 1 MiB engine blocks
+  // (downsampled when the file is larger), so the block size is
+  // total/cells when the total is known, else 1 MiB.
+  const partials = d.conns_partial || [];
+  const owners = d.conns_block || [];
+  const blockSize = d.total > 0 ? Math.max(1, d.total / n) : 1024 * 1024;
+  const fracFor = cell => {
+    for (let w = 0; w < owners.length; w++) {
+      if (owners[w] === cell) {
+        const p = partials[w] || 0;
+        return p > 0 ? Math.min(1, p / blockSize) : 0;
+      }
     }
-    ctx.fillRect(x + gap / 2, y + gap / 2, Math.max(1, cw - gap), Math.max(1, ch - gap));
+    return 0;
+  };
+  for (let i = 0; i < n; i++) {
+    const x = (i % cols) * cw, y = Math.floor(i / cols) * ch;
+    const cellW = Math.max(1, cw - gap), cellH = Math.max(1, ch - gap);
+    const c = status === 'finished' ? '1' : (blocks ? blocks[i] : '0');
+    if (c === '1') {
+      ctx.fillStyle = cDone;
+      ctx.fillRect(x + gap / 2, y + gap / 2, cellW, cellH);
+    } else if (c === '2') {
+      ctx.fillStyle = cPending;
+      ctx.fillRect(x + gap / 2, y + gap / 2, cellW, cellH);
+      const f = fracFor(i);
+      ctx.fillStyle = pulse % 2 ? cActive : cActive2;
+      // a claimed block with no bytes yet still shows a sliver,
+      // so an active cell never reads as untouched track
+      ctx.fillRect(x + gap / 2, y + gap / 2, Math.max(1, cellW * Math.max(f, 0.08)), cellH);
+    } else {
+      ctx.fillStyle = cPending;
+      ctx.fillRect(x + gap / 2, y + gap / 2, cellW, cellH);
+    }
+  }
+  // start ticks: one under each active connection's current block
+  ctx.fillStyle = cDone;
+  for (let w = 0; w < owners.length; w++) {
+    const b = owners[w];
+    if (b == null || b < 0 || b >= n) continue;
+    if (!partials[w] && (d.conns_state || [])[w] !== 2) continue;
+    const x = (b % cols) * cw, row = Math.floor(b / cols);
+    const y = (row + 1) * ch - 3;
+    ctx.beginPath();
+    ctx.moveTo(x + cw / 2, y);
+    ctx.lineTo(x + cw / 2 - 3, y + 3);
+    ctx.lineTo(x + cw / 2 + 3, y + 3);
+    ctx.closePath();
+    ctx.fill();
   }
 }
 
@@ -1239,13 +1355,13 @@ $('cfmodal').addEventListener('click', e => { if (e.target === $('cfmodal')) set
    "JavaScript - tauri://…"). Resolves the entered text, or null
    on Cancel/×/backdrop/Escape. */
 let promptResolve = null;
-function showPrompt(title, msg) {
+function showPrompt(title, msg, initial) {
   return new Promise(res => {
     if (promptResolve) promptResolve(null); // never stack two asks
     promptResolve = res;
     $('pTitle').textContent = title || 'Name';
     $('pMsg').textContent = msg || '';
-    $('pInput').value = '';
+    $('pInput').value = initial || '';
     revealModal($('pmodal'));
     $('pInput').focus();
   });
@@ -1287,6 +1403,15 @@ function select(id, openDetail) {
   if (id) selectedIds.add(id);
   if (openDetail) {
     revealModal(detailEl);
+    // G4: the details region starts EXPANDED on every open (the
+    // collapsed state is per-open, never persisted)
+    detailCollapsed = false;
+    syncDetailCollapse();
+    // the completion tab syncs to THIS entry on open too (the
+    // W193-8 bug class — a tab keeping the last-viewed entry's
+    // values), same as the limiter below
+    const d0 = items.get(id);
+    if (d0) syncCompletionPanel(d0);
     // W193-8: the Speed Limiter tab must show THIS download's
     // limit the moment the dialog opens — sync explicitly here,
     // not only on the next progress tick's renderDetail
@@ -1394,6 +1519,8 @@ function showCtxMenu(x, y, id) {
   add('Pause', () => actOnSelected(id => invoke('pause_download', { id })),
     st !== 'downloading');
   add('Properties / Status…', () => select(id, true));
+  add('Refresh download address…', () => openRefreshUrl(id),
+    st === 'downloading' || st === 'finished' || isVideoEntry(d));
   const sep1 = document.createElement('div'); sep1.className = 'ctx-sep'; ctxMenu.appendChild(sep1);
   add('Open File', () => { selectedId = id; openSelected(false); }, st !== 'finished');
   add('Open Folder', () => { selectedId = id; openSelected(true); }, st === 'queued');
@@ -1510,31 +1637,37 @@ $('delConfirm').onclick = async () => {
   // the status dialog must not silently retarget to another
   // download when its own entry is deleted — close it instead
   const detailWasShowingIt = !detailEl.classList.contains('hidden') && targets.includes(selectedId);
+  const shownId = detailWasShowingIt ? selectedId : null;
   if (TAURI) {
-    let failed = 0;
-    for (const id of targets) {
-      try {
-        // the same remove the single delete uses (it stops an active
-        // download first); the disk-file choice is passed as ticked
-        // for every entry — the backend deletes the file whatever
-        // the status, guarding only files another entry still owns
-        await invoke('remove_download', { id, deleteFile: delFile ? true : null });
-      } catch (e) {
-        console.error(e);
-        if (targets.length === 1) { toast(String(e)); return; }
-        failed++; // a batch keeps going, like Delete All Completed
-        continue;
+    // m-19: ONE bulk call for the whole batch (one persist, one
+    // pump on the backend) instead of a remove per entry. Every
+    // id reports its own result: an entry that refuses (e.g.
+    // still merging) stays in the list and its error is shown;
+    // the rest of the batch still goes.
+    let results = null;
+    try {
+      results = await invoke('remove_downloads', { ids: targets, deleteFile: delFile ? true : null });
+    } catch (e) { console.error(e); toast(String(e)); return; }
+    const failures = [];
+    for (const r of results || []) {
+      if (r && r.ok) {
+        deletedIds.add(r.id); // a late progress emit must not resurrect the row
+        items.delete(r.id);
+        selectedIds.delete(r.id);
+        prevStatusById.delete(r.id);
+        completeAnnounced.delete(r.id);
+      } else if (r) {
+        const d = items.get(r.id);
+        failures.push(`"${(d && d.name) || r.id}": ${r.error || 'could not be deleted'}`);
       }
-      deletedIds.add(id); // a late progress emit must not resurrect the row
-      items.delete(id);
-      selectedIds.delete(id);
-      prevStatusById.delete(id);
-      completeAnnounced.delete(id);
     }
     if (selectedId && !items.has(selectedId)) selectedId = items.keys().next().value || null;
-    if (detailWasShowingIt) detailEl.classList.add('hidden');
-    render();
-    if (failed) toast(failed + ' download' + (failed > 1 ? 's' : '') + ' could not be deleted');
+    // close the dialog only when ITS entry actually went — an
+    // entry that refused keeps its dialog open on itself
+    if (shownId && !items.has(shownId)) detailEl.classList.add('hidden');
+    render(); // one refresh at the end of the batch
+    if (failures.length === 1 && targets.length === 1) toast(failures[0]);
+    else if (failures.length) toast(failures.length + ' download' + (failures.length > 1 ? 's' : '') + ' could not be deleted — ' + failures[0]);
   } else {
     for (const id of targets) { items.delete(id); selectedIds.delete(id); }
     if (selectedId && !items.has(selectedId)) selectedId = items.keys().next().value || null;
@@ -1570,9 +1703,33 @@ if ($('dQueueSel')) $('dQueueSel').addEventListener('change', async () => {
 });
 $('dPause').onclick = $('btnPause').onclick;
 $('dResumeBtn').onclick = $('btnResume').onclick;
-$('dHide').onclick = () => { limiterDirty = false; detailEl.classList.add('hidden'); showNextComplete(); };
-if ($('dModalClose')) $('dModalClose').onclick = () => { limiterDirty = false; detailEl.classList.add('hidden'); showNextComplete(); };
-detailEl.addEventListener('click', e => { if (e.target === detailEl) { limiterDirty = false; detailEl.classList.add('hidden'); showNextComplete(); } });
+/* G4: the collapsed state is per-open — the toggle hides/shows
+   ONLY the details region (caption + strip + table + properties
+   group) and flips its own label; tab strip, fields, bar and
+   buttons stay. Default on open: expanded. */
+let detailCollapsed = false;
+function syncDetailCollapse() {
+  const region = $('dDetails');
+  if (region) region.classList.toggle('hidden', detailCollapsed);
+  const btn = $('dToggleDetails');
+  if (btn) btn.textContent = detailCollapsed ? 'Show details >>' : '<< Hide details';
+}
+if ($('dToggleDetails')) $('dToggleDetails').onclick = () => {
+  detailCollapsed = !detailCollapsed;
+  syncDetailCollapse();
+};
+/* G3: Cancel stops this download now AND closes the dialog —
+   through the existing pause path (it handles running, queued
+   and not-yet-live entries), so the entry and its partial
+   progress remain in the list, resumable */
+if ($('dCancelBtn')) $('dCancelBtn').onclick = async () => {
+  const id = selectedId;
+  closeDetail();
+  if (id) await actOnSelected(x => invoke('pause_download', { id: x }));
+};
+function closeDetail() { limiterDirty = false; detailEl.classList.add('hidden'); showNextComplete(); }
+if ($('dModalClose')) $('dModalClose').onclick = closeDetail;
+detailEl.addEventListener('click', e => { if (e.target === detailEl) closeDetail(); });
 $('btnStopAll').onclick = async () => {
   for (const d of items.values()) {
     if (d.status !== 'downloading') continue;
@@ -1592,6 +1749,11 @@ function pickQueueName() {
 }
 async function startQueueNow(name) {
   if (TAURI) {
+    // W4 Q-1 (UI half): scheduler_start_now now returns a Result —
+    // on an armed mandatory-update latch it FAILS with "downloads
+    // are paused until the required update is installed". That
+    // error is shown as-is and success is announced only after
+    // the command actually succeeded.
     try { await invoke('scheduler_start_now', { queue: name }); }
     catch (e) { toast('Could not start the queue: ' + e); return; }
   }
@@ -2553,6 +2715,97 @@ function growCatTypes(el) {
 document.querySelectorAll('.cat-types').forEach(t => {
   t.addEventListener('input', () => growCatTypes(t));
 });
+/* m-16: custom-category management (Options → Categories) — the
+   backend owns the rules (built-ins refuse; a deleted category's
+   downloads move to General); this list only offers the controls
+   for non-built-ins and surfaces the backend's answer honestly */
+const BUILTIN_CATEGORIES = ['General', 'Compressed', 'Documents', 'Music', 'Video', 'Programs', 'Grabber'];
+function managedCategoryNames() {
+  const names = new Set(categoryNames());
+  for (const d of items.values()) if (d.category) names.add(d.category);
+  return [...names].sort((a, b) => a.localeCompare(b));
+}
+function catStatus(msg) {
+  const st = $('oCatStatus');
+  if (!st) return;
+  st.textContent = msg || '';
+  st.classList.toggle('hidden', !msg);
+}
+function renderCatManage() {
+  const box = $('oCatManage');
+  if (!box) return;
+  box.innerHTML = '';
+  for (const name of managedCategoryNames()) {
+    const row = document.createElement('div');
+    row.className = 'cat-manage-row';
+    const lab = document.createElement('span');
+    lab.className = 'cat-name';
+    lab.textContent = name;
+    lab.title = name;
+    row.appendChild(lab);
+    if (BUILTIN_CATEGORIES.some(b => b.toLowerCase() === name.toLowerCase())) {
+      const tag = document.createElement('span');
+      tag.className = 'cat-builtin';
+      tag.textContent = 'built-in';
+      row.appendChild(tag);
+    } else {
+      const ren = document.createElement('button');
+      ren.className = 'tool';
+      ren.textContent = 'Rename';
+      ren.onclick = () => renameCategoryUi(name);
+      const del = document.createElement('button');
+      del.className = 'tool';
+      del.textContent = 'Delete';
+      del.onclick = () => deleteCategoryUi(name);
+      row.append(ren, del);
+    }
+    box.appendChild(row);
+  }
+}
+/* after a successful rename/delete the backend has already moved
+   the entries and persisted both stores — re-pull the
+   authoritative settings + list so the sidebar, the rows and
+   this panel all agree */
+async function refreshAfterCategoryChange() {
+  await loadSettings();
+  if (TAURI) {
+    try {
+      const list = await invoke('list_downloads');
+      items.clear();
+      for (const nd of list) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
+    } catch (e) { /* the next progress event resyncs */ }
+  }
+  catListSig = '';
+  renderCatManage();
+  render();
+}
+async function renameCategoryUi(name) {
+  catStatus('');
+  const next = await showPrompt('Rename category', `Rename the category "${name}" to:`, name);
+  if (next == null) return;
+  const trimmed = next.trim();
+  if (!trimmed || trimmed === name) return;
+  if (!TAURI) { catStatus('Renaming needs the NDM desktop app'); return; }
+  try {
+    await invoke('rename_category', { old: name, new: trimmed });
+  } catch (e) { catStatus('Could not rename the category: ' + e); return; }
+  // a sidebar filter on the old name would show an empty phantom
+  if (currentCat === name) currentCat = trimmed;
+  await refreshAfterCategoryChange();
+  toast(`Category renamed to "${trimmed}"`, 'info');
+}
+async function deleteCategoryUi(name) {
+  catStatus('');
+  const ok = await showConfirm(`Delete the category "${name}"?\nIts downloads move to General.`, 'Delete category');
+  if (!ok) return;
+  if (!TAURI) { catStatus('Deleting needs the NDM desktop app'); return; }
+  try {
+    await invoke('delete_category', { name });
+  } catch (e) { catStatus('Could not delete the category: ' + e); return; }
+  if (currentCat === name) { currentCat = 'All Downloads'; refreshTreeSelection(); }
+  await refreshAfterCategoryChange();
+  toast(`Category "${name}" deleted — its downloads are in General now`, 'info');
+}
 function openOptions() {
   if (anotherModalOpen('omodal')) return; // one modal layer (N-08)
   $('oDir').value = settings.default_dir;
@@ -2600,6 +2853,13 @@ function openOptions() {
   $('oExitDone').checked = !!settings.exit_when_done;
   $('oSounds').checked = settings.sound_events !== false;
   $('oCompleteDlg').checked = settings.show_complete_dialog !== false;
+  // G7: the progress dialog's start view (show / minimized / never)
+  if ($('oProgressView')) {
+    $('oProgressView').value = ['show', 'minimized', 'never'].includes(settings.progress_dialog_view)
+      ? settings.progress_dialog_view : 'show';
+  }
+  catStatus('');
+  renderCatManage();
   $('oClipboard').checked = settings.clipboard_monitor !== false;
   $('oQuotaMb').value = settings.quota_mb || 0;
   $('oQuotaHours').value = settings.quota_hours || 5;
@@ -2676,6 +2936,7 @@ $('oSave').onclick = async () => {
     exit_when_done: $('oExitDone').checked,
     sound_events: $('oSounds').checked,
     show_complete_dialog: $('oCompleteDlg').checked,
+    progress_dialog_view: $('oProgressView') ? $('oProgressView').value : (settings.progress_dialog_view || 'show'),
     clipboard_monitor: $('oClipboard').checked,
     quota_mb: Math.max(0, parseInt($('oQuotaMb').value, 10) || 0),
     quota_hours: Math.min(168, Math.max(1, parseInt($('oQuotaHours').value, 10) || 5)),
@@ -2862,6 +3123,10 @@ $('sModalClose').onclick = $('sCancel').onclick = () => smodal.classList.add('hi
 smodal.addEventListener('click', e => { if (e.target === smodal) smodal.classList.add('hidden'); });
 $('sStartNow').onclick = async () => {
   if (TAURI) {
+    // W4 Q-1 (UI half): a latched mandatory update makes this
+    // command fail — the status line carries the backend's error
+    // ("downloads are paused until the required update is
+    // installed"), never a success the start did not earn
     try { await invoke('scheduler_start_now', { queue: schedSel }); }
     catch (e) { console.error(e); $('sStatus').textContent = 'Could not start the queue: ' + e; return; }
   }
@@ -3344,18 +3609,35 @@ $('gDownload').onclick = async () => {
 
 
 
-/* ---------- detail tabs + completion options + speed limiter + open/refresh ---------- */
+/* ---------- detail tabs + completion options + speed limiter ---------- */
 // F-202-4: once the user edits this panel, progress-tick syncs must
-// not overwrite the edit before Apply reads it. The old focus-only
-// guard failed the moment focus moved to the Apply button itself:
-// the tick between mousedown and click reset the checkbox and the
-// typed value from the entry, so Apply silently applied "no limit".
-// Same pattern as the completion-radios guard above: never sync
-// over an in-progress user interaction — here, an unapplied edit.
+// not overwrite the edit mid-interaction. The old focus-only guard
+// failed the moment focus moved to the Apply button itself: the
+// tick between mousedown and click reset the checkbox and the
+// typed value from the entry, so Apply silently applied "no
+// limit". G9 keeps the guard and changes the apply model: there
+// is no Apply button anymore — toggling the checkbox or
+// committing the value (Enter / focus-out) applies at once, and
+// the dirty flag covers the window between the edit and that
+// commit so a tick can never rewrite the field under the user.
 let limiterDirty = false;
-if ($('dLimitOn')) $('dLimitOn').addEventListener('change', () => { limiterDirty = true; });
-if ($('dLimitVal')) $('dLimitVal').addEventListener('input', () => { limiterDirty = true; });
+if ($('dLimitOn')) $('dLimitOn').addEventListener('change', () => { limiterDirty = true; applyEntryLimit(); });
+if ($('dLimitVal')) {
+  $('dLimitVal').addEventListener('input', () => { limiterDirty = true; });
+  $('dLimitVal').addEventListener('change', () => { applyEntryLimit(); });
+  $('dLimitVal').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); applyEntryLimit(); }
+  });
+}
 
+/* G9/spec §2.2 prefill: the entry's own limit if set, else the
+   global limit if set, else 512 KB/s — always as an integer KB/s */
+function limiterPrefillKb(d) {
+  const own = (d && d.speed_limit) || 0;
+  if (own > 0) return Math.max(1, Math.round(own / 1024));
+  if (settings.speed_limit_bps > 0) return Math.max(1, Math.round(settings.speed_limit_bps / 1024));
+  return 512;
+}
 function syncLimiterPanel() {
   if (limiterDirty) return;
   // IDM's Speed Limiter tab is PER DOWNLOAD — it used to read and
@@ -3364,16 +3646,152 @@ function syncLimiterPanel() {
   const d = items.get(selectedId);
   const bps = (d && d.speed_limit) || 0;
   if ($('dLimitOn')) $('dLimitOn').checked = bps > 0;
-  if ($('dLimitVal')) {
-    // W193-8: show the entry's OWN limit at full fidelity — the
-    // old 1-decimal rounding rewrote 256 KB/s as "0.3" MB/s, and
-    // a stale panel could present the "2" placeholder as if it
-    // were the set value. Up to 3 decimals, trailing zeros cut.
-    $('dLimitVal').value = bps > 0
-      ? String(parseFloat((bps / (1024 * 1024)).toFixed(3)))
-      : '2';
+  if ($('dLimitVal')) $('dLimitVal').value = String(limiterPrefillKb(d));
+  // the composition note (spec §2.2): when a global limit is
+  // active, both throttles run — the lower of the two wins
+  const note = $('dLimitGlobalNote');
+  if (note) {
+    if (settings.speed_limit_bps > 0) {
+      note.textContent = `A global limit of ${fmtSize(settings.speed_limit_bps)}/sec also applies (Options) — the lower of the two wins.`;
+      note.classList.remove('hidden');
+    } else {
+      note.textContent = '';
+      note.classList.add('hidden');
+    }
   }
 }
+/* apply-on-change (G9): the checkbox state + the KB/s field go to
+   the existing set_entry_limit command immediately; unchecking
+   clears the entry's limit (0) */
+async function applyEntryLimit() {
+  const d = items.get(selectedId);
+  if (!d) { limiterDirty = false; return; }
+  const on = $('dLimitOn') && $('dLimitOn').checked;
+  const kb = Math.max(1, Math.round(Number($('dLimitVal') && $('dLimitVal').value) || 512));
+  const bps = on ? kb * 1024 : 0;
+  if ((d.speed_limit || 0) === bps) { limiterDirty = false; return; }
+  if (TAURI) {
+    try { await invoke('set_entry_limit', { id: d.id, limit: bps }); }
+    catch (e) {
+      toast('Could not set the limit: ' + e);
+      limiterDirty = false;
+      syncLimiterPanel(); // back to the value the entry really has
+      return;
+    }
+  }
+  d.speed_limit = bps;
+  limiterDirty = false;
+  toast(on ? `This download is limited to ${kb} KB/s` : 'Per-download speed limit removed', 'info');
+}
+
+/* ---------- completion options (G2): independent checkboxes ----------
+   over the entry's completion-action set. The show-complete box
+   is tri-state underneath: it reflects the per-entry override
+   when one is set, else membership of 'show_complete' in the
+   action set, else the global setting — and toggling it writes
+   the OVERRIDE (set_show_complete_override), leaving the set
+   itself alone. Every other toggle rewrites the whole set via
+   set_completion_actions. The power checkbox owns ONE set slot:
+   turn_off_pc or restart_pc, per the Shut down/Restart choice
+   beside it. */
+const COMPLETION_BOXES = [
+  ['cOpenFile', 'open_file'],
+  ['cOpenFolder', 'open_folder'],
+  ['cExitApp', 'exit_app'],
+];
+function completionActionsOf(d) {
+  // payloads from this backend always carry the set; the legacy
+  // single-string field seeds it for anything older
+  if (d && Array.isArray(d.completion_actions)) return [...d.completion_actions];
+  const legacy = (d && d.completion) || '';
+  return legacy ? [legacy] : [];
+}
+function syncCompletionPanel(d) {
+  if (!d) return;
+  const actions = completionActionsOf(d);
+  const showBox = $('cShowComplete');
+  if (showBox) {
+    // mirrors the backend's completion_show_dialog exactly:
+    // the override wins outright; a show_complete action in the
+    // set means yes; otherwise the GLOBAL setting decides (an
+    // action set without show_complete does NOT mean no)
+    showBox.checked = d.show_complete_override != null
+      ? !!d.show_complete_override
+      : (actions.includes('show_complete') ? true : settings.show_complete_dialog !== false);
+  }
+  for (const [id, action] of COMPLETION_BOXES) {
+    const el = $(id);
+    if (el) el.checked = actions.includes(action);
+  }
+  const power = actions.includes('restart_pc') ? 'restart_pc'
+    : (actions.includes('turn_off_pc') ? 'turn_off_pc' : null);
+  const powerBox = $('cPower');
+  if (powerBox) powerBox.checked = !!power;
+  document.querySelectorAll('input[name="compPower"]').forEach(r => {
+    r.checked = r.value === (power || 'turn_off_pc');
+    r.disabled = !powerBox || !powerBox.checked;
+  });
+}
+async function pushCompletionActions(d, actions) {
+  if (TAURI) {
+    try { await invoke('set_completion_actions', { id: d.id, actions }); }
+    catch (e) {
+      console.error(e); toast(String(e));
+      syncCompletionPanel(d); // the backend never saved it — show the truth
+      return false;
+    }
+  }
+  d.completion_actions = [...actions];
+  // keep the legacy single-action view in step for any other reader
+  d.completion = actions.find(a => ['open_file', 'open_folder', 'turn_off_pc', 'restart_pc'].includes(a)) || '';
+  return true;
+}
+async function toggleCompletionAction(action, on) {
+  const d = items.get(selectedId);
+  if (!d) return;
+  const actions = completionActionsOf(d).filter(a => a !== action);
+  if (on) actions.push(action);
+  await pushCompletionActions(d, actions);
+}
+for (const [id, action] of COMPLETION_BOXES) {
+  const el = $(id);
+  if (el) el.addEventListener('change', () => toggleCompletionAction(action, el.checked));
+}
+if ($('cPower')) $('cPower').addEventListener('change', async () => {
+  const d = items.get(selectedId);
+  if (!d) return;
+  const choice = (document.querySelector('input[name="compPower"]:checked') || {}).value || 'turn_off_pc';
+  const actions = completionActionsOf(d).filter(a => a !== 'turn_off_pc' && a !== 'restart_pc');
+  if ($('cPower').checked) actions.push(choice);
+  if (await pushCompletionActions(d, actions)) syncCompletionPanel(d);
+});
+document.querySelectorAll('input[name="compPower"]').forEach(r => {
+  r.addEventListener('change', async () => {
+    // switching Shut down/Restart only matters while the power
+    // action itself is ticked — it swaps the set's power slot
+    const box = $('cPower');
+    if (!box || !box.checked) return;
+    const d = items.get(selectedId);
+    if (!d) return;
+    const actions = completionActionsOf(d).filter(a => a !== 'turn_off_pc' && a !== 'restart_pc');
+    actions.push(r.value);
+    await pushCompletionActions(d, actions);
+  });
+});
+if ($('cShowComplete')) $('cShowComplete').addEventListener('change', async () => {
+  const d = items.get(selectedId);
+  if (!d) return;
+  const on = $('cShowComplete').checked;
+  if (TAURI) {
+    try { await invoke('set_show_complete_override', { id: d.id, show: on }); }
+    catch (e) {
+      console.error(e); toast(String(e));
+      syncCompletionPanel(d);
+      return;
+    }
+  }
+  d.show_complete_override = on;
+});
 
 function showDetailTab(which) {
   $('tabStatus').classList.toggle('active', which === 'status');
@@ -3387,23 +3805,6 @@ function showDetailTab(which) {
 $('tabStatus').onclick = () => showDetailTab('status');
 $('tabCompletion').onclick = () => showDetailTab('completion');
 if ($('tabLimiter')) $('tabLimiter').onclick = () => showDetailTab('limiter');
-
-if ($('dLimitApply')) {
-  $('dLimitApply').onclick = async () => {
-    const d = items.get(selectedId);
-    if (!d) return;
-    const on = $('dLimitOn').checked;
-    const valMb = Math.max(0.1, Number($('dLimitVal').value) || 1);
-    const bps = on ? Math.round(valMb * 1024 * 1024) : 0;
-    limiterDirty = false;
-    if (TAURI) {
-      try { await invoke('set_entry_limit', { id: d.id, limit: bps }); }
-      catch (e) { toast('Could not set the limit: ' + e); return; }
-    }
-    d.speed_limit = bps;
-    toast(on ? `This download is limited to ${valMb} MB/s` : 'Per-download speed limit removed', 'info');
-  };
-}
 
 /* description edits save on change (IDM's Properties field) */
 if ($('dDesc')) {
@@ -3421,44 +3822,20 @@ if ($('dDesc')) {
   });
 }
 
-document.querySelectorAll('input[name="compAct"]').forEach(r => {
-  r.addEventListener('change', async () => {
-    const d = items.get(selectedId);
-    if (!d) return;
-    if (TAURI) {
-      try { await invoke('set_completion', { id: d.id, action: r.value }); }
-      catch (e) {
-        console.error(e); toast(String(e));
-        // the backend never saved it — put the radios back on the
-        // value the entry actually has instead of showing a lie
-        const prev = d.completion || '';
-        document.querySelectorAll('input[name="compAct"]').forEach(x => {
-          x.checked = x.value === prev;
-        });
-        return;
-      }
-    }
-    d.completion = r.value;
-  });
-});
-
 async function openSelected(folder) {
   const d = items.get(selectedId);
   if (!d || !TAURI) return;
   try { await invoke('open_path', { id: d.id, folder }); }
   catch (e) { console.error(e); toast(String(e)); }
 }
-$('dOpen').onclick = () => openSelected(false);
-$('dOpenFolder').onclick = () => openSelected(true);
+/* spec §1.1: the progress dialog's Open / Open Folder / Refresh
+   URL buttons are gone — Open and Open Folder live in the
+   Download Complete dialog and the row context menu (both call
+   openSelected above), and Refresh URL is the separate Refresh
+   Address dialog below, whose own wiring stays. */
 
 /* refresh-URL modal (for expired download addresses) */
 const rmodal = $('rmodal');
-$('dRefresh').onclick = () => {
-  if (!items.get(selectedId)) return;
-  $('rUrl').value = '';
-  revealModal(rmodal);
-  $('rUrl').focus();
-};
 $('rModalClose').onclick = $('rCancel').onclick = () => rmodal.classList.add('hidden');
 rmodal.addEventListener('click', e => { if (e.target === rmodal) rmodal.classList.add('hidden'); });
 $('rSave').onclick = async () => {
@@ -3474,6 +3851,19 @@ $('rSave').onclick = async () => {
     } catch (e) { console.error(e); toast(String(e)); }
   }
 };
+
+/* the modal's one opener: the row context menu (IDM's placement).
+   rSave acts on selectedId, so select the row first; the field is
+   prefilled with the current (expired) address, ready to replace */
+function openRefreshUrl(id) {
+  const d = items.get(id);
+  if (!d) return;
+  selectedId = id;
+  $('rUrl').value = d.url || '';
+  rmodal.classList.remove('hidden');
+  $('rUrl').focus();
+  $('rUrl').select();
+}
 
 /* ---------- keyboard ---------- */
 // Escape closes the topmost open modal; Enter submits the URL field of
@@ -3618,6 +4008,50 @@ async function initTauri() {
   await listen('persist_recovered', () => {
     const b = $('persistBanner');
     if (b) b.classList.add('hidden');
+  });
+  // G7: an app-side start asks the UI to open the progress dialog
+  // on the started entry (the backend emits only when the
+  // progress_dialog_view setting is "show", and never for
+  // browser takeovers). Reuse the double-click path wholesale so
+  // the reveal targets the entry exactly like a manual open.
+  await listen('progress_dialog_reveal', e => {
+    const id = (e.payload || {}).id;
+    if (!id || deletedIds.has(id)) return;
+    if (!items.has(id)) {
+      // the start's own progress payload may not have landed yet —
+      // pull the authoritative list once, then open
+      invoke('list_downloads').then(list => {
+        for (const nd of list || []) if (!deletedIds.has(nd.id)) items.set(nd.id, normalize(nd));
+        if (items.has(id)) select(id, true);
+      }).catch(() => {});
+      return;
+    }
+    select(id, true);
+  });
+  // EXT §2: the extension-update-pending banner — a dismissible
+  // main-window banner in the same family as the persist/quota
+  // banners. The backend sets ext_notice_for at show time, so
+  // this fires at most once per bundled version; Dismiss only
+  // hides it (and tells the backend, per the command's contract).
+  await listen('ext_update_notice', e => {
+    const p = e.payload || {};
+    const b = $('extBanner');
+    if (!b) return;
+    const seen = p.seen_label || 'an older version';
+    const bundled = p.bundled || '';
+    b.innerHTML = '';
+    const txt = document.createElement('span');
+    txt.textContent = `Browser extension update pending — NDM was updated to ${bundled}, but your browser is still running extension ${seen}. Restart your browser to finish updating the extension. If you loaded the extension from a different folder, reload it from the NDM extension folder instead.`;
+    const x = document.createElement('button');
+    x.className = 'ext-dismiss';
+    x.type = 'button';
+    x.textContent = 'Dismiss';
+    x.addEventListener('click', () => {
+      b.classList.add('hidden');
+      if (TAURI) invoke('dismiss_ext_notice').catch(() => {});
+    });
+    b.append(txt, x);
+    b.classList.remove('hidden');
   });
   // a history file that had to be set aside at startup (corrupt
   // or partly unreadable): the backend kept a notice; show it
@@ -3838,7 +4272,7 @@ setInterval(() => {
   // visible — it used to redraw a hidden canvas twice a second
   if (detailEl.classList.contains('hidden')) return;
   const d = items.get(selectedId);
-  if (d && d.status === 'downloading') drawSegMap(d.blocks || '', d.status);
+  if (d && d.status === 'downloading') drawSegMap(d);
 }, 500);
 window.addEventListener('resize', () => { if (selectedId) renderDetail(); });
 /* =============== 1.5: menu bar, batch, import, about, updater =============== */
@@ -3921,19 +4355,44 @@ async function pauseAllDownloads() {
 async function deleteCompleted() {
   const done = [...items.values()].filter(d => d.status === 'finished');
   if (!done.length) { toast('No completed downloads', 'info'); return; }
-  for (const d of done) {
-    if (TAURI) {
-      try { await invoke('remove_download', { id: d.id }); } catch (e) { continue; }
+  // m-19: the same ONE bulk call the selection delete uses —
+  // per-id results decide what actually leaves the list
+  let removed = 0;
+  const failures = [];
+  if (TAURI) {
+    let results = null;
+    try {
+      results = await invoke('remove_downloads', { ids: done.map(d => d.id), deleteFile: null });
+    } catch (e) { toast('Could not delete completed downloads: ' + e); return; }
+    for (const r of results || []) {
+      if (r && r.ok) {
+        deletedIds.add(r.id);
+        items.delete(r.id);
+        selectedIds.delete(r.id);
+        prevStatusById.delete(r.id);
+        completeAnnounced.delete(r.id);
+        removed++;
+      } else if (r) {
+        failures.push(r.error || 'could not be deleted');
+      }
     }
-    deletedIds.add(d.id);
-    items.delete(d.id);
-    selectedIds.delete(d.id);
-    prevStatusById.delete(d.id);
-    completeAnnounced.delete(d.id);
+  } else {
+    for (const d of done) {
+      deletedIds.add(d.id);
+      items.delete(d.id);
+      selectedIds.delete(d.id);
+      prevStatusById.delete(d.id);
+      completeAnnounced.delete(d.id);
+      removed++;
+    }
   }
   if (selectedId && !items.has(selectedId)) selectedId = items.keys().next().value || null;
   render();
-  toast(`Deleted ${done.length} completed download${done.length > 1 ? 's' : ''} from the list`, 'info');
+  if (failures.length) {
+    toast(`${failures.length} completed download${failures.length > 1 ? 's' : ''} could not be deleted — ${failures[0]}`);
+  } else {
+    toast(`Deleted ${removed} completed download${removed > 1 ? 's' : ''} from the list`, 'info');
+  }
 }
 
 let pendingUpdate = null; // an update that arrived while a dialog was up (N-08)

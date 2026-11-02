@@ -123,12 +123,14 @@ async function init() {
   if (!hasMedia) {
     // Ask the page itself — its answer is the freshest (the
     // background's per-tab record can lag a just-loaded player).
+    // Via the background's all-frames query (F5): asking frame 0
+    // directly reported media-less on pages whose only player
+    // lives in an embedded iframe.
     try {
-      const q = await chrome.tabs.sendMessage(
-        tab.id,
-        { action: 'ndm-query-media' },
-        { frameId: 0 }
-      );
+      const q = await chrome.runtime.sendMessage({
+        action: 'ndm-query-media-all',
+        tabId: tab.id,
+      });
       if (q && q.hasMedia) hasMedia = true;
     } catch (e) {}
   }

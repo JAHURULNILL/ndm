@@ -47,13 +47,17 @@ const SAVE_EVERY: Duration = Duration::from_secs(1);
 
 static LIMIT_RATE: AtomicU64 = AtomicU64::new(0); // bytes/sec, 0 = unlimited
 static LIMIT_STATE: Mutex<Option<Instant>> = Mutex::new(None); // next free pacing slot
+static LIMIT_GEN: AtomicU64 = AtomicU64::new(0); // bumped on every limit change
 
 /// Set the global download speed limit in bytes/second (0 = unlimited).
 /// Applies to all running and future HTTP-engine downloads in this process.
 pub fn set_global_limit(bytes_per_sec: u64) {
     LIMIT_RATE.store(bytes_per_sec, Ordering::Relaxed);
-    // reset the pacing clock so a new rate starts clean
+    // reset the pacing clock so a new rate starts clean, and bump
+    // the generation so waits parked under the old rate re-reserve
+    // under the new one instead of sleeping the old slot out (M-14)
     *plock(&LIMIT_STATE) = None;
+    LIMIT_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
 pub fn global_limit() -> u64 {
@@ -224,36 +228,68 @@ pub fn resolve_pac_proxy(pac_url: &str) -> String {
     String::new()
 }
 
-/// Charge `n` downloaded bytes against the global pacing clock (GCRA-style
-/// slot reservation): every charge reserves n/rate seconds on a shared
-/// timeline and the caller sleeps until its slot begins. Aggregate throughput
-/// converges to exactly the configured rate, with no burst-and-starve cycle.
-/// Per-download pacing (IDM's Speed Limiter tab is per download):
-/// same slot algorithm as the global limiter, but scoped to one
-/// download's Shared state. Both throttles apply — a download obeys
-/// its own limit AND the global one.
-/// Wait until a pacing slot in slices of at most 50 ms, re-checking
-/// the halt flags and the CURRENT limit on every slice (finding #9:
-/// the bare `thread::sleep` this replaces could park one worker for
-/// the whole slot — at 1 KB/s a 512 KiB charge is ~8 minutes, and
-/// the sleeps of 16 workers stack into hours before a pause, cancel
-/// or stop is even noticed). A limit raised mid-wait shortens the
-/// remaining wait proportionally; a limit cleared ends it at once;
-/// setting the flags ends it at once (the caller's loop then
-/// settles the pause/cancel through the normal paths).
-fn pace_wait(shared: &Shared, slot: Instant, charged_rate: u64, rate_now: impl Fn() -> u64) {
+/// Pacing (GCRA-style slot reservation, M-13/M-14 rework).
+///
+/// The old pacer charged bytes AFTER they were read: the slot could
+/// start at the read's own start time, so on an idle timeline every
+/// connection's first 512 KiB read escaped at wire speed (~18.5 MiB
+/// across a pool before the first wait ever bit), and a mid-flight
+/// limit change only took effect once the far-future slots reserved
+/// at the old rate had drained (≥15 s, then a catch-up burst).
+///
+/// The reworked pacer reserves BEFORE the read: reserving `n` bytes
+/// pushes the shared virtual finish line out by n/rate and the
+/// caller waits until its slot BEGINS before reading a single byte,
+/// so the limit holds from byte 0 — the only uncharged bytes in
+/// flight are the one bounded slice each reservation grants.
+/// Reservations are capped at PACE_SLICE so no single charge can
+/// push the finish line (or a peer's wait) far out. A short read
+/// refunds the un-read remainder. Limit changes bump a generation
+/// counter and reset the timeline (the setters already did the
+/// reset): a parked wait notices within one 50 ms slice, abandons
+/// its stale reservation and re-reserves under the new rate — the
+/// change is effective within ~2 s and there is no old-debt
+/// catch-up burst, because the debt was discarded with the reset.
+/// Both throttles apply — a download obeys its own limit AND the
+/// global one (composition = min, the cleared F2 behaviour).
+const PACE_SLICE: u64 = 32 * 1024;
+
+enum PaceWait {
+    Reached,
+    Halted,
+    Changed,
+    Cleared,
+}
+
+/// Wait until `slot` in slices of at most 50 ms, re-checking the
+/// halt flags and the CURRENT limit on every slice (finding #9:
+/// one bare sleep could park a worker for a whole slot — at
+/// 1 KB/s a 512 KiB charge is ~8 minutes). A generation bump
+/// (limit changed) or a cleared limit ends the wait at once.
+fn pace_wait(
+    shared: &Shared,
+    slot: Instant,
+    charged_rate: u64,
+    rate_now: impl Fn() -> u64,
+    gen_now: impl Fn() -> u64,
+    charged_gen: u64,
+) -> PaceWait {
     let mut wait_left = slot.saturating_duration_since(Instant::now());
     let mut last_rate = charged_rate;
     while !wait_left.is_zero() {
         if shared.failed.load(Ordering::Relaxed)
             || shared.control.cancelled.load(Ordering::Relaxed)
             || shared.control.paused.load(Ordering::Relaxed)
+            || shared.superseded.load(Ordering::Relaxed)
         {
-            return;
+            return PaceWait::Halted;
+        }
+        if gen_now() != charged_gen {
+            return PaceWait::Changed;
         }
         let rate = rate_now();
         if rate == 0 {
-            return;
+            return PaceWait::Cleared;
         }
         if rate != last_rate && last_rate > 0 {
             wait_left = Duration::from_secs_f64(
@@ -263,44 +299,132 @@ fn pace_wait(shared: &Shared, slot: Instant, charged_rate: u64, rate_now: impl F
         }
         let step = wait_left.min(Duration::from_millis(50));
         std::thread::sleep(step);
-        wait_left -= step;
+        wait_left = wait_left.saturating_sub(step);
+        // a wait the rate change left still far out must not be
+        // slept through nominally: recompute from the real clock
+        // every slice so timer overshoot never accumulates (#9)
+        let real_left = slot.saturating_duration_since(Instant::now());
+        if real_left < wait_left {
+            wait_left = real_left;
+        }
+    }
+    PaceWait::Reached
+}
+
+/// Reserve `amount` bytes on one pacing timeline and wait until
+/// the reserved slot begins. Returns false only when a halt flag
+/// landed during the wait (the caller settles pause/cancel through
+/// its normal paths). A limit change mid-wait loops and
+/// re-reserves under the new rate — the stale charge vanished with
+/// the setter's timeline reset, so nothing is double-charged.
+fn pace_reserve(
+    shared: &Shared,
+    state: &Mutex<Option<Instant>>,
+    amount: u64,
+    rate_now: impl Fn() -> u64,
+    gen_now: impl Fn() -> u64,
+) -> bool {
+    if amount == 0 {
+        return true;
+    }
+    loop {
+        let rate = rate_now();
+        if rate == 0 {
+            return true;
+        }
+        let gen = gen_now();
+        let slot = {
+            let mut st = plock(state);
+            let now = Instant::now();
+            // no in-flight credit: an idle timeline starts at NOW,
+            // never in the past, so a drained queue grants exactly
+            // one slice immediately and paces everything after it
+            let slot = (*st).unwrap_or(now).max(now);
+            let cost = Duration::from_secs_f64(amount as f64 / rate as f64);
+            *st = Some(slot + cost);
+            slot
+        };
+        match pace_wait(shared, slot, rate, &rate_now, &gen_now, gen) {
+            PaceWait::Reached | PaceWait::Cleared => return true,
+            PaceWait::Halted => return false,
+            PaceWait::Changed => continue,
+        }
     }
 }
 
-fn throttle_own(shared: &Shared, n: u64, since: Instant) {
-    let rate = shared.own_limit.load(Ordering::Relaxed);
-    if rate == 0 || n == 0 {
+/// Give back the un-read part of a reservation (a short read, or a
+/// halt that landed between two limiters' reservations): the
+/// virtual finish line moves back by the refunded cost, so the
+/// aggregate charge always equals the bytes actually read.
+fn pace_refund(state: &Mutex<Option<Instant>>, amount: u64, rate: u64) {
+    if amount == 0 || rate == 0 {
         return;
     }
-    let slot = {
-        let mut st = plock(&shared.own_limit_state);
-        let now = Instant::now();
-        let slot = (*st).unwrap_or(now).max(since);
-        let cost = Duration::from_secs_f64(n as f64 / rate as f64);
-        *st = Some(slot + cost);
-        slot
-    };
-    pace_wait(shared, slot, rate, || {
-        shared.own_limit.load(Ordering::Relaxed)
-    });
+    let mut st = plock(state);
+    if let Some(t) = *st {
+        let cost = Duration::from_secs_f64(amount as f64 / rate as f64);
+        *st = t.checked_sub(cost);
+    }
 }
 
-fn throttle_global(shared: &Shared, n: u64, since: Instant) {
-    let rate = LIMIT_RATE.load(Ordering::Relaxed);
-    if rate == 0 || n == 0 {
+/// The read size a worker may take right now: unbounded (the
+/// caller's normal buffer) when no limit is set, one PACE_SLICE
+/// when any limit is active.
+fn pace_grant_size(shared: &Shared, want: usize) -> usize {
+    if LIMIT_RATE.load(Ordering::Relaxed) == 0
+        && shared.own_limit.load(Ordering::Relaxed) == 0
+    {
+        want
+    } else {
+        want.min(PACE_SLICE as usize)
+    }
+}
+
+/// Reserve `amount` bytes on BOTH pacing timelines (global, then
+/// this download's own) and wait until the later slot begins.
+/// Returns false when a halt flag landed during the wait.
+fn pace_before_read(shared: &Shared, amount: u64) -> bool {
+    let global_rate = LIMIT_RATE.load(Ordering::Relaxed);
+    if global_rate > 0
+        && !pace_reserve(shared, &LIMIT_STATE, amount, || LIMIT_RATE.load(Ordering::Relaxed), || {
+            LIMIT_GEN.load(Ordering::Relaxed)
+        })
+    {
+        return false;
+    }
+    if shared.own_limit.load(Ordering::Relaxed) > 0
+        && !pace_reserve(
+            shared,
+            &shared.own_limit_state,
+            amount,
+            || shared.own_limit.load(Ordering::Relaxed),
+            || shared.own_limit_gen.load(Ordering::Relaxed),
+        )
+    {
+        // the global timeline keeps a charge for bytes that were
+        // never read — hand it back so the aggregate stays honest
+        pace_refund(&LIMIT_STATE, amount, global_rate);
+        return false;
+    }
+    true
+}
+
+/// Refund the un-read remainder of a `pace_before_read` grant on
+/// both timelines (short read / EOF).
+fn pace_refund_both(shared: &Shared, amount: u64) {
+    if amount == 0 {
         return;
     }
-    let slot = {
-        let mut st = plock(&LIMIT_STATE);
-        let now = Instant::now();
-        // credit the time the bytes spent in flight: if the pacing queue has
-        // drained, the slot may start at the read's start time instead of now
-        let slot = (*st).unwrap_or(now).max(since);
-        let cost = Duration::from_secs_f64(n as f64 / rate as f64);
-        *st = Some(slot + cost);
-        slot
-    };
-    pace_wait(shared, slot, rate, || LIMIT_RATE.load(Ordering::Relaxed));
+    pace_refund(
+        &LIMIT_STATE,
+        amount,
+        LIMIT_RATE.load(Ordering::Relaxed),
+    );
+    pace_refund(
+        &shared.own_limit_state,
+        amount,
+        shared.own_limit.load(Ordering::Relaxed),
+    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -346,6 +470,17 @@ pub struct Progress {
     /// cumulative bytes fetched by each connection this session —
     /// the data behind IDM's per-connection progress table
     pub conn_bytes: Vec<u64>,
+    /// per-connection phase for the progress dialog's Info column
+    /// (G1): 0 = waiting for a claim, 1 = request sent, awaiting
+    /// response headers ("Send GET…"), 2 = reading the body
+    /// ("Receiving data…"). Session-only; never journalled.
+    pub conn_states: Vec<u8>,
+    /// bytes each connection has written toward its current,
+    /// unfinished block (the fractional fill of the segment strip)
+    pub conn_partial: Vec<u64>,
+    /// the block index each connection is currently working on,
+    /// -1 when it holds no block (strip start markers, G1)
+    pub conn_block: Vec<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -456,12 +591,47 @@ struct Shared {
     /// removal paths wait for `Download::is_settled` before
     /// sweeping the journal (R4 item 2)
     settled: AtomicBool,
+    /// set by the supervisor when it settles WITHOUT a worker — the
+    /// worker was parked on a server-held connection past the
+    /// settle grace (W1 F13 / C-2). A detached worker that wakes
+    /// later checks this before every write and block mark, so it
+    /// can never write into a file a settled (or superseding)
+    /// download now owns.
+    superseded: AtomicBool,
+    /// per-worker progress-dialog surface (G1): phase 0 waiting /
+    /// 1 request sent / 2 receiving, and the current block index
+    /// (usize::MAX = none). Session-only, never journalled.
+    conn_phase: Vec<AtomicU8>,
+    conn_block: Vec<AtomicUsize>,
+    /// bumped whenever this download's own limit changes, so a
+    /// pacing wait parked under the old rate re-reserves under the
+    /// new one instead of sleeping out the old slot (M-14)
+    own_limit_gen: AtomicU64,
+    /// the lying-Content-Encoding-header proof passed for this job
+    /// (DIAG fix): block runs skip the header veto because the
+    /// bodies were proven identity. True encoders never set this —
+    /// their proof fails on the encoded length alone.
+    ignore_encoding: bool,
+    /// journal sync policy state (W1 F15): when the data file was
+    /// last synced to stable storage, and how many bytes workers
+    /// have written since. A periodic journal save may only sync
+    /// the journal itself once it has FIRST synced the data file
+    /// (see save_state), so the journal never durably claims bytes
+    /// the data file does not hold.
+    last_data_sync: Mutex<Instant>,
+    bytes_since_sync: AtomicU64,
 }
 
 /// How long the whole worker pool may move zero bytes before the
 /// download is declared failed (permanent errors fail immediately,
 /// without waiting for this window).
 const STALL_LIMIT: Duration = Duration::from_secs(30);
+
+/// How long the supervisor waits for workers to wind down once a
+/// terminal intent exists before it settles without them (C-2):
+/// settlement is bounded by STALL_LIMIT + SETTLE_GRACE (+ one poll
+/// tick), never by a parked worker's connection.
+const SETTLE_GRACE: Duration = Duration::from_secs(5);
 
 /// Lock a Shared mutex, recovering the guard if a previous holder
 /// panicked while holding it. A poisoned mutex must degrade to
@@ -484,6 +654,11 @@ fn plock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// limit) never evaluated it, so a genuine stall could sit
 /// non-terminal forever instead of ending in an error (F-15).
 fn fail_if_stalled(shared: &Shared, total_blocks: usize) -> bool {
+    if shared.control.paused.load(Ordering::Relaxed) {
+        // a paused download waits on the user, not the network —
+        // the stall clock only runs against an active pool
+        return false;
+    }
     if shared.done_count.load(Ordering::Relaxed) >= total_blocks {
         return false;
     }
@@ -600,7 +775,26 @@ fn try_claim(shared: &Shared, total_blocks: usize) -> Option<(usize, usize)> {
     Some((s, e))
 }
 
-fn save_state(shared: &Shared, force: bool) {
+/// Durable-point cadence for periodic journal saves (W1 F15 +
+/// DIAG speed report): a periodic save syncs at most once per
+/// 16 MiB of new data or 5 s, whichever comes first — every-save
+/// fsync was a measurable speed tax on consumer disks, and syncing
+/// the JOURNAL without the DATA was a durability hole (on power
+/// loss the journal could durably claim bytes the data file never
+/// held). Forced/terminal saves are always durable.
+const SYNC_EVERY_BYTES: u64 = 16 << 20;
+const SYNC_EVERY: Duration = Duration::from_secs(5);
+
+/// The sync policy for one journal save, as a pure decision so it
+/// can be unit-tested without a disk: `durable` saves sync data
+/// file → journal file → directory, in that order, so a durable
+/// journal never claims bytes the data file does not hold;
+/// non-durable saves write the journal with no sync at all.
+fn sync_is_durable(force: bool, bytes_since_sync: u64, since_sync: Duration) -> bool {
+    force || bytes_since_sync >= SYNC_EVERY_BYTES || since_sync >= SYNC_EVERY
+}
+
+fn save_state(shared: &Shared, force: bool, data_file: Option<&File>) {
     let mut last = if force {
         plock(&shared.last_save)
     } else {
@@ -615,6 +809,11 @@ fn save_state(shared: &Shared, force: bool) {
     {
         return;
     }
+    let durable = sync_is_durable(
+        force,
+        shared.bytes_since_sync.load(Ordering::Relaxed),
+        plock(&shared.last_data_sync).elapsed(),
+    );
     let snapshot = plock(&shared.state).clone();
     // write-then-rename keeps the on-disk state valid even if killed mid-save
     let tmp = shared.state_path.with_extension("json.tmp");
@@ -624,24 +823,34 @@ fn save_state(shared: &Shared, force: bool) {
     // supervisor's final save, immediately followed by deleting the
     // state file — is exactly the one that must not silently fail.
     //
-    // Every save syncs the journal file (and, after the rename, its
-    // directory): the periodic-save comment in the worker promises a
-    // crash or power loss loses at most the in-flight block, which is
-    // only true if the journal bytes are on stable storage, not just
-    // in the page cache. A failure anywhere is RECORDED on the job
-    // (finding #8a) instead of swallowed — a journal that can never
-    // be written means this download has no resume protection, and
-    // that must be visible, not silent.
+    // Sync policy (W1 F15): a DURABLE save syncs the DATA file
+    // first, then the journal, then its directory — the journal
+    // must never be the most durable copy of a byte. A non-durable
+    // periodic save syncs nothing: it is a crash hint for the page
+    // cache era, and the next durable point (≤16 MiB / ≤5 s away,
+    // or the forced terminal save) restores the invariant. A
+    // failure anywhere is RECORDED on the job (finding #8a) instead
+    // of swallowed — a journal that can never be written means this
+    // download has no resume protection, and that must be visible.
     let save_result: io::Result<()> = (|| {
+        if durable {
+            if let Some(df) = data_file {
+                df.sync_all()?;
+            }
+        }
         {
             let f = File::create(&tmp)?;
             serde_json::to_writer(&f, &snapshot).map_err(io::Error::from)?;
-            f.sync_all()?;
+            if durable {
+                f.sync_all()?;
+            }
         } // f drops here — the handle is closed before the rename
         std::fs::rename(&tmp, &shared.state_path)?;
-        if let Some(dir) = shared.state_path.parent() {
-            if let Ok(d) = File::open(dir) {
-                let _ = d.sync_all();
+        if durable {
+            if let Some(dir) = shared.state_path.parent() {
+                if let Ok(d) = File::open(dir) {
+                    let _ = d.sync_all();
+                }
             }
         }
         Ok(())
@@ -650,6 +859,10 @@ fn save_state(shared: &Shared, force: bool) {
         Ok(()) => {
             *plock(&shared.last_journal_error) = None;
             shared.since_save.store(0, Ordering::Relaxed);
+            if durable {
+                shared.bytes_since_sync.store(0, Ordering::Relaxed);
+                *plock(&shared.last_data_sync) = Instant::now();
+            }
             *last = Instant::now();
         }
         Err(e) => {
@@ -689,6 +902,11 @@ pub struct Probe {
     pub last_modified: Option<String>,
     pub suggested_name: Option<String>,
     pub final_url: String,
+    /// the server labels responses with a Content-Encoding header
+    /// but the bodies were PROVEN identity (the DIAG lying-header
+    /// proof in verify_range / probe_once): transfer paths for this
+    /// job skip the header veto. Never set for a true encoder.
+    pub ignore_encoding_header: bool,
 }
 
 /// Extract a clean filename from a `Content-Disposition` header value
@@ -925,9 +1143,59 @@ fn parse_content_range(v: &str) -> Option<(u64, u64, Option<u64>)> {
     Some((start_num, end_num, total_num))
 }
 
+/// The lying-header proof (DIAG Report 1 fix): a response claims a
+/// Content-Encoding the request refused, yet its body may still be
+/// identity — some servers stamp the header on every answer while
+/// sending the file untouched, and vetoing the header alone demoted
+/// those files from 8 connections to 1 (or failed the probe
+/// outright). The proof for a 1-byte range answer already in hand:
+/// its declared length must be EXACTLY 1 (a real encoding of one
+/// byte is never one byte — a gzip stream alone is ~21), and its
+/// byte must equal the first byte a plain identity fetch returns
+/// for offset 0, whose own declared length must match the known
+/// total when there is one (an encoded whole-file body reports the
+/// ENCODED length). Anything short of the full proof is not a lie
+/// we trust: the caller keeps the veto / demotion, so true
+/// encoders still fail safe.
+fn prove_encoding_lie(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: &Auth,
+    origin_url: &str,
+    verify_byte: u8,
+    known_total: Option<u64>,
+) -> bool {
+    let Ok(plain) = apply_auth_scoped(agent.get(url), auth, url, origin_url)
+        .set("Accept-Encoding", "identity")
+        .call()
+    else {
+        return false;
+    };
+    if let Some(t) = known_total {
+        if let Some(cl) = plain
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            if cl != t {
+                return false;
+            }
+        }
+    }
+    let mut byte = [0u8; 1];
+    plain
+        .into_reader()
+        .read_exact(&mut byte)
+        .map(|_| byte[0] == verify_byte)
+        .unwrap_or(false)
+}
+
 /// Confirm with a real 1-byte request that the server honours Range —
 /// some servers advertise `Accept-Ranges: bytes` but answer 200 to actual
 /// range requests; trusting the header alone bricks those downloads.
+/// Returns (range_ok, ignore_encoding_header): the second is set
+/// when the answer carried a Content-Encoding header but the
+/// lying-header proof passed — the job keeps its connections and
+/// its transfer paths skip the header veto for this job only.
 fn verify_range(
     agent: &ureq::Agent,
     url: &str,
@@ -935,7 +1203,7 @@ fn verify_range(
     header_claim: bool,
     auth: &Auth,
     origin_url: &str,
-) -> bool {
+) -> (bool, bool) {
     // `url` is the HEAD's post-redirect address: if that is another
     // host than the one the credentials belong to, they are scoped
     // out (finding #13)
@@ -946,23 +1214,48 @@ fn verify_range(
     {
         Ok(resp) => {
             if resp.status() != 206 {
-                return false;
-            }
-            if response_encoding(&resp).is_some() {
-                return false;
+                return (false, false);
             }
             // the answer must be exactly the byte we asked for, from a
             // file of exactly the probed size — a server that streams
             // from a different offset is not range-capable for our use
-            resp.header("Content-Range")
+            let cr_ok = resp
+                .header("Content-Range")
                 .and_then(parse_content_range)
                 .map(|(s, e, t)| s == 0 && e == 0 && (t.is_none() || t == Some(total)))
-                .unwrap_or(false)
+                .unwrap_or(false);
+            if !cr_ok {
+                return (false, false);
+            }
+            if response_encoding(&resp).is_none() {
+                return (true, false);
+            }
+            // a Content-Encoding header on the verify answer: demote
+            // (the old behaviour) unless the header is proven a lie.
+            // A real encoder's 1-byte answer is never 1 byte long.
+            let cl_ok = resp
+                .header("Content-Length")
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|cl| cl == 1)
+                .unwrap_or(false);
+            if !cl_ok {
+                return (false, false);
+            }
+            let mut byte = [0u8; 1];
+            let read_ok = resp
+                .into_reader()
+                .read_exact(&mut byte)
+                .is_ok();
+            if read_ok && prove_encoding_lie(agent, url, auth, origin_url, byte[0], Some(total)) {
+                (true, true)
+            } else {
+                (false, false)
+            }
         }
         // a definitive HTTP refusal settles it (the claim is false); only
         // a transport failure leaves the question open — trust the header
-        Err(ureq::Error::Status(..)) => false,
-        Err(_) => header_claim,
+        Err(ureq::Error::Status(..)) => (false, false),
+        Err(_) => (header_claim, false),
     }
 }
 
@@ -1022,7 +1315,8 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                     .header("Accept-Ranges")
                     .map(|v| v.eq_ignore_ascii_case("bytes"))
                     .unwrap_or(false);
-                let range_ok = verify_range(agent, &resolved, total, header_claim, auth, url);
+                let (range_ok, ignore_encoding_header) =
+                    verify_range(agent, &resolved, total, header_claim, auth, url);
                 return Ok(Probe {
                     total,
                     range_ok,
@@ -1031,6 +1325,7 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                     last_modified,
                     suggested_name,
                     final_url: resolved,
+                    ignore_encoding_header,
                 });
             }
         }
@@ -1079,14 +1374,61 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
             });
         }
     };
-    if let Some(enc) = response_encoding(&resp) {
+    // A Content-Encoding header on the probe answer is a
+    // Definitive failure — UNLESS the lying-header proof passes for
+    // it (DIAG fix): a 206 answer with an exact Content-Range, a
+    // declared length of exactly 1 and a byte matching a plain
+    // identity fetch is an identity body wearing a false header, so
+    // the probe succeeds with range support and the job is marked
+    // to skip the header veto. Any other encoded answer (including
+    // a 200, whose body the proof cannot isolate to one byte) stays
+    // Definitive. All header facts are captured BEFORE the proof
+    // consumes the response body.
+    let probe_enc = response_encoding(&resp);
+    let probe_status = resp.status();
+    let probe_cr = resp.header("Content-Range").and_then(parse_content_range);
+    let probe_cl = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok());
+    let probe_etag = resp.header("ETag").map(|s| s.to_string());
+    let probe_lm = resp.header("Last-Modified").map(|s| s.to_string());
+    let resolved = resp.get_url().to_string();
+    let suggested_name = extract_suggested_name(&resp, url).or(head_suggested);
+    if let Some(enc) = &probe_enc {
+        let mut proven = false;
+        if probe_status == 206 {
+            if let Some((s, e, t)) = probe_cr {
+                if s == 0 && e == 0 && probe_cl == Some(1) {
+                    // read the single byte, then run the plain-fetch
+                    // comparison against the resolved address
+                    let mut byte = [0u8; 1];
+                    if resp.into_reader().read_exact(&mut byte).is_ok()
+                        && prove_encoding_lie(agent, &resolved, auth, url, byte[0], t)
+                    {
+                        proven = true;
+                    }
+                    if proven {
+                        return Ok(Probe {
+                            total: t.unwrap_or(0),
+                            range_ok: t.is_some(),
+                            unknown_size: t.is_none(),
+                            etag: probe_etag,
+                            last_modified: probe_lm,
+                            suggested_name,
+                            final_url: resolved,
+                            ignore_encoding_header: true,
+                        });
+                    }
+                }
+            }
+        }
+        let _ = enc;
         return Err(ProbeFail::Definitive(format!(
             "probe: server answered with Content-Encoding: {enc} despite an identity request"
         )));
     }
-    let resolved = resp.get_url().to_string();
-    let suggested_name = extract_suggested_name(&resp, url).or(head_suggested);
-    if resp.status() == 206 {
+    let resp_status_is_206 = probe_status == 206;
+    if resp_status_is_206 {
         let (s, _e, total_opt) = resp
             .header("Content-Range")
             .and_then(parse_content_range)
@@ -1115,6 +1457,7 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
             last_modified: resp.header("Last-Modified").map(|s| s.to_string()),
             suggested_name,
             final_url: resolved,
+            ignore_encoding_header: false,
         });
     }
     let etag = resp.header("ETag").map(|s| s.to_string());
@@ -1133,6 +1476,7 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                 last_modified,
                 suggested_name,
                 final_url: resolved,
+                ignore_encoding_header: false,
             });
         }
     };
@@ -1144,6 +1488,7 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
         last_modified,
         suggested_name,
         final_url: resolved,
+        ignore_encoding_header: false,
     })
 }
 
@@ -1208,6 +1553,15 @@ fn download_block_run(
     if !is_gvideo {
         req = req.set("Range", &format!("bytes={req_start}-{end}"));
     }
+    // G1: the request is being sent — the dialog's Info column
+    // shows "Send GET…" until the headers are in and the body
+    // starts arriving ("Receiving data…")
+    if let Some(p) = shared.conn_phase.get(worker_id) {
+        p.store(1, Ordering::Relaxed);
+    }
+    if let Some(b) = shared.conn_block.get(worker_id) {
+        b.store(*cur_block, Ordering::Relaxed);
+    }
     let resp = req.call().map_err(|e| {
         if matches!(e, ureq::Error::Status(403, _) | ureq::Error::Status(429, _)) {
             shared.throttle_events.fetch_add(1, Ordering::Relaxed);
@@ -1218,13 +1572,18 @@ fn download_block_run(
             BlockError::Retry(format!("http: {e}"))
         }
     })?;
-    if let Some(enc) = response_encoding(&resp) {
-        // encoded bytes written at file offsets would assemble a
-        // corrupt "finished" file; the server was asked for identity
-        // and this will not change between retries (finding #3)
-        return Err(BlockError::Permanent(format!(
-            "server answered with Content-Encoding: {enc} despite an identity request"
-        )));
+    if !shared.ignore_encoding {
+        if let Some(enc) = response_encoding(&resp) {
+            // encoded bytes written at file offsets would assemble a
+            // corrupt "finished" file; the server was asked for identity
+            // and this will not change between retries (finding #3).
+            // Skipped only when the job's bodies were proven identity
+            // despite the header (the DIAG lying-header proof) — the
+            // bytes written are still exactly the bytes received.
+            return Err(BlockError::Permanent(format!(
+                "server answered with Content-Encoding: {enc} despite an identity request"
+            )));
+        }
     }
     let status = resp.status();
     // the end of THIS response — a server may legally answer a
@@ -1278,6 +1637,10 @@ fn download_block_run(
         )));
     }
 
+    // G1: headers are in, the body is next — "Receiving data…"
+    if let Some(p) = shared.conn_phase.get(worker_id) {
+        p.store(2, Ordering::Relaxed);
+    }
     let mut reader = resp.into_reader();
     let mut buf = vec![0u8; 512 * 1024];
     // work-stealing cap: once armed (see the check in the loop),
@@ -1290,6 +1653,12 @@ fn download_block_run(
     // fetched fresh by whoever claims them
     let mut cap_block: Option<usize> = None;
     loop {
+        if shared.superseded.load(Ordering::Relaxed) {
+            // the supervisor settled without this worker (C-2): it
+            // must never write again — the file may already belong
+            // to a superseding download
+            return Err(BlockError::Cancelled);
+        }
         if shared.control.cancelled.load(Ordering::Relaxed) {
             return Err(BlockError::Cancelled);
         }
@@ -1306,11 +1675,28 @@ fn download_block_run(
         if remaining == 0 {
             break;
         }
+        // Pacing reserves BEFORE the read (M-13): the grant is
+        // charged against both limiters' timelines and the worker
+        // waits for its slot first, so the limit holds from byte 0
+        // instead of letting every connection's first read escape
+        // at wire speed.
         let want = (buf.len() as u64).min(remaining) as usize;
-        let read_at = Instant::now();
+        let grant = pace_grant_size(shared, want);
+        if !pace_before_read(shared, grant as u64) {
+            if shared.control.paused.load(Ordering::Relaxed) {
+                return Err(BlockError::Paused);
+            }
+            return Err(BlockError::Cancelled);
+        }
         let n = reader
-            .read(&mut buf[..want])
-            .map_err(|e| BlockError::Retry(format!("read: {e}")))?;
+            .read(&mut buf[..grant])
+            .map_err(|e| {
+                pace_refund_both(shared, grant as u64);
+                BlockError::Retry(format!("read: {e}"))
+            })?;
+        if (n as u64) < grant as u64 {
+            pace_refund_both(shared, grant as u64 - n as u64);
+        }
         if n == 0 {
             break;
         }
@@ -1322,6 +1708,9 @@ fn download_block_run(
         // (The loop-top check alone let exactly one in-flight
         // chunk land on disk after every pause / quota halt —
         // battery19 t1 "pause holds" and t6 "quota pauses".)
+        if shared.superseded.load(Ordering::Relaxed) {
+            return Err(BlockError::Cancelled);
+        }
         if shared.control.cancelled.load(Ordering::Relaxed) {
             return Err(BlockError::Cancelled);
         }
@@ -1343,11 +1732,17 @@ fn download_block_run(
             cb.fetch_add(n as u64, Ordering::Relaxed);
         }
         shared.since_save.fetch_add(n as u64, Ordering::Relaxed);
+        shared.bytes_since_sync.fetch_add(n as u64, Ordering::Relaxed);
 
         // Mark any completed blocks in this contiguous run immediately
         while *cur_block < b_end_excl {
             let b_limit = ((*cur_block as u64 + 1) * block_size).min(total);
             if *pos >= b_limit {
+                if shared.superseded.load(Ordering::Relaxed) {
+                    // detached zombie (C-2): marks are writes too —
+                    // a superseded worker changes nothing, ever
+                    return Err(BlockError::Cancelled);
+                }
                 {
                     let mut st = plock(&shared.state);
                     if st.done[*cur_block] == 0 {
@@ -1357,6 +1752,9 @@ fn download_block_run(
                 }
                 shared.block_state[*cur_block].store(1, Ordering::Relaxed);
                 *cur_block += 1;
+                if let Some(b) = shared.conn_block.get(worker_id) {
+                    b.store(*cur_block, Ordering::Relaxed);
+                }
                 if *cur_block < b_end_excl {
                     shared.block_state[*cur_block].store(2, Ordering::Relaxed);
                 }
@@ -1368,7 +1766,7 @@ fn download_block_run(
         // itself to 1 s / 4 MiB and try-locks): a crash or power loss
         // must lose at most the in-flight block, never a whole claim
         // run of up to 256 blocks whose marks existed only in RAM
-        save_state(shared, false);
+        save_state(shared, false, Some(file));
         if *cur_block < b_end_excl {
             let b_base = (*cur_block as u64) * block_size;
             shared.partial[worker_id].store((*pos).saturating_sub(b_base), Ordering::Relaxed);
@@ -1390,8 +1788,6 @@ fn download_block_run(
             };
             cap_block = split_point(first_unwritten, b_end_excl);
         }
-        throttle_global(&shared, n as u64, read_at);
-        throttle_own(shared, n as u64, read_at);
     }
     if let Some(split) = cap_block {
         let cap_byte = ((split as u64) * block_size).min(total);
@@ -1442,7 +1838,18 @@ fn worker(
         (st.block_size, st.total)
     };
     loop {
-        if shared.failed.load(Ordering::Relaxed)
+        // G1: between claims this connection is waiting, holding
+        // no block — the phase/block surface says so until the
+        // next run's request goes out
+        if let Some(p) = shared.conn_phase.get(id) {
+            p.store(0, Ordering::Relaxed);
+        }
+        if let Some(b) = shared.conn_block.get(id) {
+            b.store(usize::MAX, Ordering::Relaxed);
+        }
+        shared.partial[id].store(0, Ordering::Relaxed);
+        if shared.superseded.load(Ordering::Relaxed)
+            || shared.failed.load(Ordering::Relaxed)
             || shared.control.cancelled.load(Ordering::Relaxed)
             || shared.done_count.load(Ordering::Relaxed) >= total_blocks
         {
@@ -1550,6 +1957,9 @@ fn worker(
             let mut cur_pos = start;
             let mut attempt = 0;
             shared.block_state[cur_block].store(2, Ordering::Relaxed);
+            if let Some(b) = shared.conn_block.get(id) {
+                b.store(cur_block, Ordering::Relaxed);
+            }
 
             loop {
                 // A run that "succeeds" without moving the cursor —
@@ -1586,7 +1996,7 @@ fn worker(
                         // the consecutive-failure count
                         attempt = 0;
                         shared.partial[id].store(0, Ordering::Relaxed);
-                        save_state(&shared, false);
+                        save_state(&shared, false, Some(&*file));
                         if cur_block >= b_last {
                             break;
                         }
@@ -1823,6 +2233,31 @@ impl Download {
                 .iter()
                 .map(|c| c.load(Ordering::Relaxed))
                 .collect(),
+            conn_states: self
+                .shared
+                .conn_phase
+                .iter()
+                .map(|p| p.load(Ordering::Relaxed))
+                .collect(),
+            conn_partial: self
+                .shared
+                .partial
+                .iter()
+                .map(|p| p.load(Ordering::Relaxed))
+                .collect(),
+            conn_block: self
+                .shared
+                .conn_block
+                .iter()
+                .map(|b| {
+                    let v = b.load(Ordering::Relaxed);
+                    if v == usize::MAX {
+                        -1
+                    } else {
+                        v as i64
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -1833,9 +2268,13 @@ impl Download {
         let old = self.shared.own_limit.swap(bytes_per_sec, Ordering::Relaxed);
         // a changed limit starts a fresh pacing clock, exactly like
         // the global setter — keeping the old clock made a raised
-        // limit wait out slots reserved at the previous rate
+        // limit wait out slots reserved at the previous rate. The
+        // generation bump makes waits parked under the old rate
+        // re-reserve under the new one within one slice (M-14),
+        // instead of ignoring the change for ≥15 s.
         if bytes_per_sec != old {
             *plock(&self.shared.own_limit_state) = None;
+            self.shared.own_limit_gen.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1891,6 +2330,7 @@ fn verify_block_bytes(
     out: &Path,
     start: u64,
     end: u64,
+    ignore_encoding: bool,
 ) -> bool {
     use std::io::{Seek, SeekFrom};
     let want = (end - start) as usize;
@@ -1904,7 +2344,7 @@ fn verify_block_bytes(
     else {
         return false;
     };
-    if resp.status() != 206 || response_encoding(&resp).is_some() {
+    if resp.status() != 206 || (!ignore_encoding && response_encoding(&resp).is_some()) {
         return false;
     }
     // the answer must be the range that was asked for — a server
@@ -1943,47 +2383,176 @@ fn verify_block_bytes(
 /// when it settles, on every exit path.
 static IN_FLIGHT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
-struct InFlightGuard(PathBuf);
+/// The canonical identity of an output path (W1 F3): the file
+/// itself when it exists (a symlinked FILE resolves to its
+/// target), else its canonicalised parent directory plus the file
+/// name (a symlinked DIRECTORY spelling — `linkdir/alias/f.bin`
+/// where alias → the real dir — resolves to the real location, so
+/// two spellings of one file share one guard key and one lock
+/// file). When nothing on disk can be canonicalised yet, fall
+/// back to lexical normalisation against the cwd, as before.
+fn canonical_key(out: &Path) -> PathBuf {
+    let abs = if out.is_absolute() {
+        out.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(out))
+            .unwrap_or_else(|_| out.to_path_buf())
+    };
+    if let Ok(c) = std::fs::canonicalize(&abs) {
+        return c;
+    }
+    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) {
+        if let Ok(cp) = std::fs::canonicalize(parent) {
+            return cp.join(name);
+        }
+    }
+    let mut parts: Vec<std::path::Component> = Vec::new();
+    for c in abs.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect()
+}
+
+/// Unix: an OS advisory exclusive lock (flock) on a per-output
+/// lock file, held for the download's life — the cross-process
+/// half of the same-path guard (W1 F3b: two CLI processes spliced
+/// one file while both reported DONE). Declared directly against
+/// libc's flock so no new dependency is needed; closing the file
+/// (guard drop, or process exit for any reason including SIGKILL)
+/// releases it, so a crashed owner can never lock a path forever.
+#[cfg(unix)]
+mod os_file_lock {
+    use std::fs::File;
+    use std::os::raw::c_int;
+    use std::os::unix::io::AsRawFd;
+
+    extern "C" {
+        fn flock(fd: c_int, operation: c_int) -> c_int;
+    }
+    const LOCK_EX: c_int = 2;
+    const LOCK_NB: c_int = 4;
+
+    pub fn try_acquire(file: &File) -> bool {
+        unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) == 0 }
+    }
+}
+
+struct InFlightGuard {
+    key: PathBuf,
+    /// the held-open lock file (Unix: flocked; other platforms:
+    /// created exclusively and deleted on drop)
+    lock_file: Option<File>,
+    lock_path: PathBuf,
+}
 
 impl InFlightGuard {
     fn register(out: &Path) -> Result<Self, String> {
-        // the same file reached by different relative spellings is
-        // the same path: normalise lexically against the cwd
-        let key = if out.is_absolute() {
-            out.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map(|cwd| cwd.join(out))
-                .unwrap_or_else(|_| out.to_path_buf())
-        };
-        let key: PathBuf = {
-            let mut parts: Vec<std::path::Component> = Vec::new();
-            for c in key.components() {
-                match c {
-                    std::path::Component::CurDir => {}
-                    std::path::Component::ParentDir => {
-                        parts.pop();
-                    }
-                    other => parts.push(other),
-                }
+        let key = canonical_key(out);
+        let mut os_str = key.clone().into_os_string();
+        os_str.push(".ndm.lock");
+        let lock_path = PathBuf::from(os_str);
+        {
+            let mut registry = plock(&IN_FLIGHT);
+            if registry.contains(&key) {
+                return Err(format!(
+                    "another download is already writing {}",
+                    out.display()
+                ));
             }
-            parts.iter().collect()
-        };
-        let mut registry = plock(&IN_FLIGHT);
-        if registry.contains(&key) {
-            return Err(format!(
-                "another download is already writing {}",
-                out.display()
-            ));
+            registry.push(key.clone());
         }
-        registry.push(key.clone());
-        Ok(Self(key))
+        // cross-process half: claim the OS lock for this output.
+        // Any failure rolls the in-process registration back, so a
+        // rejected start leaves no trace in either registry.
+        let claim = Self::claim_os_lock(&lock_path);
+        match claim {
+            Ok(f) => Ok(Self {
+                key,
+                lock_file: Some(f),
+                lock_path,
+            }),
+            Err(e) => {
+                plock(&IN_FLIGHT).retain(|p| p != &key);
+                Err(e)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn claim_os_lock(lock_path: &Path) -> Result<File, String> {
+        // the lock file lives next to the output; its parent is
+        // the canonical parent dir, which exists whenever the
+        // download itself can be created. If it cannot be opened
+        // at all (a read-only folder the download would fail in
+        // anyway), fall back to the in-process guard alone rather
+        // than inventing a new failure mode for a working path.
+        let f = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)
+        {
+            Ok(f) => f,
+            Err(_) => {
+                return Ok(File::open("/dev/null").map_err(|e| e.to_string())?);
+            }
+        };
+        if os_file_lock::try_acquire(&f) {
+            Ok(f)
+        } else {
+            Err("another download is already writing this file".to_string())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn claim_os_lock(lock_path: &Path) -> Result<File, String> {
+        // fallback where flock does not exist: an exclusively
+        // created lock file carrying the owner's pid. An existing
+        // file means another live process owns the path (a stale
+        // file from a crashed owner blocks until removed — the
+        // conservative direction: never splice two writers).
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{}", std::process::id());
+                Ok(f)
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(
+                "another download is already writing this file".to_string(),
+            ),
+            // a folder that cannot hold the lock file cannot hold
+            // the download either; degrade to the process-local
+            // guard instead of failing a start that used to work
+            Err(_) => File::open(lock_path).map_err(|e| e.to_string()),
+        }
     }
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        plock(&IN_FLIGHT).retain(|p| p != &self.0);
+        plock(&IN_FLIGHT).retain(|p| p != &self.key);
+        // Unix: closing the flocked file releases the OS lock; the
+        // (empty) lock file itself stays — deleting it while a
+        // contender holds the deleted inode open would split the
+        // lock. Other platforms: the exclusive-create file is the
+        // lock, so it goes with the guard.
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
+        let _ = &self.lock_file;
+        let _ = &self.lock_path;
     }
 }
 
@@ -2129,7 +2698,16 @@ fn start_impl(
                 let all_match = picks.iter().all(|&b| {
                     let start = b as u64 * bs;
                     let end = ((b as u64 + 1) * bs).min(total);
-                    verify_block_bytes(&agent, &probed.final_url, auth, url, out, start, end)
+                    verify_block_bytes(
+                        &agent,
+                        &probed.final_url,
+                        auth,
+                        url,
+                        out,
+                        start,
+                        end,
+                        probed.ignore_encoding_header,
+                    )
                 });
                 if !all_match {
                     existing_state = None;
@@ -2229,6 +2807,13 @@ fn start_impl(
         last_split: Mutex::new(None),
         last_journal_error: Mutex::new(None),
         settled: AtomicBool::new(false),
+        superseded: AtomicBool::new(false),
+        conn_phase: (0..max_conn).map(|_| AtomicU8::new(0)).collect(),
+        conn_block: (0..max_conn).map(|_| AtomicUsize::new(usize::MAX)).collect(),
+        own_limit_gen: AtomicU64::new(0),
+        ignore_encoding: probed.ignore_encoding_header,
+        last_data_sync: Mutex::new(Instant::now()),
+        bytes_since_sync: AtomicU64::new(0),
         auth: auth.clone(),
     });
 
@@ -2256,8 +2841,50 @@ fn start_impl(
     {
         let s = shared.clone();
         std::thread::spawn(move || {
-            for h in handles {
-                let _ = h.join();
+            // Bounded settlement (W1 F13 / C-2): joining the workers
+            // unconditionally wedged the whole download when ONE
+            // worker parked on a server-held connection — the
+            // transfer agent's read timeout never surfaced for that
+            // call, so the join never returned, the final journal
+            // save never landed, `settled` never fired and the
+            // InFlightGuard leaked (the path stayed undownloadable
+            // until process exit). The supervisor now polls the
+            // handles: while the pool is healthy it waits as
+            // before, but once a terminal intent exists (failure
+            // declared by the stall policy — which the supervisor
+            // also evaluates itself — a cancel, or completion) it
+            // grants the workers SETTLE_GRACE to wind down, then
+            // settles WITHOUT the stragglers. Detached workers are
+            // made harmless first: `superseded` is checked before
+            // every write, block mark and journal save, so a
+            // late-waking zombie can never write into a file this
+            // settlement (or a superseding download) now owns.
+            let mut intent_since: Option<Instant> = None;
+            loop {
+                if handles.iter().all(|h| h.is_finished()) {
+                    for h in handles {
+                        let _ = h.join();
+                    }
+                    break;
+                }
+                let intent = s.failed.load(Ordering::Relaxed)
+                    || s.control.cancelled.load(Ordering::Relaxed)
+                    || s.done_count.load(Ordering::Relaxed) >= total_blocks;
+                if intent {
+                    let since = *intent_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= SETTLE_GRACE {
+                        s.superseded.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                } else {
+                    intent_since = None;
+                    // the pool may be parked with nobody left to
+                    // evaluate the failure policy (the F13 shape:
+                    // every live worker stuck inside one call) —
+                    // the supervisor evaluates it itself
+                    fail_if_stalled(&s, total_blocks);
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
             // Settle from the atomics alone. For the ERROR /
             // CANCELLED / PAUSED outcomes the terminal status is
@@ -2287,7 +2914,7 @@ fn start_impl(
                     b.store(1, Ordering::Relaxed);
                 }
                 let _ = file.sync_all();
-                save_state(&s, true);
+                save_state(&s, true, Some(&*file));
                 remove_file_bounded(&s.state_path);
                 set_status(&s, Status::Finished);
             } else {
@@ -2305,7 +2932,7 @@ fn start_impl(
                     }
                 }
                 let _ = file.sync_all();
-                save_state(&s, true);
+                save_state(&s, true, Some(&*file));
             }
             // the LAST write this download will ever make has
             // landed: removal paths waiting on is_settled may now
@@ -2344,6 +2971,11 @@ fn start_impl(
 
 /// A completed download handle for a zero-byte file (no threads needed).
 fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Download> {
+    // a finished download leaves no resume journal behind (W1 F7):
+    // a stale journal claiming sealed blocks for a file that just
+    // finished empty is litter today and a landmine for any future
+    // path that trusts it without the exact size guard
+    remove_file_bounded(&state_path);
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
             url: String::new(),
@@ -2378,6 +3010,13 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         last_split: Mutex::new(None),
         last_journal_error: Mutex::new(None),
         settled: AtomicBool::new(true),
+        superseded: AtomicBool::new(false),
+        conn_phase: vec![AtomicU8::new(0)],
+        conn_block: vec![AtomicUsize::new(usize::MAX)],
+        own_limit_gen: AtomicU64::new(0),
+        ignore_encoding: false,
+        last_data_sync: Mutex::new(Instant::now()),
+        bytes_since_sync: AtomicU64::new(0),
         auth: Auth::default(),
     });
     Arc::new(Download {
@@ -2387,6 +3026,16 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         resumable: false,
         started: Instant::now(),
     })
+}
+
+/// Whether a single-stream attempt's error is definitive — the
+/// server has given an answer retrying cannot change (the
+/// Content-Encoding veto, a 404/410) — mirroring the ranged path's
+/// BlockError::Permanent classification (W1 F14).
+fn single_error_is_permanent(e: &str) -> bool {
+    e.contains("Content-Encoding")
+        || e.contains("status code 404")
+        || e.contains("status code 410")
 }
 
 fn start_single_stream(
@@ -2433,6 +3082,13 @@ fn start_single_stream(
         last_split: Mutex::new(None),
         last_journal_error: Mutex::new(None),
         settled: AtomicBool::new(false),
+        superseded: AtomicBool::new(false),
+        conn_phase: vec![AtomicU8::new(0)],
+        conn_block: vec![AtomicUsize::new(usize::MAX)],
+        own_limit_gen: AtomicU64::new(0),
+        ignore_encoding: probed.ignore_encoding_header,
+        last_data_sync: Mutex::new(Instant::now()),
+        bytes_since_sync: AtomicU64::new(0),
         auth: auth.clone(),
     });
     let download = Arc::new(Download {
@@ -2448,19 +3104,43 @@ fn start_single_stream(
     let auth = auth.clone();
     std::thread::spawn(move || {
         let agent = build_agent_for(&url);
+        // M-1 (W1 F1): when a resume journal exists for this path,
+        // the demotion to single-stream must NOT File::create over
+        // the preallocated partial — a plain body that then failed
+        // (truncated, reset, over-long) destroyed every sealed
+        // block while the journal still claimed them. Spool the
+        // replacement body to a temp file instead and only rename
+        // it over the partial once it is verified complete; on any
+        // failure the partial and its journal stay exactly as they
+        // were, and a later start can still resume them.
+        let spool = shared.state_path.exists() && out.exists();
+        let spool_path: PathBuf = {
+            let mut s = out.clone().into_os_string();
+            s.push(".ndm.spool");
+            PathBuf::from(s)
+        };
         let attempt_once = || -> Result<(), String> {
             shared.active_workers.store(1, Ordering::Relaxed);
+            if let Some(p) = shared.conn_phase.first() {
+                p.store(1, Ordering::Relaxed);
+            }
             let resp = apply_auth(agent.get(&url), &auth)
                 .set("Accept-Encoding", "identity")
                 .call()
                 .map_err(|e| format!("http: {e}"))?;
-            if let Some(enc) = response_encoding(&resp) {
-                return Err(format!(
-                    "server answered with Content-Encoding: {enc} despite an identity request"
-                ));
+            if !shared.ignore_encoding {
+                if let Some(enc) = response_encoding(&resp) {
+                    return Err(format!(
+                        "server answered with Content-Encoding: {enc} despite an identity request"
+                    ));
+                }
+            }
+            if let Some(p) = shared.conn_phase.first() {
+                p.store(2, Ordering::Relaxed);
             }
             let mut reader = resp.into_reader();
-            let f = File::create(&out).map_err(|e| format!("create: {e}"))?;
+            let write_path: &Path = if spool { &spool_path } else { &out };
+            let f = File::create(write_path).map_err(|e| format!("create: {e}"))?;
             let mut buf = vec![0u8; 512 * 1024];
             let mut pos = 0u64;
             // bytes read from the stream but not yet written: a
@@ -2486,9 +3166,22 @@ fn start_single_stream(
                     }
                     set_status(&shared, Status::Downloading);
                 }
-                let read_at = Instant::now();
                 if held == 0 {
-                    let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
+                    // pacing reserves BEFORE the read, exactly as
+                    // on the ranged path (M-13)
+                    let grant = pace_grant_size(&shared, buf.len());
+                    if !pace_before_read(&shared, grant as u64) {
+                        continue; // a halt landed; the checks above settle it
+                    }
+                    let n = reader
+                        .read(&mut buf[..grant])
+                        .map_err(|e| {
+                            pace_refund_both(&shared, grant as u64);
+                            format!("read: {e}")
+                        })?;
+                    if (n as u64) < grant as u64 {
+                        pace_refund_both(&shared, grant as u64 - n as u64);
+                    }
                     if n == 0 {
                         break;
                     }
@@ -2510,6 +3203,9 @@ fn start_single_stream(
                 // HEAD/GET disagreement): stop now instead of writing
                 // the whole over-long body and reporting it backwards
                 if expected_total > 0 && pos > expected_total {
+                    if spool {
+                        let _ = std::fs::remove_file(&spool_path);
+                    }
                     return Err(format!(
                         "server sent more data than the probed size ({expected_total} bytes)"
                     ));
@@ -2518,14 +3214,26 @@ fn start_single_stream(
                 if let Some(cb) = shared.conn_bytes.first() {
                     cb.fetch_add(n as u64, Ordering::Relaxed);
                 }
-                throttle_global(&shared, n as u64, read_at);
-                throttle_own(&shared, n as u64, read_at);
             }
             // a clean early EOF must not pose as a finished file
             if expected_total > 0 && pos != expected_total {
+                if spool {
+                    let _ = std::fs::remove_file(&spool_path);
+                }
                 return Err(format!(
                     "short download: got {pos} of {expected_total} bytes"
                 ));
+            }
+            if spool {
+                // the replacement body is verified complete: only
+                // NOW may it replace the partial (M-1). The handle
+                // closes first — renaming over an open file fails
+                // on Windows.
+                drop(f);
+                if let Err(e) = std::fs::rename(&spool_path, &out) {
+                    let _ = std::fs::remove_file(&spool_path);
+                    return Err(format!("could not replace the partial file: {e}"));
+                }
             }
             Ok(())
         };
@@ -2546,11 +3254,19 @@ fn start_single_stream(
             match attempt_once() {
                 Ok(()) => break Ok(()),
                 Err(e) => {
+                    if spool {
+                        let _ = std::fs::remove_file(&spool_path);
+                    }
                     if shared.control.cancelled.load(Ordering::Relaxed) {
                         set_status(&shared, Status::Cancelled);
                         break Ok(());
                     }
-                    if attempt >= 5 {
+                    // m-5 (W1 F14): definitive errors — the
+                    // Content-Encoding veto, 404/410 — fail fast
+                    // like the ranged path's Permanent class, not
+                    // after 5 retries and ~15 s of backoff spent
+                    // re-asking a question with a settled answer
+                    if single_error_is_permanent(&e) || attempt >= 5 {
                         break Err(e);
                     }
                     let deadline = Instant::now() + Duration::from_secs(1u64 << (attempt - 1));
@@ -2566,11 +3282,21 @@ fn start_single_stream(
         match result {
             Ok(()) => {
                 shared.active_workers.store(0, Ordering::Relaxed);
-                if !shared.control.cancelled.load(Ordering::Relaxed) {
+                if shared.control.cancelled.load(Ordering::Relaxed) {
+                    if spool {
+                        let _ = std::fs::remove_file(&spool_path);
+                    }
+                } else {
                     shared.done_count.store(1, Ordering::Relaxed);
                     if let Some(b) = shared.block_state.first() {
                         b.store(1, Ordering::Relaxed);
                     }
+                    // a finished download leaves no resume journal
+                    // behind — on this path a journal exists only
+                    // when the download was a demoted resume (M-1),
+                    // and its blocks describe the file the spool
+                    // just replaced, not this one
+                    remove_file_bounded(&shared.state_path);
                     set_status(&shared, Status::Finished);
                 }
             }
@@ -2623,6 +3349,72 @@ pub fn peek_state(url: &str, out: &Path) -> Option<Peeked> {
         done_bytes: s.done_bytes(),
         blocks: s.done.clone(),
     })
+}
+
+/// Re-point a resume journal at a new address for the same file —
+/// the engine half of Refresh Download Address. The journal FILE is
+/// keyed to the output path, but the `State` inside records the URL
+/// it was created for, and both consumers (`peek_state` above and
+/// the resume filter in `start_impl`) refuse a journal whose URL
+/// differs from the one being started. Rewriting that one field —
+/// and nothing else — is what lets a refreshed entry keep its
+/// sealed blocks: the next start runs the journal through the
+/// ordinary resume verification against the NEW address (total,
+/// ETag / Last-Modified, sampled sealed-block bytes) and discards
+/// it, restarting from zero, on any mismatch. This function makes
+/// no sameness judgement of its own.
+///
+/// Returns false — journal untouched — when there is no journal,
+/// when it does not belong to `old_url`, or when it fails the same
+/// poison guards `peek_state` applies: a journal too broken to
+/// render is too broken to re-point.
+pub fn rebind_state_url(out: &Path, old_url: &str, new_url: &str) -> bool {
+    let path = state_path_for(out);
+    let raw = match std::fs::read(&path) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let mut s: State = match serde_json::from_slice(&raw) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    if s.url != old_url
+        || s.block_size == 0
+        || s.block_size > 64 * 1024 * 1024
+        || s.done.len() != s.total.div_ceil(s.block_size) as usize
+        || s.done.iter().any(|&b| b > 1)
+        || !out.exists()
+        || out.metadata().map(|m| m.len()).unwrap_or(0) != s.total
+    {
+        return false;
+    }
+    s.url = new_url.to_string();
+    // write-then-rename, exactly as save_state does it — the
+    // on-disk journal is never torn. This write is one-shot and
+    // user-initiated (not the periodic hot path), so it takes the
+    // durable form: journal synced, renamed, directory synced.
+    let tmp = path.with_extension("json.tmp");
+    let written: io::Result<()> = (|| {
+        {
+            let f = File::create(&tmp)?;
+            serde_json::to_writer(&f, &s).map_err(io::Error::from)?;
+            f.sync_all()?;
+        } // handle closed before the rename (Windows sharing rules)
+        std::fs::rename(&tmp, &path)?;
+        if let Some(dir) = path.parent() {
+            if let Ok(d) = File::open(dir) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    })();
+    match written {
+        Ok(()) => true,
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            false
+        }
+    }
 }
 
 fn legacy_state_path_for(out: &Path) -> PathBuf {
@@ -5254,7 +6046,7 @@ mod audit207_tests {
             PathBuf::from("/tmp/ndm-207-no-such-dir/state.ndm.json"),
         );
         assert!(dl.last_journal_error().is_none());
-        save_state(&dl.shared, true);
+        save_state(&dl.shared, true, None);
         let err = dl.last_journal_error().expect("the failed save must be recorded");
         assert!(err.contains("resume state"), "unexpected record: {err}");
     }
@@ -5270,17 +6062,20 @@ mod audit207_tests {
         let dl = finished_empty_download(control, PathBuf::from("/tmp/ndm-207-pace.ndm.json"));
         // a cleared limit ends the wait at once
         let t0 = Instant::now();
-        pace_wait(&dl.shared, Instant::now() + Duration::from_secs(30), 1000, || 0);
+        let r = pace_wait(&dl.shared, Instant::now() + Duration::from_secs(30), 1000, || 0, || 0, 0);
+        assert!(matches!(r, PaceWait::Cleared), "cleared limit must end the wait");
         assert!(t0.elapsed() < Duration::from_millis(500), "cleared limit must end the wait");
         // a pause ends the wait at once
         dl.control.pause();
         let t0 = Instant::now();
-        pace_wait(&dl.shared, Instant::now() + Duration::from_secs(30), 1000, || 1000);
+        let r = pace_wait(&dl.shared, Instant::now() + Duration::from_secs(30), 1000, || 1000, || 0, 0);
+        assert!(matches!(r, PaceWait::Halted), "pause must interrupt the wait");
         assert!(t0.elapsed() < Duration::from_millis(500), "pause must interrupt the wait");
         dl.control.resume();
         // an ordinary short wait still waits
         let t0 = Instant::now();
-        pace_wait(&dl.shared, Instant::now() + Duration::from_millis(200), 1000, || 1000);
+        let r = pace_wait(&dl.shared, Instant::now() + Duration::from_millis(200), 1000, || 1000, || 0, 0);
+        assert!(matches!(r, PaceWait::Reached), "the slot must be reached by waiting");
         assert!(t0.elapsed() >= Duration::from_millis(150), "the slot must be honoured");
     }
 
@@ -5358,5 +6153,1455 @@ mod audit207_tests {
         );
         let p = dl.progress();
         assert_eq!(p.sealed_done_bytes, p.total);
+    }
+}
+
+// ---------- 2.0.8 fix batch (engine worker): C-2, M-1, M-2,
+// M-13/M-14, F15 sync policy, DIAG lying-header, m-5, m-1, G1 ----------
+
+#[cfg(test)]
+mod audit208_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn pattern_body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
+    }
+
+    fn wait_terminal(dl: &Download, deadline: Duration) -> Option<Status> {
+        let t0 = Instant::now();
+        loop {
+            if dl.is_terminal() {
+                return Some(dl.status());
+            }
+            if t0.elapsed() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_settled(dl: &Download, deadline: Duration) {
+        let t0 = Instant::now();
+        while !dl.is_settled() {
+            assert!(t0.elapsed() < deadline, "download never settled");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    struct Req {
+        method: String,
+        range: Option<String>,
+    }
+
+    fn test_server<F>(handler: F) -> u16
+    where
+        F: Fn(&Req) -> Vec<u8> + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = Arc::new(handler);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let handler = handler.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let _path = parts.next().unwrap_or("/").to_string();
+                    let mut range = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                if let Some((k, v)) = h.split_once(':') {
+                                    let v = v.trim().to_string();
+                                    if k.trim().eq_ignore_ascii_case("range") {
+                                        range = Some(v.clone());
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let req = Req { method, range };
+                    let resp = handler(&req);
+                    let _ = s.write_all(&resp);
+                });
+            }
+        });
+        port
+    }
+
+    fn http_resp(status: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {status}\r\n").into_bytes();
+        for (k, v) in headers {
+            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"Connection: close\r\n\r\n");
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A proper range server; every GET is delayed by `delay`.
+    fn delayed_range_server(body: Vec<u8>, delay: Duration) -> u16 {
+        let body = Arc::new(body);
+        test_server(move |req| {
+            let total = body.len() as u64;
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            std::thread::sleep(delay);
+            if let Some(r) = &req.range {
+                let r = r.trim().strip_prefix("bytes=").unwrap_or(r);
+                let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+                let a: u64 = a.parse().unwrap_or(0);
+                let b: u64 = if b.is_empty() { total - 1 } else { b.parse().unwrap_or(total - 1) };
+                let end = b.min(total - 1);
+                let slice = &body[a as usize..=end as usize];
+                return http_resp(
+                    "206 Partial Content",
+                    &[
+                        ("Content-Range", format!("bytes {a}-{end}/{total}")),
+                        ("Content-Length", slice.len().to_string()),
+                    ],
+                    slice,
+                );
+            }
+            http_resp("200 OK", &[("Content-Length", total.to_string())], &body)
+        })
+    }
+
+    fn tmp_out(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ndm-208-{tag}-{}.bin", std::process::id()))
+    }
+
+    // --- item 5: journal sync policy (pure) ---
+
+    #[test]
+    fn journal_sync_policy_bounds_the_fsync_cadence() {
+        // forced/terminal saves are always durable
+        assert!(sync_is_durable(true, 0, Duration::ZERO));
+        // a periodic save below both thresholds syncs nothing
+        assert!(!sync_is_durable(false, 0, Duration::ZERO));
+        assert!(!sync_is_durable(
+            false,
+            SYNC_EVERY_BYTES - 1,
+            SYNC_EVERY - Duration::from_millis(1)
+        ));
+        // either threshold crossing makes the save durable
+        assert!(sync_is_durable(false, SYNC_EVERY_BYTES, Duration::ZERO));
+        assert!(sync_is_durable(false, 0, SYNC_EVERY));
+    }
+
+    // --- item 4: pacer math (pure-ish, own-limit timeline) ---
+
+    fn shared_with_own_limit(rate: u64) -> Arc<Download> {
+        let dl = finished_empty_download(
+            Arc::new(Control {
+                paused: AtomicBool::new(false),
+                cancelled: AtomicBool::new(false),
+            }),
+            PathBuf::from("/tmp/ndm-208-pace.ndm.json"),
+        );
+        dl.shared.own_limit.store(rate, Ordering::Relaxed);
+        dl
+    }
+
+    #[test]
+    fn pace_reserve_grants_one_slice_at_once_then_paces() {
+        // 1 MiB/s, 100 KiB reservations: the first is granted
+        // immediately (its slot starts now), the rest are spaced
+        // ~0.1 s apart by the shared timeline — the limit holds
+        // from byte 0 instead of the first reads escaping free
+        let dl = shared_with_own_limit(1_000_000);
+        let t0 = Instant::now();
+        assert!(pace_reserve(
+            &dl.shared,
+            &dl.shared.own_limit_state,
+            100_000,
+            || dl.shared.own_limit.load(Ordering::Relaxed),
+            || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+        ));
+        assert!(
+            t0.elapsed() < Duration::from_millis(60),
+            "first slice must be granted at once, took {:?}",
+            t0.elapsed()
+        );
+        for _ in 0..4 {
+            assert!(pace_reserve(
+                &dl.shared,
+                &dl.shared.own_limit_state,
+                100_000,
+                || dl.shared.own_limit.load(Ordering::Relaxed),
+                || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+            ));
+        }
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "5 paced grants at 1 MiB/s must take ~0.4 s, took {elapsed:?} (burst!)"
+        );
+        assert!(elapsed < Duration::from_secs(3), "grants over-paced: {elapsed:?}");
+    }
+
+    #[test]
+    fn pace_reserve_limit_change_takes_effect_promptly() {
+        // a reservation parked for ~30 s at 1 KB/s must be released
+        // within ~2 s of the limit being cleared (M-14), and a
+        // reservation parked at a low rate must re-reserve promptly
+        // when the limit is raised — never sleep out the old slot.
+        // (The FIRST reservation on a fresh timeline grants at
+        // once; it is the SECOND that parks behind it — so each
+        // half pre-charges once before parking the waiter.)
+        let dl = shared_with_own_limit(1000);
+        assert!(pace_reserve(
+            &dl.shared,
+            &dl.shared.own_limit_state,
+            PACE_SLICE,
+            || dl.shared.own_limit.load(Ordering::Relaxed),
+            || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+        ));
+        let dl2 = dl.clone();
+        let waiter = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let ok = pace_reserve(
+                &dl2.shared,
+                &dl2.shared.own_limit_state,
+                PACE_SLICE,
+                || dl2.shared.own_limit.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_gen.load(Ordering::Relaxed),
+            );
+            (ok, t0.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        dl.set_limit(0); // cleared entirely
+        let (ok, elapsed) = waiter.join().unwrap();
+        assert!(ok, "a cleared limit still grants the read");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "clearing the limit took {elapsed:?} to reach a parked reservation"
+        );
+
+        let dl = shared_with_own_limit(1000);
+        assert!(pace_reserve(
+            &dl.shared,
+            &dl.shared.own_limit_state,
+            PACE_SLICE,
+            || dl.shared.own_limit.load(Ordering::Relaxed),
+            || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+        ));
+        let dl2 = dl.clone();
+        let waiter = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let ok = pace_reserve(
+                &dl2.shared,
+                &dl2.shared.own_limit_state,
+                PACE_SLICE,
+                || dl2.shared.own_limit.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_gen.load(Ordering::Relaxed),
+            );
+            (ok, t0.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        dl.set_limit(10_000_000); // raised 10000x
+        let (ok, elapsed) = waiter.join().unwrap();
+        assert!(ok);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "raising the limit took {elapsed:?} to reach a parked reservation"
+        );
+    }
+
+    // --- item 3: canonical key + symlink guard ---
+
+    #[test]
+    fn canonical_key_resolves_symlinked_directories() {
+        let base = std::env::temp_dir().join(format!("ndm-208-canon-{}", std::process::id()));
+        let real = base.join("real");
+        let linkdir = base.join("linkdir");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&linkdir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, linkdir.join("alias")).unwrap();
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let a = canonical_key(&real.join("f.bin"));
+            let b = canonical_key(&linkdir.join("alias").join("f.bin"));
+            assert_eq!(a, b, "symlink spelling must share the guard key");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn second_start_via_symlink_spelling_fails_fast() {
+        let body = pattern_body(8 * 1024 * 1024);
+        let port = delayed_range_server(body.clone(), Duration::from_millis(200));
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let base = std::env::temp_dir().join(format!("ndm-208-sym-{}", std::process::id()));
+        let real = base.join("real");
+        let linkdir = base.join("linkdir");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&linkdir).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, linkdir.join("alias")).unwrap();
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let out_real = real.join("f.bin");
+        let dl = start(&url, &out_real, 4, 256 * 1024).unwrap();
+        #[cfg(unix)]
+        {
+            let out_link = linkdir.join("alias").join("f.bin");
+            let err = start(&url, &out_link, 4, 256 * 1024)
+                .err()
+                .expect("a second start via a symlink spelling must fail");
+            assert!(err.contains("already writing"), "unexpected error: {err}");
+        }
+        dl.control.cancel();
+        wait_settled(&dl, Duration::from_secs(30));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- item 3: cross-process guard (child does the attempt) ---
+
+    #[test]
+    fn inflight_cross_process_child() {
+        // runs only inside the spawned child (env-guarded); in the
+        // main run this is a no-op so it cannot recurse
+        let Ok(url) = std::env::var("NDM208_XPROC_URL") else {
+            return;
+        };
+        let out = std::env::var("NDM208_XPROC_OUT").unwrap();
+        let r = start(&url, Path::new(&out), 2, 256 * 1024);
+        assert!(
+            r.is_err(),
+            "a second PROCESS starting on the same path must be rejected"
+        );
+        let err = r.err().unwrap();
+        assert!(err.contains("already writing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn inflight_guard_holds_across_processes() {
+        if std::env::var("NDM208_XPROC_URL").is_ok() {
+            return; // we ARE the child; the sibling test did the work
+        }
+        let body = pattern_body(8 * 1024 * 1024);
+        let port = delayed_range_server(body.clone(), Duration::from_millis(250));
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("xproc");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args(["inflight_cross_process_child", "--nocapture"])
+            .env("NDM208_XPROC_URL", &url)
+            .env("NDM208_XPROC_OUT", out.to_string_lossy().into_owned())
+            .status()
+            .expect("child test binary must run");
+        assert!(status.success(), "child process guard check failed: {status}");
+        dl.control.cancel();
+        wait_settled(&dl, Duration::from_secs(30));
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    // --- item 1 (C-2): a worker parked on a held connection ---
+
+    /// Range server whose handler for ranges starting at or after
+    /// `hang_from` accepts the request and then never answers and
+    /// never closes (the handler thread sleeps with the socket
+    /// open — the F13 shape).
+    fn hang_tail_server(body: Vec<u8>, hang_from: u64) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = range.unwrap_or((0, total - 1));
+                    if re >= hang_from && !(rs == 0 && re == 0) {
+                        // parked: any request whose range REACHES the
+                        // hanging tail (a multi-block run including it
+                        // counts) gets no response, socket held open
+                        std::thread::sleep(Duration::from_secs(600));
+                        return;
+                    }
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = s.write_all(slice);
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn parked_worker_cannot_wedge_settlement() {
+        // 8 blocks; only the LAST block's range hangs. Every other
+        // block lands, then one worker parks inside its request.
+        // Pre-fix: the supervisor's join never returned — settled
+        // never fired, the journal's final save never landed and
+        // the path stayed locked for the process's life.
+        let body = pattern_body(2 * 1024 * 1024);
+        let block = 256 * 1024u64;
+        let port = hang_tail_server(body.clone(), 7 * block);
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("hang");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 4, block).unwrap();
+        // terminal via the stall policy (~30 s), settled within
+        // the grace that follows — bounded, never eternal
+        let st = wait_terminal(&dl, Duration::from_secs(90));
+        assert_eq!(st, Some(Status::Error), "status: {:?}", dl.status());
+        wait_settled(&dl, Duration::from_secs(30));
+        assert!(
+            t0.elapsed() < Duration::from_secs(100),
+            "settlement took {:?} — not bounded",
+            t0.elapsed()
+        );
+        let p = dl.progress();
+        assert!(
+            p.error.as_deref().unwrap_or("").contains("no progress"),
+            "error must name the stall: {:?}",
+            p.error
+        );
+        // the final journal save landed: the journal exists and
+        // credits exactly the blocks that sealed before the hang
+        let journal = state_path_for(&out);
+        assert!(journal.exists(), "the final save must land even when a worker is parked");
+        let raw = std::fs::read(&journal).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        let credited = v["done"].as_array().unwrap().iter().filter(|b| **b == 1).count();
+        assert!(credited >= 1 && credited < 8, "journal credits {credited}/8 blocks");
+        drop(dl);
+        // the guard was released with the settlement: the same
+        // path accepts a fresh start immediately
+        let dl2 = start(&url, &out, 2, block).expect("guard must release on settle");
+        dl2.control.cancel();
+        wait_settled(&dl2, Duration::from_secs(60));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    // --- item 2 (M-1): 416 demotion must not destroy sealed progress ---
+
+    fn write_journal(out: &Path, url: &str, total: u64, block: u64, done: &[u8]) {
+        let v = serde_json::json!({
+            "url": url, "total": total, "block_size": block,
+            "etag": null, "last_modified": null, "done": done,
+        });
+        std::fs::write(state_path_for(out), serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn resume_against_416_server_preserves_partial_and_journal() {
+        // the F1 shape: 12 blocks were sealed into a preallocated
+        // partial; the server now 416s every range and its plain
+        // GET truncates at 1000 bytes. Pre-fix, the single-stream
+        // demotion File::create-truncated the partial, then failed
+        // short — sealed progress destroyed, journal orphaned.
+        let total = 1024 * 1024u64;
+        let block = 256 * 1024u64;
+        let original = pattern_body(total as usize);
+        let original2 = original.clone();
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if req.range.is_some() {
+                return http_resp(
+                    "416 Range Not Satisfiable",
+                    &[
+                        ("Content-Range", format!("bytes */{total}")),
+                        ("Content-Length", "0".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            // plain GET: correct length header, truncated body
+            http_resp(
+                "200 OK",
+                &[("Content-Length", total.to_string())],
+                &original2[..1000],
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("r416");
+        std::fs::write(&out, &original).unwrap();
+        write_journal(&out, &url, total, block, &[1, 1, 0, 0]);
+        let dl = start(&url, &out, 2, block).unwrap();
+        assert_eq!(
+            wait_terminal(&dl, Duration::from_secs(90)),
+            Some(Status::Error),
+            "the truncated plain body must fail, got {:?}",
+            dl.status()
+        );
+        wait_settled(&dl, Duration::from_secs(10));
+        drop(dl);
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            original,
+            "the partial must survive a failed demotion byte-for-byte"
+        );
+        let journal = state_path_for(&out);
+        assert!(journal.exists(), "the journal must survive too");
+        let raw = std::fs::read(&journal).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["done"], serde_json::json!([1, 1, 0, 0]));
+        let spool = {
+            let mut s = out.clone().into_os_string();
+            s.push(".ndm.spool");
+            PathBuf::from(s)
+        };
+        assert!(!spool.exists(), "the spool must be cleaned up after a failed attempt");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&journal);
+    }
+
+    #[test]
+    fn demoted_single_stream_success_replaces_and_clears_journal() {
+        // same demotion, but the plain GET is healthy: the spool
+        // replaces the partial, the file is byte-exact and the
+        // stale journal (which described the OLD file) is removed
+        let total = 512 * 1024u64;
+        let block = 256 * 1024u64;
+        let body = pattern_body(total as usize);
+        let body2 = body.clone();
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if req.range.is_some() {
+                return http_resp(
+                    "416 Range Not Satisfiable",
+                    &[
+                        ("Content-Range", format!("bytes */{total}")),
+                        ("Content-Length", "0".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            http_resp("200 OK", &[("Content-Length", total.to_string())], &body2)
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("r416ok");
+        std::fs::write(&out, vec![0u8; total as usize]).unwrap();
+        write_journal(&out, &url, total, block, &[1, 0]);
+        let dl = start(&url, &out, 2, block).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert!(
+            !state_path_for(&out).exists(),
+            "a finished download must not leave the stale journal behind"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- item 7 (m-5): single-stream definitive errors fail fast ---
+
+    #[test]
+    fn single_stream_encoding_veto_fails_fast_without_retries() {
+        // gzipplain shape: ranges are refused by a 200 full body,
+        // the plain GET is encoding-labelled garbage. Pre-fix the
+        // single-stream loop retried the proven-permanent veto 5x
+        // (~15 s of backoff); now it must fail on the FIRST plain
+        // GET, and a pre-existing target stays untouched (the veto
+        // precedes any create).
+        let total = 200_000u64;
+        let plain_gets = Arc::new(AtomicUsize::new(0));
+        let counter = plain_gets.clone();
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if req.range.is_some() {
+                // a 200 to the verify GET: range_ok = false, demote
+                return http_resp(
+                    "200 OK",
+                    &[("Content-Length", total.to_string())],
+                    &vec![7u8; 100],
+                );
+            }
+            counter.fetch_add(1, Ordering::Relaxed);
+            http_resp(
+                "200 OK",
+                &[
+                    ("Content-Length", "50".to_string()),
+                    ("Content-Encoding", "gzip".to_string()),
+                ],
+                &vec![0x1fu8; 50],
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("ssfast");
+        std::fs::write(&out, b"PRE-EXISTING").unwrap();
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Error));
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "a permanent error must fail fast, took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(
+            plain_gets.load(Ordering::Relaxed),
+            1,
+            "exactly one plain GET — no retries of a definitive answer"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), b"PRE-EXISTING");
+        wait_settled(&dl, Duration::from_secs(10));
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn single_error_classification_matches_the_ranged_path() {
+        assert!(single_error_is_permanent(
+            "server answered with Content-Encoding: gzip despite an identity request"
+        ));
+        assert!(single_error_is_permanent("http: http://x/f: status code 404"));
+        assert!(single_error_is_permanent("http: http://x/f: status code 410"));
+        assert!(!single_error_is_permanent("read: response body closed before all bytes were read"));
+        assert!(!single_error_is_permanent("short download: got 3 of 9 bytes"));
+    }
+
+    // --- item 6 (DIAG c): the lying Content-Encoding header ---
+
+    /// A range server that stamps Content-Encoding: gzip on EVERY
+    /// response while sending identity bodies (the lying header).
+    fn lying_header_server(body: Vec<u8>, head_ok: bool) -> u16 {
+        let body = Arc::new(body);
+        test_server(move |req| {
+            let total = body.len() as u64;
+            if req.method == "HEAD" {
+                if !head_ok {
+                    return http_resp("405 Method Not Allowed", &[("Content-Length", "0".to_string())], &[]);
+                }
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if let Some(r) = &req.range {
+                let r = r.trim().strip_prefix("bytes=").unwrap_or(r);
+                let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+                let a: u64 = a.parse().unwrap_or(0);
+                let b: u64 = if b.is_empty() { total - 1 } else { b.parse().unwrap_or(total - 1) };
+                let end = b.min(total - 1);
+                let slice = &body[a as usize..=end as usize];
+                return http_resp(
+                    "206 Partial Content",
+                    &[
+                        ("Content-Range", format!("bytes {a}-{end}/{total}")),
+                        ("Content-Length", slice.len().to_string()),
+                        ("Content-Encoding", "gzip".to_string()),
+                    ],
+                    slice,
+                );
+            }
+            http_resp(
+                "200 OK",
+                &[
+                    ("Content-Length", total.to_string()),
+                    ("Content-Encoding", "gzip".to_string()),
+                ],
+                &body,
+            )
+        })
+    }
+
+    #[test]
+    fn lying_encoding_header_keeps_range_support_via_head() {
+        let body = pattern_body(1024 * 1024);
+        let port = lying_header_server(body.clone(), true);
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let p = probe(&url).expect("the lying-header proof must pass");
+        assert!(p.range_ok, "a proven liar must keep range support");
+        assert!(p.ignore_encoding_header);
+        let out = tmp_out("liehead");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body, "content must be byte-exact");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn lying_encoding_header_keeps_range_support_via_probe_get() {
+        // HEAD refused: the probe's own range GET carries the
+        // lying header — pre-fix this failed the probe Definitively
+        let body = pattern_body(1024 * 1024);
+        let port = lying_header_server(body.clone(), false);
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let p = probe(&url).expect("the probe GET proof must pass");
+        assert!(p.range_ok);
+        assert!(p.ignore_encoding_header);
+        let out = tmp_out("lieget");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn true_encoder_still_fails_safe_and_fast() {
+        // a TRUE encoder: the verify answer's body is a 21-byte
+        // encoded blob (never 1 byte), the plain GET is encoded
+        // garbage too. The proof must fail, the demotion must hit
+        // the single-stream veto, and that veto is Permanent — the
+        // pre-existing target stays byte-identical.
+        let total = 200_000u64;
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if req.range.is_some() {
+                return http_resp(
+                    "206 Partial Content",
+                    &[
+                        ("Content-Range", format!("bytes 0-0/{total}")),
+                        ("Content-Length", "21".to_string()),
+                        ("Content-Encoding", "gzip".to_string()),
+                    ],
+                    &vec![0x1fu8; 21],
+                );
+            }
+            http_resp(
+                "200 OK",
+                &[
+                    ("Content-Length", "21".to_string()),
+                    ("Content-Encoding", "gzip".to_string()),
+                ],
+                &vec![0x1fu8; 21],
+            )
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let p = probe(&url).expect("probe falls back, does not fail");
+        assert!(!p.range_ok, "a true encoder must not keep range support");
+        assert!(!p.ignore_encoding_header);
+        let out = tmp_out("trueenc");
+        std::fs::write(&out, b"PRE-EXISTING").unwrap();
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Error));
+        assert!(t0.elapsed() < Duration::from_secs(10), "must fail fast");
+        assert_eq!(std::fs::read(&out).unwrap(), b"PRE-EXISTING");
+        wait_settled(&dl, Duration::from_secs(10));
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- item 8 (m-1 / F7): finishing empty deletes the journal ---
+
+    #[test]
+    fn finishing_as_empty_deletes_the_old_journal() {
+        let total = 1024 * 1024u64;
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp("405 Method Not Allowed", &[("Content-Length", "0".to_string())], &[]);
+            }
+            if req.range.is_some() {
+                return http_resp(
+                    "416 Range Not Satisfiable",
+                    &[
+                        ("Content-Range", format!("bytes */{total}")),
+                        ("Content-Length", "0".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            http_resp("200 OK", &[("Content-Length", "0".to_string())], &[])
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("emptyfin");
+        std::fs::write(&out, vec![0u8; total as usize]).unwrap();
+        write_journal(&out, &url, total, 256 * 1024, &[1, 1, 0, 0]);
+        let journal = state_path_for(&out);
+        assert!(journal.exists());
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap().len(), 0);
+        assert!(!journal.exists(), "the stale journal must be deleted on an empty finish");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// A range server that drips each body in 64 KiB pieces with
+    /// `drip` between them, so a download stays observably in the
+    /// receiving phase instead of flashing past it.
+    fn drip_range_server(body: Vec<u8>, drip: Duration) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = range.unwrap_or((0, total - 1));
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                        .as_bytes(),
+                    );
+                    for piece in slice.chunks(64 * 1024) {
+                        std::thread::sleep(drip);
+                        if s.write_all(piece).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    // --- item 9 (G1): per-connection surface on a live download ---
+
+    #[test]
+    fn progress_exposes_conn_phase_partial_and_block() {
+        let body = pattern_body(4 * 1024 * 1024);
+        let port = drip_range_server(body.clone(), Duration::from_millis(30));
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("g1");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        // sample while live: the G1 vectors exist, are sized to
+        // the connection count, and at least one connection is
+        // seen receiving (phase 2) on a real block (>= 0)
+        let mut saw_receiving = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(20) {
+            let p = dl.progress();
+            assert_eq!(p.conn_states.len(), 4);
+            assert_eq!(p.conn_partial.len(), 4);
+            assert_eq!(p.conn_block.len(), 4);
+            assert!(p.conn_states.iter().all(|&s| s <= 2));
+            if p.conn_states.iter().any(|&s| s == 2)
+                && p.conn_block.iter().any(|&b| b >= 0)
+            {
+                saw_receiving = true;
+                break;
+            }
+            if dl.is_terminal() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(saw_receiving, "no connection was ever seen receiving on a block");
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- item 4: limiter on the wire (dedicated child process) ---
+
+    #[test]
+    fn limiter_wire_child() {
+        // runs only inside the spawned child (env-guarded): the
+        // GLOBAL limiter is process-wide, so the wire measurement
+        // must not share a process with the rest of the suite
+        if std::env::var("NDM208_LIMIT_CHILD").is_err() {
+            return;
+        }
+        let body = pattern_body(2 * 1024 * 1024);
+        let port = delayed_range_server(body.clone(), Duration::ZERO);
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("limwire");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        set_global_limit(200_000);
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        let mut samples: Vec<(f64, u64)> = Vec::new();
+        let mut halved_at: Option<f64> = None;
+        loop {
+            let t = t0.elapsed().as_secs_f64();
+            samples.push((t, dl.progress().fetched_session));
+            if halved_at.is_none() && t >= 3.0 {
+                set_global_limit(100_000); // halve mid-flight
+                halved_at = Some(t);
+            }
+            if halved_at.map(|h| t - h >= 2.5).unwrap_or(false) {
+                break;
+            }
+            assert!(t < 20.0, "measurement window overran");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let at = |t: f64| -> u64 {
+            samples
+                .iter()
+                .min_by(|a, b| (a.0 - t).abs().partial_cmp(&(b.0 - t).abs()).unwrap())
+                .map(|s| s.1)
+                .unwrap_or(0)
+        };
+        // first second: within ~2x of the 200 KB/s limit (pre-fix,
+        // every connection's first 512 KiB escaped uncharged and
+        // the whole 2 MiB landed inside the first second)
+        let first_sec = at(1.0);
+        assert!(
+            first_sec <= 420_000,
+            "first-second bytes {first_sec} blow past the 200 KB/s limit"
+        );
+        // steady state (second 2): within a slice of the limit
+        let second = at(2.0) - at(1.0);
+        assert!(
+            (140_000..=280_000).contains(&second),
+            "steady-state second moved {second} bytes at a 200 KB/s limit"
+        );
+        // the halving is effective within 2 s, with no catch-up
+        // burst: by the second after the change the flow runs at
+        // the NEW rate (~100 KB in that second, one slice of
+        // carryover tolerated) — the old pacer ignored a change
+        // for ≥15 s and would still be moving ~200 KB there
+        let h = halved_at.unwrap();
+        let after_total = at(h + 2.0) - at(h);
+        assert!(
+            after_total <= 480_000,
+            "2 s after halving to 100 KB/s, {after_total} bytes moved (burst)"
+        );
+        let second_after = at(h + 2.0) - at(h + 1.0);
+        assert!(
+            (30_000..=180_000).contains(&second_after),
+            "the second after halving moved {second_after} bytes — the new rate did not take hold"
+        );
+        set_global_limit(0);
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    #[test]
+    fn limiter_holds_from_byte_zero_and_follows_changes_on_the_wire() {
+        if std::env::var("NDM208_LIMIT_CHILD").is_ok() {
+            return; // we ARE the child; the sibling test did the work
+        }
+        let exe = std::env::current_exe().unwrap();
+        let status = std::process::Command::new(exe)
+            .args(["limiter_wire_child", "--nocapture"])
+            .env("NDM208_LIMIT_CHILD", "1")
+            .status()
+            .expect("child test binary must run");
+        assert!(status.success(), "limiter wire check failed in the child: {status}");
+    }
+
+    // --- Refresh Download Address, IDM-true: a refreshed entry
+    // keeps its sealed progress when the new address serves the
+    // same file, and restarts — honestly — when it does not. The
+    // refresh itself is `rebind_state_url` (the journal's recorded
+    // URL flips); every keep/discard decision below is made by the
+    // ordinary start-path verification, exactly as for any resume.
+
+    /// Lay down the on-disk remains of a paused download: a
+    /// full-size partial whose sealed blocks hold the real bytes
+    /// (the rest zero fill) plus its resume journal under `url`.
+    fn refresh_partial(out: &Path, url: &str, body: &[u8], block: u64, sealed: &[u8]) {
+        let mut partial = vec![0u8; body.len()];
+        for (i, &s) in sealed.iter().enumerate() {
+            if s == 1 {
+                let a = i * block as usize;
+                let b = ((i + 1) * block as usize).min(body.len());
+                partial[a..b].copy_from_slice(&body[a..b]);
+            }
+        }
+        std::fs::write(out, &partial).unwrap();
+        write_journal(out, url, body.len() as u64, block, sealed);
+    }
+
+    fn write_journal_validators(
+        out: &Path,
+        url: &str,
+        total: u64,
+        block: u64,
+        done: &[u8],
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) {
+        let v = serde_json::json!({
+            "url": url, "total": total, "block_size": block,
+            "etag": etag, "last_modified": last_modified, "done": done,
+        });
+        std::fs::write(state_path_for(out), serde_json::to_vec(&v).unwrap()).unwrap();
+    }
+
+    /// Range-capable handler serving `body`, optionally with an
+    /// ETag validator on every response (HEAD, 206 and 200 alike,
+    /// as real servers send it).
+    fn range_handler(body: Vec<u8>, etag: Option<String>) -> impl Fn(&Req) -> Vec<u8> + Send + Sync {
+        move |req| {
+            let total = body.len() as u64;
+            let mut head: Vec<(&str, String)> = vec![
+                ("Content-Length", total.to_string()),
+                ("Accept-Ranges", "bytes".to_string()),
+            ];
+            if let Some(e) = &etag {
+                head.push(("ETag", e.clone()));
+            }
+            if req.method == "HEAD" {
+                return http_resp("200 OK", &head, &[]);
+            }
+            if let Some(r) = &req.range {
+                let r = r.trim().strip_prefix("bytes=").unwrap_or(r);
+                let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+                let a: u64 = a.parse().unwrap_or(0);
+                let b: u64 = if b.is_empty() {
+                    total - 1
+                } else {
+                    b.parse().unwrap_or(total - 1)
+                };
+                let end = b.min(total - 1);
+                let slice = &body[a as usize..=end as usize];
+                let mut h: Vec<(&str, String)> = vec![
+                    ("Content-Range", format!("bytes {a}-{end}/{total}")),
+                    ("Content-Length", slice.len().to_string()),
+                ];
+                if let Some(e) = &etag {
+                    h.push(("ETag", e.clone()));
+                }
+                return http_resp("206 Partial Content", &h, slice);
+            }
+            http_resp("200 OK", &head, &body)
+        }
+    }
+
+    #[test]
+    fn rebind_state_url_flips_only_a_valid_matching_journal() {
+        let body = pattern_body(1024 * 1024);
+        let block = 256 * 1024u64;
+        let out = tmp_out("rebind");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let url1 = "http://127.0.0.1:1/old.bin";
+        let url2 = "http://127.0.0.1:2/fresh.bin";
+        // no journal at all
+        assert!(!rebind_state_url(&out, url1, url2));
+        refresh_partial(&out, url1, &body, block, &[1, 1, 0, 0]);
+        // a journal belonging to a different URL is not ours to flip
+        assert!(!rebind_state_url(&out, "http://127.0.0.1:9/other.bin", url2));
+        assert!(peek_state(url1, &out).is_some(), "journal must be untouched");
+        // the flip: the old address loses the journal, the new one
+        // gains it whole — total, sealed bytes and block map intact
+        assert!(rebind_state_url(&out, url1, url2));
+        assert!(peek_state(url1, &out).is_none());
+        let pk = peek_state(url2, &out).expect("rebound journal must peek under the new URL");
+        assert_eq!(pk.total, body.len() as u64);
+        assert_eq!(pk.done_bytes, 2 * block);
+        assert_eq!(pk.blocks, vec![1u8, 1, 0, 0]);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    #[test]
+    fn rebind_state_url_refuses_poison_and_size_lies() {
+        let block = 256 * 1024u64;
+        let out = tmp_out("rebindbad");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let url1 = "http://127.0.0.1:1/old.bin";
+        let url2 = "http://127.0.0.1:2/fresh.bin";
+        // block map that disagrees with its own block size
+        std::fs::write(&out, vec![0u8; 1024 * 1024]).unwrap();
+        write_journal(&out, url1, 1024 * 1024, block, &[1, 1]);
+        assert!(!rebind_state_url(&out, url1, url2));
+        assert!(peek_state(url1, &out).is_none(), "poison stays untrusted either way");
+        // partial file no longer the journal's full size
+        write_journal(&out, url1, 1024 * 1024, block, &[1, 1, 0, 0]);
+        std::fs::write(&out, vec![0u8; 500]).unwrap();
+        assert!(!rebind_state_url(&out, url1, url2));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    #[test]
+    fn refresh_same_file_resumes_from_sealed_bytes() {
+        let body = pattern_body(1024 * 1024);
+        let block = 256 * 1024u64;
+        // one server, two addresses: the fresh URL serves the SAME
+        // file (the expired-link case the feature exists for)
+        let port = delayed_range_server(body.clone(), Duration::from_millis(300));
+        let url1 = format!("http://127.0.0.1:{port}/old.bin");
+        let url2 = format!("http://127.0.0.1:{port}/fresh.bin");
+        let out = tmp_out("refkeep");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        refresh_partial(&out, &url1, &body, block, &[1, 1, 0, 0]);
+        assert!(
+            peek_state(&url2, &out).is_none(),
+            "before the refresh the new address owns nothing"
+        );
+        assert!(rebind_state_url(&out, &url1, &url2));
+        let dl = start(&url2, &out, 2, block).unwrap();
+        // the start credited the kept blocks instead of zeroing
+        // them: with every GET delayed 300 ms no new block can
+        // have sealed yet
+        assert_eq!(dl.progress().sealed_done_bytes, 2 * block);
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        // only the missing remainder was fetched this session (one
+        // block of slack for a work-stealing re-read; a restart
+        // would have fetched all four)
+        assert!(
+            dl.progress().fetched_session <= 3 * block,
+            "resume fetched {} bytes for a {}-byte remainder",
+            dl.progress().fetched_session,
+            2 * block
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert!(!state_path_for(&out).exists(), "finished download removes its journal");
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn refresh_different_total_restarts_from_zero() {
+        let body_a = pattern_body(1024 * 1024);
+        let body_b = pattern_body(1536 * 1024);
+        let block = 256 * 1024u64;
+        let url1 = "http://127.0.0.1:1/old.bin".to_string();
+        let port = delayed_range_server(body_b.clone(), Duration::from_millis(300));
+        let url2 = format!("http://127.0.0.1:{port}/fresh.bin");
+        let out = tmp_out("refsize");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        refresh_partial(&out, &url1, &body_a, block, &[1, 1, 0, 0]);
+        assert!(rebind_state_url(&out, &url1, &url2));
+        // the kept journal still PEEKS (peek does not probe): the
+        // discard decision belongs to the start's verification
+        assert_eq!(peek_state(&url2, &out).map(|p| p.done_bytes), Some(2 * block));
+        let dl = start(&url2, &out, 2, block).unwrap();
+        assert_eq!(dl.progress().total, body_b.len() as u64);
+        assert_eq!(
+            dl.progress().sealed_done_bytes, 0,
+            "a different total must discard the kept journal"
+        );
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(90)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        assert_eq!(std::fs::read(&out).unwrap(), body_b);
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn refresh_same_size_different_content_restarts_via_block_check() {
+        let body_a = pattern_body(1024 * 1024);
+        let body_c: Vec<u8> = body_a.iter().map(|b| b ^ 0xFF).collect();
+        let block = 256 * 1024u64;
+        let url1 = "http://127.0.0.1:1/old.bin".to_string();
+        // no validators on this server: the start must byte-compare
+        // sampled sealed blocks against the new content to decide
+        let port = delayed_range_server(body_c.clone(), Duration::from_millis(300));
+        let url2 = format!("http://127.0.0.1:{port}/fresh.bin");
+        let out = tmp_out("refcontent");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        refresh_partial(&out, &url1, &body_a, block, &[1, 1, 1, 0]);
+        assert!(rebind_state_url(&out, &url1, &url2));
+        let dl = start(&url2, &out, 2, block).unwrap();
+        assert_eq!(
+            dl.progress().sealed_done_bytes, 0,
+            "different content under the same size must discard the kept journal"
+        );
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(90)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            body_c,
+            "the file must be the new content whole — never a splice"
+        );
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn refresh_validator_mismatch_restarts_and_match_resumes() {
+        let body = pattern_body(1024 * 1024);
+        let block = 256 * 1024u64;
+        let url1 = "http://127.0.0.1:1/old.bin";
+        // --- mismatch: sealed under ETag "v1", the fresh address
+        // answers "v2" for the same bytes — the start's filter
+        // refuses the journal outright, no sampling involved
+        let port = test_server(range_handler(body.clone(), Some("\"v2\"".to_string())));
+        let url2 = format!("http://127.0.0.1:{port}/fresh.bin");
+        let out = tmp_out("refetag");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        refresh_partial(&out, url1, &body, block, &[1, 1, 0, 0]);
+        write_journal_validators(&out, url1, body.len() as u64, block, &[1, 1, 0, 0], Some("\"v1\""), None);
+        assert!(rebind_state_url(&out, url1, &url2));
+        let dl = start(&url2, &out, 2, block).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        assert!(
+            dl.progress().fetched_session >= 3 * block + block / 2,
+            "a changed validator must re-fetch the file (fetched {})",
+            dl.progress().fetched_session
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        // --- match: the fresh address answers the SAME ETag —
+        // the journal is trusted on the validators alone and the
+        // sealed half is kept
+        let port = test_server(range_handler(body.clone(), Some("\"v1\"".to_string())));
+        let url2 = format!("http://127.0.0.1:{port}/fresh.bin");
+        let out = tmp_out("refetagok");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        refresh_partial(&out, url1, &body, block, &[1, 1, 0, 0]);
+        write_journal_validators(&out, url1, body.len() as u64, block, &[1, 1, 0, 0], Some("\"v1\""), None);
+        assert!(rebind_state_url(&out, url1, &url2));
+        let dl = start(&url2, &out, 2, block).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        assert!(
+            dl.progress().fetched_session <= 3 * block,
+            "a matching validator must keep the sealed half (fetched {})",
+            dl.progress().fetched_session
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn refresh_onto_no_range_server_replaces_cleanly() {
+        let body_a = pattern_body(1024 * 1024);
+        let body_d: Vec<u8> = body_a.iter().map(|b| b ^ 0xFF).collect();
+        let block = 256 * 1024u64;
+        let total = body_d.len();
+        let served = body_d.clone();
+        // no Accept-Ranges anywhere and Range is ignored: the
+        // canonical no-range server — the start demotes to the
+        // single-stream spool path (M-1)
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp("200 OK", &[("Content-Length", total.to_string())], &[]);
+            }
+            http_resp("200 OK", &[("Content-Length", total.to_string())], &served)
+        });
+        let url2 = format!("http://127.0.0.1:{port}/fresh.bin");
+        let out = tmp_out("refnorng");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        refresh_partial(&out, "http://127.0.0.1:1/old.bin", &body_a, block, &[1, 1, 0, 0]);
+        assert!(rebind_state_url(&out, "http://127.0.0.1:1/old.bin", &url2));
+        let dl = start(&url2, &out, 2, block).unwrap();
+        assert!(!dl.progress().resumable, "a no-range start must be the single-stream path");
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        wait_settled(&dl, Duration::from_secs(10));
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            body_d,
+            "the replacement must be whole and exact — the kept partial must not bleed into it"
+        );
+        assert!(
+            !state_path_for(&out).exists(),
+            "the stale journal goes with the finish"
+        );
+        let spool = {
+            let mut s = out.clone().into_os_string();
+            s.push(".ndm.spool");
+            PathBuf::from(s)
+        };
+        assert!(!spool.exists(), "the spool must be renamed away, not left behind");
+        drop(dl);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn refresh_onto_failing_no_range_server_keeps_partial_and_journal() {
+        let body_a = pattern_body(1024 * 1024);
+        let block = 256 * 1024u64;
+        let total = body_a.len() as u64;
+        let served = body_a.clone();
+        let port = test_server(move |req| {
+            if req.method == "HEAD" {
+                return http_resp("200 OK", &[("Content-Length", total.to_string())], &[]);
+            }
+            // correct length promised, body cut at 1000 bytes
+            http_resp("200 OK", &[("Content-Length", total.to_string())], &served[..1000])
+        });
+        let url2 = format!("http://127.0.0.1:{port}/fresh.bin");
+        let out = tmp_out("refnorngfail");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        refresh_partial(&out, "http://127.0.0.1:1/old.bin", &body_a, block, &[1, 1, 0, 0]);
+        let partial_before = std::fs::read(&out).unwrap();
+        assert!(rebind_state_url(&out, "http://127.0.0.1:1/old.bin", &url2));
+        let dl = start(&url2, &out, 2, block).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(120)), Some(Status::Error));
+        wait_settled(&dl, Duration::from_secs(10));
+        drop(dl);
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            partial_before,
+            "a failed replacement must leave the kept partial byte-for-byte"
+        );
+        let pk = peek_state(&url2, &out).expect("the kept journal must survive a failed demotion");
+        assert_eq!(pk.done_bytes, 2 * block);
+        assert_eq!(pk.blocks, vec![1u8, 1, 0, 0]);
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
     }
 }

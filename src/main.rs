@@ -136,8 +136,19 @@ fn main() {
     // supervisor's final journal save lands — exiting on it alone
     // could cut that save off and overstate what a resume would
     // find. Wait for the settled flag: the supervisor sets it only
-    // after the final save, on every outcome.
+    // after the final save, on every outcome. The wait itself has a
+    // hard backstop (C-2): the engine's settlement is bounded, but
+    // the CLI must never hang forever on any engine state — after
+    // the deadline it reports and exits instead of waiting into
+    // eternity on a wedged download.
+    let settle_deadline = Instant::now() + Duration::from_secs(120);
     while !dl.is_settled() {
+        if Instant::now() >= settle_deadline {
+            eprintln!(
+                "\n[ndm] FAILED — the engine did not settle within 120s; abandoning this run (run again to resume)"
+            );
+            std::process::exit(1);
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     let p = dl.progress();

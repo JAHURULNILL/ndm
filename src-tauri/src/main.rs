@@ -59,6 +59,17 @@ struct ProgressPayload {
     /// cumulative bytes per connection this session (IDM's
     /// per-connection progress table); empty for video jobs
     conns_detail: Vec<u64>,
+    /// per-connection state codes mirroring the engine Progress
+    /// (G1, progress dialog's segment strip): 0 = idle/pending,
+    /// 1 = sealed, 2 = active; empty for video jobs and restored
+    /// entries, which have no engine connection table
+    conns_state: Vec<u8>,
+    /// per-connection in-flight (unsealed) bytes, parallel to
+    /// conns_state (G1)
+    conns_partial: Vec<u64>,
+    /// per-connection current block index, parallel to
+    /// conns_state; -1 = no block claimed right now (G1)
+    conns_block: Vec<i64>,
     /// the user's own note for this download (IDM's Description)
     description: String,
     /// this download's own speed limit in bytes/sec (0 = none)
@@ -68,6 +79,11 @@ struct ProgressPayload {
     save_to: String,
     /// the page this download came from ("" = none)
     referer: String,
+    /// G2: the entry's ordered completion actions (see SavedEntry)
+    completion_actions: Vec<String>,
+    /// G2: the entry's per-download show-complete-dialog override
+    /// (None = follow the global setting)
+    show_complete_override: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -109,6 +125,24 @@ struct SavedEntry {
     /// "", "open_file" or "open_folder" — runs when the download finishes
     #[serde(default)]
     completion: String,
+    /// G2: the full ordered completion-action list (values:
+    /// show_complete / open_file / open_folder / exit_app /
+    /// turn_off_pc / restart_pc). The legacy single `completion`
+    /// string above is mapped into this list on load (see
+    /// legacy_completion_actions) and dropped on the next persist
+    /// once the list is stored. Empty = fall back to the legacy
+    /// field's meaning.
+    #[serde(default)]
+    completion_actions: Vec<String>,
+    /// G2: per-download override of the global "show the Download
+    /// complete dialog" setting; None = follow the global setting
+    #[serde(default)]
+    show_complete_override: Option<bool>,
+    /// m-8: automatic-retry attempts already spent on this entry.
+    /// The retry budget (RETRY_MAX) must survive restarts, so the
+    /// count lives in the journal, not only in the in-memory map.
+    #[serde(default)]
+    retry_count: u32,
     /// why the entry last failed — shown in the list and the status
     /// dialog, and kept across restarts so "Error" is never a dead end
     #[serde(default)]
@@ -329,6 +363,21 @@ struct Settings {
     /// way) is always respected.
     #[serde(default)]
     clipboard_monitor: bool,
+    /// G7: how the per-download progress dialog appears on an
+    /// app-side start: "show" (open it), "minimized" (open it
+    /// minimized — this shell only records the choice), or
+    /// "never" (list only). Browser-takeover starts never open it.
+    #[serde(default = "def_progress_view")]
+    progress_dialog_view: String,
+    /// EXT §1c: the bundled extension version the user has already
+    /// been shown the "extension update available" notice for;
+    /// the notice is shown at most once per bundled version
+    #[serde(default)]
+    ext_notice_for: String,
+}
+
+fn def_progress_view() -> String {
+    "show".to_string()
 }
 
 fn def_quota_hours() -> u64 {
@@ -444,6 +493,8 @@ impl Default for Settings {
             quota_mb: 0,
             quota_hours: def_quota_hours(),
             clipboard_monitor: false,
+            progress_dialog_view: def_progress_view(),
+            ext_notice_for: String::new(),
         }
     }
 }
@@ -578,6 +629,14 @@ impl Settings {
         // sane bounds (1 TB per window, at most a week per window)
         self.quota_mb = self.quota_mb.min(1_000_000);
         self.quota_hours = self.quota_hours.min(24 * 7);
+        // G7: only the three known dialog-view modes are valid
+        if !matches!(
+            self.progress_dialog_view.as_str(),
+            "show" | "minimized" | "never"
+        ) {
+            self.progress_dialog_view = def_progress_view();
+        }
+        self.ext_notice_for = self.ext_notice_for.trim().to_string();
     }
 }
 
@@ -1205,6 +1264,22 @@ struct Entry {
     pause_requested: AtomicBool,
     /// "", "open_file" or "open_folder" — runs once when it finishes
     completion: Mutex<String>,
+    /// G2: the ordered completion-action list (show_complete /
+    /// open_file / open_folder / exit_app / turn_off_pc /
+    /// restart_pc); the legacy `completion` string is kept in sync
+    /// as a shim for the first file/power action it contains
+    completion_actions: Mutex<Vec<String>>,
+    /// G2: per-download override of the global show-complete-dialog
+    /// setting; None = follow the global setting
+    show_complete_override: Mutex<Option<bool>>,
+    /// M-5: the recorded final path of this entry's file (video:
+    /// the merged file's real location, restored from the journal
+    /// and updated whenever a job records one). Resolution and
+    /// delete-with-file PREFER this path whenever it is set — a
+    /// folder scan may only guess when no path was ever recorded,
+    /// so a same-size stranger's file can never be bound to (or
+    /// deleted for) this entry.
+    final_path: Mutex<String>,
     /// the named queue this entry belongs to (movable between
     /// queues from the status dialog, like IDM)
     queue: Mutex<String>,
@@ -1576,14 +1651,31 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             error: p.error.clone().unwrap_or_default(),
             queue: entry_queue(entry),
             conns_detail: Vec::new(),
+            conns_state: Vec::new(),
+            conns_partial: Vec::new(),
+            conns_block: Vec::new(),
             description: entry.description.lock_ok().clone(),
             speed_limit: *entry.speed_limit.lock_ok(),
             save_to: entry.out_path.to_string_lossy().to_string(),
             referer: entry.referer.clone(),
+            completion_actions: entry.completion_actions.lock_ok().clone(),
+            show_complete_override: *entry.show_complete_override.lock_ok(),
         };
     }
-    let (total, done_bytes, rate, conns, status, blocks, resumable, error_text, conns_detail) =
-        match &entry.download {
+    let (
+        total,
+        done_bytes,
+        rate,
+        conns,
+        status,
+        blocks,
+        resumable,
+        error_text,
+        conns_detail,
+        conns_state,
+        conns_partial,
+        conns_block,
+    ) = match &entry.download {
         Some(dl) => {
             let p = dl.progress();
             let rate = if p.status == ndm::Status::Downloading {
@@ -1612,6 +1704,9 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 p.resumable,
                 p.error.unwrap_or_default(),
                 p.conn_bytes,
+                p.conn_states,
+                p.conn_partial,
+                p.conn_block,
             )
         }
         None => match &*entry.restored.lock_ok() {
@@ -1625,6 +1720,9 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 r.resumable,
                 r.error.clone(),
                 Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ),
             None => (
                 0,
@@ -1636,12 +1734,19 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
                 false,
                 String::new(),
                 Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ),
         },
     };
-    let status = if entry.download.is_none()
-        && entry.video.is_none()
-        && entry.queued.load(Ordering::Relaxed)
+    // m-18: an entry carrying the queued flag IS queued, whatever
+    // its underlying record says — a re-queued entry whose engine
+    // handle reports "paused" (window close, pause-all) must read
+    // "queued" in every list, the scheduler's included: the flag
+    // and the label may never diverge (M-12's divergence class).
+    let status = if entry.queued.load(Ordering::Relaxed)
+        && (status == "paused" || (entry.download.is_none() && entry.video.is_none()))
     {
         "queued".to_string()
     } else if entry.download.is_none()
@@ -1681,10 +1786,15 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         error: error_text,
         queue: entry_queue(entry),
         conns_detail,
+        conns_state,
+        conns_partial,
+        conns_block,
         description: entry.description.lock_ok().clone(),
         speed_limit: *entry.speed_limit.lock_ok(),
         save_to: entry.out_path.to_string_lossy().to_string(),
         referer: entry.referer.clone(),
+        completion_actions: entry.completion_actions.lock_ok().clone(),
+        show_complete_override: *entry.show_complete_override.lock_ok(),
     }
 }
 
@@ -1722,10 +1832,10 @@ fn persist(state: &AppState) {
     if path.as_os_str().is_empty() {
         return;
     }
-    if DOWNLOADS_CORRUPT.load(Ordering::Relaxed) && state.entries.lock_ok().is_empty() {
-        return;
-    }
     let order = state.order.lock_ok().clone();
+    // m-8: snapshot the retry budgets once, so every record in
+    // this write carries the count as of the same moment
+    let retry_counts = state.retries.lock_ok().clone();
     let saved: Vec<SavedEntry> = order
         .iter()
         .filter_map(|id| state.get(id))
@@ -1777,6 +1887,12 @@ fn persist(state: &AppState) {
             } else {
                 None
             };
+            // M-5: keep the entry's recorded path in step with
+            // what the job reports, so resolution and deletion
+            // prefer it immediately, not only after a restore
+            if let Some(fp) = &final_path {
+                *e.final_path.lock_ok() = fp.clone();
+            }
             SavedEntry {
                 id: e.id.clone(),
                 name: e.name.clone(),
@@ -1796,7 +1912,25 @@ fn persist(state: &AppState) {
                 // The on-screen payload keeps the live figure.
                 done_bytes: match &e.download {
                     Some(dl) => dl.progress().sealed_done_bytes,
-                    None => p.done_bytes,
+                    None => {
+                        // m-9: a video job's LIVE count includes
+                        // bytes that are still only in flight; the
+                        // journal may never claim more than the
+                        // durable on-disk figure (sealed engine
+                        // blocks / completed yt-dlp parts). A
+                        // finished or merging job's output is
+                        // already whole, so its live figure IS the
+                        // durable one.
+                        if e.kind == "video" && e.video.is_some() {
+                            if p.status == "finished" || p.status == "merging" {
+                                p.done_bytes
+                            } else {
+                                p.done_bytes.min(video_durable_done_bytes(&e))
+                            }
+                        } else {
+                            p.done_bytes
+                        }
+                    }
                 },
                 status: if e.queued.load(Ordering::Relaxed) {
                     "queued".to_string()
@@ -1808,7 +1942,22 @@ fn persist(state: &AppState) {
                 audio: e.audio,
                 cookies: e.cookies.clone(),
                 referer: e.referer.clone(),
-                completion: e.completion.lock_ok().clone(),
+                // G2: once an action list is stored, the legacy
+                // single-action field is dropped (the list is the
+                // record now); with no list stored, the legacy
+                // string is still the only record and is written
+                // as-is
+                completion: {
+                    let actions = e.completion_actions.lock_ok();
+                    if actions.is_empty() {
+                        e.completion.lock_ok().clone()
+                    } else {
+                        String::new()
+                    }
+                },
+                completion_actions: e.completion_actions.lock_ok().clone(),
+                show_complete_override: *e.show_complete_override.lock_ok(),
+                retry_count: retry_counts.get(&e.id).map(|(n, _)| *n).unwrap_or(0),
                 error: p.error.clone(),
                 queue: entry_queue(&e),
                 login: e.login.clone(),
@@ -1819,6 +1968,14 @@ fn persist(state: &AppState) {
             }
         })
         .collect();
+    // m-11: the quarantine guard releases on the SNAPSHOT actually
+    // being written, not on the raw entry map: a map holding only
+    // in-flight placeholder stubs (filtered out of the snapshot
+    // above) must not lift the guard and let an empty write land
+    // over the journal
+    if DOWNLOADS_CORRUPT.load(Ordering::Relaxed) && saved.is_empty() {
+        return;
+    }
     let tmp = path.with_extension("json.tmp");
     // F-4: a failed journal write used to vanish silently — the
     // list then quietly reverted on the next launch and nobody
@@ -1936,6 +2093,72 @@ fn open_target(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot open: {e}"))
 }
 
+/// m-9: the DURABLE byte figure for a video entry — what is
+/// actually on disk in completed form, never the live counter.
+/// Engine parts (.{stem}.ndm_stream*.part) contribute their
+/// SEALED bytes, read from their engine state files (fully
+/// downloaded blocks only); when no engine parts exist, yt-dlp's
+/// part files for the stem contribute their lengths (a .part
+/// only grows by bytes actually written). 0 when nothing
+/// durable is on disk yet.
+fn video_durable_done_bytes(entry: &Entry) -> u64 {
+    let stem = video::safe_filename_stem(&entry.name);
+    if stem.is_empty() {
+        return 0;
+    }
+    let Ok(rd) = std::fs::read_dir(&entry.out_path) else {
+        return 0;
+    };
+    let mut engine_parts: Vec<PathBuf> = Vec::new();
+    let mut ytdlp_bytes: u64 = 0;
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".part") {
+            // engine part: ".{stem}.ndm_stream<i>.<ext>.part" —
+            // the stem may carry a uniquified " (n)" suffix
+            if let Some(base) = name
+                .strip_prefix('.')
+                .and_then(|inner| inner.split_once(".ndm_stream"))
+                .map(|(base, _)| base)
+            {
+                if base == stem || base.starts_with(&format!("{stem} (")) {
+                    engine_parts.push(p);
+                    continue;
+                }
+            }
+        }
+        if (name.ends_with(".part") || name.ends_with(".ytdl"))
+            && (name.starts_with(&format!("{stem}."))
+                || name.starts_with(&format!("{stem} (")))
+        {
+            ytdlp_bytes += e.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    if !engine_parts.is_empty() {
+        let mut sealed: u64 = 0;
+        for part in &engine_parts {
+            let sp = ndm::state_path_for(part);
+            if let Ok(text) = std::fs::read_to_string(&sp) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let total = v["total"].as_u64().unwrap_or(0);
+                    let block = v["block_size"].as_u64().unwrap_or(0);
+                    let full = v["done"]
+                        .as_array()
+                        .map(|a| a.iter().filter(|b| b.as_u64() == Some(1)).count() as u64)
+                        .unwrap_or(0);
+                    sealed += full.saturating_mul(block).min(total);
+                }
+            }
+        }
+        return sealed;
+    }
+    ytdlp_bytes
+}
+
 fn resolve_video_file(entry: &Entry) -> PathBuf {
     if let Some(job) = &entry.video {
         if let Some(fp) = job
@@ -1948,6 +2171,15 @@ fn resolve_video_file(entry: &Entry) -> PathBuf {
         {
             return fp;
         }
+    }
+    // M-5: a recorded final path outranks every heuristic below.
+    // When one is set it is returned AS RECORDED — even while the
+    // file is missing — so finished-checks honestly fail and
+    // delete-with-file removes nothing for this entry, instead
+    // of the folder scan binding it to a same-size stranger.
+    let recorded = entry.final_path.lock_ok().clone();
+    if !recorded.is_empty() {
+        return PathBuf::from(recorded);
     }
     if entry.out_path.is_file() {
         return entry.out_path.clone();
@@ -2207,6 +2439,21 @@ fn quota_note_removed(state: &AppState, entry: &Entry) {
     }
 }
 
+/// Record bytes that stopped being credited to a live entry
+/// WITHOUT the entry leaving the list — a start whose resume
+/// verification discarded sealed blocks (the address now serves a
+/// different file), or a refresh whose journal could not be kept.
+/// quota_note_removed's rule, applied at the moment the credit
+/// disappears: spent traffic stays on the meter exactly once, in
+/// quota_removed, instead of silently refunding itself when the
+/// entry's counter restarts from zero.
+fn quota_note_discarded(state: &AppState, bytes: u64) {
+    if bytes > 0 {
+        *state.quota_removed.lock().unwrap() += bytes;
+        save_quota(state);
+    }
+}
+
 /// Serialises quota saves: every caller used to share the one
 /// quota.json.tmp name with no lock, so two saves landing
 /// together could interleave into a torn file — which load_quota
@@ -2388,35 +2635,83 @@ fn maybe_exit_when_done(app: &AppHandle, state: &AppState, finished_queue: &str)
     }
 }
 
-/// The per-download "Options on completion" action, run once at finish.
-fn run_completion_action(entry: &Entry) {
-    let action = entry.completion.lock_ok().clone();
-    if !action.is_empty() {
-        // audit trail (F-19): the value acted on is THIS entry's own
-        // stored field — written per entry by set_completion and
-        // carried verbatim through every entry rebuild (swap_live,
-        // demote_terminal_live, the video relaunch) — never a shared
-        // or global slot, so one download's choice cannot fire for
-        // another. Log which action fires, for which entry.
-        eprintln!(
-            "[ndm] completion action for {} ({}): {action}",
-            entry.id, entry.name
-        );
+/// G2: the completion actions an entry runs at finish, in
+/// order: the stored list when one exists, else the legacy
+/// single action mapped the same way the journal load maps it
+/// (legacy_completion_actions).
+fn completion_actions_of(entry: &Entry) -> Vec<String> {
+    let stored = entry.completion_actions.lock_ok().clone();
+    if !stored.is_empty() {
+        return stored;
     }
-    // IDM's "Options on completion" also offers turning the computer
-    // off (or restarting it) when this download finishes
-    match action.as_str() {
-        "turn_off_pc" => {
-            do_power_action("shutdown", false);
-            return;
-        }
-        "restart_pc" => {
-            do_power_action("restart", false);
-            return;
-        }
-        _ => {}
+    legacy_completion_actions(&entry.completion.lock_ok(), &[])
+}
+
+/// G2: does the "Download complete" dialog show for this entry?
+/// The per-entry override wins outright; then a show_complete
+/// action in the entry's own list; then the global setting.
+fn completion_show_dialog(actions: &[String], show_override: Option<bool>, global: bool) -> bool {
+    if let Some(o) = show_override {
+        return o;
     }
-    let target = match action.as_str() {
+    if actions.iter().any(|a| a == "show_complete") {
+        return true;
+    }
+    global
+}
+
+/// G2: the drained-queue guard for per-entry terminal actions
+/// (exit_app / turn_off_pc / restart_pc): downloads ran this
+/// session, no automatic retry is pending, nothing is paused,
+/// active or queued — the same conditions maybe_exit_when_done
+/// enforces for the queue/global actions, so a per-entry power
+/// action can never fire under other live downloads.
+fn entry_power_guard_clear(state: &AppState) -> bool {
+    if !state.had_active.load(Ordering::Relaxed) {
+        return false;
+    }
+    if !state.retries.lock_ok().is_empty() {
+        return false;
+    }
+    let entries: Vec<Arc<Entry>> = state.entries.lock().unwrap().values().cloned().collect();
+    if entries.iter().any(|e| e.queued.load(Ordering::Relaxed)) {
+        return false;
+    }
+    if entries.iter().any(|e| payload_of(e).status == "paused") {
+        return false;
+    }
+    count_active(state) == 0
+}
+
+/// The terminal actions in a completion list: the power
+/// action (turn_off_pc wins over restart_pc when both are
+/// listed; either wins over exit_app at fire time) and whether
+/// exit_app is present.
+fn completion_terminal_of(actions: &[String]) -> (Option<String>, bool) {
+    let mut power: Option<String> = None;
+    let mut exit_app = false;
+    for a in actions {
+        match a.as_str() {
+            "turn_off_pc" => {
+                if power.is_none() {
+                    power = Some("shutdown".to_string());
+                }
+            }
+            "restart_pc" => {
+                if power.is_none() {
+                    power = Some("restart".to_string());
+                }
+            }
+            "exit_app" => exit_app = true,
+            _ => {}
+        }
+    }
+    (power, exit_app)
+}
+
+/// One open action (open_file / open_folder) for a finished entry.
+fn run_open_action(entry: &Entry, action: &str) {
+    let target = match action {
         "open_file" => {
             if entry.kind == "video" {
                 resolve_video_file(entry)
@@ -2438,6 +2733,77 @@ fn run_completion_action(entry: &Entry) {
         _ => return,
     };
     let _ = open_target(&target);
+}
+
+/// G2: run a finished entry's completion actions in their
+/// stored order: the open actions first (in list order), then
+/// the terminal actions (exit_app / turn_off_pc / restart_pc)
+/// through the drained-queue guard. A terminal action whose
+/// guard is not yet clear stays pending: every later finish
+/// re-evaluates ALL entries' pending terminal actions, so the
+/// action fires when the queue actually drains, never under
+/// other active downloads. Returns true when a terminal action
+/// fired (the caller then skips maybe_exit_when_done — the
+/// per-entry action replaces the queue/global one).
+fn run_completion_actions(app: &AppHandle, state: &AppState, entry: &Entry) -> bool {
+    let actions = completion_actions_of(entry);
+    if !actions.is_empty() {
+        // audit trail (F-19): the values acted on are THIS
+        // entry's own stored list — written per entry by
+        // set_completion_actions and carried verbatim through
+        // every entry rebuild (swap_live, demote, the video
+        // relaunch) — never a shared or global slot
+        eprintln!(
+            "[ndm] completion actions for {} ({}): {}",
+            entry.id,
+            entry.name,
+            actions.join(", ")
+        );
+        for a in &actions {
+            if a == "open_file" || a == "open_folder" {
+                run_open_action(entry, a);
+            }
+        }
+    }
+    // terminal candidates: the finishing entry first, then any
+    // other entry whose terminal action is still pending
+    let (mut power, mut exit_app) = completion_terminal_of(&actions);
+    if power.is_none() && !exit_app {
+        let entries: Vec<Arc<Entry>> =
+            state.entries.lock().unwrap().values().cloned().collect();
+        for e in &entries {
+            if e.id != entry.id {
+                let (p, x) = completion_terminal_of(&completion_actions_of(e));
+                if power.is_none() {
+                    power = p;
+                }
+                exit_app = exit_app || x;
+            }
+            if power.is_some() || exit_app {
+                break;
+            }
+        }
+    }
+    if power.is_none() && !exit_app {
+        return false;
+    }
+    if !entry_power_guard_clear(state) {
+        return false;
+    }
+    if let Some(act) = power {
+        eprintln!("[ndm] per-entry completion power action firing: {act}");
+        // a dry-run (test/safety valve) writes its marker but
+        // must not then exit as if the machine were going down
+        let dry = std::env::var("NDM_POWER_DRY_RUN")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        do_power_action(&act, false);
+        if dry {
+            return true;
+        }
+    }
+    app.exit(0);
+    true
 }
 
 /// Emit progress for one entry until it pauses, queues, or reaches a
@@ -2507,13 +2873,25 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                         pump_queue(&app);
                         break;
                     }
-                    run_completion_action(&entry);
                     let state = app.state::<AppState>();
+                    // G2: the entry's completion actions run in
+                    // their stored order — opens first, terminal
+                    // actions through the drained-queue guard
+                    let actions = completion_actions_of(&entry);
+                    let terminal_fired = run_completion_actions(&app, &state, &entry);
                     state.retries.lock_ok().remove(&entry.id);
                     if current_settings(&state).sound_events {
                         play_event_sound(true);
                     }
-                    if current_settings(&state).show_complete_dialog {
+                    // G2: the complete dialog shows when the
+                    // per-entry override says so, or the entry's
+                    // action list asks for it, or the global
+                    // setting does (in that priority)
+                    if completion_show_dialog(
+                        &actions,
+                        *entry.show_complete_override.lock_ok(),
+                        current_settings(&state).show_complete_dialog,
+                    ) {
                         let done_path = if entry.kind == "video" {
                             resolve_video_file(&entry)
                         } else {
@@ -2532,7 +2910,11 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                     }
                     persist(&state);
                     pump_queue(&app);
-                    maybe_exit_when_done(&app, &state, &entry_queue(&entry));
+                    // a per-entry terminal action that fired
+                    // replaces the queue/global drained handling
+                    if !terminal_fired {
+                        maybe_exit_when_done(&app, &state, &entry_queue(&entry));
+                    }
                     break;
                 }
                 "error" | "cancelled" => {
@@ -2636,6 +3018,9 @@ fn swap_live(
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(stub.completion.lock().unwrap().clone()),
+        completion_actions: Mutex::new(stub.completion_actions.lock().unwrap().clone()),
+        show_complete_override: Mutex::new(*stub.show_complete_override.lock().unwrap()),
+        final_path: Mutex::new(stub.final_path.lock().unwrap().clone()),
         queue: Mutex::new(entry_queue(&stub)),
         login: stub.login.clone(),
         password: stub.password.clone(),
@@ -2670,9 +3055,15 @@ fn swap_live(
 /// while its bytes sat sealed on disk.
 const ALREADY_STARTING: &str = "the download is already starting";
 const REMOVED_BEFORE_START: &str = "the download was removed before it could start";
+/// M-3: a start refused because the mandatory-update latch is
+/// armed. Benign by design: the entry is not at fault, so no
+/// caller may record an error, register a retry, or deface the
+/// record over it — the entry simply stays queued/paused until
+/// the update is installed and the latch clears.
+const LATCH_BLOCKED: &str = "downloads are paused until the required update is installed";
 
 fn benign_start_rejection(e: &str) -> bool {
-    e == ALREADY_STARTING || e == REMOVED_BEFORE_START
+    e == ALREADY_STARTING || e == REMOVED_BEFORE_START || e == LATCH_BLOCKED
 }
 
 /// Record a stub start's failure on the entry: the visible error
@@ -2700,6 +3091,23 @@ fn record_start_failure(state: &AppState, entry: &Entry, e: &str) -> bool {
 }
 
 async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, String> {
+    // M-3: the mandatory-update latch gates the engine choke
+    // point itself. While it is armed every start refuses with
+    // the benign LATCH_BLOCKED sentinel before touching any
+    // entry state, so callers leave the entry exactly as it was
+    // (queued stays queued, nothing is recorded as failed)
+    if app.state::<AppState>().update_required.load(Ordering::Relaxed) {
+        return Err(LATCH_BLOCKED.to_string());
+    }
+    // the bytes the list currently credits this entry with,
+    // captured before the start: if the engine's resume
+    // verification below keeps fewer of them (the address now
+    // serves a different file than the one the journal was
+    // sealed against — the Refresh Address case), the discarded
+    // difference is noted into quota_removed once the start
+    // lands, so spent traffic cannot silently refund itself by
+    // restarting from zero (see quota_note_discarded).
+    let credited = payload_of(stub).done_bytes;
     let url = stub.url.clone();
     let out_path = stub.out_path.clone();
     let max_conn = {
@@ -2774,6 +3182,20 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
             return Err(format!("internal join error: {e}"));
         }
     };
+    // what the start's verification actually kept of the credited
+    // bytes — sealed only: a live partial block is the new
+    // session's own traffic, not kept credit. Ranged starts only,
+    // plus the empty-file start (total 0), which discards by
+    // definition: a single-stream demotion discards nothing at
+    // start — its spool keeps the partial and journal until a
+    // verified replacement lands (M-1) — so it is excluded here.
+    let p0 = dl.progress();
+    let discarded_at_start =
+        if (p0.resumable || p0.total == 0) && credited > p0.sealed_done_bytes {
+            credited - p0.sealed_done_bytes
+        } else {
+            0
+        };
     // the entry may have been deleted or refreshed while the probe was
     // running: never resurrect a stub the map no longer holds, or the
     // download would run invisibly with no row and no way to stop it
@@ -2811,6 +3233,16 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
             }
         }
     };
+    // the verification discarded part of the credited progress:
+    // those bytes leave the entry's counter here, so they move
+    // into the removed-bytes meter — noted exactly once, only on
+    // this landed-start path (a start that failed or was removed
+    // mid-flight discarded nothing the removal paths have not
+    // already accounted for)
+    if discarded_at_start > 0 {
+        let state = app.state::<AppState>();
+        quota_note_discarded(&state, discarded_at_start);
+    }
     // a pause pressed while the probe was in flight is honoured the
     // moment the download goes live (the press used to be discarded)
     if stub.pause_requested.swap(false, Ordering::SeqCst) {
@@ -2980,6 +3412,9 @@ fn rehome_if_finished_conflict(
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
         pause_requested: AtomicBool::new(stub.pause_requested.load(Ordering::SeqCst)),
         completion: Mutex::new(stub.completion.lock().unwrap().clone()),
+        completion_actions: Mutex::new(stub.completion_actions.lock().unwrap().clone()),
+        show_complete_override: Mutex::new(*stub.show_complete_override.lock().unwrap()),
+        final_path: Mutex::new(stub.final_path.lock().unwrap().clone()),
         queue: Mutex::new(entry_queue(stub)),
         login: stub.login.clone(),
         password: stub.password.clone(),
@@ -3214,6 +3649,9 @@ fn register_http_stub(
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
+        completion_actions: Mutex::new(Vec::new()),
+        show_complete_override: Mutex::new(None),
+        final_path: Mutex::new(String::new()),
         queue: Mutex::new(queue.to_string()),
         login: login.to_string(),
         password: password.to_string(),
@@ -3307,6 +3745,9 @@ fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<Entr
         removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+        completion_actions: Mutex::new(entry.completion_actions.lock().unwrap().clone()),
+        show_complete_override: Mutex::new(*entry.show_complete_override.lock().unwrap()),
+        final_path: Mutex::new(entry.final_path.lock().unwrap().clone()),
         queue: Mutex::new(entry_queue(entry)),
         login: entry.login.clone(),
         password: entry.password.clone(),
@@ -3330,6 +3771,15 @@ fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<Entr
 /// entry gets the engine; a restored video entry gets a fresh yt-dlp job
 /// (which continues its .part files); a live-but-paused one just resumes.
 fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
+    // M-3: while the mandatory-update latch is armed, no start
+    // path may run an entry — the queue pump, the promoter,
+    // scheduler window edges and Start-Queue-Now all funnel
+    // through here (or start_engine, which refuses the same
+    // way). The entry is left exactly as it was: queued stays
+    // queued, nothing is errored or dequeued.
+    if app.state::<AppState>().update_required.load(Ordering::Relaxed) {
+        return;
+    }
     // a finished entry must never be (re)started: resuming its dead
     // handle would spawn a fresh emit loop whose first tick runs
     // the completion action a second time
@@ -3433,7 +3883,19 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
         // entry built below clones the stamp off this one
         stamp_last_try(&entry);
         let state = app.state::<AppState>();
-        match video::VideoJob::start(
+        // M-4: hand the job the journal's recorded final path —
+        // if a previous run's merge completed but was never
+        // finalized, the job adopts that file instead of
+        // re-downloading every part into a "(1)" duplicate
+        let recorded_final = {
+            let fp = entry.final_path.lock_ok().clone();
+            if fp.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(fp))
+            }
+        };
+        match video::VideoJob::start_with_recorded_final(
             &entry.url,
             &entry.out_path,
             &entry.selector,
@@ -3454,6 +3916,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 .map(|r| r.total)
                 .unwrap_or(0),
             0.0,
+            recorded_final,
         ) {
             Ok(job) => {
             job.set_limit(*entry.speed_limit.lock().unwrap());
@@ -3488,6 +3951,9 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+                completion_actions: Mutex::new(entry.completion_actions.lock().unwrap().clone()),
+                show_complete_override: Mutex::new(*entry.show_complete_override.lock().unwrap()),
+                final_path: Mutex::new(entry.final_path.lock().unwrap().clone()),
                 queue: Mutex::new(entry_queue(&entry)),
                 login: entry.login.clone(),
                 password: entry.password.clone(),
@@ -3863,8 +4329,18 @@ fn never_started_parked(e: &Entry) -> bool {
 /// queue while parked. Only never-started entries are adopted (see
 /// never_started_parked) — a file the user paused after it ran is
 /// never auto-started by this.
-fn adopt_parked_entries(app: &AppHandle, state: &AppState, s: &Settings, queue: &str) -> bool {
-    if !queue_has_schedule(s, queue) {
+fn adopt_parked_entries(
+    app: &AppHandle,
+    state: &AppState,
+    s: &Settings,
+    queue: &str,
+    force: bool,
+) -> bool {
+    // M-11: "Start Queue Now" adopts REGARDLESS of schedule —
+    // the user pressing Start is the schedule. The passive
+    // adopters (settings save, window-open edge) keep the gate:
+    // without a schedule there is nothing to adopt FOR.
+    if !force && !queue_has_schedule(s, queue) {
         return false;
     }
     let order = state.order.lock().unwrap().clone();
@@ -3905,6 +4381,49 @@ fn claim_queued(e: &Entry) -> bool {
     }
 }
 
+/// M-3: the pump's claim. While the mandatory-update latch is
+/// armed the claim refuses WITHOUT consuming the queued flag —
+/// entries stay queued (not errored, not dequeued) until the
+/// update is installed, and the first pump after the latch
+/// clears picks them up exactly where they were.
+fn try_claim_for_pump(state: &AppState, e: &Entry) -> bool {
+    if state.update_required.load(Ordering::Relaxed) {
+        return false;
+    }
+    claim_queued(e)
+}
+
+/// M-12: hand an entry back to its queue — the in-memory flag
+/// AND the restored record move together. The re-queue paths
+/// used to set only the flag, leaving the record (the journal's
+/// and the payload's view of a handle-less entry) saying
+/// "paused": flag and record are one fact, and their divergence
+/// is what stranded re-queued entries outside every claim path
+/// that reads the record.
+fn mark_requeued(e: &Entry) {
+    e.queued.store(true, Ordering::Relaxed);
+    if let Some(r) = e.restored.lock().unwrap().as_mut() {
+        if r.status != "finished" {
+            r.status = "queued".to_string();
+        }
+    }
+}
+
+/// G7: after an app-side start, when the user's progress-dialog
+/// setting is "show", tell the UI to open the per-download
+/// progress dialog on this entry. "minimized" and "never" emit
+/// nothing in this shell, and browser-takeover starts (the host
+/// paths) never call this — the browser already has the user's
+/// attention (spec §1.3).
+fn maybe_reveal_progress_dialog(app: &AppHandle, state: &AppState, entry: &Entry) {
+    if current_settings(state).progress_dialog_view == "show" {
+        let _ = app.emit(
+            "progress_dialog_reveal",
+            serde_json::json!({ "id": entry.id }),
+        );
+    }
+}
+
 /// Fill free simultaneous-download slots from the queues. The cap is
 /// per queue (IDM: each queue downloads N files at a time).
 fn pump_queue(app: &AppHandle) {
@@ -3926,8 +4445,10 @@ fn pump_queue(app: &AppHandle) {
         if max == 0 {
             for id in &order {
                 if let Some(e) = state.get(id) {
-                    if entry_queue(&e) == cfg.name && claim_queued(&e) {
+                    if entry_queue(&e) == cfg.name && try_claim_for_pump(&state, &e) {
+                        let claimed = e.clone();
                         start_entry(app, e);
+                        maybe_reveal_progress_dialog(app, &state, &claimed);
                     }
                 }
             }
@@ -3947,8 +4468,10 @@ fn pump_queue(app: &AppHandle) {
             }
             // atomic claim: two pumps running at once must never start
             // the same entry twice (two engines, one output file)
-            if claim_queued(&e) {
+            if try_claim_for_pump(&state, &e) {
+                let claimed = e.clone();
                 start_entry(app, e);
+                maybe_reveal_progress_dialog(app, &state, &claimed);
                 active += 1;
             }
         }
@@ -3988,8 +4511,10 @@ fn start_all_queued(app: &AppHandle, queue: Option<&str>) {
             if cap > 0 && *running >= cap {
                 continue;
             }
-            if claim_queued(&e) {
+            if try_claim_for_pump(&state, &e) {
+                let claimed = e.clone();
                 start_entry(app, e);
+                maybe_reveal_progress_dialog(app, &state, &claimed);
                 *running += 1;
             }
         }
@@ -4035,7 +4560,10 @@ fn pause_all(app: &AppHandle, requeue: bool, queue: Option<&str>) {
                 job.pause();
             }
             if requeue && was_downloading {
-                e.queued.store(true, Ordering::Relaxed);
+                // M-12: flag AND record together (mark_requeued) —
+                // the record is what the next session's journal
+                // and every handle-less payload read
+                mark_requeued(&e);
             }
             if !requeue
                 && e.download.is_none()
@@ -4108,7 +4636,7 @@ fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) 
     // holds parked Download-Later entries) adopts those entries now
     // (R5-5a): they join the queue and wait for their window
     for cfg in &s.queues {
-        adopt_parked_entries(&app, &state, &s, &cfg.name);
+        adopt_parked_entries(&app, &state, &s, &cfg.name, false);
     }
     // the pump itself respects every queue's window, quota and cap
     // (including "no cap"), so saving settings just gives it a chance
@@ -4136,7 +4664,7 @@ fn set_entry_queue(
     // an entry moved INTO a scheduled queue while parked as Download
     // Later joins that queue's schedule (R5-5a) instead of sitting
     // paused in it forever
-    adopt_parked_entries(&app, &state, &s, &queue);
+    adopt_parked_entries(&app, &state, &s, &queue, false);
     pump_queue(&app);
     Ok(())
 }
@@ -4347,13 +4875,27 @@ fn set_entry_description(
 }
 
 #[tauri::command]
-fn scheduler_start_now(app: AppHandle, state: State<'_, AppState>, queue: Option<String>) {
+fn scheduler_start_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    queue: Option<String>,
+) -> Result<String, String> {
     let q = queue.unwrap_or_else(main_queue_name);
+    // M-3: an armed mandatory-update latch blocks Start Queue
+    // Now like every other start path — and the command must SAY
+    // so instead of announcing a start that cannot happen
+    if state.update_required.load(Ordering::Relaxed) {
+        return Err(LATCH_BLOCKED.to_string());
+    }
     state.sched_override.lock().unwrap().insert(q.clone());
-    // "Start Queue Now" runs the queue — its parked Download-Later
-    // entries are part of the queue, so adopt them first (R5-5a);
-    // a no-op for queues without a schedule
-    adopt_parked_entries(&app, &state, &current_settings(&state), &q);
+    // M-11: "Start Queue Now" runs the queue — its parked
+    // Download-Later entries are part of the queue, so adopt them
+    // first, schedule or no schedule (the button press IS the
+    // schedule; the window override inserted above covers the
+    // running window). Adoption used to be schedule-gated, so
+    // for an unscheduled queue this silently started nothing
+    // while the UI announced success.
+    adopt_parked_entries(&app, &state, &current_settings(&state), &q, true);
     // the QUEUE's effective cap decides, not the global value: a
     // queue with its own cap fills its slots through the pump
     // instead of flooding past its simultaneous limit
@@ -4362,6 +4904,7 @@ fn scheduler_start_now(app: AppHandle, state: State<'_, AppState>, queue: Option
     } else {
         pump_queue(&app);
     }
+    Ok(format!("queue \"{q}\" started"))
 }
 
 #[tauri::command]
@@ -4634,8 +5177,28 @@ async fn add_download(
         ok => ok,
     };
     match first_start {
-        Ok(_) => Ok(id),
+        Ok(_) => {
+            // G7: an app-side start that went live
+            maybe_reveal_progress_dialog(&app, &state, &stub);
+            Ok(id)
+        }
         Err(e) => {
+            // m-7: a benign rejection (D1) is not this add's
+            // failure — a rival start is already in flight for
+            // the entry, or the update latch armed between the
+            // gate above and the start: leave the entry exactly
+            // as it is and report success, as resume_download
+            // does. Deleting the stub here destroyed a healthy
+            // entry over a race it did not lose.
+            if benign_start_rejection(&e) {
+                if e == LATCH_BLOCKED {
+                    // parked behind the latch: the pump claims
+                    // it the moment the update is installed
+                    stub.queued.store(true, Ordering::Relaxed);
+                }
+                persist(&state);
+                return Ok(id);
+            }
             // remove only OUR stub: a refresh during the probe replaces
             // the entry under this id, and that fresh entry must survive
             let ours = state
@@ -4777,7 +5340,8 @@ async fn resume_download(
         let _ = app.emit("progress", payload_of(&entry));
         // same emit-loop revival as start_entry: a resumed HTTP
         // download must keep reporting and must finish properly
-        spawn_emit_loop(app, entry);
+        spawn_emit_loop(app.clone(), entry.clone());
+        maybe_reveal_progress_dialog(&app, &state, &entry);
         Ok(())
     } else if entry.kind == "video" {
         // live job resumes in place; a restored entry starts a fresh job
@@ -4788,7 +5352,8 @@ async fn resume_download(
             // return on a failed resume before the stamp ever ran
             stamp_last_try(&entry);
             job.resume(&state.components())?;
-            spawn_emit_loop(app, entry);
+            spawn_emit_loop(app.clone(), entry.clone());
+            maybe_reveal_progress_dialog(&app, &state, &entry);
         } else {
             // same arbitration as the HTTP path: an atomic claim, and a
             // staleness re-check before the live entry is installed —
@@ -4801,7 +5366,18 @@ async fn resume_download(
             // stamped before the start runs, as in start_engine:
             // a failed spawn was still a try
             stamp_last_try(&entry);
-            let job = match video::VideoJob::start(
+            // M-4: the journal's recorded final path goes to the
+            // job, exactly as on the start_entry path — a kept
+            // merge is adopted, never re-downloaded
+            let recorded_final = {
+                let fp = entry.final_path.lock_ok().clone();
+                if fp.is_empty() {
+                    None
+                } else {
+                    Some(PathBuf::from(fp))
+                }
+            };
+            let job = match video::VideoJob::start_with_recorded_final(
                 &entry.url,
                 &entry.out_path,
                 &entry.selector,
@@ -4819,6 +5395,7 @@ async fn resume_download(
                     .map(|r| r.total)
                     .unwrap_or(0),
                 0.0,
+                recorded_final,
             ) {
                 Ok(j) => j,
                 Err(e) => {
@@ -4851,6 +5428,9 @@ async fn resume_download(
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+                completion_actions: Mutex::new(entry.completion_actions.lock().unwrap().clone()),
+                show_complete_override: Mutex::new(*entry.show_complete_override.lock().unwrap()),
+                final_path: Mutex::new(entry.final_path.lock().unwrap().clone()),
                 queue: Mutex::new(entry_queue(&entry)),
                 login: entry.login.clone(),
                 password: entry.password.clone(),
@@ -4874,14 +5454,18 @@ async fn resume_download(
                 map.insert(live.id.clone(), live.clone());
             }
             entry.starting.store(false, Ordering::SeqCst);
-            spawn_emit_loop(app, live);
+            spawn_emit_loop(app.clone(), live.clone());
+            maybe_reveal_progress_dialog(&app, &state, &live);
             persist(&state);
         }
         Ok(())
     } else {
         // restored entry: start the engine — it resumes from its state file
         match start_engine(app.clone(), &entry).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                maybe_reveal_progress_dialog(&app, &state, &entry);
+                Ok(())
+            }
             Err(e) => {
                 // mirror start_entry's failure handling: a genuine
                 // failure surfaces on the entry as a visible error
@@ -4903,6 +5487,105 @@ async fn resume_download(
     }
 }
 
+/// One entry's removal, minus the persist and the pump: the
+/// batch command (m-19) runs this per entry and persists ONCE
+/// at the end — 200 single removals used to mean 200 settles
+/// interleaved with 200 full journal writes. M-6: the settle
+/// runs before ANY state is mutated, so a refusal (a merge
+/// still running) leaves the entry, its retry registration and
+/// its files exactly as they were.
+fn remove_entry_inner(
+    app: &AppHandle,
+    state: &AppState,
+    id: &str,
+    delete_file: bool,
+) -> Result<(), String> {
+    let entry = state.get(id).ok_or("unknown download id")?;
+    // judged BEFORE anything is cancelled: cancelling a video
+    // job rewrites its status to "cancelled", which would make
+    // a finished entry look unfinished to the check below
+    let was_finished = entry_is_finished(&entry);
+    // settle BEFORE any file is touched: the engines write
+    // their resume state one last time on the way out, and the
+    // old cancel-then-immediately-delete raced that write —
+    // the journal survived the delete and unique_out_path then
+    // treated the name as taken forever (R3). discard_entry
+    // (the browser dialog's path) already settled this way;
+    // the app's own removal now gets the same treatment.
+    settle_entry_engines(&entry)?;
+    state.retries.lock_ok().remove(id);
+    delete_progress_file(app, id);
+    // its downloaded bytes stay on the quota meter even though
+    // the entry leaves the list (deleting must not refund quota)
+    quota_note_removed(state, &entry);
+    entry.removed.store(true, Ordering::SeqCst);
+    // the engine's state file is our own bookkeeping: leaving it
+    // behind would make unique_out_path treat the path as taken
+    // forever (phantom "name (1)" on every future re-add). The
+    // partial data file itself is the user's — it stays.
+    sweep_engine_state_file(&entry);
+    // a video entry's intermediates are NDM's own working
+    // files, not user data: deleting a mid-download video used
+    // to orphan a full-size .ndm_stream part + its journal in
+    // the save folder (R3). The sweep covers exactly the
+    // discard set (stream parts, mux/audio temps, yt-dlp
+    // parts — journals ride along by prefix); the entry's
+    // final file follows the ordinary rule below.
+    if entry.kind == "video" && !was_finished {
+        sweep_video_temps(&entry);
+    }
+    // a captured-cookies file belongs to this entry alone and holds
+    // the user's browser session: it must not outlive the entry
+    if let Some(path) = state.cookies_path(&entry.cookies) {
+        let _ = std::fs::remove_file(path);
+    }
+    // IDM's delete confirmation offers "also delete the file":
+    // only then does the downloaded data itself go (the plain
+    // list removal above always keeps it). W193-2: the choice
+    // applies to the entry's file WHATEVER its status — the
+    // old rule silently kept the file of any entry that was
+    // not finished, so deleting an ACTIVE download with the
+    // box ticked stopped it, dropped the row, and left the
+    // partial on disk anyway. The engines have settled by
+    // now, so removing the file cannot race a writer. One
+    // guard (W193-5): if ANOTHER live entry points at the
+    // same file, the file stays — it is that entry's data too.
+    if delete_file {
+        let target = entry_file_path(&entry);
+        // snapshot first, file paths computed unlocked (the
+        // same discipline as the duplicate finders)
+        let others: Vec<Arc<Entry>> = state
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        let shared = others.iter().any(|e| {
+            e.id != entry.id
+                && !e.removed.load(Ordering::Relaxed)
+                && entry_file_path(e) == target
+        });
+        if !shared {
+            let _ = std::fs::remove_file(&target);
+        }
+    }
+    // the emit loop is stopped and the entry is leaving: its
+    // progress mirror must not survive it (the delete at the
+    // top of this command ran before the settle, when a last
+    // emit could still rewrite it — discard_entry does the
+    // same at its end)
+    delete_progress_file(app, id);
+    state.entries.lock_ok().remove(id);
+    state.order.lock_ok().retain(|x| x.as_str() != id);
+    // same removal signal discard_entry emits: this command is
+    // normally invoked BY the window (which drops the row itself),
+    // but the list must never depend on which path removed the
+    // entry (R3 X-REF)
+    let _ = app.emit("entry_removed", serde_json::json!({ "id": id }));
+    Ok(())
+}
+
 #[tauri::command]
 fn remove_download(
     app: AppHandle,
@@ -4910,93 +5593,35 @@ fn remove_download(
     id: String,
     delete_file: Option<bool>,
 ) -> Result<(), String> {
-    state.retries.lock_ok().remove(&id);
-    delete_progress_file(&app, &id);
-    if let Some(entry) = state.get(&id) {
-        // judged BEFORE anything is cancelled: cancelling a video
-        // job rewrites its status to "cancelled", which would make
-        // a finished entry look unfinished to the check below
-        let was_finished = entry_is_finished(&entry);
-        // its downloaded bytes stay on the quota meter even though
-        // the entry leaves the list (deleting must not refund quota)
-        quota_note_removed(&state, &entry);
-        entry.removed.store(true, Ordering::SeqCst);
-        // settle BEFORE any file is touched: the engines write
-        // their resume state one last time on the way out, and the
-        // old cancel-then-immediately-delete raced that write —
-        // the journal survived the delete and unique_out_path then
-        // treated the name as taken forever (R3). discard_entry
-        // (the browser dialog's path) already settled this way;
-        // the app's own removal now gets the same treatment.
-        settle_entry_engines(&entry);
-        // the engine's state file is our own bookkeeping: leaving it
-        // behind would make unique_out_path treat the path as taken
-        // forever (phantom "name (1)" on every future re-add). The
-        // partial data file itself is the user's — it stays.
-        sweep_engine_state_file(&entry);
-        // a video entry's intermediates are NDM's own working
-        // files, not user data: deleting a mid-download video used
-        // to orphan a full-size .ndm_stream part + its journal in
-        // the save folder (R3). The sweep covers exactly the
-        // discard set (stream parts, mux/audio temps, yt-dlp
-        // parts — journals ride along by prefix); the entry's
-        // final file follows the ordinary rule below.
-        if entry.kind == "video" && !was_finished {
-            sweep_video_temps(&entry);
-        }
-        // a captured-cookies file belongs to this entry alone and holds
-        // the user's browser session: it must not outlive the entry
-        if let Some(path) = state.cookies_path(&entry.cookies) {
-            let _ = std::fs::remove_file(path);
-        }
-        // IDM's delete confirmation offers "also delete the file":
-        // only then does the downloaded data itself go (the plain
-        // list removal above always keeps it). W193-2: the choice
-        // applies to the entry's file WHATEVER its status — the
-        // old rule silently kept the file of any entry that was
-        // not finished, so deleting an ACTIVE download with the
-        // box ticked stopped it, dropped the row, and left the
-        // partial on disk anyway. The engines have settled by
-        // now, so removing the file cannot race a writer. One
-        // guard (W193-5): if ANOTHER live entry points at the
-        // same file, the file stays — it is that entry's data too.
-        if delete_file.unwrap_or(false) {
-            let target = entry_file_path(&entry);
-            // snapshot first, file paths computed unlocked (the
-            // same discipline as the duplicate finders)
-            let others: Vec<Arc<Entry>> = state
-                .entries
-                .lock()
-                .unwrap()
-                .values()
-                .cloned()
-                .collect();
-            let shared = others.iter().any(|e| {
-                e.id != entry.id
-                    && !e.removed.load(Ordering::Relaxed)
-                    && entry_file_path(e) == target
-            });
-            if !shared {
-                let _ = std::fs::remove_file(&target);
-            }
-        }
-        // the emit loop is stopped and the entry is leaving: its
-        // progress mirror must not survive it (the delete at the
-        // top of this command ran before the settle, when a last
-        // emit could still rewrite it — discard_entry does the
-        // same at its end)
-        delete_progress_file(&app, &id);
-    }
-    state.entries.lock_ok().remove(&id);
-    state.order.lock_ok().retain(|x| x != &id);
-    // same removal signal discard_entry emits: this command is
-    // normally invoked BY the window (which drops the row itself),
-    // but the list must never depend on which path removed the
-    // entry (R3 X-REF)
-    let _ = app.emit("entry_removed", serde_json::json!({ "id": id }));
+    remove_entry_inner(&app, &state, &id, delete_file.unwrap_or(false))?;
     persist(&state);
     pump_queue(&app);
     Ok(())
+}
+
+/// m-19: bulk removal — ONE command for the whole selection,
+/// with a single persist (and one pump) at the end instead of a
+/// persist per entry. Every entry reports its own result: one
+/// that refuses (M-6 — still merging) names its error and does
+/// not block the rest of the batch.
+#[tauri::command]
+fn remove_downloads(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+    delete_file: Option<bool>,
+) -> Vec<serde_json::Value> {
+    let delete_file = delete_file.unwrap_or(false);
+    let results: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| match remove_entry_inner(&app, &state, id, delete_file) {
+            Ok(()) => serde_json::json!({ "id": id, "ok": true }),
+            Err(e) => serde_json::json!({ "id": id, "ok": false, "error": e }),
+        })
+        .collect();
+    persist(&state);
+    pump_queue(&app);
+    results
 }
 
 #[tauri::command]
@@ -5029,9 +5654,246 @@ fn set_completion(state: State<'_, AppState>, id: String, action: String) -> Res
         return Err("unknown completion action".to_string());
     }
     let entry = state.get(&id).ok_or("unknown download id")?;
-    *entry.completion.lock().unwrap() = action;
+    *entry.completion.lock().unwrap() = action.clone();
+    // G2 shim: the legacy single action also seeds the action
+    // list, so the two views of the setting never diverge
+    *entry.completion_actions.lock().unwrap() = legacy_completion_actions(&action, &[]);
     persist(&state);
     Ok(())
+}
+
+/// The known completion actions (G2).
+const COMPLETION_ACTIONS: [&str; 6] = [
+    "show_complete",
+    "open_file",
+    "open_folder",
+    "exit_app",
+    "turn_off_pc",
+    "restart_pc",
+];
+
+/// Validate + normalize a completion-action list from the UI:
+/// known values only, deduplicated, order preserved.
+fn valid_completion_actions(actions: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for a in actions {
+        if !COMPLETION_ACTIONS.contains(&a.as_str()) {
+            return Err("unknown completion action".to_string());
+        }
+        if !out.contains(a) {
+            out.push(a.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// The legacy single-action shim value for an action list: the
+/// first file/power action it contains (the only values the
+/// legacy field ever held), else "".
+fn legacy_completion_of(actions: &[String]) -> String {
+    actions
+        .iter()
+        .find(|a| {
+            matches!(
+                a.as_str(),
+                "open_file" | "open_folder" | "turn_off_pc" | "restart_pc"
+            )
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// G2: set an entry's whole completion-action list at once.
+#[tauri::command]
+fn set_completion_actions(
+    state: State<'_, AppState>,
+    id: String,
+    actions: Vec<String>,
+) -> Result<(), String> {
+    let actions = valid_completion_actions(&actions)?;
+    let entry = state.get(&id).ok_or("unknown download id")?;
+    *entry.completion_actions.lock().unwrap() = actions.clone();
+    *entry.completion.lock().unwrap() = legacy_completion_of(&actions);
+    persist(&state);
+    Ok(())
+}
+
+/// G2: set (or clear, with None) an entry's per-download
+/// override of the global show-complete-dialog setting.
+#[tauri::command]
+fn set_show_complete_override(
+    state: State<'_, AppState>,
+    id: String,
+    show: Option<bool>,
+) -> Result<(), String> {
+    let entry = state.get(&id).ok_or("unknown download id")?;
+    *entry.show_complete_override.lock().unwrap() = show;
+    persist(&state);
+    Ok(())
+}
+
+/// m-16: the categories the built-in table (and the Grabber)
+/// own — they can be neither renamed nor deleted.
+const BUILTIN_CATEGORIES: [&str; 7] = [
+    "General",
+    "Compressed",
+    "Documents",
+    "Music",
+    "Video",
+    "Programs",
+    "Grabber",
+];
+
+fn category_is_builtin(name: &str) -> bool {
+    BUILTIN_CATEGORIES
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(name))
+}
+
+/// Every category name currently in use: the built-ins, the
+/// settings maps' keys, and every entry's category.
+fn category_names_in_use(state: &AppState, s: &Settings) -> Vec<String> {
+    let mut names: Vec<String> = BUILTIN_CATEGORIES.iter().map(|c| c.to_string()).collect();
+    for k in s.category_exts.keys().chain(s.category_dirs.keys()) {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(k)) {
+            names.push(k.clone());
+        }
+    }
+    for e in state.entries.lock().unwrap().values() {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(&e.category)) {
+            names.push(e.category.clone());
+        }
+    }
+    names
+}
+
+/// Rebuild one entry under a different category — Entry's
+/// `category` is a plain field, so the swap_live pattern
+/// applies: a fresh Entry carrying every field across.
+fn clone_entry_with_category(e: &Entry, category: &str) -> Arc<Entry> {
+    Arc::new(Entry {
+        id: e.id.clone(),
+        name: e.name.clone(),
+        url: e.url.clone(),
+        out_path: e.out_path.clone(),
+        category: category.to_string(),
+        added: e.added.clone(),
+        last_try: Mutex::new(e.last_try.lock_ok().clone()),
+        download: e.download.clone(),
+        video: e.video.clone(),
+        kind: e.kind.clone(),
+        selector: e.selector.clone(),
+        audio: e.audio,
+        cookies: e.cookies.clone(),
+        referer: e.referer.clone(),
+        completion: Mutex::new(e.completion.lock_ok().clone()),
+        completion_actions: Mutex::new(e.completion_actions.lock_ok().clone()),
+        show_complete_override: Mutex::new(*e.show_complete_override.lock_ok()),
+        final_path: Mutex::new(e.final_path.lock_ok().clone()),
+        restored: Mutex::new(e.restored.lock_ok().clone()),
+        queued: AtomicBool::new(e.queued.load(Ordering::Relaxed)),
+        sample: Mutex::new(*e.sample.lock_ok()),
+        emitting: AtomicBool::new(false),
+        starting: AtomicBool::new(e.starting.load(Ordering::Relaxed)),
+        slot_preclaimed: AtomicBool::new(e.slot_preclaimed.load(Ordering::Relaxed)),
+        removed: AtomicBool::new(e.removed.load(Ordering::Relaxed)),
+        pause_requested: AtomicBool::new(e.pause_requested.load(Ordering::SeqCst)),
+        queue: Mutex::new(entry_queue(e)),
+        login: e.login.clone(),
+        password: e.password.clone(),
+        description: Mutex::new(e.description.lock_ok().clone()),
+        speed_limit: Mutex::new(*e.speed_limit.lock_ok()),
+    })
+}
+
+/// m-16: rename a category — the settings maps (extension
+/// rules + per-category folders) are re-keyed and every entry
+/// in the category is rewritten; both stores persist.
+fn rename_category_in(state: &AppState, old: &str, new: &str) -> Result<(), String> {
+    let new = new.trim();
+    if new.is_empty() {
+        return Err("the new category name is empty".to_string());
+    }
+    let mut s = current_settings(state);
+    let in_use = category_names_in_use(state, &s);
+    let canonical = in_use
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(old.trim()))
+        .cloned()
+        .ok_or("unknown category")?;
+    if category_is_builtin(&canonical) {
+        return Err("built-in categories cannot be renamed".to_string());
+    }
+    if in_use
+        .iter()
+        .any(|n| n != &canonical && n.eq_ignore_ascii_case(new))
+    {
+        return Err("a category with that name already exists".to_string());
+    }
+    if let Some(v) = s.category_exts.remove(&canonical) {
+        s.category_exts.insert(new.to_string(), v);
+    }
+    if let Some(v) = s.category_dirs.remove(&canonical) {
+        s.category_dirs.insert(new.to_string(), v);
+    }
+    *state.settings.lock().unwrap() = s;
+    save_settings(state);
+    let ids: Vec<String> = state.order.lock().unwrap().clone();
+    for id in ids {
+        if let Some(e) = state.get(&id) {
+            if e.category == canonical {
+                let fresh = clone_entry_with_category(&e, new);
+                state.entries.lock().unwrap().insert(id, fresh);
+            }
+        }
+    }
+    persist(state);
+    Ok(())
+}
+
+/// m-16: delete a category — built-ins refuse; its entries
+/// fall back to the default category ("General") and its
+/// settings keys go; both stores persist.
+fn delete_category_in(state: &AppState, name: &str) -> Result<(), String> {
+    let mut s = current_settings(state);
+    let in_use = category_names_in_use(state, &s);
+    let canonical = in_use
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(name.trim()))
+        .cloned()
+        .ok_or("unknown category")?;
+    if category_is_builtin(&canonical) {
+        return Err("built-in categories cannot be deleted".to_string());
+    }
+    s.category_exts.remove(&canonical);
+    s.category_dirs.remove(&canonical);
+    *state.settings.lock().unwrap() = s;
+    save_settings(state);
+    let ids: Vec<String> = state.order.lock().unwrap().clone();
+    for id in ids {
+        if let Some(e) = state.get(&id) {
+            if e.category == canonical {
+                let fresh = clone_entry_with_category(&e, "General");
+                state.entries.lock().unwrap().insert(id, fresh);
+            }
+        }
+    }
+    persist(state);
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_category(
+    state: State<'_, AppState>,
+    old: String,
+    new: String,
+) -> Result<(), String> {
+    rename_category_in(&state, &old, &new)
+}
+
+#[tauri::command]
+fn delete_category(state: State<'_, AppState>, name: String) -> Result<(), String> {
+    delete_category_in(&state, &name)
 }
 
 /// Is the video engine usable right now? yt-dlp is the engine
@@ -5222,12 +6084,37 @@ fn usable_update_asset(info: &ndm::updater::ReleaseInfo) -> bool {
     }
 }
 
+/// Latch hardening: is a fetched release version well-formed —
+/// an optional leading 'v', then at least one dot-separated
+/// component, every component non-empty digits? ("2.0.8",
+/// "v2.0.8" and "3" are; "", "v", "2..1" and "2.x" are not.)
+fn release_version_well_formed(v: &str) -> bool {
+    let v = v.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
+    if v.is_empty() {
+        return false;
+    }
+    v.split('.')
+        .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn do_check_update(app: &AppHandle) -> serde_json::Value {
     let state = app.state::<AppState>();
     let info = match ndm::updater::fetch_release() {
         Ok(info) => info,
         Err(e) => return serde_json::json!({ "status": "error", "message": e }),
     };
+    // latch hardening: a fetched record with an empty or
+    // unparseable version must never reach the "current" branch
+    // below — a comparison against garbage sorts unpredictably,
+    // and that branch CLEARS an armed latch and any pending
+    // offer. Only a well-formed record may do that.
+    if !release_version_well_formed(&info.version) {
+        return serde_json::json!({
+            "status": "error",
+            "message": "the update feed returned an unreadable version"
+        });
+    }
     let current = env!("CARGO_PKG_VERSION");
     if ndm::updater::version_cmp(&info.version, current) != std::cmp::Ordering::Greater {
         // #19: every check recomputes the latch FROM SCRATCH.
@@ -5440,6 +6327,11 @@ async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Result<()
                 // with no hint that a restart completes the update),
                 // and tell the UI to offer that restart
                 state.update_required.store(false, Ordering::SeqCst);
+                // m-10: the pending offer clears WITH the latch —
+                // it used to survive, so the update banner (and a
+                // second install of the same package) outlived
+                // the install it belonged to
+                *state.pending_update.lock().unwrap() = None;
                 let _ = app.emit(
                     "update_installed",
                     serde_json::json!({ "version": info.version }),
@@ -5707,10 +6599,16 @@ fn discard_cookies(state: State<'_, AppState>, token: String) {
 
 #[tauri::command]
 /// "Refresh download address" for an expired link: point the entry at a
-/// fresh URL for the same file. The engine state file is keyed to the old
-/// URL, so it is removed and the download restarts cleanly rather than
-/// trusting stale state; the entry keeps its name, folder and place in
-/// the list.
+/// fresh URL for the same file, IDM-style — the sealed progress is
+/// KEPT. The engine journal file is keyed to the output path and
+/// records its URL inside; `ndm::rebind_state_url` re-points that
+/// record at the new address, so the next start runs the ordinary
+/// resume verification against it (total, ETag / Last-Modified,
+/// sampled sealed-block bytes) and resumes from the sealed bytes
+/// when the new address serves the same file — or discards the
+/// journal and restarts from zero when it does not. The entry
+/// keeps its name, folder and place in the list, and stays paused
+/// either way; which of the two happened is decided at that start.
 fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: String) -> Result<(), String> {
     let new_url = new_url.trim().to_string();
     if !(new_url.starts_with("http://") || new_url.starts_with("https://")) {
@@ -5727,8 +6625,8 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
     if entry.kind == "video" {
         // a video entry stores the page address, and yt-dlp resolves a
         // fresh media address from it on every start — there is no
-        // expiring link to refresh (and the HTTP state-file cleanup
-        // below would be meaningless for it)
+        // expiring link to refresh (and it has no HTTP resume
+        // journal for the rebind below to re-point)
         return Err("video addresses are re-resolved on every start; nothing to refresh".to_string());
     }
     if entry.starting.load(Ordering::SeqCst) {
@@ -5737,6 +6635,14 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         // entry — refuse until the start settles
         return Err("the download is starting — try again in a moment".to_string());
     }
+    // what the quota meter currently credits this entry with,
+    // captured before anything is cancelled: a live handle's
+    // figure includes its unsealed partial block, a stub's is its
+    // restored record. Whatever of it does not survive the
+    // refresh is noted into quota_removed below — so the spent
+    // traffic is neither refunded nor double-counted.
+    let credited = payload_of(&entry).done_bytes;
+    let total = payload_of(&entry).total;
     if let Some(dl) = &entry.download {
         dl.control.cancel();
     }
@@ -5744,12 +6650,33 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         job.cancel();
     }
     entry.removed.store(true, Ordering::SeqCst); // stop a stray emit loop
-    // the refreshed entry restarts from byte 0: the bytes it already
-    // downloaded stay on the quota meter (the same accounting the
-    // remove paths use), or refreshing would refund spent budget
-    quota_note_removed(&state, &entry);
-    let total = payload_of(&entry).total;
-    let _ = std::fs::remove_file(ndm::state_path_for(&entry.out_path));
+    // let the engine settle before touching its journal: the
+    // supervisor's final save writes the definitive sealed state
+    // (still under the old URL), and the rebind below must land
+    // after it, not race it. Best-effort — if the settle cap
+    // expires, the refresh proceeds as it always did and the
+    // worst case is the old behaviour at the next start (a
+    // restart), never corruption: start_engine's accounting
+    // covers any bytes a lost race leaves uncredited.
+    let _ = settle_entry_engines(&entry);
+    // keep what can be kept: re-point the journal at the new
+    // address, then read the kept progress back from the journal
+    // itself — the journal, not this record, is the resume truth.
+    // A journal that cannot be re-pointed (missing, poisoned, not
+    // this entry's) keeps nothing; the partial stays on disk but
+    // no start will trust it, which the accounting below records.
+    let kept = if ndm::rebind_state_url(&entry.out_path, &entry.url, &new_url) {
+        ndm::peek_state(&new_url, &entry.out_path)
+    } else {
+        None
+    };
+    let (kept_total, kept_done, kept_blocks) = match &kept {
+        Some(pk) => (pk.total, pk.done_bytes, pk.blocks.clone()),
+        None => (total, 0, Vec::new()),
+    };
+    if credited > kept_done {
+        quota_note_discarded(&state, credited - kept_done);
+    }
     let fresh = Arc::new(Entry {
         id: entry.id.clone(),
         name: entry.name.clone(),
@@ -5766,21 +6693,27 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         referer: entry.referer.clone(),
         audio: entry.audio,
         restored: Mutex::new(Some(Restored {
-            total,
-            done_bytes: 0,
-            blocks: Vec::new(),
+            total: kept_total,
+            done_bytes: kept_done,
+            blocks: kept_blocks,
             resumable: true,
             status: "paused".to_string(),
             error: String::new(),
         })),
         queued: AtomicBool::new(false),
-        sample: Mutex::new((Instant::now(), 0, 0.0)),
+        // the rate sampler's baseline is the kept position, as in
+        // demote_terminal_live — seeding 0 would divide the kept
+        // history by the first live seconds on the next start
+        sample: Mutex::new((Instant::now(), kept_done, 0.0)),
         emitting: AtomicBool::new(false),
         starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(false),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+        completion_actions: Mutex::new(entry.completion_actions.lock().unwrap().clone()),
+        show_complete_override: Mutex::new(*entry.show_complete_override.lock().unwrap()),
+        final_path: Mutex::new(entry.final_path.lock().unwrap().clone()),
         queue: Mutex::new(entry_queue(&entry)),
         login: entry.login.clone(),
         password: entry.password.clone(),
@@ -6098,6 +7031,7 @@ fn do_add_video(
     force: bool,
     queue: String,
     dir_explicit: bool,
+    from_browser: bool,
 ) -> Result<String, String> {
     if state.update_required.load(Ordering::SeqCst) {
         return Err("please install the required update before starting new downloads".to_string());
@@ -6221,6 +7155,9 @@ fn do_add_video(
                 removed: AtomicBool::new(false),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(String::new()),
+                completion_actions: Mutex::new(Vec::new()),
+                show_complete_override: Mutex::new(None),
+                final_path: Mutex::new(String::new()),
                 queue: Mutex::new(queue.clone()),
                 login: login.clone(),
                 password: password.clone(),
@@ -6283,6 +7220,13 @@ fn do_add_video(
             // both go back
             state.entries.lock().unwrap().remove(&id);
             state.order.lock().unwrap().retain(|x| x != &id);
+            // m-13: the captured-cookies file goes with the
+            // rolled-back entry, exactly as on the HTTP add
+            // path — a browser session file must not outlive
+            // the entry it was captured for
+            if let Some(path) = state.cookies_path(&stub.cookies) {
+                let _ = std::fs::remove_file(path);
+            }
             release_entry_id(state, &id);
             return Err(e);
         }
@@ -6325,6 +7269,9 @@ fn do_add_video(
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
         pause_requested: AtomicBool::new(false),
         completion: Mutex::new(String::new()),
+        completion_actions: Mutex::new(stub.completion_actions.lock().unwrap().clone()),
+        show_complete_override: Mutex::new(*stub.show_complete_override.lock().unwrap()),
+        final_path: Mutex::new(stub.final_path.lock().unwrap().clone()),
         queue: Mutex::new(entry_queue(&stub)),
         login: stub.login.clone(),
         password: stub.password.clone(),
@@ -6356,6 +7303,11 @@ fn do_add_video(
         if let Some(j) = &entry.video {
             j.pause();
         }
+    }
+    // G7: an app-side video start reveals the progress dialog;
+    // a browser-takeover start never does (spec §1.3)
+    if !from_browser {
+        maybe_reveal_progress_dialog(app, state, &entry);
     }
     spawn_emit_loop(app.clone(), entry);
     persist(state);
@@ -6399,6 +7351,7 @@ async fn add_video(
         force.unwrap_or(false),
         queue.unwrap_or_else(main_queue_name),
         dir_explicit.unwrap_or(false),
+        false,
     )?;
     if let Some(d) = &description {
         if let Some(e) = state.get(&id) {
@@ -6518,6 +7471,42 @@ fn demote_phantom_finished(entry: &Entry) {
     }
 }
 
+/// M-4 restore trust: is the kept merge a journal entry points
+/// at complete enough to promote the entry to finished? A
+/// "paused" entry's merge had fully finalized, so only the exact
+/// recorded length proves it. A "merging" entry means the app
+/// died mid-merge: the muxed output is slightly LARGER than its
+/// parts, so any length within [0.5×, 2×] of the journal total
+/// is consistent with a completed merge (the start path then
+/// re-verifies through start_with_recorded_final's own guards).
+fn kept_merge_complete(status: &str, total: u64, len: Option<u64>) -> bool {
+    let Some(len) = len else { return false };
+    if total == 0 || len == 0 {
+        return false;
+    }
+    match status {
+        "paused" => len == total,
+        "merging" => (len as u128) * 2 >= total as u128 && (len as u128) <= (total as u128) * 2,
+        _ => false,
+    }
+}
+
+/// G2: the completion-action list a journal record means. A
+/// stored list wins; otherwise the legacy single-action string
+/// maps to its one action ("" → none, "open_file" → [open_file],
+/// "open_folder" → [open_folder], the power values likewise).
+fn legacy_completion_actions(legacy: &str, stored: &[String]) -> Vec<String> {
+    if !stored.is_empty() {
+        return stored.to_vec();
+    }
+    match legacy {
+        "open_file" | "open_folder" | "turn_off_pc" | "restart_pc" => {
+            vec![legacy.to_string()]
+        }
+        _ => Vec::new(),
+    }
+}
+
 fn restore_saved(state: &AppState) {
     let path = state.data_file.lock().unwrap().clone();
     let raw = match std::fs::read(&path) {
@@ -6571,17 +7560,27 @@ fn restore_saved(state: &AppState) {
         let stamp = chrono::Utc::now().timestamp();
         let backup = path.with_extension(format!("json.dropped-{stamp}"));
         let body = serde_json::to_string_pretty(&dropped).unwrap_or_default();
+        let n = dropped.len();
         if std::fs::write(&backup, body).is_ok() {
-            let n = dropped.len();
             *state.startup_notice.lock_ok() = Some(format!(
                 "{n} entr{} in the download history could not be read and {} set aside in {}. The rest of the list loaded normally.",
                 if n == 1 { "y" } else { "ies" },
                 if n == 1 { "was" } else { "were" },
                 backup.display()
             ));
+        } else {
+            // m-12: the notice must survive even when the backup
+            // write itself fails — dropped records are never
+            // silent, and the log line is the last-resort record
+            eprintln!("[ndm] {n} journal record(s) could not be read and the backup write failed: {dropped:?}");
+            *state.startup_notice.lock_ok() = Some(format!(
+                "{n} entr{} in the download history could not be read and had to be set aside (the backup copy could not be written). The rest of the list loaded normally.",
+                if n == 1 { "y" } else { "ies" }
+            ));
         }
     }
     let mut max_seq = 0u64;
+    let mut retry_seed: Vec<(String, u32)> = Vec::new();
     for s in saved {
         // the retired catch-all category name maps to "General"
         let s = if s.category == "All Downloads" {
@@ -6621,6 +7620,9 @@ fn restore_saved(state: &AppState) {
             // a duplicated id in the file must not render the row twice
             continue;
         }
+        if s.retry_count > 0 {
+            retry_seed.push((s.id.clone(), s.retry_count));
+        }
         let out_path = PathBuf::from(&s.out_path);
         if s.kind == "video" {
             // #15: a merge that completed before the restart is
@@ -6640,14 +7642,25 @@ fn restore_saved(state: &AppState) {
                     .filter(|m| m.is_file())
                     .map(|m| m.len())
             };
-            let merged_complete = s.status == "paused"
-                && s.total > 0
-                && matches!(recorded_final_len, Some(len) if len == s.total);
+            let merged_complete = kept_merge_complete(&s.status, s.total, recorded_final_len);
             let finished = s.status == "finished" || merged_complete;
-            let done = if finished { s.total } else { s.done_bytes.min(s.total) };
+            // M-4: a "merging" journal entry's output is slightly
+            // larger than its parts, so the restored total adopts
+            // the file's real length — the finished checks compare
+            // length == total and would reject the file otherwise
+            let restored_total = if merged_complete && s.status == "merging" {
+                recorded_final_len.unwrap_or(s.total)
+            } else {
+                s.total
+            };
+            let done = if finished {
+                restored_total
+            } else {
+                s.done_bytes.min(s.total)
+            };
             let n = 128usize;
-            let done_cells = if s.total > 0 {
-                ((done as u128 * n as u128) / s.total as u128) as usize
+            let done_cells = if restored_total > 0 {
+                ((done as u128 * n as u128) / restored_total as u128) as usize
             } else {
                 0
             };
@@ -6671,7 +7684,7 @@ fn restore_saved(state: &AppState) {
                 referer: s.referer.clone(),
                 audio: s.audio,
                 restored: Mutex::new(Some(Restored {
-                    total: s.total,
+                    total: restored_total,
                     done_bytes: done,
                     blocks,
                     resumable: true,
@@ -6694,6 +7707,12 @@ fn restore_saved(state: &AppState) {
                 removed: AtomicBool::new(false),
                 pause_requested: AtomicBool::new(false),
                 completion: Mutex::new(s.completion.clone()),
+                completion_actions: Mutex::new(legacy_completion_actions(
+                    &s.completion,
+                    &s.completion_actions,
+                )),
+                show_complete_override: Mutex::new(s.show_complete_override),
+                final_path: Mutex::new(s.final_path.clone()),
                 queue: Mutex::new(s.queue.clone()),
                 login: s.login.clone(),
                 password: s.password.clone(),
@@ -6785,6 +7804,12 @@ fn restore_saved(state: &AppState) {
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(s.completion.clone()),
+            completion_actions: Mutex::new(legacy_completion_actions(
+                &s.completion,
+                &s.completion_actions,
+            )),
+            show_complete_override: Mutex::new(s.show_complete_override),
+            final_path: Mutex::new(s.final_path.clone()),
             queue: Mutex::new(s.queue.clone()),
             login: s.login.clone(),
             password: s.password.clone(),
@@ -6794,6 +7819,16 @@ fn restore_saved(state: &AppState) {
         demote_phantom_finished(&entry);
         state.entries.lock().unwrap().insert(s.id.clone(), entry);
         state.order.lock().unwrap().push(s.id.clone());
+    }
+    // m-8: retry budgets spent before the restart still count —
+    // the restored attempts come due shortly after launch rather
+    // than instantly, so a crash loop cannot burn the whole
+    // budget in one burst
+    if !retry_seed.is_empty() {
+        let mut retries = state.retries.lock_ok();
+        for (id, n) in retry_seed {
+            retries.insert(id, (n, Instant::now() + Duration::from_secs(30)));
+        }
     }
     state.seq.store(max_seq + 1, Ordering::Relaxed);
 }
@@ -6807,7 +7842,109 @@ const WARM_MAX_INFLIGHT: usize = 4;
 /// Process the browser extension's incoming queue file. A leftover
 /// `incoming.processing` from a crashed run is drained first, so queued
 /// links are never silently lost.
+/// EXT §1c: one ext_seen.json stamp, as the host writes it:
+/// `{ "ext_version": <string|null>, "at": <unix seconds> }`. A
+/// null version positively means a pre-handshake extension is
+/// alive (it pings without the field), not an error.
+#[derive(Deserialize)]
+struct ExtSeen {
+    #[serde(default)]
+    ext_version: Option<String>,
+    #[serde(default)]
+    at: i64,
+}
+
+/// EXT §1c decision (pure): Some(bundled) = show the notice for
+/// that bundled version now.
+/// - no stamp → None (no evidence any extension runs)
+/// - the notice was already shown for this bundled version → None
+/// - seen == bundled → None
+/// - seen is null (a pre-handshake extension) → show
+/// - seen < bundled → show
+/// - seen > bundled → None (never nag toward a downgrade)
+fn ext_notice_decision(stamp: Option<&ExtSeen>, bundled: &str, shown_for: &str) -> Option<String> {
+    let stamp = stamp?;
+    if shown_for == bundled {
+        return None;
+    }
+    match &stamp.ext_version {
+        None => Some(bundled.to_string()),
+        Some(seen) => match ndm::updater::version_cmp(seen, bundled) {
+            std::cmp::Ordering::Less => Some(bundled.to_string()),
+            _ => None,
+        },
+    }
+}
+
+/// EXT §1c/§2: read the host's ext_seen.json stamp from the
+/// data dir; when the decision says show, record
+/// ext_notice_for = bundled in the settings AT SHOW TIME (so
+/// the notice is one-time per bundled version even if the app
+/// is killed before it is read) and emit the banner event.
+fn check_ext_notice(app: &AppHandle, state: &AppState) {
+    let Some(dir) = state
+        .data_file
+        .lock_ok()
+        .parent()
+        .map(|p| p.to_path_buf())
+    else {
+        return;
+    };
+    let stamp: Option<ExtSeen> = std::fs::read_to_string(dir.join("ext_seen.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok());
+    let shown_for = current_settings(state).ext_notice_for;
+    // the bundled extension version is the app version (the
+    // release discipline keeps extension/manifest.json == app
+    // version; the spec's §1c ruling)
+    let Some(bundled) =
+        ext_notice_decision(stamp.as_ref(), env!("CARGO_PKG_VERSION"), &shown_for)
+    else {
+        return;
+    };
+    let seen_label = stamp
+        .as_ref()
+        .and_then(|s| s.ext_version.clone())
+        .unwrap_or_else(|| "an older version".to_string());
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.ext_notice_for = bundled.clone();
+    }
+    save_settings(state);
+    let _ = app.emit(
+        "ext_update_notice",
+        serde_json::json!({ "seen_label": seen_label, "bundled": bundled }),
+    );
+}
+
+/// EXT §2: dismissing the banner changes nothing in state —
+/// ext_notice_for was already recorded at show time, so the
+/// notice stays one-time per bundled version either way.
+#[tauri::command]
+fn dismiss_ext_notice() {}
+
 fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
+    // EXT §1c: the extension version stamp is re-checked while
+    // the incoming queue is being processed (throttled — the
+    // drain runs on every queue-file change, the check at most
+    // every 10 s)
+    {
+        static LAST_EXT_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+        let due = {
+            let mut last = LAST_EXT_CHECK.lock_ok();
+            match *last {
+                Some(t) if t.elapsed() < Duration::from_secs(10) => false,
+                _ => {
+                    *last = Some(Instant::now());
+                    true
+                }
+            }
+        };
+        if due {
+            let state = handle.state::<AppState>();
+            check_ext_notice(handle, &state);
+        }
+    }
     let queue = queue_dir.join("incoming.jsonl");
     let processing = queue_dir.join("incoming.processing");
     if !processing.exists() {
@@ -7010,7 +8147,20 @@ fn drop_cookies_token(state: &AppState, token: &str) {
 /// parts survived deletes (R3). A paused engine's workers are
 /// already gone — nothing is left to write, so there is nothing
 /// to wait for on that side.
-fn settle_entry_engines(entry: &Entry) {
+/// M-6: may a removal proceed past the settle wait? Only a job
+/// that actually SETTLED may be swept. A merge still running at
+/// the cap means the removal must REFUSE — sweeping under a live
+/// ffmpeg deletes files the merge is writing, and the old
+/// expire-and-sweep-anyway rule did exactly that.
+fn settle_outcome(settled: bool) -> Result<(), String> {
+    if settled {
+        Ok(())
+    } else {
+        Err("still merging — try again when the merge finishes".to_string())
+    }
+}
+
+fn settle_entry_engines(entry: &Entry) -> Result<(), String> {
     if let Some(dl) = &entry.download {
         dl.control.cancel();
         // Wait for SETTLED, not merely terminal: the engine's
@@ -7037,16 +8187,23 @@ fn settle_entry_engines(entry: &Entry) {
         // settled (is_settled now includes the spawn thread's
         // alive flag), not for the flipped status. The cap is far
         // longer than the HTTP one because a merge of a long video
-        // legitimately takes tens of seconds; on expiry the
-        // sweeps below still run, exactly as before.
+        // legitimately takes tens of seconds. M-6: on expiry the
+        // removal REFUSES (settle_outcome) — the entry and its
+        // files stay untouched and the user retries once the
+        // merge has finished, instead of the sweep deleting the
+        // file out from under a running ffmpeg.
+        let mut settled = false;
         for _ in 0..600 {
             let st = job.progress.lock_ok().status.clone();
             if matches!(st.as_str(), "cancelled" | "error" | "finished") && job.is_settled() {
+                settled = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+        settle_outcome(settled)?;
     }
+    Ok(())
 }
 
 /// Remove an entry's engine resume-state file, and keep removing
@@ -7168,7 +8325,12 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
     // discard aborts with nothing touched, under the same rule as
     // the finished guard above (R2-EXT-05).
     if entry.video.is_some() {
-        settle_entry_engines(entry);
+        // M-6: a job that will not settle (a merge still running)
+        // refuses the discard too — nothing is touched and the
+        // entry stays, exactly as with the finished guard above
+        if settle_entry_engines(entry).is_err() {
+            return;
+        }
         if entry_is_finished(entry) {
             return;
         }
@@ -7181,7 +8343,9 @@ fn discard_entry(app: &AppHandle, state: &AppState, entry: &Arc<Entry>) {
         // the resume state one last time, and deleting the files
         // before that would leave an orphan state file behind (a
         // later download of the same name could trust stale blocks)
-        settle_entry_engines(entry);
+        if settle_entry_engines(entry).is_err() {
+            return;
+        }
     }
     state.entries.lock_ok().remove(&entry.id);
     state.order.lock_ok().retain(|x| x != &entry.id);
@@ -7436,6 +8600,7 @@ fn handle_incoming_line(handle: &AppHandle, line: &str) {
             force,
             main_queue_name(),
             false,
+            true,
         ) {
             Ok(entry_id) => write_ack_and_result(
                 handle,
@@ -8147,6 +9312,10 @@ fn main() {
                 load_settings(&state);
                 load_quota(&state);
                 restore_saved(&state);
+                // EXT §1c: the extension-update notice is also
+                // evaluated once at startup (and then throttled
+                // through drain_incoming)
+                check_ext_notice(app.handle(), &state);
             }
             // silent update check + the one-time anonymous install
             // count. Nothing is shown unless an update exists.
@@ -8296,7 +9465,8 @@ fn main() {
                                     {
                                         slot.1 = Instant::now() + Duration::from_secs(30);
                                     }
-                                    e.queued.store(true, Ordering::Relaxed);
+                                    // M-12: flag AND record together
+                                    mark_requeued(&e);
                                     any = true;
                                 }
                                 DueRetry::Keep => {
@@ -8354,7 +9524,7 @@ fn main() {
                             // the catch-all for entries restored from
                             // disk parked, which no add/move/settings
                             // path has touched this session
-                            adopt_parked_entries(&handle4, &state, &s, &cfg.name);
+                            adopt_parked_entries(&handle4, &state, &s, &cfg.name, false);
                             if effective_cap(&s, &cfg.name) == 0 && !quota_blocks(&state) {
                                 // start-all respects Download limits:
                                 // an exhausted quota is not overridden
@@ -8560,6 +9730,7 @@ fn main() {
             pause_download,
             resume_download,
             remove_download,
+            remove_downloads,
             list_downloads,
             probe_file,
             probe_video,
@@ -8578,6 +9749,11 @@ fn main() {
             scheduler_stop_now,
             open_path,
             set_completion,
+            set_completion_actions,
+            set_show_complete_override,
+            rename_category,
+            delete_category,
+            dismiss_ext_notice,
             refresh_url,
             take_pending_videos,
             take_startup_notice,
@@ -8834,6 +10010,9 @@ mod tests {
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(String::new()),
+            completion_actions: Mutex::new(Vec::new()),
+            show_complete_override: Mutex::new(None),
+            final_path: Mutex::new(String::new()),
             queue: Mutex::new(String::new()),
             login: String::new(),
             password: String::new(),
@@ -9093,6 +10272,9 @@ mod tests {
             removed: AtomicBool::new(false),
             pause_requested: AtomicBool::new(false),
             completion: Mutex::new(String::new()),
+            completion_actions: Mutex::new(Vec::new()),
+            show_complete_override: Mutex::new(None),
+            final_path: Mutex::new(String::new()),
             queue: Mutex::new(String::new()),
             login: String::new(),
             password: String::new(),
@@ -9736,21 +10918,16 @@ mod tests {
         persist(&state);
         // compare the recorded path semantically, by parsing the
         // journal: in the raw JSON text a Windows path's
-        // backslashes are escaped ("\\"), so searching the raw
-        // text for the un-escaped path can never match there
+        // backslashes are escaped, so a raw `contains` check for
+        // the plain path can never match there
         let text = std::fs::read_to_string(&data_file).unwrap();
-        let journal: serde_json::Value =
-            serde_json::from_str(&text).expect("journal is valid JSON");
+        let journal: Vec<serde_json::Value> =
+            serde_json::from_str(&text).expect("journal parses");
         let recorded = journal
-            .as_array()
-            .and_then(|entries| {
-                entries
-                    .iter()
-                    .find(|s| s.get("id").and_then(|v| v.as_str()) == Some("dl-9"))
-            })
-            .and_then(|s| s.get("final_path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or_else(|| panic!("journal must record the merged path: {text}"));
+            .iter()
+            .find(|r| r["id"] == "dl-9")
+            .and_then(|r| r["final_path"].as_str())
+            .unwrap_or_default();
         assert_eq!(
             recorded,
             merged.to_string_lossy().as_ref(),
@@ -9872,6 +11049,375 @@ mod tests {
         // as optional
         let offer = pending_update_payload(Some(&info), false);
         assert_eq!(offer["mandatory"], false);
+    }
+
+    // ── 2.0.8 hunt batch (Wave 2, app) ──
+
+    #[test]
+    fn mandatory_update_latch_blocks_the_pump_claim() {
+        // M-3: while the mandatory-update latch is armed, the
+        // pump's claim refuses WITHOUT consuming the queued
+        // flag — the entry stays queued (not errored, not
+        // dequeued) and starts once the latch clears
+        let state = state_with_data_file(PathBuf::from("/tmp/ndm-m3-test.json"));
+        let e = parked_entry(0, "queued");
+        e.queued.store(true, Ordering::Relaxed);
+        state.update_required.store(true, Ordering::Relaxed);
+        assert!(!try_claim_for_pump(&state, &e));
+        assert!(e.queued.load(Ordering::Relaxed), "flag must survive a refused claim");
+        // the start-engine gate reports the latch with the
+        // shared rejection text (m-7 treats it as benign)
+        assert!(benign_start_rejection(LATCH_BLOCKED));
+        state.update_required.store(false, Ordering::Relaxed);
+        assert!(try_claim_for_pump(&state, &e));
+        assert!(!e.queued.load(Ordering::Relaxed), "a real claim consumes the flag");
+        assert!(!try_claim_for_pump(&state, &e), "nothing left to claim");
+    }
+
+    #[test]
+    fn latch_rejection_text_is_stable_for_the_benign_check() {
+        // start_engine's latch arm returns this exact constant;
+        // add_download's m-7 branch keys on it through
+        // benign_start_rejection, so the wording is load-bearing
+        assert_eq!(
+            LATCH_BLOCKED,
+            "downloads are paused until the required update is installed"
+        );
+    }
+
+    #[test]
+    fn recorded_final_path_binds_finished_and_resolve() {
+        // M-5: a restored video entry with a recorded final_path
+        // binds its finished-check and its file resolution to
+        // THAT file — never to a same-size stranger the folder
+        // scan would otherwise pick
+        let dir = std::env::temp_dir().join(format!("ndm-m5-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let recorded = dir.join("recorded.mp4");
+        let stranger = dir.join("movie.mp4");
+        std::fs::write(&recorded, b"12345").unwrap();
+        std::fs::write(&stranger, b"abcde").unwrap();
+
+        let mut e = restored_entry("movie.mp4", "video", 5, dir.clone());
+        *e.final_path.lock().unwrap() = recorded.to_string_lossy().into_owned();
+        assert_eq!(resolve_video_file(&e), recorded);
+        assert_eq!(entry_file_path(&e), recorded);
+        assert!(entry_is_finished(&e));
+
+        // the recorded file is deleted while a same-size
+        // stranger remains: no phantom finish, and resolution
+        // still names the (missing) recorded file, so
+        // delete-with-file removes nothing for this entry
+        std::fs::remove_file(&recorded).unwrap();
+        assert_eq!(resolve_video_file(&e), recorded);
+        assert!(!entry_is_finished(&e));
+        assert!(stranger.exists(), "the stranger is never touched");
+
+        // with NO recorded path the heuristics still apply
+        *e.final_path.lock().unwrap() = String::new();
+        e.out_path = dir.clone();
+        assert!(entry_is_finished(&e), "scan finds the same-size file as before");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kept_merge_trust_accepts_merging_within_tolerance() {
+        // M-4 restore trust: "paused" keeps the exact-length
+        // rule; "merging" accepts a merge output within
+        // [0.5×, 2×] of the journal total (a merge output is
+        // slightly larger than its parts)
+        assert!(kept_merge_complete("paused", 1000, Some(1000)));
+        assert!(!kept_merge_complete("paused", 1000, Some(1001)));
+        assert!(!kept_merge_complete("paused", 1000, None));
+        assert!(kept_merge_complete("merging", 1000, Some(1000)));
+        assert!(kept_merge_complete("merging", 1000, Some(1500)));
+        assert!(kept_merge_complete("merging", 1000, Some(500)));
+        assert!(kept_merge_complete("merging", 1000, Some(2000)));
+        assert!(!kept_merge_complete("merging", 1000, Some(499)));
+        assert!(!kept_merge_complete("merging", 1000, Some(2001)));
+        assert!(!kept_merge_complete("merging", 1000, None));
+        assert!(!kept_merge_complete("downloading", 1000, Some(1000)));
+    }
+
+    #[test]
+    fn requeue_moves_flag_and_record_together() {
+        // M-12 (the divergence class): window-close re-queue
+        // used to set only the in-memory flag; the record kept
+        // saying "paused", so the payload mislabeled the entry
+        // (m-18) and record-reading claim paths skipped it.
+        // Simulate: run in window 1 → re-queue at close →
+        // window 2 opens → the pump must claim it.
+        let state = state_with_data_file(PathBuf::from("/tmp/ndm-m12-test.json"));
+        let e = parked_entry(400, "paused");
+        mark_requeued(&e);
+        assert!(e.queued.load(Ordering::Relaxed));
+        assert_eq!(e.restored.lock().unwrap().as_ref().unwrap().status, "queued");
+        assert_eq!(payload_of(&e).status, "queued");
+        // window 2: the claim succeeds exactly once
+        assert!(try_claim_for_pump(&state, &e));
+        assert!(!try_claim_for_pump(&state, &e));
+        // a finished record is never resurrected by a re-queue
+        let f = parked_entry(1000, "finished");
+        mark_requeued(&f);
+        assert_eq!(f.restored.lock().unwrap().as_ref().unwrap().status, "finished");
+    }
+
+    #[test]
+    fn journal_queued_entry_restores_claimable() {
+        // M-12 restore half: a journal-"queued" record restores
+        // with its in-memory flag set, so a restart mid-window
+        // leaves it claimable by the pump
+        let dir = std::env::temp_dir().join(format!("ndm-m12r-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        std::fs::write(
+            &data_file,
+            r#"[{"id":"dl-3","name":"q.bin","url":"https://example.com/q.bin",
+                 "out_path":"/tmp/q.bin","added":"2026-10-01 09:15","total":100,
+                 "done_bytes":10,"status":"queued","kind":"http"}]"#,
+        )
+        .unwrap();
+        let state = state_with_data_file(data_file);
+        restore_saved(&state);
+        let e = state.get("dl-3").expect("queued entry restored");
+        assert!(e.queued.load(Ordering::Relaxed));
+        assert_eq!(payload_of(&e).status, "queued");
+        assert!(try_claim_for_pump(&state, &e));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn retry_counts_survive_the_journal_round_trip() {
+        // m-8: retry attempt counts persist in the journal and
+        // restore back into the retry map, so the budget of 10
+        // survives restarts
+        let dir = std::env::temp_dir().join(format!("ndm-m8-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        let state = state_with_data_file(data_file.clone());
+        let entry = Arc::new(restored_entry("r.bin", "http", 100, dir.join("r.bin")));
+        state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
+        state.order.lock().unwrap().push("dl-1".to_string());
+        state
+            .retries
+            .lock()
+            .unwrap()
+            .insert("dl-1".to_string(), (4, Instant::now()));
+        persist(&state);
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(text.contains("\"retry_count\":4"), "journal: {text}");
+
+        let state2 = state_with_data_file(data_file);
+        restore_saved(&state2);
+        let retries = state2.retries.lock().unwrap();
+        assert_eq!(retries.get("dl-1").map(|(n, _)| *n), Some(4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn video_durable_bytes_count_sealed_parts_not_live_claims() {
+        // m-9: durable progress for a video = the sealed bytes
+        // in the engine parts' state files (or the yt-dlp .part
+        // lengths) — never the job's live in-memory count
+        let dir = std::env::temp_dir().join(format!("ndm-m9-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = restored_entry("movie.mp4", "video", 1000, dir.clone());
+        assert_eq!(video_durable_done_bytes(&e), 0);
+        // an engine part with 3 of 10 blocks sealed
+        let part = dir.join(".movie.ndm_stream0.mp4.part");
+        std::fs::write(&part, b"partial").unwrap();
+        let sp = ndm::state_path_for(&part);
+        std::fs::write(
+            &sp,
+            r#"{"total":1000,"block_size":100,"done":[1,1,1,0,0,0,0,0,0,0]}"#,
+        )
+        .unwrap();
+        assert_eq!(video_durable_done_bytes(&e), 300);
+        // without engine parts, yt-dlp fragments count by length
+        std::fs::remove_file(&part).unwrap();
+        std::fs::remove_file(&sp).unwrap();
+        std::fs::write(dir.join("movie.f137.mp4.part"), b"12345").unwrap();
+        assert_eq!(video_durable_done_bytes(&e), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settle_refusal_is_an_honest_error() {
+        // M-6: a settle that times out under a live merge must
+        // refuse the delete, never sweep anyway
+        assert!(settle_outcome(true).is_ok());
+        let err = settle_outcome(false).unwrap_err();
+        assert!(err.contains("still merging"), "error: {err}");
+    }
+
+    #[test]
+    fn malformed_release_versions_are_rejected() {
+        // latch hardening: only a well-formed fetched version
+        // may take do_check_update's "current" branch and clear
+        // an armed latch / pending offer
+        assert!(release_version_well_formed("2.0.8"));
+        assert!(release_version_well_formed("v2.0.8"));
+        assert!(release_version_well_formed(" 2.0.8 "));
+        assert!(release_version_well_formed("2.0"));
+        assert!(!release_version_well_formed(""));
+        assert!(!release_version_well_formed("v"));
+        assert!(!release_version_well_formed("2..1"));
+        assert!(!release_version_well_formed("2.0.x"));
+        assert!(!release_version_well_formed("latest"));
+        assert!(!release_version_well_formed("2.0.8-beta"));
+    }
+
+    #[test]
+    fn legacy_completion_maps_to_the_action_list() {
+        // G2 load mapping: stored lists win; the legacy single
+        // action maps to a one-element list; "" maps to none
+        assert!(legacy_completion_actions("", &[]).is_empty());
+        assert_eq!(legacy_completion_actions("open_file", &[]), ["open_file"]);
+        assert_eq!(legacy_completion_actions("turn_off_pc", &[]), ["turn_off_pc"]);
+        assert!(legacy_completion_actions("bogus", &[]).is_empty());
+        let stored = vec!["show_complete".to_string(), "exit_app".to_string()];
+        assert_eq!(legacy_completion_actions("open_file", &stored), stored);
+    }
+
+    #[test]
+    fn completion_actions_round_trip_the_journal() {
+        // G2: the action list + show override persist and
+        // restore; the legacy field is dropped once the list is
+        // stored (persist writes it empty)
+        let dir = std::env::temp_dir().join(format!("ndm-g2-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data_file = dir.join("downloads.json");
+        let state = state_with_data_file(data_file.clone());
+        let entry = Arc::new(restored_entry("c.bin", "http", 100, dir.join("c.bin")));
+        *entry.completion_actions.lock().unwrap() =
+            vec!["show_complete".to_string(), "open_folder".to_string()];
+        *entry.show_complete_override.lock().unwrap() = Some(false);
+        state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
+        state.order.lock().unwrap().push("dl-1".to_string());
+        persist(&state);
+        let text = std::fs::read_to_string(&data_file).unwrap();
+        assert!(text.contains("\"open_folder\""), "journal: {text}");
+        assert!(text.contains("\"show_complete_override\":false"), "journal: {text}");
+
+        let state2 = state_with_data_file(data_file);
+        restore_saved(&state2);
+        let back = state2.get("dl-1").expect("entry restored");
+        assert_eq!(
+            completion_actions_of(&back),
+            ["show_complete", "open_folder"]
+        );
+        assert_eq!(*back.show_complete_override.lock().unwrap(), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_show_dialog_priority() {
+        // G2 gating: per-entry override > the list's own
+        // show_complete action > the global setting
+        assert!(completion_show_dialog(&[], Some(true), false));
+        assert!(!completion_show_dialog(&["show_complete".into()], Some(false), true));
+        assert!(completion_show_dialog(&["show_complete".into()], None, false));
+        assert!(completion_show_dialog(&[], None, true));
+        assert!(!completion_show_dialog(&["open_file".into()], None, false));
+    }
+
+    #[test]
+    fn completion_action_validation_dedupes_and_rejects_unknown() {
+        let ok = valid_completion_actions(&[
+            "open_file".to_string(),
+            "open_file".to_string(),
+            "exit_app".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(ok, ["open_file", "exit_app"]);
+        assert!(valid_completion_actions(&["dance".to_string()]).is_err());
+        // the legacy shim of a list is its first file/power action
+        assert_eq!(
+            legacy_completion_of(&["show_complete".into(), "restart_pc".into()]),
+            "restart_pc"
+        );
+        assert_eq!(legacy_completion_of(&["show_complete".into()]), "");
+    }
+
+    #[test]
+    fn category_rename_and_delete_rewrite_entries() {
+        // m-16: rename re-keys the settings maps and rewrites
+        // every entry's category; delete refuses built-ins and
+        // reassigns its entries to General
+        let dir = std::env::temp_dir().join(format!("ndm-m16-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_with_data_file(dir.join("downloads.json"));
+        *state.settings_file.lock().unwrap() = dir.join("settings.json");
+        {
+            let mut s = state.settings.lock().unwrap();
+            s.category_exts
+                .insert("Work".to_string(), vec!["xyz".to_string()]);
+            s.category_dirs
+                .insert("Work".to_string(), "/tmp/work".to_string());
+        }
+        let mut e = restored_entry("w.bin", "http", 10, dir.join("w.bin"));
+        e.category = "Work".to_string();
+        state.entries.lock().unwrap().insert("dl-1".to_string(), Arc::new(e));
+        state.order.lock().unwrap().push("dl-1".to_string());
+
+        assert!(rename_category_in(&state, "General", "X").is_err(), "built-in rename refuses");
+        assert!(rename_category_in(&state, "Work", "Video").is_err(), "collision refuses");
+        assert!(rename_category_in(&state, "Work", "  ").is_err(), "empty refuses");
+        assert!(rename_category_in(&state, "Nope", "X").is_err(), "unknown refuses");
+        rename_category_in(&state, "Work", "Jobs").unwrap();
+        assert_eq!(state.get("dl-1").unwrap().category, "Jobs");
+        {
+            let s = state.settings.lock().unwrap();
+            assert!(s.category_exts.contains_key("Jobs"));
+            assert!(!s.category_exts.contains_key("Work"));
+            assert_eq!(s.category_dirs.get("Jobs").map(|d| d.as_str()), Some("/tmp/work"));
+        }
+        assert!(delete_category_in(&state, "Music").is_err(), "built-in delete refuses");
+        delete_category_in(&state, "Jobs").unwrap();
+        assert_eq!(state.get("dl-1").unwrap().category, "General");
+        assert!(!state.settings.lock().unwrap().category_exts.contains_key("Jobs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ext_notice_decision_matrix() {
+        // EXT §1c/§5: the full decision matrix
+        let stamp = |v: Option<&str>| ExtSeen {
+            ext_version: v.map(|s| s.to_string()),
+            at: 0,
+        };
+        // no stamp → never
+        assert_eq!(ext_notice_decision(None, "2.0.8", ""), None);
+        // already shown for this bundled version → never
+        assert_eq!(ext_notice_decision(Some(&stamp(Some("2.0.7"))), "2.0.8", "2.0.8"), None);
+        assert_eq!(ext_notice_decision(Some(&stamp(None)), "2.0.8", "2.0.8"), None);
+        // seen == bundled → never
+        assert_eq!(ext_notice_decision(Some(&stamp(Some("2.0.8"))), "2.0.8", ""), None);
+        // null (pre-handshake extension alive) → show
+        assert_eq!(
+            ext_notice_decision(Some(&stamp(None)), "2.0.8", ""),
+            Some("2.0.8".to_string())
+        );
+        // seen older → show
+        assert_eq!(
+            ext_notice_decision(Some(&stamp(Some("2.0.7"))), "2.0.8", ""),
+            Some("2.0.8".to_string())
+        );
+        // seen newer → never (no downgrade nag)
+        assert_eq!(ext_notice_decision(Some(&stamp(Some("2.0.9"))), "2.0.8", ""), None);
+        // shown for an OLDER bundled version does not suppress
+        // the notice for a newer one
+        assert_eq!(
+            ext_notice_decision(Some(&stamp(Some("2.0.7"))), "2.0.8", "2.0.7"),
+            Some("2.0.8".to_string())
+        );
     }
 }
 

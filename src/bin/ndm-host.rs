@@ -99,16 +99,18 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
                 // hand-off costs the next one well under a second —
                 // only a LIVE owner's lock is waited on
                 if lock_is_stale(&lock_path) {
-                    let _ = std::fs::remove_file(&lock_path);
+                    // reaped through the fingerprint check, so a
+                    // lock a fresh owner created in the meantime is
+                    // never the file that gets removed
+                    reap_stale_lock(&lock_path);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
-    if guard.is_none() && lock_is_stale(&lock_path) {
+    if guard.is_none() && reap_stale_lock(&lock_path) {
         // one last recovery attempt after the spin before falling
         // back to the unlocked append
-        let _ = std::fs::remove_file(&lock_path);
         guard = acquire_queue_lock(&lock_path);
     }
     let result = (|| {
@@ -143,7 +145,22 @@ fn acquire_queue_lock(lock_path: &std::path::Path) -> Option<std::fs::File> {
 /// Whether this pid currently names a live process.
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+    // /proc/<pid> exists for a ZOMBIE too — the entry only goes
+    // away once the parent reaps it — so existence alone made a
+    // dead hand-off's lock look owned by a live process and every
+    // later hand-off burned its whole spin on it (W1 F12). Read
+    // the stat state field instead, the same care app_is_running
+    // below already takes: state 'Z' is dead, whatever /proc says.
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match stat.rsplit_once(')') {
+        Some((_, rest)) => !rest.trim_start().starts_with('Z'),
+        // a stat we cannot parse still proves the process exists;
+        // stay conservative and call it alive
+        None => true,
+    }
 }
 
 #[cfg(windows)]
@@ -214,6 +231,61 @@ fn lock_is_stale(lock_path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The identity of one lock file at one instant: its exact content
+/// (the owner pid) plus its inode, so a file that was removed and
+/// re-created by a NEW owner in between never compares equal to
+/// the one that was judged stale.
+#[derive(PartialEq, Eq)]
+struct LockFingerprint {
+    content: Vec<u8>,
+    #[cfg(unix)]
+    ino: u64,
+    len: u64,
+}
+
+fn lock_fingerprint(lock_path: &std::path::Path) -> Option<LockFingerprint> {
+    let content = std::fs::read(lock_path).ok()?;
+    let meta = std::fs::metadata(lock_path).ok()?;
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    Some(LockFingerprint {
+        content,
+        #[cfg(unix)]
+        ino,
+        len: meta.len(),
+    })
+}
+
+/// Remove the lock only if it is still byte-for-byte the file the
+/// caller fingerprinted — the close-the-TOCTOU half of the stale
+/// reap (W1 F12): `lock_is_stale` → `remove_file` was not atomic
+/// with the next owner's `create_new`, so a host that judged a
+/// lock stale just before a new owner re-created it could delete
+/// the NEW owner's lock and append concurrently with it.
+fn remove_lock_if_matches(lock_path: &std::path::Path, expected: &LockFingerprint) -> bool {
+    if lock_fingerprint(lock_path).as_ref() != Some(expected) {
+        return false;
+    }
+    std::fs::remove_file(lock_path).is_ok()
+}
+
+/// Reap the queue lock if — and only if — it is stale: fingerprint
+/// it, judge it, then re-verify the fingerprint immediately before
+/// removing, so the file removed is provably the file that was
+/// judged stale and never a fresh owner's lock.
+fn reap_stale_lock(lock_path: &std::path::Path) -> bool {
+    let Some(fp) = lock_fingerprint(lock_path) else {
+        return false;
+    };
+    if !lock_is_stale(lock_path) {
+        return false;
+    }
+    remove_lock_if_matches(lock_path, &fp)
+}
+
 /// Apply the app's configured proxy to this process before running
 /// probes. The settings live in settings.json in the same data dir
 /// as the queue; the proxy is a process-local static in the engine,
@@ -235,10 +307,78 @@ fn apply_saved_proxy_settings() {
     ndm::set_proxy_protocols(flag("proxy_http"), flag("proxy_https"), flag("proxy_ftp"));
 }
 
+const EXT_STAMP_FILE_NAME: &str = "ext_seen.json";
+/// A stamp older than this is refreshed even when the version it
+/// records is unchanged, so `at` stays a meaningful "the extension
+/// was last seen talking" instead of the first sighting forever.
+const EXT_STAMP_MAX_AGE_SECS: u64 = 24 * 60 * 60;
+
+fn ext_stamp_path() -> io::Result<PathBuf> {
+    Ok(app_data_dir()?.join(EXT_STAMP_FILE_NAME))
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record what a ping claims the running extension's version is
+/// (EXT-AUTOUPDATE-SPEC §1b): `ext_seen.json` in the data dir,
+/// `{ "ext_version": <string|null>, "at": <unix seconds> }`. A ping
+/// without the field records `null` — that positively means a
+/// pre-handshake extension is alive, not an error. Write-if-changed:
+/// the file is rewritten only when the version differs from the
+/// stored one or the stored stamp is over 24 h old. The host stays
+/// dumb — it never learns the bundled version; comparing is the
+/// app's job. Failures are swallowed: a stamp that cannot be
+/// written must never change the ping reply.
+fn record_ext_seen(stamp_path: &std::path::Path, message: &Value, now_secs: u64) {
+    let version: Option<String> = message
+        .get("ext_version")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if let Ok(raw) = std::fs::read_to_string(stamp_path) {
+        if let Ok(stored) = serde_json::from_str::<Value>(&raw) {
+            let has_field = stored.get("ext_version").is_some();
+            let stored_version = stored
+                .get("ext_version")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let stored_at = stored.get("at").and_then(Value::as_u64).unwrap_or(0);
+            if has_field
+                && stored_version == version
+                && now_secs.saturating_sub(stored_at) <= EXT_STAMP_MAX_AGE_SECS
+            {
+                return;
+            }
+        }
+    }
+    let body = json!({ "ext_version": version, "at": now_secs }).to_string();
+    let _ = write_private_file(stamp_path, body.as_bytes());
+}
+
 /// Handles one parsed message; returns the reply object to frame back.
 fn handle(message: &Value) -> Value {
+    let stamp = ext_stamp_path().ok();
+    handle_at(message, stamp.as_deref(), unix_now_secs())
+}
+
+/// `handle` with the extension-stamp path and clock injected, so
+/// tests can observe the stamp without touching the real data dir
+/// (the same injection pattern as the queue-lock tests).
+fn handle_at(message: &Value, stamp_path: Option<&std::path::Path>, now_secs: u64) -> Value {
     match message.get("type").and_then(Value::as_str) {
-        Some("ping") => json!({ "ok": true, "pong": true }),
+        Some("ping") => {
+            // ONLY the ping arm ever touches the stamp (§1b): a
+            // download from a new extension carries no ext_version
+            // and must not overwrite a good stamp with its absence
+            if let Some(path) = stamp_path {
+                record_ext_seen(path, message, now_secs);
+            }
+            json!({ "ok": true, "pong": true })
+        }
         Some("probe") => handle_probe(message),
         Some("probe_file") => handle_probe_file(message),
         Some("show_app") => handle_show_app(),
@@ -953,6 +1093,153 @@ mod tests {
         // owner writes its pid): still inside the grace window
         std::fs::write(&lock, "").unwrap();
         assert!(!lock_is_stale(&lock), "fresh legacy lock must get its grace window");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zombie_owner_lock_is_reaped_promptly() {
+        // W1 F12: a child that exits and is never waited on stays a
+        // zombie — /proc/<pid> exists, but it owns nothing. The old
+        // existence-only probe called it alive, so every hand-off
+        // burned its full spin and appended unlocked.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let stat_path = format!("/proc/{pid}/stat");
+        let mut is_zombie = false;
+        for _ in 0..100 {
+            if let Ok(s) = std::fs::read_to_string(&stat_path) {
+                if s.rsplit_once(')')
+                    .map(|(_, rest)| rest.trim_start().starts_with('Z'))
+                    .unwrap_or(false)
+                {
+                    is_zombie = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(is_zombie, "the test child must reach zombie state");
+        assert!(!process_alive(pid), "a zombie must not count as alive");
+        let dir = std::env::temp_dir().join(format!("ndm-host-zombie-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("incoming.lock");
+        std::fs::write(&lock, pid.to_string()).unwrap();
+        assert!(lock_is_stale(&lock), "a zombie owner's lock is stale at once");
+        assert!(reap_stale_lock(&lock), "a zombie owner's lock must be reaped");
+        assert!(!lock.exists(), "the reaped lock must be gone");
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_owner_lock_survives_a_stale_reap() {
+        // W1 F12 TOCTOU: a lock judged stale is fingerprinted; if a
+        // fresh owner re-created the lock in the race window, the
+        // removal aimed at the old file must not touch the new one.
+        let dir = std::env::temp_dir().join(format!("ndm-host-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("incoming.lock");
+        std::fs::write(&lock, "4194304").unwrap();
+        let judged = lock_fingerprint(&lock).expect("lock must fingerprint");
+        assert!(lock_is_stale(&lock));
+        // the fresh owner arrives between the judgement and the removal
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, std::process::id().to_string()).unwrap();
+        assert!(
+            !remove_lock_if_matches(&lock, &judged),
+            "a fresh owner's lock must never be removed on a stale fingerprint"
+        );
+        assert!(lock.exists());
+        assert_eq!(
+            std::fs::read_to_string(&lock).unwrap().trim(),
+            std::process::id().to_string()
+        );
+        // and the reap path itself leaves a live owner's lock alone
+        assert!(!reap_stale_lock(&lock));
+        assert!(lock.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn stamp_test_path(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ndm-host-stamp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stamp = dir.join("ext_seen.json");
+        (dir, stamp)
+    }
+
+    #[test]
+    fn ping_with_ext_version_writes_stamp() {
+        let (dir, stamp) = stamp_test_path("with");
+        let reply = handle_at(
+            &json!({ "type": "ping", "ext_version": "2.0.8" }),
+            Some(&stamp),
+            1_000,
+        );
+        assert_eq!(reply, json!({ "ok": true, "pong": true }), "ping reply is unchanged");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&stamp).unwrap()).unwrap();
+        assert_eq!(v["ext_version"], json!("2.0.8"));
+        assert_eq!(v["at"], json!(1_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ping_without_ext_version_writes_null_stamp() {
+        // a pre-handshake extension's ping has no field: the stamp
+        // must record null — positive evidence an old extension lives
+        let (dir, stamp) = stamp_test_path("without");
+        let reply = handle_at(&json!({ "type": "ping" }), Some(&stamp), 2_000);
+        assert_eq!(reply, json!({ "ok": true, "pong": true }));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&stamp).unwrap()).unwrap();
+        assert!(v["ext_version"].is_null(), "absent field stamps null: {v}");
+        assert_eq!(v["at"], json!(2_000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_identical_ping_does_not_rewrite_stamp() {
+        let (dir, stamp) = stamp_test_path("changed");
+        handle_at(&json!({ "type": "ping", "ext_version": "2.0.8" }), Some(&stamp), 1_000);
+        handle_at(&json!({ "type": "ping", "ext_version": "2.0.8" }), Some(&stamp), 2_000);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&stamp).unwrap()).unwrap();
+        assert_eq!(v["at"], json!(1_000), "an identical ping must not rewrite the stamp");
+        // a changed version rewrites at once
+        handle_at(&json!({ "type": "ping", "ext_version": "2.0.9" }), Some(&stamp), 2_000);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&stamp).unwrap()).unwrap();
+        assert_eq!(v["ext_version"], json!("2.0.9"));
+        assert_eq!(v["at"], json!(2_000));
+        // and the same version refreshes once the stamp is >24 h old
+        let later = 2_000 + 25 * 60 * 60;
+        handle_at(&json!({ "type": "ping", "ext_version": "2.0.9" }), Some(&stamp), later);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&stamp).unwrap()).unwrap();
+        assert_eq!(v["at"], json!(later), "a stamp older than 24 h is refreshed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_ping_message_never_touches_stamp() {
+        let (dir, stamp) = stamp_test_path("nonping");
+        let _ = handle_at(
+            &json!({ "type": "progress", "id": "abc123" }),
+            Some(&stamp),
+            1_000,
+        );
+        assert!(!stamp.exists(), "a progress message must not create a stamp");
+        handle_at(&json!({ "type": "ping", "ext_version": "2.0.8" }), Some(&stamp), 1_000);
+        let before = std::fs::read_to_string(&stamp).unwrap();
+        let _ = handle_at(
+            &json!({ "type": "progress", "id": "abc123", "ext_version": "9.9.9" }),
+            Some(&stamp),
+            5_000,
+        );
+        assert_eq!(
+            std::fs::read_to_string(&stamp).unwrap(),
+            before,
+            "a progress message must not modify an existing stamp"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

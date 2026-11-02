@@ -460,14 +460,23 @@ pub fn fetch_hls_default_audio(url: &str, referer: &str, cookie: &str) -> Option
         .build();
     let mut req = agent
         .get(url)
-        .set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36");
+        .set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
+        .set("Accept-Encoding", "identity");
     if !referer.is_empty() {
         req = req.set("Referer", referer);
     }
     if !cookie.is_empty() {
         req = req.set("Cookie", cookie);
     }
-    let text = req.call().ok()?.into_string().ok()?;
+    let resp = req.call().ok()?;
+    // W1 F11: without this check a gzipped manifest silently
+    // degrades to "no separate audio found" — compressed bytes
+    // contain no #EXTM3U marker — and the download that follows
+    // comes out audio-less instead of failing honestly
+    if crate::response_encoding(&resp).is_some() {
+        return None;
+    }
+    let text = resp.into_string().ok()?;
     if text.len() > 4 * 1024 * 1024 || !text.contains("#EXTM3U") {
         return None;
     }
@@ -1013,6 +1022,56 @@ mod tests {
             hls_default_audio_rendition(master, "https://cdn.test:8443/h/master.m3u8"),
             Some("https://cdn.test:8443/abs/a.m3u8".to_string())
         );
+    }
+
+    /// Serve one HTTP response with the given extra headers and
+    /// body on a loopback port; return the manifest URL.
+    fn serve_manifest(extra_headers: &str, body: &str) -> String {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n",
+            body.len()
+        );
+        let mut raw = head.into_bytes();
+        raw.extend_from_slice(body.as_bytes());
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = sock.write_all(&raw);
+            let _ = sock.flush();
+        });
+        format!("http://127.0.0.1:{port}/master.m3u8")
+    }
+
+    #[test]
+    fn hls_fetch_rejects_an_encoded_manifest() {
+        // W1 F11: the same master playlist, served plain vs with a
+        // gzip Content-Encoding label — plain resolves the default
+        // audio rendition, encoded must be rejected outright (None
+        // for the honest reason) rather than parsed as compressed
+        // bytes that happen to contain no #EXTM3U and silently
+        // degrade to "no audio"
+        let master = "#EXTM3U\n\
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aud\",NAME=\"main\",DEFAULT=YES,URI=\"aud/pl.m3u8\"\n\
+            #EXT-X-STREAM-INF:BANDWIDTH=800000,AUDIO=\"aud\"\n\
+            v360/prog.m3u8\n";
+        let plain = serve_manifest("", master);
+        let expected = format!(
+            "{}/aud/pl.m3u8",
+            plain.rsplit_once('/').map(|(base, _)| base).unwrap()
+        );
+        assert_eq!(fetch_hls_default_audio(&plain, "", ""), Some(expected));
+        let encoded = serve_manifest("Content-Encoding: gzip\r\n", master);
+        assert_eq!(fetch_hls_default_audio(&encoded, "", ""), None);
     }
 
     #[test]
