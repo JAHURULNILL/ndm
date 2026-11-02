@@ -1245,6 +1245,11 @@ function renderDetail() {
       dc.classList.remove('hidden');
       const states = d.conns_state || [];
       const infoFor = i => {
+        // N1: a finished entry's workers all sit at phase 0 (no
+        // block held), which the phase map below reads as
+        // 'Waiting…' even with every byte downloaded — when the
+        // entry itself is finished, every shown row is done
+        if (isFinished) return 'Done';
         const s = states[i];
         return s === 1 ? 'Send GET…' : s === 2 ? 'Receiving data…' : 'Waiting…';
       };
@@ -4181,8 +4186,8 @@ async function initTauri() {
   // banners. The backend sets ext_notice_for at show time, so
   // this fires at most once per bundled version; Dismiss only
   // hides it (and tells the backend, per the command's contract).
-  await listen('ext_update_notice', e => {
-    const p = e.payload || {};
+  const showExtNotice = p => {
+    p = p || {};
     const b = $('extBanner');
     if (!b) return;
     const seen = p.seen_label || 'an older version';
@@ -4200,7 +4205,15 @@ async function initTauri() {
     });
     b.append(txt, x);
     b.classList.remove('hidden');
-  });
+  };
+  await listen('ext_update_notice', e => showExtNotice(e.payload));
+  // D-6: setup() emits before this listener is registered and
+  // Tauri does not buffer events — pull any notice the backend
+  // is still holding so the one-time banner cannot be lost
+  try {
+    const pendingExt = await invoke('take_pending_ext_notice');
+    if (pendingExt) showExtNotice(pendingExt);
+  } catch (e) { /* older backend: no notice to pull */ }
   // a history file that had to be set aside at startup (corrupt
   // or partly unreadable): the backend kept a notice; show it
   // once, sticky, so an empty-looking list is never a mystery
