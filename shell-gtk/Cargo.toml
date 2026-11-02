@@ -1,0 +1,42 @@
+# ndm-shell-gtk — NDM native Linux shell (GTK 3 via gtk-rs).
+#
+# Phase 5 scaffold (NATIVE-PLAN.md §3 + §4 Phase 5): main window,
+# category pane, download list, block-map cell renderer seam,
+# EventSink bridge. Behaviour lives in ndm-core; this crate holds
+# widgets only.
+[package]
+name = "ndm-shell-gtk"
+version = "2.1.0"
+edition = "2021"
+description = "NDM — native GTK 3 shell over the ndm-core seam (Linux)"
+license = "MIT OR Apache-2.0"
+authors = ["Nill"]
+
+[[bin]]
+name = "ndm-shell-gtk"
+path = "src/main.rs"
+
+[dependencies]
+# GTK 3 line, pinned to the distro target (Zorin/Kubuntu ship
+# GTK 3.24 — NATIVE-PLAN.md §3). gio/glib are the matching 0.18
+# gtk-rs companions; gtk re-exports them, the explicit deps keep
+# the versions honest at this crate's own surface.
+gtk = { version = "0.18", features = ["v3_24"] }
+glib = "0.18"
+gio = "0.18"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# The real core (Phase-1 extraction, ../core): the seam types are
+# re-exported through src/sink.rs, so call sites in this crate only
+# ever name `crate::sink::{...}`.
+ndm-core = { path = "../core" }
+
+# Detach from the repository-root workspace (same trick the
+# src-tauri crate uses): this shell builds on its own lockfile
+# and target dir.
+[workspace]
+
+[profile.release]
+opt-level = 3
+strip = "symbols"

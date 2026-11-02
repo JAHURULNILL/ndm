@@ -1,0 +1,46 @@
+[package]
+name = "ndm-shell-win"
+version = "2.1.0"
+edition = "2021"
+description = "NDM — native Windows shell (raw Win32 via the windows crate, winui helpers)"
+license = "MIT OR Apache-2.0"
+authors = ["Nill"]
+
+[[bin]]
+name = "ndm-shell-win"
+path = "src/main.rs"
+
+# Detach from the root workspace (same trick src-tauri/ and the planned
+# core/ use): this crate builds on its own schedule in Phase 2.
+[workspace]
+
+[dependencies]
+# windows 0.62.2 is the exact version the shipped tree already compiles:
+# it is the `windows` entry in both ~/ndm-native/Cargo.lock and
+# ~/ndm-native/src-tauri/Cargo.lock (pulled in today via wry /
+# webview2-com). Matching its major.minor line keeps one windows crate
+# in the combined tree and reuses the version CI already proves.
+# Features are only the Win32 surfaces this shell actually calls.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemServices",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+windows-core = "0.62"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ndm-core = { path = "../core" }
+
+[profile.release]
+opt-level = 3
+strip = "symbols"

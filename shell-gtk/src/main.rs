@@ -1,0 +1,2737 @@
+//! ndm-shell-gtk — NDM's native Linux shell (GTK 3, gtk-rs).
+//!
+//! The main window (1120×720, min 860×540 — the §1.1 spec the
+//! Tauri window carries today), the app's real toolbar /
+//! category / column / menu surfaces read from the web UI
+//! (`ui/index.html`, `ui/app.js`), the block map as a custom
+//! cell renderer, and the `EventSink` bridge that replaces
+//! Tauri `emit`/`listen`.
+//!
+//! FUNCTIONAL WIRING (this stage): `main` bootstraps ndm-core
+//! in the exact order the Tauri shell's setup() does
+//! (AppState::new → Ctx::new → init_paths → startup sweeps →
+//! ext notice → the background entry points), the list is
+//! filled from core's `list_downloads` and kept live through
+//! the sink, the category tree filters the list with the web
+//! UI's semantics, and the toolbar / menus / row context menu
+//! call the core commands of the same name. Actions with no
+//! honest core path in this shell yet report themselves in
+//! the status bar instead of pretending to work — the same
+//! no-fake-fallback rule the web UI follows (app.js F-2). The
+//! per-download progress dialog (progress.rs) opens from a row
+//! double-click, the row menu's "Show progress", and core's
+//! ProgressDialogReveal.
+
+mod blockmap;
+mod dialogs;
+mod form;
+mod gtksink;
+mod modals;
+mod basket;
+mod grabber;
+mod misc;
+mod options;
+mod prefs;
+mod progress;
+mod scheduler;
+mod sink;
+mod video;
+
+use gtk::prelude::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gtksink::{GtkEventSink, UiMessage};
+use sink::{AppEvent, AppState, Ctx, ProgressView};
+
+// ---------------------------------------------------------------------------
+// Download-list model columns.
+//
+// The visible TreeView columns are the web UI's real column set
+// in its real order (app.js COLUMN_DEFS): File Name, Q, Size,
+// Status, Time left, Transfer rate, Last Try Date, Description,
+// Date Added, Save To — plus the block-map column the plan (§3)
+// assigns to a custom cell renderer, appended after the real set
+// so their order is untouched. The remaining model columns are
+// bookkeeping the renderers/handlers need (entry id, raw bytes).
+// ---------------------------------------------------------------------------
+const COL_ID: u32 = 0; // String — entry id (not a visible column)
+const COL_NAME: u32 = 1; // String — File Name
+const COL_Q: u32 = 2; // String — Q (queue marker)
+const COL_SIZE: u32 = 3; // String — Size (formatted)
+const COL_STATUS: u32 = 4; // String — Status (formatted)
+const COL_TIMELEFT: u32 = 5; // String — Time left (formatted)
+const COL_RATE: u32 = 6; // String — Transfer rate (formatted)
+const COL_LASTTRY: u32 = 7; // String — Last Try Date (formatted)
+const COL_DESC: u32 = 8; // String — Description
+const COL_ADDED: u32 = 9; // String — Date Added (formatted)
+const COL_SAVETO: u32 = 10; // String — Save To
+const COL_BLOCKS: u32 = 11; // String — 128-char block map (renderer)
+const COL_FRACTION: u32 = 12; // f64 — done/total (renderer fallback)
+const COL_DONE: u32 = 13; // u64 — raw done bytes
+const COL_TOTAL: u32 = 14; // u64 — raw total bytes
+const COL_SPEED: u32 = 15; // f64 — raw speed B/s
+const NCOLS: usize = 16;
+
+// Category-tree model columns: the row label plus the filter
+// key the selection applies (app.js visibleItems semantics:
+// "All Downloads", a category name, "Unfinished", "Finished",
+// "Grabber", or "queue:<name>"; "" = not selectable, the
+// Queues header row).
+const CAT_COL_LABEL: u32 = 0;
+const CAT_COL_FILTER: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Formatting — mirrors of the web UI's list formatters (app.js):
+// sizes always 2 decimals, rates in "/sec", humanised time-left,
+// IDM date shape. One format on every surface (app.js W-6).
+// ---------------------------------------------------------------------------
+const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+
+fn fmt_size_f(mut v: f64) -> String {
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    format!("{:.2} {}", v, UNITS[i])
+}
+
+fn fmt_size(b: u64) -> String {
+    fmt_size_f(b as f64)
+}
+
+fn fmt_rate(bps: f64) -> String {
+    if !(bps > 0.0) {
+        return String::new();
+    }
+    if bps < 1024.0 {
+        return format!("{:.2} KB/sec", bps / 1024.0);
+    }
+    format!("{}/sec", fmt_size_f(bps))
+}
+
+fn fmt_left(secs: f64) -> String {
+    let sec = secs.max(0.0).round() as u64;
+    if sec < 60 {
+        return format!("{} sec", sec);
+    }
+    let m = sec / 60;
+    let s = sec % 60;
+    if m < 60 {
+        return format!("{} min {} sec", m, s);
+    }
+    format!("{} hour(s) {} min", m / 60, m % 60)
+}
+
+const IDM_MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// "YYYY-MM-DD HH:MM:SS" → "Mon DD HH:MM:SS YYYY" (app.js
+/// fmtIdmDate); unparseable strings pass through unchanged.
+fn fmt_idm_date(s: &str) -> String {
+    let bytes = s.as_bytes();
+    if bytes.len() < 16 {
+        return s.to_string();
+    }
+    let (year, rest) = s.split_at(4);
+    let mut parts = rest.split(|c| c == '-' || c == ' ' || c == 'T' || c == ':');
+    let _ = parts.next(); // leading empty from the '-' split
+    let (Some(month), Some(day), Some(hh), Some(mm)) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return s.to_string();
+    };
+    let Ok(m) = month.parse::<usize>() else {
+        return s.to_string();
+    };
+    if !(1..=12).contains(&m) {
+        return s.to_string();
+    }
+    let ss = parts.next().unwrap_or("");
+    if ss.is_empty() {
+        format!("{} {} {}:{} {}", IDM_MONTHS[m - 1], day, hh, mm, year)
+    } else {
+        format!("{} {} {}:{}:{} {}", IDM_MONTHS[m - 1], day, hh, mm, ss, year)
+    }
+}
+
+fn pct_of(total: u64, done: u64) -> f64 {
+    if total > 0 {
+        (100.0 * done as f64 / total as f64).min(100.0)
+    } else {
+        0.0
+    }
+}
+
+/// The list's Status cell text (app.js cellHtml 'status'):
+/// "Complete" / "Error" / "Queued" / phase labels, else the
+/// bare 2-decimal percentage.
+fn status_text(d: &ProgressView) -> String {
+    match d.status.as_str() {
+        "finished" => "Complete".to_string(),
+        "error" => "Error".to_string(),
+        "queued" => "Queued".to_string(),
+        "starting" => {
+            if d.detail.trim().is_empty() {
+                "Starting…".to_string()
+            } else {
+                d.detail.clone()
+            }
+        }
+        "merging" => "Merging…".to_string(),
+        _ if d.total > 0 => format!("{:.2}%", pct_of(d.total, d.done_bytes)),
+        s => {
+            let mut c = s.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI state shared by the builders, the actions and the event
+// handler. Everything here is touched only on the GTK main
+// thread (core work goes through `ctx` / the core runtime).
+// ---------------------------------------------------------------------------
+struct Ui {
+    window: gtk::ApplicationWindow,
+    store: gtk::ListStore,
+    /// Status bar sections (plan §1/§2 spike: 3 parts) —
+    /// [0] list counts, [1] aggregate transfer rate,
+    /// [2] current notice / readiness.
+    status: [gtk::Label; 3],
+    /// ETA credibility samples per entry (app.js noteEtaSample):
+    /// id → (last done_bytes seen, distinct-sample count).
+    eta_samples: RefCell<HashMap<String, (u64, u32)>>,
+    /// The core handle every action calls through.
+    ctx: Ctx,
+    /// The shell's mirror of the core list (id → last payload
+    /// view), in core list order via `order`. Filters, Delete
+    /// Completed and the counts read this, exactly as the web
+    /// UI reads its `items` map.
+    entries: RefCell<HashMap<String, ProgressView>>,
+    order: RefCell<Vec<String>>,
+    /// The active category-tree filter key (see CAT_COL_FILTER).
+    filter: RefCell<String>,
+    list_view: gtk::TreeView,
+    cat_store: gtk::TreeStore,
+    cat_view: gtk::TreeView,
+    /// The queue the Start/Stop Queue toolbar buttons act on
+    /// (app.js queuePick: the picked queue, else the first).
+    queue_pick: RefCell<String>,
+    /// The toolbar widget + its buttons by app.js TOOLBAR_DEFS
+    /// id — the Customize Toolbar dialog shows/hides through
+    /// this map (prefs `ndm-toolbar-v1`).
+    toolbar: RefCell<Option<gtk::Toolbar>>,
+    toolbar_buttons: RefCell<HashMap<String, gtk::ToolButton>>,
+    /// The main list's column configuration (prefs
+    /// `ndm-columns-v2`), applied by populate_columns.
+    col_cfg: RefCell<Vec<prefs::ColumnCfg>>,
+    /// The View menu's Drop Basket check item — the basket
+    /// window's own close button keeps it in step (basket.rs).
+    basket_check: RefCell<Option<gtk::CheckMenuItem>>,
+}
+
+/// ETA text for a payload, "~"-marked until credible — the same
+/// rule as app.js fmtEta (≥256 KB downloaded AND ≥3 distinct
+/// samples), empty whenever no honest estimate exists.
+fn eta_text(ui: &Ui, d: &ProgressView) -> String {
+    if d.status != "downloading" || d.total == 0 || !(d.speed_bps > 0.0) {
+        if d.status != "downloading" {
+            ui.eta_samples.borrow_mut().remove(&d.id);
+        }
+        return String::new();
+    }
+    let remaining = d.total.saturating_sub(d.done_bytes);
+    if remaining == 0 {
+        return String::new();
+    }
+    let mut samples = ui.eta_samples.borrow_mut();
+    let entry = samples.entry(d.id.clone()).or_insert((d.done_bytes, 1));
+    if entry.0 != d.done_bytes {
+        entry.0 = d.done_bytes;
+        entry.1 += 1;
+    }
+    let credible = d.done_bytes >= 256 * 1024 && entry.1 >= 3;
+    let text = fmt_left(remaining as f64 / d.speed_bps);
+    if credible {
+        text
+    } else {
+        format!("~{}", text)
+    }
+}
+
+fn find_iter(store: &gtk::ListStore, id: &str) -> Option<gtk::TreeIter> {
+    let mut iter = store.iter_first()?;
+    loop {
+        let row_id: String = store
+            .value(&iter, COL_ID as i32)
+            .get()
+            .unwrap_or_default();
+        if row_id == id {
+            return Some(iter);
+        }
+        if !store.iter_next(&mut iter) {
+            return None;
+        }
+    }
+}
+
+/// Write one payload into its list row, creating the row on first
+/// sight. This is the native replacement for the web UI's
+/// progress-event row update (render/updateRowCells).
+fn apply_progress(ui: &Ui, d: &ProgressView) {
+    let left = eta_text(ui, d);
+    let iter = match find_iter(&ui.store, &d.id) {
+        Some(it) => it,
+        None => ui.store.append(),
+    };
+    // IDM shows its queue glyph here; text stand-in until Phase 5 icons
+    let q: String = if matches!(d.status.as_str(), "downloading" | "paused" | "queued") {
+        "●".to_string()
+    } else {
+        String::new()
+    };
+    let size = if d.total > 0 || d.status == "finished" {
+        fmt_size(d.total)
+    } else {
+        "Unknown".to_string()
+    };
+    let fraction = if d.total > 0 {
+        (d.done_bytes as f64 / d.total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    ui.store.set(
+        &iter,
+        &[
+            (COL_ID, &d.id as &dyn gtk::glib::ToValue),
+            (COL_NAME, &d.name as &dyn gtk::glib::ToValue),
+            (COL_Q, &q as &dyn gtk::glib::ToValue),
+            (COL_SIZE, &size as &dyn gtk::glib::ToValue),
+            (COL_STATUS, &status_text(d) as &dyn gtk::glib::ToValue),
+            (COL_TIMELEFT, &left as &dyn gtk::glib::ToValue),
+            (
+                COL_RATE,
+                &(if d.status == "downloading" {
+                    fmt_rate(d.speed_bps)
+                } else {
+                    String::new()
+                }) as &dyn gtk::glib::ToValue,
+            ),
+            (
+                COL_LASTTRY,
+                &fmt_idm_date(if d.last_try.is_empty() {
+                    &d.added
+                } else {
+                    &d.last_try
+                }) as &dyn gtk::glib::ToValue,
+            ),
+            (COL_DESC, &d.description as &dyn gtk::glib::ToValue),
+            (COL_ADDED, &fmt_idm_date(&d.added) as &dyn gtk::glib::ToValue),
+            (COL_SAVETO, &d.save_to as &dyn gtk::glib::ToValue),
+            (COL_BLOCKS, &d.blocks as &dyn gtk::glib::ToValue),
+            (COL_FRACTION, &fraction as &dyn gtk::glib::ToValue),
+            (COL_DONE, &d.done_bytes as &dyn gtk::glib::ToValue),
+            (COL_TOTAL, &d.total as &dyn gtk::glib::ToValue),
+            (COL_SPEED, &d.speed_bps as &dyn gtk::glib::ToValue),
+        ],
+    );
+    refresh_status_counts(ui);
+}
+
+/// Sections [0]/[1] of the status bar follow the list itself:
+/// row count and the summed live rate of downloading rows.
+fn refresh_status_counts(ui: &Ui) {
+    let mut count = 0u32;
+    let mut active = 0u32;
+    let mut speed = 0.0f64;
+    if let Some(mut iter) = ui.store.iter_first() {
+        loop {
+            count += 1;
+            let sp: f64 = ui
+                .store
+                .value(&iter, COL_SPEED as i32)
+                .get()
+                .unwrap_or_default();
+            if sp > 0.0 {
+                active += 1;
+                speed += sp;
+            }
+            if !ui.store.iter_next(&mut iter) {
+                break;
+            }
+        }
+    }
+    ui.status[0].set_text(&if count == 0 {
+        "No downloads".to_string()
+    } else {
+        format!("{} download{}", count, if count == 1 { "" } else { "s" })
+    });
+    ui.status[1].set_text(&if active > 0 {
+        format!("Total: {}", fmt_rate(speed))
+    } else {
+        String::new()
+    });
+}
+
+fn set_notice(ui: &Ui, text: &str) {
+    ui.status[2].set_text(text);
+}
+
+// ---------------------------------------------------------------------------
+// List data — the mirror, the filter, full refreshes.
+// ---------------------------------------------------------------------------
+
+/// The web UI's filter semantics (app.js visibleItems), verbatim:
+/// Finished → status finished; Unfinished → status not finished;
+/// "queue:<name>" → entry queue equals the name; "All Downloads"
+/// → everything; anything else → entry category equals the key
+/// (this is also how the "Grabber projects" row, key "Grabber",
+/// filters).
+fn entry_visible(filter: &str, d: &ProgressView) -> bool {
+    if filter == "All Downloads" {
+        true
+    } else if filter == "Finished" {
+        d.status == "finished"
+    } else if filter == "Unfinished" {
+        d.status != "finished"
+    } else if let Some(q) = filter.strip_prefix("queue:") {
+        d.queue == q
+    } else {
+        d.category == filter
+    }
+}
+
+/// Rebuild the mirror and the visible rows from core's list.
+/// Deliberately ONLY for startup, a category-filter change, an
+/// explicit Refresh, and the completion of a user action (add /
+/// queue reorder) — never per core event: Progress,
+/// DownloadComplete and EntryRemoved all update single rows
+/// incrementally, so the per-event cost stays O(1) in rows.
+fn refresh_list(ui: &Ui) {
+    let views: Vec<ProgressView> = sink::list_downloads(ui.ctx.clone())
+        .iter()
+        .map(ProgressView::from)
+        .collect();
+    {
+        let mut entries = ui.entries.borrow_mut();
+        let mut order = ui.order.borrow_mut();
+        entries.clear();
+        order.clear();
+        for v in &views {
+            entries.insert(v.id.clone(), v.clone());
+            order.push(v.id.clone());
+        }
+    }
+    ui.store.clear();
+    let filter = ui.filter.borrow().clone();
+    for v in &views {
+        if entry_visible(&filter, v) {
+            apply_progress(ui, v);
+        }
+    }
+    refresh_status_counts(ui);
+}
+
+/// One live payload: update the mirror, then the row — creating
+/// it when the entry belongs to the current filter, removing it
+/// when it no longer does.
+fn upsert_entry(ui: &Ui, d: &ProgressView) {
+    {
+        let mut entries = ui.entries.borrow_mut();
+        if !entries.contains_key(&d.id) {
+            ui.order.borrow_mut().push(d.id.clone());
+        }
+        entries.insert(d.id.clone(), d.clone());
+    }
+    if entry_visible(&ui.filter.borrow(), d) {
+        apply_progress(ui, d);
+    } else if let Some(mut iter) = find_iter(&ui.store, &d.id) {
+        ui.store.remove(&mut iter);
+        ui.eta_samples.borrow_mut().remove(&d.id);
+        refresh_status_counts(ui);
+    }
+}
+
+fn remove_entry_local(ui: &Ui, id: &str) {
+    ui.entries.borrow_mut().remove(id);
+    ui.order.borrow_mut().retain(|x| x != id);
+    ui.eta_samples.borrow_mut().remove(id);
+    if let Some(mut iter) = find_iter(&ui.store, id) {
+        ui.store.remove(&mut iter);
+    }
+    refresh_status_counts(ui);
+}
+
+/// The ids the list selection currently names, in row order.
+fn selected_ids(ui: &Ui) -> Vec<String> {
+    let (paths, model) = ui.list_view.selection().selected_rows();
+    let mut ids = Vec::new();
+    for path in paths {
+        if let Some(iter) = model.iter(&path) {
+            let id: String = model.value(&iter, COL_ID as i32).get().unwrap_or_default();
+            if !id.is_empty() {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+fn select_id(ui: &Ui, id: &str) {
+    if let Some(iter) = find_iter(&ui.store, id) {
+        let sel = ui.list_view.selection();
+        sel.unselect_all();
+        sel.select_iter(&iter);
+        if let Some(path) = ui.store.path(&iter) {
+            ui.list_view.scroll_to_cell(Some(&path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Settings accessors. Core's `Settings` fields are private to
+// the core crate, so the shell reads them through the struct's
+// own Serialize shape — the same JSON the web UI consumes.
+// ---------------------------------------------------------------------------
+fn settings_json(ui: &Ui) -> serde_json::Value {
+    serde_json::to_value(sink::get_settings(ui.ctx.clone())).unwrap_or(serde_json::Value::Null)
+}
+
+fn queue_names(ui: &Ui) -> Vec<String> {
+    let s = settings_json(ui);
+    let names: Vec<String> = s
+        .get("queues")
+        .and_then(|q| q.as_array())
+        .map(|qs| {
+            qs.iter()
+                .filter_map(|q| q.get("name").and_then(|n| n.as_str()).map(|n| n.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        vec!["Main download queue".to_string()]
+    } else {
+        names
+    }
+}
+
+/// app.js pickQueueName: the picked queue while it still
+/// exists, else the first queue.
+fn pick_queue_name(ui: &Ui) -> String {
+    let names = queue_names(ui);
+    let pick = ui.queue_pick.borrow().clone();
+    if names.iter().any(|n| n == &pick) {
+        pick
+    } else {
+        names.into_iter().next().unwrap_or_else(|| "Main download queue".to_string())
+    }
+}
+
+fn category_names(ui: &Ui) -> Vec<String> {
+    let state = ui.ctx.state();
+    let s = sink::current_settings(state);
+    sink::category_names_in_use(state, &s)
+}
+
+// ---------------------------------------------------------------------------
+// Actions — every one calls the ndm-core command of the same
+// name the web UI invokes (src-tauri wrappers show the shapes).
+// Async core commands run on core's own runtime via block_on
+// from this (non-runtime) thread — the same pattern core's
+// incoming-line handler uses for resume_download.
+// ---------------------------------------------------------------------------
+
+/// A yes/no question in the app's own dialog (the web UI's
+/// showConfirm equivalent, dialogs::show_confirm).
+fn confirm_dialog(ui: &Ui, title: &str, text: &str, ok_label: &str) -> bool {
+    dialogs::show_confirm(&ui.window, title, text, ok_label)
+}
+
+/// Write one settings change through core's set_settings,
+/// round-tripping every other field from the current settings
+/// (the same full-struct save the web UI's saveSettings does).
+fn update_settings(ui: &Ui, mutate: impl Fn(&mut serde_json::Map<String, serde_json::Value>)) {
+    let mut v = settings_json(ui);
+    if let Some(obj) = v.as_object_mut() {
+        mutate(obj);
+    }
+    if let Ok(s) = serde_json::from_value::<sink::Settings>(v) {
+        let _ = sink::set_settings(ui.ctx.clone(), s);
+    }
+}
+
+/// Add URL — the web UI's Download File Info flow (app.js
+/// openFileDialog / runFileProbe / submitAdd): ask for the
+/// address, probe it through core's probe_file (which fills
+/// size / resume support / detected category / the folder the
+/// file will actually land in), let the user confirm or adjust
+/// folder, category, queue, name and description, then call
+/// core's add_download with dir_explicit — the dialog's folder
+/// is the final word, exactly as in submitAdd. A duplicate
+/// answer from core gets the web UI's "download again as a new
+/// copy?" confirm and the force retry.
+fn open_add_dialog(ui: &Rc<Ui>) {
+    open_file_dialog(ui, None);
+}
+
+/// The offer variant (app.js openFileDialog with a payload —
+/// an extension catch, a basket / clipboard / drop hand-off):
+/// the address stage is skipped and the flow opens on the
+/// probed File Info, prefilled with the offered address and
+/// the browser's suggested name (the title's basename); the
+/// probe and the add both carry the captured session token
+/// and the page the file came from, the dialog's title names
+/// the source exactly as app.js titles it, and cancelling
+/// discards the token, so a session the user did not use
+/// never lingers on disk (app.js closeFileDialog).
+fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
+    let offer_str = |key: &str| {
+        offer
+            .and_then(|v| v.get(key))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let cookies: Option<String> = match offer_str("cookies") {
+        c if c.is_empty() => None,
+        c => Some(c),
+    };
+    let referer: Option<String> = match offer_str("pageUrl") {
+        r if r.is_empty() => None,
+        r => Some(r),
+    };
+    let url = if offer.is_some() {
+        offer_str("url").trim().to_string()
+    } else {
+        let url_fields = [dialogs::FieldSpec::entry("url", "Download address", "")];
+        let Some(values) =
+            dialogs::run_dialog(&ui.window, "Add New Download", &url_fields, "Continue")
+        else {
+            return;
+        };
+        values
+            .get("url")
+            .and_then(|v| v.as_text())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    if url.is_empty() {
+        if offer.is_none() {
+            set_notice(ui, "Enter a download address first");
+        }
+        return;
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        set_notice(ui, "The address must start with http:// or https://");
+        return;
+    }
+
+    // Probe (core probe_file). A failed probe does not block
+    // the add — the web UI shows "—" and still lets the user
+    // start — but the failure is shown in the dialog, not hidden.
+    let probe = sink::rt::block_on(sink::probe_file(
+        ui.ctx.clone(),
+        url.clone(),
+        cookies.clone(),
+        referer.clone(),
+        None,
+        None,
+    ));
+    let (total, size_text, resume_text, probed_category, probed_dir, suggested, probe_note) =
+        match &probe {
+            Ok(info) => {
+                let total = info.get("total").and_then(|x| x.as_u64()).unwrap_or(0);
+                let size = if total > 0 {
+                    fmt_size(total)
+                } else {
+                    "Unknown".to_string()
+                };
+                let resume = match info.get("resumable").and_then(|x| x.as_bool()) {
+                    Some(true) => "Yes".to_string(),
+                    Some(false) => "No".to_string(),
+                    None => "—".to_string(),
+                };
+                (
+                    total,
+                    size,
+                    resume,
+                    info.get("category")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("General")
+                        .to_string(),
+                    info.get("dir")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    info.get("suggested_name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    String::new(),
+                )
+            }
+            Err(e) => (
+                0,
+                "—".to_string(),
+                "—".to_string(),
+                "General".to_string(),
+                String::new(),
+                String::new(),
+                format!("Could not check this address: {}", e),
+            ),
+        };
+
+    let s = settings_json(ui);
+    let default_dir = s
+        .get("default_dir")
+        .and_then(|x| x.as_str())
+        .unwrap_or("~/Downloads")
+        .to_string();
+    let dir_initial = if probed_dir.is_empty() {
+        default_dir
+    } else {
+        probed_dir
+    };
+    let mut fields = vec![
+        dialogs::FieldSpec::readonly("url", "Address", &url),
+        dialogs::FieldSpec::readonly("size", "File size", &size_text),
+        dialogs::FieldSpec::readonly("resume", "Resume support", &resume_text),
+    ];
+    if !probe_note.is_empty() {
+        fields.push(dialogs::FieldSpec::readonly("note", "Note", &probe_note));
+    }
+    fields.push(dialogs::FieldSpec::entry("dir", "Save to", &dir_initial));
+    fields.push(dialogs::FieldSpec::combo(
+        "category",
+        "Category",
+        category_names(ui),
+        &probed_category,
+    ));
+    fields.push(dialogs::FieldSpec::combo(
+        "queue",
+        "Queue",
+        queue_names(ui),
+        &pick_queue_name(ui),
+    ));
+    // app.js: the offered title's basename is the name; the
+    // probe's suggested name only fills a name left empty.
+    let name_initial = {
+        let title = offer_str("title");
+        let base = title
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if base.is_empty() { suggested.clone() } else { base }
+    };
+    fields.push(dialogs::FieldSpec::entry("name", "File name", &name_initial));
+    fields.push(dialogs::FieldSpec::entry("description", "Description", ""));
+    fields.push(dialogs::FieldSpec::check("later", "Download later", false));
+
+    let info_title = match offer_str("source").as_str() {
+        "clipboard" => "Download link was found in clipboard. Do you want to download it?",
+        "basket" => "Link dropped on the basket — download it?",
+        "drop" => "Link dropped — download it?",
+        _ => "Download File Info",
+    };
+    let Some(values) = dialogs::run_dialog(&ui.window, info_title, &fields, "Start Download")
+    else {
+        // Cancel / close: the captured session is discarded,
+        // never left behind for a download nobody confirmed.
+        if let Some(token) = &cookies {
+            sink::discard_cookies(ui.ctx.clone(), token.clone());
+        }
+        return;
+    };
+    let text = |key: &str| {
+        values
+            .get(key)
+            .and_then(|v| v.as_text())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let dir = {
+        let d = text("dir");
+        if d.is_empty() { dir_initial } else { d }
+    };
+    let category = {
+        let c = text("category");
+        if c.is_empty() { None } else { Some(c) }
+    };
+    let queue = {
+        let q = text("queue");
+        if q.is_empty() { None } else { Some(q) }
+    };
+    let name = {
+        let n = text("name");
+        if n.is_empty() { None } else { Some(n) }
+    };
+    let description = {
+        let d = text("description");
+        if d.is_empty() { None } else { Some(d) }
+    };
+    let later = values.get("later").and_then(|v| v.as_bool()).unwrap_or(false);
+    let total_arg = if total > 0 { Some(total) } else { None };
+
+    let before: std::collections::HashSet<String> = ui.entries.borrow().keys().cloned().collect();
+    let add = |force: bool| {
+        sink::rt::block_on(sink::add_download(
+            ui.ctx.clone(),
+            url.clone(),
+            dir.clone(),
+            Some(later),
+            category.clone(),
+            name.clone(),
+            cookies.clone(),
+            referer.clone(),
+            Some(force),
+            queue.clone(),
+            None,
+            None,
+            description.clone(),
+            total_arg,
+            Some(true),
+        ))
+    };
+    let result = match add(false) {
+        Err(e) if e.starts_with("duplicate:") => {
+            // IDM asks what to do about a duplicate link — so
+            // does the web UI (W193-17), and so does this shell.
+            if confirm_dialog(
+                ui,
+                "Download again",
+                "This file is already in the download list.\nDownload it again as a new copy?",
+                "Download again",
+            ) {
+                add(true)
+            } else {
+                // the user chose to keep the existing entry —
+                // done, not an error
+                return;
+            }
+        }
+        other => other,
+    };
+    match result {
+        Ok(_) => {
+            refresh_list(ui);
+            // the just-added entry becomes the selection (IDM
+            // behaviour, app.js F-07)
+            let fresh = ui
+                .order
+                .borrow()
+                .iter()
+                .find(|id| !before.contains(*id))
+                .cloned();
+            if let Some(id) = fresh {
+                select_id(ui, &id);
+            }
+            set_notice(ui, "Download added");
+        }
+        Err(e) => set_notice(ui, &format!("Could not add the download: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Incoming file offers — app.js queueFileLink / pumpFileLinks:
+// presented one at a time in the File Info dialog above, never
+// stacked over a dialog the user is already working in. They
+// wait in this queue while any modal is up (the wave-1 yield
+// discipline — the same modal depth the Download Complete
+// dialog yields to, modals.rs) and are pumped when the last
+// modal closes (dialogs.rs calls pump_file_offers back from
+// its close hooks, exactly as it pumps completions) and when
+// a presented offer's own dialog finishes. A repeat of the
+// address already presented or already waiting is dropped.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// Offers waiting for their dialog, in arrival order.
+    static FILE_OFFER_QUEUE: RefCell<Vec<serde_json::Value>> = RefCell::new(Vec::new());
+    /// The address of the offer on screen right now.
+    static FILE_OFFER_PRESENTED: RefCell<Option<String>> = RefCell::new(None);
+    /// The Ui the pump runs against — captured on the first
+    /// offer (modals.rs' COMPLETE_ANCHOR pattern), so the
+    /// modal-close hooks in dialogs.rs can pump without
+    /// holding a Ui themselves.
+    static FILE_OFFER_ANCHOR: RefCell<Option<Rc<Ui>>> = RefCell::new(None);
+}
+
+fn queue_incoming_file(ui: &Rc<Ui>, payload: serde_json::Value) {
+    FILE_OFFER_ANCHOR.with(|a| *a.borrow_mut() = Some(ui.clone()));
+    let url = payload
+        .get("url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        set_notice(ui, "Incoming file without an address");
+        return;
+    }
+    let presented =
+        FILE_OFFER_PRESENTED.with(|p| p.borrow().as_deref() == Some(url.as_str()));
+    let queued = FILE_OFFER_QUEUE.with(|q| {
+        q.borrow()
+            .iter()
+            .any(|v| v.get("url").and_then(|x| x.as_str()) == Some(url.as_str()))
+    });
+    if presented || queued {
+        return; // the same address is already on its way in
+    }
+    FILE_OFFER_QUEUE.with(|q| q.borrow_mut().push(payload));
+    pump_file_offers();
+}
+
+/// Present the next waiting offer, if the way is clear: no
+/// modal dialog up and no offer already on screen.
+pub fn pump_file_offers() {
+    if dialogs::modal_open()
+        || FILE_OFFER_PRESENTED.with(|p| p.borrow().is_some())
+    {
+        return;
+    }
+    let Some(ui) = FILE_OFFER_ANCHOR.with(|a| a.borrow().clone()) else {
+        return;
+    };
+    let next = FILE_OFFER_QUEUE.with(|q| {
+        if q.borrow().is_empty() {
+            None
+        } else {
+            Some(q.borrow_mut().remove(0))
+        }
+    });
+    let Some(next) = next else { return };
+    let url = next
+        .get("url")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    FILE_OFFER_PRESENTED.with(|p| *p.borrow_mut() = Some(url));
+    open_file_dialog(&ui, Some(&next));
+    FILE_OFFER_PRESENTED.with(|p| *p.borrow_mut() = None);
+    // The dialog this offer opened has closed — the next
+    // waiting offer gets its turn (app.js: every modal-close
+    // path calls pumpFileLinks back).
+    pump_file_offers();
+}
+
+fn resume_ids(ui: &Rc<Ui>, ids: &[String]) {
+    if ids.is_empty() {
+        set_notice(ui, "Select a download first");
+        return;
+    }
+    let mut errors = Vec::new();
+    for id in ids {
+        let r = sink::rt::block_on(sink::resume_download(ui.ctx.clone(), id.clone()));
+        if let Err(e) = r {
+            errors.push(e);
+        }
+    }
+    if let Some(e) = errors.into_iter().next() {
+        set_notice(ui, &format!("Could not resume: {}", e));
+    }
+}
+
+fn pause_ids(ui: &Rc<Ui>, ids: &[String]) {
+    if ids.is_empty() {
+        set_notice(ui, "Select a download first");
+        return;
+    }
+    for id in ids {
+        if let Err(e) = sink::pause_download(ui.ctx.clone(), id.clone()) {
+            set_notice(ui, &format!("Could not stop: {}", e));
+            return;
+        }
+    }
+}
+
+/// The toolbar's Stop All and the Downloads menu's Pause All
+/// share the web UI's shape: pause every entry whose status is
+/// "downloading", keep going past individual failures.
+fn pause_all_downloading(ui: &Rc<Ui>) {
+    let ids: Vec<String> = ui
+        .order
+        .borrow()
+        .iter()
+        .filter(|id| {
+            ui.entries
+                .borrow()
+                .get(*id)
+                .map(|d| d.status == "downloading")
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if ids.is_empty() {
+        set_notice(ui, "Nothing is downloading");
+        return;
+    }
+    let mut n = 0;
+    for id in &ids {
+        if sink::pause_download(ui.ctx.clone(), id.clone()).is_ok() {
+            n += 1;
+        }
+    }
+    set_notice(ui, &format!("Stopped {} download{}", n, if n == 1 { "" } else { "s" }));
+}
+
+/// Delete with the web UI's confirm behaviour (app.js
+/// openDeleteConfirm + its confirm handler): ONE dialog for the
+/// whole batch, one "also delete the file" checkbox (applies to
+/// every status), then core's bulk remove_downloads — per-id
+/// results decide what actually leaves the list, and failures
+/// are reported, never hidden.
+fn delete_ids(ui: &Rc<Ui>, ids: Vec<String>) {
+    let ids: Vec<String> = ids
+        .into_iter()
+        .filter(|id| ui.entries.borrow().contains_key(id))
+        .collect();
+    if ids.is_empty() {
+        set_notice(ui, "Select a download first");
+        return;
+    }
+    let (title_text, file_label) = if ids.len() == 1 {
+        let name = ui
+            .entries
+            .borrow()
+            .get(&ids[0])
+            .map(|d| {
+                if d.name.is_empty() {
+                    "download".to_string()
+                } else {
+                    d.name.clone()
+                }
+            })
+            .unwrap_or_else(|| "download".to_string());
+        (
+            format!("Delete \"{}\" from the list?", name),
+            "Also delete the file from the disk (including a partial download)",
+        )
+    } else {
+        (
+            format!("Delete {} downloads from the list?", ids.len()),
+            "Also delete the files from the disk (including partial downloads)",
+        )
+    };
+    let fields = [
+        dialogs::FieldSpec::readonly("name", "", &title_text),
+        dialogs::FieldSpec::check("file", file_label, false),
+    ];
+    let Some(values) = dialogs::run_dialog(&ui.window, "Delete", &fields, "Delete") else {
+        return;
+    };
+    let delete_file = values.get("file").and_then(|v| v.as_bool()).unwrap_or(false);
+    run_delete(ui, ids, delete_file);
+}
+
+fn run_delete(ui: &Rc<Ui>, ids: Vec<String>, delete_file: bool) {
+    let results = sink::remove_downloads(ui.ctx.clone(), ids, Some(delete_file));
+    let mut removed = 0usize;
+    let mut failures: Vec<String> = Vec::new();
+    for r in &results {
+        let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("");
+        if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+            removed += 1;
+            remove_entry_local(ui, id);
+        } else {
+            let name = ui
+                .entries
+                .borrow()
+                .get(id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| id.to_string());
+            let err = r
+                .get("error")
+                .and_then(|x| x.as_str())
+                .unwrap_or("could not be deleted");
+            failures.push(format!("\"{}\": {}", name, err));
+        }
+    }
+    // the EntryRemoved events fire for these rows too;
+    // remove_entry_local above is idempotent, so event and
+    // result paths converge without a full-list rebuild
+    if failures.len() == 1 {
+        set_notice(ui, &failures[0]);
+    } else if !failures.is_empty() {
+        set_notice(
+            ui,
+            &format!(
+                "{} downloads could not be deleted — {}",
+                failures.len(),
+                failures[0]
+            ),
+        );
+    } else if removed > 0 {
+        set_notice(
+            ui,
+            &format!(
+                "Deleted {} download{} from the list",
+                removed,
+                if removed == 1 { "" } else { "s" }
+            ),
+        );
+    }
+}
+
+/// Delete Completed (app.js deleteCompleted): every finished
+/// entry, no confirm dialog, files stay on disk, one bulk call.
+fn delete_completed(ui: &Rc<Ui>) {
+    let ids: Vec<String> = ui
+        .order
+        .borrow()
+        .iter()
+        .filter(|id| {
+            ui.entries
+                .borrow()
+                .get(*id)
+                .map(|d| d.status == "finished")
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    if ids.is_empty() {
+        set_notice(ui, "No completed downloads");
+        return;
+    }
+    run_delete(ui, ids, false);
+}
+
+fn start_queue_now(ui: &Rc<Ui>) {
+    let name = pick_queue_name(ui);
+    match sink::scheduler_start_now(ui.ctx.clone(), Some(name.clone())) {
+        Ok(_) => set_notice(ui, &format!("Queue \"{}\" started", name)),
+        Err(e) => set_notice(ui, &format!("Could not start the queue: {}", e)),
+    }
+}
+
+fn stop_queue_now(ui: &Rc<Ui>) {
+    let name = pick_queue_name(ui);
+    sink::scheduler_stop_now(ui.ctx.clone(), Some(name.clone()));
+    set_notice(ui, &format!("Queue \"{}\" stopped", name));
+}
+
+/// Help → Check for Updates (app.js manualUpdateCheck): the
+/// verdict stays on screen — an offer opens the Update dialog,
+/// "current" and failures land in the status bar. The check
+/// itself is core's check_update; it runs on this thread after
+/// painting the "Checking…" notice, so the wait is visible.
+fn manual_update_check(ui: &Rc<Ui>) {
+    set_notice(ui, "Checking for updates…");
+    while gtk::events_pending() {
+        gtk::main_iteration_do(false);
+    }
+    let r = sink::rt::block_on(sink::check_update(ui.ctx.clone()));
+    match r {
+        Ok(v) if v.get("status").and_then(|x| x.as_str()) == Some("available") => {
+            modals::show_update(&ui.window, ui.ctx.clone(), &v);
+        }
+        Ok(v) if v.get("status").and_then(|x| x.as_str()) == Some("current") => {
+            let ver = v.get("version").and_then(|x| x.as_str()).unwrap_or("");
+            set_notice(ui, &format!("NDM is up to date ({})", ver));
+        }
+        _ => set_notice(ui, "Could not reach the update server — try again later"),
+    }
+}
+
+fn open_selected(ui: &Rc<Ui>, folder: bool) {
+    let Some(id) = selected_ids(ui).into_iter().next() else {
+        set_notice(ui, "Select a download first");
+        return;
+    };
+    if let Err(e) = sink::open_path(ui.ctx.clone(), id, folder) {
+        set_notice(ui, &format!("Could not open: {}", e));
+    }
+}
+
+/// Refresh download address (IDM, app.js ctx menu): prompt for
+/// the new address, then core's refresh_url decides whether the
+/// entry resumes against it or restarts from zero.
+fn refresh_address(ui: &Rc<Ui>, id: &str) {
+    let current = ui
+        .entries
+        .borrow()
+        .get(id)
+        .map(|d| d.url.clone())
+        .unwrap_or_default();
+    // Mirror app.js openRefreshAddress (#rmodal): the current
+    // address shown read-only, the same-file/different-file
+    // note, and the new-address field prefilled with the
+    // current URL.
+    let fields = [
+        dialogs::FieldSpec::readonly("cur", "Current address", &current),
+        dialogs::FieldSpec::readonly(
+            "note",
+            "",
+            "Download addresses often expire. Paste a fresh one for the same file: \
+             if the new address serves the same file, the download continues from \
+             its current progress; if it serves a different file, the download \
+             starts over. Which of the two applies is decided when the download \
+             next starts.",
+        ),
+        dialogs::FieldSpec::entry("url", "New URL for the same file", &current),
+    ];
+    let Some(values) = dialogs::run_dialog(&ui.window, "Refresh download address", &fields, "Refresh")
+    else {
+        return;
+    };
+    let new_url = values
+        .get("url")
+        .and_then(|v| v.as_text())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if new_url.is_empty() {
+        return;
+    }
+    match sink::refresh_url(ui.ctx.clone(), id.to_string(), new_url) {
+        Ok(()) => set_notice(ui, "Address refreshed — the download stays paused"),
+        Err(e) => set_notice(ui, &format!("Could not refresh the address: {}", e)),
+    }
+}
+
+/// Export the downloads list (app.js exportList): core's
+/// export_downloads writes the JSON file itself (to
+/// ~/Downloads/ndm-downloads-export.json) and returns its path;
+/// the shell only narrates where it went.
+fn export_downloads_action(ui: &Ui) {
+    match sink::export_downloads(ui.ctx.clone()) {
+        Ok(path) => set_notice(
+            ui,
+            &format!(
+                "Exported the list to {path} — keep it or share it to move downloads between computers"
+            ),
+        ),
+        Err(e) => set_notice(ui, &format!("Export failed: {e}")),
+    }
+}
+
+/// Import a downloads list (app.js openImport/importFromText):
+/// paste the exported JSON, then one core add_download per row,
+/// always "later" so nothing starts on its own. Rows carry no
+/// folder of their own in the export format — the folder comes
+/// from save_to/path when present (a file path gives its
+/// folder), else the default directory. Counts and messages
+/// mirror app.js exactly.
+fn import_downloads(ui: &Rc<Ui>) {
+    let fields = [
+        dialogs::FieldSpec::readonly(
+            "head",
+            "",
+            "Paste an exported NDM downloads list (JSON)",
+        ),
+        dialogs::FieldSpec::textarea("json", "", ""),
+    ];
+    let Some(values) = dialogs::run_dialog(&ui.window, "Import downloads", &fields, "Import")
+    else {
+        return;
+    };
+    let text = values
+        .get("json")
+        .and_then(|v| v.as_text())
+        .unwrap_or("")
+        .to_string();
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) else {
+        set_notice(ui, "Import failed: That is not valid JSON.");
+        return;
+    };
+    let items: Vec<&serde_json::Value> = match &parsed {
+        serde_json::Value::Array(a) => a.iter().collect(),
+        serde_json::Value::Object(_) => vec![&parsed],
+        _ => Vec::new(),
+    };
+    if items.is_empty() {
+        set_notice(ui, "Import failed: No downloads found in that list.");
+        return;
+    }
+    let default_dir = settings_json(ui)
+        .get("default_dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let str_of = |v: &serde_json::Value, key: &str| {
+        v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+    };
+    let (mut ok, mut err) = (0usize, 0usize);
+    for row in items {
+        let url = str_of(row, "url").unwrap_or_default();
+        let save_to = str_of(row, "save_to")
+            .or_else(|| str_of(row, "path"))
+            .unwrap_or_default();
+        let dir = if save_to.is_empty() {
+            default_dir.clone()
+        } else {
+            let last = save_to.rsplit('/').next().unwrap_or("");
+            if last.contains('.') {
+                save_to
+                    .rsplit_once('/')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or(save_to.clone())
+            } else {
+                save_to.clone()
+            }
+        };
+        let total = row.get("total").and_then(|t| t.as_u64()).filter(|t| *t > 0);
+        let added = sink::rt::block_on(sink::add_download(
+            ui.ctx.clone(),
+            url,
+            dir,
+            Some(true),
+            str_of(row, "category"),
+            str_of(row, "name"),
+            None,
+            None,
+            None,
+            str_of(row, "queue"),
+            None,
+            None,
+            None,
+            total,
+            None,
+        ));
+        if added.is_ok() {
+            ok += 1;
+        } else {
+            err += 1;
+        }
+    }
+    refresh_list(ui);
+    let msg = if ok > 0 && err > 0 {
+        format!("Imported {ok} download(s), {err} failed — the rest were skipped")
+    } else if ok > 0 {
+        format!("Imported {ok} download(s) (paused — start them when ready)")
+    } else {
+        "Import failed: nothing could be imported from that list".to_string()
+    };
+    set_notice(ui, &msg);
+}
+
+/// Move the entry to another queue (app.js ctx menu "Move to
+/// queue", shown only when more than one queue exists).
+fn move_to_queue(ui: &Rc<Ui>, id: &str, queue: &str) {
+    let current = ui
+        .entries
+        .borrow()
+        .get(id)
+        .map(|d| d.queue.clone())
+        .unwrap_or_default();
+    if current == queue {
+        return;
+    }
+    match sink::set_entry_queue(ui.ctx.clone(), id.to_string(), queue.to_string()) {
+        Ok(()) => {
+            // core emits a Progress payload for the entry, which
+            // lands it in (or out of) the current filter through
+            // the ordinary upsert path — no rebuild needed
+            if let Some(d) = ui.entries.borrow_mut().get_mut(id) {
+                d.queue = queue.to_string();
+            }
+            set_notice(ui, &format!("Moved to queue \"{}\"", queue));
+        }
+        Err(e) => set_notice(ui, &format!("Could not move the download: {}", e)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Builders — menu bar, toolbar, category pane, list, status bar.
+// Names and order are the web UI's (ui/index.html menubar +
+// toolbar, app.js TOOLBAR_DEFS / COLUMN_DEFS / tree markup).
+// ---------------------------------------------------------------------------
+
+/// A menu action this shell cannot run yet reports itself in
+/// the status bar rather than faking success (app.js F-2 rule).
+fn stub_action(ui: &Rc<Ui>, label: &str) -> impl Fn() + 'static {
+    let ui = ui.clone();
+    let label = label.to_string();
+    move || set_notice(&ui, &format!("{} — not yet available in the native shell", label))
+}
+
+/// Open (or raise) the per-download progress dialog for an
+/// entry (PROGRESS-DIALOG-SPEC §1.3: row double-click, the row
+/// menu's "Show progress", and core's ProgressDialogReveal).
+/// Seeded from the shell's mirror; live payloads keep it current
+/// through the dispatcher's progress routing.
+fn open_progress_dialog(ui: &Rc<Ui>, id: &str) {
+    open_progress_dialog_view(ui, id, false);
+}
+
+/// G7: the "minimized" reveal — the dialog opens lowered
+/// (iconified), its live state running from the start.
+fn open_progress_dialog_lowered(ui: &Rc<Ui>, id: &str) {
+    open_progress_dialog_view(ui, id, true);
+}
+
+fn open_progress_dialog_view(ui: &Rc<Ui>, id: &str, minimized: bool) {
+    let view = ui.entries.borrow().get(id).cloned();
+    let Some(view) = view else {
+        set_notice(ui, "That download is no longer in the list");
+        return;
+    };
+    let s = settings_json(ui);
+    let info = progress::OpenInfo {
+        queues: queue_names(ui),
+        global_limit: s
+            .get("speed_limit_bps")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0),
+        global_show_complete: s
+            .get("show_complete_dialog")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
+    };
+    progress::open_or_raise(&ui.window, ui.ctx.clone(), &view, info, minimized);
+}
+
+fn menu_item(label: &str) -> gtk::MenuItem {
+    gtk::MenuItem::with_label(label)
+}
+
+fn build_menubar(ui: &Rc<Ui>) -> gtk::MenuBar {
+    let bar = gtk::MenuBar::new();
+    let add_menu = |bar: &gtk::MenuBar, title: &str, build: &dyn Fn(&gtk::Menu)| {
+        let root = menu_item(title);
+        let menu = gtk::Menu::new();
+        build(&menu);
+        root.set_submenu(Some(&menu));
+        bar.add(&root);
+    };
+    let stub_item = |menu: &gtk::Menu, title: &str, label: &str| {
+        let item = menu_item(label);
+        let f = stub_action(ui, &format!("{} → {}", title, label));
+        item.connect_activate(move |_| f());
+        menu.add(&item);
+    };
+    let real_item = |menu: &gtk::Menu, label: &str, f: Box<dyn Fn()>| {
+        let item = menu_item(label);
+        item.connect_activate(move |_| f());
+        menu.add(&item);
+    };
+
+    // Tasks — the web UI's menu; Batch / Grabber / Scheduler
+    // destinations are not part of this stage and stay labelled
+    // stubs; Import/Export are wired (item 7).
+    add_menu(&bar, "Tasks", &|menu| {
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Add Batch Download…",
+            Box::new(move || misc::show_batch(&u)),
+        );
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Import Downloads…",
+            Box::new(move || import_downloads(&u)),
+        );
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Export Downloads",
+            Box::new(move || export_downloads_action(&u)),
+        );
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Grabber",
+            Box::new(move || grabber::show(u.clone(), None, false)),
+        );
+        let u = ui.clone();
+        real_item(menu, "Scheduler", Box::new(move || scheduler::show(&u)));
+    });
+
+    // File — Add New Download is the real Add URL flow; Exit
+    // closes the window, which exits the app (see build_ui's
+    // destroy → quit wiring, mirroring the Tauri shell's
+    // CloseRequested → exit(0)).
+    add_menu(&bar, "File", &|menu| {
+        let u = ui.clone();
+        real_item(menu, "Add New Download…", Box::new(move || open_add_dialog(&u)));
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Add Video…",
+            Box::new(move || video::show(u.clone(), None, None)),
+        );
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Add Batch Download…",
+            Box::new(move || misc::show_batch(&u)),
+        );
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Import Downloads…",
+            Box::new(move || import_downloads(&u)),
+        );
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Export Downloads",
+            Box::new(move || export_downloads_action(&u)),
+        );
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Exit",
+            Box::new(move || {
+                u.window.close();
+            }),
+        );
+    });
+
+    // Downloads — every item wired to its core command.
+    add_menu(&bar, "Downloads", &|menu| {
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Start All",
+            Box::new(move || {
+                let n = sink::start_all(u.ctx.clone());
+                set_notice(
+                    &u,
+                    &if n > 0 {
+                        format!("Started {} download{}", n, if n == 1 { "" } else { "s" })
+                    } else {
+                        "Nothing to start".to_string()
+                    },
+                );
+            }),
+        );
+        let u = ui.clone();
+        real_item(menu, "Pause All", Box::new(move || pause_all_downloading(&u)));
+        let u = ui.clone();
+        real_item(menu, "Stop All", Box::new(move || pause_all_downloading(&u)));
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Select All",
+            Box::new(move || {
+                u.list_view.selection().select_all();
+            }),
+        );
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Delete Selected",
+            Box::new(move || {
+                let ids = selected_ids(&u);
+                delete_ids(&u, ids);
+            }),
+        );
+        let u = ui.clone();
+        real_item(menu, "Delete All Completed", Box::new(move || delete_completed(&u)));
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Delete All…",
+            Box::new(move || {
+                // app.js deleteAllEntries: EVERY entry, through
+                // the same one-dialog batch delete
+                let ids = u.order.borrow().clone();
+                delete_ids(&u, ids);
+            }),
+        );
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let u = ui.clone();
+        real_item(
+            menu,
+            "Grabber",
+            Box::new(move || grabber::show(u.clone(), None, false)),
+        );
+        let u = ui.clone();
+        real_item(menu, "Scheduler", Box::new(move || scheduler::show(&u)));
+        let u = ui.clone();
+        real_item(menu, "Options", Box::new(move || options::show(&u)));
+    });
+
+    // View — the checkable toggles keep their scaffold form
+    // (state display only); Refresh List is real.
+    {
+        let root = menu_item("View");
+        let menu = gtk::Menu::new();
+        for label in ["Dark Theme", "Categories Sidebar"] {
+            let item = gtk::CheckMenuItem::with_label(label);
+            if label != "Dark Theme" {
+                item.set_active(true);
+            }
+            menu.add(&item);
+        }
+        {
+            // Drop Basket is real: it owns the basket window's
+            // visibility (basket.rs), starting hidden.
+            let item = gtk::CheckMenuItem::with_label("Drop Basket");
+            item.set_active(false);
+            *ui.basket_check.borrow_mut() = Some(item.clone());
+            let u = ui.clone();
+            item.connect_toggled(move |it| basket::set_visible(&u, it.is_active()));
+            menu.add(&item);
+        }
+        menu.add(&gtk::SeparatorMenuItem::new());
+        for label in [
+            "Sort by Name",
+            "Sort by Date Added",
+            "Sort by Size",
+            "Sort by Status",
+        ] {
+            stub_item(&menu, "View", label);
+        }
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let u = ui.clone();
+        real_item(&menu, "Columns…", Box::new(move || misc::show_columns(&u)));
+        let u = ui.clone();
+        real_item(
+            &menu,
+            "Customize Toolbar…",
+            Box::new(move || misc::show_toolbar_cfg(&u)),
+        );
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let u = ui.clone();
+        real_item(
+            &menu,
+            "Refresh List",
+            Box::new(move || {
+                refresh_list(&u);
+                rebuild_category_tree(&u);
+            }),
+        );
+        root.set_submenu(Some(&menu));
+        bar.add(&root);
+    }
+
+    // Help — About is the dialog builder's worked example and
+    // is fully real already (dialogs::show_about).
+    {
+        let root = menu_item("Help");
+        let menu = gtk::Menu::new();
+        let u = ui.clone();
+        real_item(
+            &menu,
+            "Check for Updates…",
+            Box::new(move || manual_update_check(&u)),
+        );
+        let u = ui.clone();
+        real_item(
+            &menu,
+            "Keyboard Shortcuts",
+            Box::new(move || misc::show_shortcuts(&u)),
+        );
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let about = menu_item("About NDM");
+        let ui2 = ui.clone();
+        about.connect_activate(move |_| dialogs::show_about(&ui2.window));
+        menu.add(&about);
+        root.set_submenu(Some(&menu));
+        bar.add(&root);
+    }
+    bar
+}
+
+/// The toolbar: IDM's set and order as the web UI carries them
+/// (ui/index.html #toolbar / app.js TOOLBAR_DEFS) — Add URL,
+/// Resume, Stop, Stop All, separator, Delete, Delete Completed,
+/// Options, Scheduler, Start Queue, Stop Queue, Grabber. The
+/// split buttons' queue-picker halves (▼) collapse into the
+/// main button in this shell; Start/Stop Queue act on the
+/// picked queue (see pick_queue_name).
+fn build_toolbar(ui: &Rc<Ui>) -> gtk::Toolbar {
+    let bar = gtk::Toolbar::new();
+    bar.set_style(gtk::ToolbarStyle::Both);
+    let register = |ui: &Rc<Ui>, id: &str, btn: &gtk::ToolButton| {
+        ui.toolbar_buttons
+            .borrow_mut()
+            .insert(id.to_string(), btn.clone());
+    };
+    let add_real = |id: &str, label: &str, f: Box<dyn Fn()>| {
+        let btn = gtk::ToolButton::builder().label(label).build();
+        register(ui, id, &btn);
+        btn.connect_clicked(move |_| f());
+        bar.add(&btn);
+    };
+    let add_stub = |id: &str, label: &str| {
+        let btn = gtk::ToolButton::builder().label(label).build();
+        register(ui, id, &btn);
+        let f = stub_action(ui, label);
+        btn.connect_clicked(move |_| f());
+        bar.add(&btn);
+    };
+
+    let u = ui.clone();
+    add_real("btnAdd", "Add URL", Box::new(move || open_add_dialog(&u)));
+    let u = ui.clone();
+    add_real(
+        "btnResume",
+        "Resume",
+        Box::new(move || {
+            let ids = selected_ids(&u);
+            resume_ids(&u, &ids);
+        }),
+    );
+    let u = ui.clone();
+    add_real(
+        "btnStop",
+        "Stop",
+        Box::new(move || {
+            let ids = selected_ids(&u);
+            pause_ids(&u, &ids);
+        }),
+    );
+    let u = ui.clone();
+    add_real("btnStopAll", "Stop All", Box::new(move || pause_all_downloading(&u)));
+    bar.add(&gtk::SeparatorToolItem::new());
+    let u = ui.clone();
+    add_real(
+        "btnDelete",
+        "Delete",
+        Box::new(move || {
+            let ids = selected_ids(&u);
+            delete_ids(&u, ids);
+        }),
+    );
+    let u = ui.clone();
+    add_real("btnDelDone", "Delete Completed", Box::new(move || delete_completed(&u)));
+    let u = ui.clone();
+    add_real("btnOptions", "Options", Box::new(move || options::show(&u)));
+    let u = ui.clone();
+    add_real("btnScheduler", "Scheduler", Box::new(move || scheduler::show(&u)));
+    let u = ui.clone();
+    add_real("btnStartQueue", "Start Queue", Box::new(move || start_queue_now(&u)));
+    let u = ui.clone();
+    add_real("btnStopQueue", "Stop Queue", Box::new(move || stop_queue_now(&u)));
+    let u = ui.clone();
+    add_real(
+        "btnGrabber",
+        "Grabber",
+        Box::new(move || grabber::show(u.clone(), None, false)),
+    );
+    *ui.toolbar.borrow_mut() = Some(bar.clone());
+    bar
+}
+
+/// Apply the toolbar config (show/hide + size) — app.js
+/// applyToolbarCfg; called at startup and on dialog save.
+pub(crate) fn apply_toolbar(ui: &Ui) {
+    let cfg = prefs::load_toolbar();
+    let buttons = ui.toolbar_buttons.borrow();
+    for (id, _) in prefs::TOOLBAR_DEFS {
+        if let Some(btn) = buttons.get(id) {
+            // no_show_all: the window's show_all (state-restored
+            // seam) must not resurrect a configured-hidden button.
+            btn.set_no_show_all(true);
+            btn.set_visible(!cfg.hidden.iter().any(|h| h == id));
+        }
+    }
+    if let Some(bar) = ui.toolbar.borrow().as_ref() {
+        if cfg.size == "small" {
+            bar.set_style(gtk::ToolbarStyle::Icons);
+            bar.set_icon_size(gtk::IconSize::SmallToolbar);
+        } else {
+            bar.set_style(gtk::ToolbarStyle::Both);
+            bar.set_icon_size(gtk::IconSize::LargeToolbar);
+        }
+    }
+}
+
+/// The category pane: one GtkTreeView over a TreeStore whose
+/// rows are (re)built by rebuild_category_tree from real core
+/// state — the web UI's top-level rows (ui/index.html #catTree):
+/// All Downloads (with the five file-type children plus any
+/// custom categories in use), Unfinished, Finished, Grabber
+/// projects, Queues (one child per configured queue).
+fn build_category_pane() -> (gtk::TreeStore, gtk::TreeView) {
+    let store = gtk::TreeStore::new(&[
+        gtk::glib::types::Type::STRING, // CAT_COL_LABEL
+        gtk::glib::types::Type::STRING, // CAT_COL_FILTER
+    ]);
+    let view = gtk::TreeView::with_model(&store);
+    view.set_headers_visible(false);
+    let col = gtk::TreeViewColumn::new();
+    col.set_title("Categories");
+    let cell = gtk::CellRendererText::new();
+    gtk::prelude::CellLayoutExt::pack_start(&col, &cell, true);
+    gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "text", CAT_COL_LABEL as i32);
+    view.append_column(&col);
+    (store, view)
+}
+
+/// (Re)seed the category tree from core state: built-in
+/// category children, custom categories in use (app.js: names
+/// from entries/settings beyond the built-ins, "General" and
+/// "Grabber" excluded — they have no tree node / their own row),
+/// and the configured queues under Queues.
+fn rebuild_category_tree(ui: &Ui) {
+    let store = &ui.cat_store;
+    store.clear();
+    let append = |parent: Option<&gtk::TreeIter>, label: &str, filter: &str| -> gtk::TreeIter {
+        let iter = store.append(parent);
+        store.set(
+            &iter,
+            &[
+                (CAT_COL_LABEL, &label as &dyn gtk::glib::ToValue),
+                (CAT_COL_FILTER, &filter as &dyn gtk::glib::ToValue),
+            ],
+        );
+        iter
+    };
+    let all = append(None, "All Downloads", "All Downloads");
+    for child in ["Compressed", "Documents", "Music", "Programs", "Video"] {
+        append(Some(&all), child, child);
+    }
+    // custom categories in use join the All Downloads children,
+    // as the web UI's tree rebuild does
+    let builtin = [
+        "General",
+        "Compressed",
+        "Documents",
+        "Music",
+        "Video",
+        "Programs",
+        "Grabber",
+    ];
+    for name in category_names(ui) {
+        if !builtin.contains(&name.as_str()) {
+            append(Some(&all), &name, &name);
+        }
+    }
+    append(None, "Unfinished", "Unfinished");
+    append(None, "Finished", "Finished");
+    append(None, "Grabber projects", "Grabber");
+    let queues = append(None, "Queues", "");
+    for name in queue_names(ui) {
+        append(Some(&queues), &name, &format!("queue:{}", name));
+    }
+    ui.cat_view.expand_row(&gtk::TreePath::new_first(), false);
+    let _ = queues;
+    // keep the current filter's row selected (first fill:
+    // "All Downloads")
+    let current = ui.filter.borrow().clone();
+    select_category_row(ui, &current);
+}
+
+fn select_category_row(ui: &Ui, filter: &str) {
+    fn walk(
+        ui: &Ui,
+        parent: Option<&gtk::TreeIter>,
+        filter: &str,
+    ) -> bool {
+        let mut i = 0;
+        loop {
+            let Some(iter) = ui.cat_store.iter_nth_child(parent, i) else {
+                return false;
+            };
+            let key: String = ui
+                .cat_store
+                .value(&iter, CAT_COL_FILTER as i32)
+                .get()
+                .unwrap_or_default();
+            if key == filter {
+                if let Some(path) = ui.cat_store.path(&iter) {
+                    ui.cat_view.expand_to_path(&path);
+                    ui.cat_view.selection().select_path(&path);
+                }
+                return true;
+            }
+            if walk(ui, Some(&iter), filter) {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    walk(ui, None, filter);
+}
+
+/// The download list: GtkTreeView over a ListStore; visible
+/// columns come from the column config (app.js COLUMN_DEFS /
+/// `ndm-columns-v2`) + the block-map renderer column, which is
+/// this shell's own and always appended last (see the
+/// model-column table at the top of this file).
+fn column_model(id: &str) -> u32 {
+    match id {
+        "name" => COL_NAME,
+        "q" => COL_Q,
+        "size" => COL_SIZE,
+        "status" => COL_STATUS,
+        "timeleft" => COL_TIMELEFT,
+        "rate" => COL_RATE,
+        "lasttry" => COL_LASTTRY,
+        "desc" => COL_DESC,
+        "added" => COL_ADDED,
+        "saveto" => COL_SAVETO,
+        _ => COL_NAME,
+    }
+}
+
+pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
+    for col in view.columns() {
+        view.remove_column(&col);
+    }
+    for c in cfg.iter().filter(|c| c.visible) {
+        let (_, title, _, _) = prefs::COLUMN_DEFS
+            .iter()
+            .find(|(id, _, _, _)| *id == c.id)
+            .copied()
+            .unwrap_or(("name", "File Name", 0, false));
+        let model_col = column_model(&c.id);
+        let col = gtk::TreeViewColumn::new();
+        col.set_title(title);
+        col.set_resizable(true);
+        if c.width > 0 {
+            col.set_fixed_width(c.width);
+            col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+        }
+        let cell = gtk::CellRendererText::new();
+        if model_col == COL_NAME {
+            cell.set_property("ellipsize", gtk::pango::EllipsizeMode::End);
+        }
+        gtk::prelude::CellLayoutExt::pack_start(&col, &cell, true);
+        gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "text", model_col as i32);
+        view.append_column(&col);
+    }
+    // Block map — custom renderer (blockmap.rs), fed by the
+    // model's blocks + fraction columns.
+    let col = gtk::TreeViewColumn::new();
+    col.set_title("Blocks");
+    col.set_resizable(true);
+    col.set_fixed_width(160);
+    col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+    let cell = blockmap::BlockMapRenderer::new();
+    gtk::prelude::CellLayoutExt::pack_start(&col, &cell, true);
+    gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "blocks", COL_BLOCKS as i32);
+    gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "fraction", COL_FRACTION as i32);
+    view.append_column(&col);
+}
+
+pub(crate) fn apply_columns(ui: &Ui) {
+    populate_columns(&ui.list_view, &ui.col_cfg.borrow());
+}
+
+fn build_download_list(store: &gtk::ListStore, cfg: &[prefs::ColumnCfg]) -> gtk::TreeView {
+    let view = gtk::TreeView::with_model(store);
+    view.set_grid_lines(gtk::TreeViewGridLines::Horizontal);
+    view.set_reorderable(false);
+    let selection = view.selection();
+    selection.set_mode(gtk::SelectionMode::Multiple);
+    populate_columns(&view, cfg);
+    view
+}
+
+/// The row context menu — the web UI's showCtxMenu shape
+/// (app.js): header (entry name), Resume, Pause,
+/// Properties / Status…, Refresh download address…, separator,
+/// Open File, Open Folder, separator, Delete…, separator,
+/// Select All, Delete All…. "Move to queue" appears between
+/// Open Folder and Delete when more than one queue exists
+/// (app.js: its own headed section), and — as in the web UI —
+/// every item acts on the row the menu was opened for / the
+/// current selection.
+fn build_context_menu(ui: &Rc<Ui>, name: &str, id: Option<String>) -> gtk::Menu {
+    let menu = gtk::Menu::new();
+    let head = menu_item(name);
+    head.set_sensitive(false);
+    menu.add(&head);
+    let real = |label: &str, f: Box<dyn Fn()>| {
+        let item = menu_item(label);
+        item.connect_activate(move |_| f());
+        menu.add(&item);
+    };
+
+    {
+        let (u, id) = (ui.clone(), id.clone());
+        real(
+            "Resume",
+            Box::new(move || {
+                if let Some(id) = &id {
+                    resume_ids(&u, std::slice::from_ref(id));
+                }
+            }),
+        );
+    }
+    {
+        let (u, id) = (ui.clone(), id.clone());
+        real(
+            "Pause",
+            Box::new(move || {
+                if let Some(id) = &id {
+                    pause_ids(&u, std::slice::from_ref(id));
+                }
+            }),
+        );
+    }
+    {
+        // The per-download progress dialog (PROGRESS-DIALOG-SPEC
+        // §1.3: the row menu's "Show progress").
+        let item = menu_item("Show progress");
+        let (u, id) = (ui.clone(), id.clone());
+        item.connect_activate(move |_| {
+            if let Some(id) = &id {
+                open_progress_dialog(&u, id);
+            }
+        });
+        menu.add(&item);
+    }
+    {
+        let (u, id) = (ui.clone(), id.clone());
+        real(
+            "Refresh download address…",
+            Box::new(move || {
+                if let Some(id) = &id {
+                    refresh_address(&u, id);
+                }
+            }),
+        );
+    }
+    menu.add(&gtk::SeparatorMenuItem::new());
+    {
+        let u = ui.clone();
+        real("Open File", Box::new(move || open_selected(&u, false)));
+    }
+    {
+        let u = ui.clone();
+        real("Open Folder", Box::new(move || open_selected(&u, true)));
+    }
+    // "Move to queue" — only when more than one queue exists,
+    // exactly as the web UI omits the section otherwise.
+    let queues = queue_names(ui);
+    if queues.len() > 1 {
+        menu.add(&gtk::SeparatorMenuItem::new());
+        let head = menu_item("Move to queue");
+        head.set_sensitive(false);
+        menu.add(&head);
+        let current = id
+            .as_ref()
+            .and_then(|id| ui.entries.borrow().get(id).map(|d| d.queue.clone()))
+            .unwrap_or_default();
+        for qn in queues {
+            let label = if qn == current {
+                format!("✓ {}", qn)
+            } else {
+                qn.clone()
+            };
+            let (u, idc, q) = (ui.clone(), id.clone(), qn.clone());
+            real(
+                &label,
+                Box::new(move || {
+                    if let Some(id) = &idc {
+                        move_to_queue(&u, id, &q);
+                    }
+                }),
+            );
+        }
+    }
+    menu.add(&gtk::SeparatorMenuItem::new());
+    {
+        let u = ui.clone();
+        real(
+            "Delete…",
+            Box::new(move || {
+                // the whole multi-selection when the menu's row
+                // is part of one, else just that row (app.js
+                // openDeleteConfirm's target rule)
+                let ids = selected_ids(&u);
+                delete_ids(&u, ids);
+            }),
+        );
+    }
+    menu.add(&gtk::SeparatorMenuItem::new());
+    {
+        let u = ui.clone();
+        real(
+            "Select All",
+            Box::new(move || {
+                u.list_view.selection().select_all();
+            }),
+        );
+    }
+    {
+        let u = ui.clone();
+        real(
+            "Delete All…",
+            Box::new(move || {
+                let ids = u.order.borrow().clone();
+                delete_ids(&u, ids);
+            }),
+        );
+    }
+    // Queue order within the entry's queue (core move_in_queue,
+    // the Scheduler's reorder primitive) — a small real extra
+    // the row menu is the natural home for.
+    {
+        let (u, id) = (ui.clone(), id.clone());
+        real(
+            "Move Up in Queue",
+            Box::new(move || {
+                if let Some(id) = &id {
+                    let _ = sink::move_in_queue(u.ctx.clone(), id.clone(), true);
+                    refresh_list(&u);
+                }
+            }),
+        );
+    }
+    {
+        let (u, id) = (ui.clone(), id.clone());
+        real(
+            "Move Down in Queue",
+            Box::new(move || {
+                if let Some(id) = &id {
+                    let _ = sink::move_in_queue(u.ctx.clone(), id.clone(), false);
+                    refresh_list(&u);
+                }
+            }),
+        );
+    }
+    menu.show_all();
+    menu
+}
+
+/// Status bar with 3 sections (see `Ui::status`).
+fn build_statusbar(status: &[gtk::Label; 3]) -> gtk::Box {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    for (i, label) in status.iter().enumerate() {
+        label.set_halign(gtk::Align::Start);
+        label.set_margin_start(6);
+        label.set_margin_end(6);
+        let frame = gtk::Frame::new(None);
+        frame.set_shadow_type(gtk::ShadowType::In);
+        frame.add(label);
+        if i == 2 {
+            frame.set_hexpand(true);
+        }
+        bar.add(&frame);
+    }
+    bar
+}
+
+// ---------------------------------------------------------------------------
+// Event dispatch — runs ONLY on the GTK main thread (the channel
+// receiver is attached to the default main context). One match
+// arm per AppEvent variant, deliberately without a wildcard:
+// the enum is the contract (sink.rs), and a new core event must
+// fail this compile until the shell handles it.
+// ---------------------------------------------------------------------------
+fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
+    match event {
+        AppEvent::Progress(payload) => {
+            // Real row update — the list's whole live surface.
+            // Core's payload fields are private, so the row code
+            // reads the decoded wire view (see sink.rs). The
+            // same view feeds an open progress dialog for this
+            // entry (progress.rs routes by id).
+            let view = ProgressView::from(&payload);
+            upsert_entry(ui, &view);
+            progress::update(&view);
+        }
+        AppEvent::DownloadComplete(v) => {
+            // One row update, nothing more: mark the mirror
+            // entry finished and land the finish in its row
+            // (cadence rule — no full-list rebuild per event;
+            // the final Progress payload carries the same state
+            // and the next user-initiated refresh resyncs all).
+            // The Download Complete dialog itself is a later
+            // stage's surface.
+            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                if let Some(d) = ui.entries.borrow_mut().get_mut(id) {
+                    d.status = "finished".to_string();
+                    if d.total > 0 {
+                        d.done_bytes = d.total;
+                    }
+                    d.speed_bps = 0.0;
+                }
+                let still_visible = ui
+                    .entries
+                    .borrow()
+                    .get(id)
+                    .map(|d| entry_visible(&ui.filter.borrow(), d))
+                    .unwrap_or(false);
+                if still_visible {
+                    if let Some(iter) = find_iter(&ui.store, id) {
+                        ui.store.set(
+                            &iter,
+                            &[
+                                (COL_STATUS, &"Complete" as &dyn gtk::glib::ToValue),
+                                (COL_FRACTION, &1.0f64 as &dyn gtk::glib::ToValue),
+                                (COL_RATE, &"" as &dyn gtk::glib::ToValue),
+                                (COL_TIMELEFT, &"" as &dyn gtk::glib::ToValue),
+                                (COL_SPEED, &0.0f64 as &dyn gtk::glib::ToValue),
+                            ],
+                        );
+                        refresh_status_counts(ui);
+                    }
+                } else if let Some(mut iter) = find_iter(&ui.store, id) {
+                    ui.store.remove(&mut iter);
+                    refresh_status_counts(ui);
+                }
+            }
+            // An open progress dialog for this entry shows the
+            // final state and stays open (spec §1.3).
+            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                if let Some(d) = ui.entries.borrow().get(id).cloned() {
+                    progress::update(&d);
+                }
+            }
+            let name = v
+                .get("name")
+                .and_then(|x| x.as_str())
+                .unwrap_or("");
+            if name.is_empty() {
+                set_notice(ui, "Download complete");
+            } else {
+                set_notice(ui, &format!("Download complete: {}", name));
+            }
+            // The Download Complete dialog: core emitted this
+            // event only when its completion_show_dialog rule
+            // passed (override → entry action → global), so the
+            // shell simply shows it (modals.rs mirrors cmodal,
+            // including yield-to-dialogs and the batch fold).
+            modals::on_download_complete(&ui.window, ui.ctx.clone(), &v);
+        }
+        AppEvent::EntryRemoved(v) => {
+            // Real: rows leave the list only through this event
+            // (the web UI's listener contract, payload {id}).
+            // One row removal per event — a bulk remove emits
+            // one event per row, so this stays O(1) per event
+            // instead of rebuilding the whole list N times.
+            if let Some(id) = v.get("id").and_then(|x| x.as_str()) {
+                progress::close(id);
+                modals::forget_complete(id);
+                remove_entry_local(ui, id);
+            }
+        }
+        AppEvent::IncomingFile(v) => {
+            // Browser-caught files and basket / clipboard /
+            // drop hand-offs: the File Info dialog prefilled
+            // with the offered payload, queued behind any open
+            // modal exactly as app.js queues file links.
+            queue_incoming_file(ui, v);
+        }
+        AppEvent::IncomingVideo(v) => {
+            let url = v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let cookies = v
+                .get("cookies")
+                .and_then(|x| x.as_str())
+                .filter(|x| !x.is_empty())
+                .map(|x| x.to_string());
+            if url.starts_with("http://") || url.starts_with("https://") {
+                video::show(ui.clone(), Some(url), cookies);
+            } else {
+                set_notice(ui, "Incoming video without an address");
+            }
+        }
+        AppEvent::IncomingGrab(v) => {
+            // The extension's grab-all-links: the wizard opens
+            // with the page filled in and exploration running
+            // (app.js pumpGrabLinks).
+            let url = v
+                .get("url")
+                .and_then(|x| x.as_str())
+                .filter(|x| !x.is_empty())
+                .or_else(|| v.get("pageUrl").and_then(|x| x.as_str()))
+                .unwrap_or("")
+                .to_string();
+            if url.starts_with("http://") || url.starts_with("https://") {
+                grabber::show(ui.clone(), Some(url), true);
+            } else {
+                set_notice(ui, "Incoming grab without an address");
+            }
+        }
+        AppEvent::BasketNote(v) => {
+            let text = v
+                .get("text")
+                .and_then(|x| x.as_str())
+                .unwrap_or("Basket note");
+            basket::on_basket_note(ui, text);
+            set_notice(ui, text);
+        }
+        AppEvent::ComponentsProgress(v) => {
+            // The video picker waits on this invisibly (its gate);
+            // the status line only names a component in flight.
+            video::on_components_progress(&v);
+            if let Some(name) = v.get("name").and_then(|x| x.as_str()) {
+                set_notice(ui, &format!("Setting up the video engine: {}", name));
+            }
+        }
+        AppEvent::UpdateAvailable(v) => {
+            // The Update dialog (modals.rs mirrors umodal,
+            // mandatory mode included).
+            if v.get("status").and_then(|x| x.as_str()) == Some("available") {
+                modals::show_update(&ui.window, ui.ctx.clone(), &v);
+            }
+            set_notice(ui, "A new version of NDM is available");
+        }
+        AppEvent::UpdateProgress(v) => {
+            modals::on_update_progress(&v);
+        }
+        AppEvent::UpdateInstalled(_) => {
+            modals::on_update_installed();
+            set_notice(ui, "Update installed — restart NDM to use it");
+        }
+        AppEvent::QuotaExceeded(_) => {
+            set_notice(ui, "Download limit reached for this period");
+        }
+        AppEvent::QuotaCleared(_) => {
+            set_notice(ui, "Download limit cleared");
+        }
+        AppEvent::ExitVetoed(v) => {
+            // Core postponed an automatic exit because a
+            // download is paused (maybe_exit_when_done) — the
+            // shell's job is only to surface it.
+            let paused = v.get("paused").and_then(|x| x.as_u64()).unwrap_or(0);
+            if paused > 0 {
+                set_notice(
+                    ui,
+                    &format!(
+                        "Exit postponed: {} download{} paused",
+                        paused,
+                        if paused == 1 { "" } else { "s" }
+                    ),
+                );
+            } else {
+                set_notice(ui, "Exit postponed: a download is paused");
+            }
+        }
+        AppEvent::PersistFailed(_) => {
+            set_notice(ui, "Warning: the download list could not be saved");
+        }
+        AppEvent::PersistRecovered(_) => {
+            set_notice(ui, "Download list saved");
+        }
+        AppEvent::DropFileIgnored(v) => {
+            let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            set_notice(ui, &format!("Not a web link: {}", name));
+        }
+        AppEvent::ExtUpdateNotice(_) => {
+            set_notice(ui, "Browser extension update pending — restart the browser");
+        }
+        AppEvent::ProgressDialogReveal(v) => {
+            // Core emits this on starts when the
+            // progress_dialog_view setting is "show" or
+            // "minimized" (§1.3/G7 — core's
+            // maybe_reveal_progress_dialog is the gate) and the
+            // payload carries the view. The shell's part: "show"
+            // opens/raises the real dialog; "minimized" creates
+            // it lowered (iconified), never presented.
+            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            if !id.is_empty() {
+                if v.get("view").and_then(|x| x.as_str()) == Some("minimized") {
+                    open_progress_dialog_lowered(ui, id);
+                } else {
+                    open_progress_dialog(ui, id);
+                }
+            }
+        }
+    }
+}
+
+fn handle_ui_message(ui: &Rc<Ui>, msg: UiMessage) -> gtk::glib::ControlFlow {
+    match msg {
+        UiMessage::Event(event) => handle_app_event(ui, event),
+        UiMessage::RaiseMainWindow => {
+            ui.window.present();
+        }
+        UiMessage::ExitApp => {
+            ui.window.close();
+            return gtk::glib::ControlFlow::Break;
+        }
+    }
+    gtk::glib::ControlFlow::Continue
+}
+
+// ---------------------------------------------------------------------------
+// Startup show seam — NATIVE-PLAN.md §1.4: the Tauri shell shows
+// the window on the WebView's first page-load `Finished`; the
+// native replacement key is "state restored" — the journal is
+// back and the first list fill has run. The native shell has
+// no page-load gate, so the window shows as soon as build_ui
+// has bootstrapped state and filled the list; a `--background`
+// start stays hidden either way, as today.
+// ---------------------------------------------------------------------------
+fn on_state_restored(window: &gtk::ApplicationWindow, background: bool) {
+    if background {
+        window.hide();
+    } else {
+        window.show_all();
+        window.present();
+    }
+}
+
+/// The app-data dir on Linux — the Tauri app's own:
+/// ($XDG_DATA_HOME or ~/.local/share)/com.ndm.downloadmanager
+/// (the same computation the Tauri shell's single-instance
+/// guard makes for its port).
+pub(crate) fn app_data_dir() -> PathBuf {
+    let base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(x) if !x.is_empty() => PathBuf::from(x),
+        _ => std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join(".local").join("share"))
+            .unwrap_or_else(|| PathBuf::from(".local/share")),
+    };
+    base.join("com.ndm.downloadmanager")
+}
+
+fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot) {
+    let store = gtk::ListStore::new(&[
+        gtk::glib::types::Type::STRING, // COL_ID
+        gtk::glib::types::Type::STRING, // COL_NAME
+        gtk::glib::types::Type::STRING, // COL_Q
+        gtk::glib::types::Type::STRING, // COL_SIZE
+        gtk::glib::types::Type::STRING, // COL_STATUS
+        gtk::glib::types::Type::STRING, // COL_TIMELEFT
+        gtk::glib::types::Type::STRING, // COL_RATE
+        gtk::glib::types::Type::STRING, // COL_LASTTRY
+        gtk::glib::types::Type::STRING, // COL_DESC
+        gtk::glib::types::Type::STRING, // COL_ADDED
+        gtk::glib::types::Type::STRING, // COL_SAVETO
+        gtk::glib::types::Type::STRING, // COL_BLOCKS
+        gtk::glib::types::Type::F64,    // COL_FRACTION
+        gtk::glib::types::Type::U64,    // COL_DONE
+        gtk::glib::types::Type::U64,    // COL_TOTAL
+        gtk::glib::types::Type::F64,    // COL_SPEED
+    ]);
+    debug_assert_eq!(store.n_columns() as usize, NCOLS);
+
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .title("Nill Download Manager")
+        .default_width(1120) // §1.1 main-window spec
+        .default_height(720)
+        .build();
+    window.set_size_request(860, 540); // §1.1 minimum size
+
+    // Closing the main window IS the user leaving (Tauri shell,
+    // N-12: CloseRequested on main → exit(0); there is no tray
+    // and no close-to-tray mode). The window's destruction
+    // therefore quits the application outright.
+    {
+        let app = app.clone();
+        window.connect_destroy(move |_| {
+            app.quit();
+        });
+    }
+
+    let (cat_store, cat_view) = build_category_pane();
+    let col_cfg = prefs::load_columns();
+    let list = build_download_list(&store, &col_cfg);
+
+    let ui = Rc::new(Ui {
+        window: window.clone(),
+        store: store.clone(),
+        status: [gtk::Label::new(None), gtk::Label::new(None), gtk::Label::new(None)],
+        eta_samples: RefCell::new(HashMap::new()),
+        ctx: ctx.clone(),
+        entries: RefCell::new(HashMap::new()),
+        order: RefCell::new(Vec::new()),
+        filter: RefCell::new("All Downloads".to_string()),
+        list_view: list.clone(),
+        cat_store: cat_store.clone(),
+        cat_view: cat_view.clone(),
+        queue_pick: RefCell::new("Main download queue".to_string()),
+        toolbar: RefCell::new(None),
+        toolbar_buttons: RefCell::new(HashMap::new()),
+        col_cfg: RefCell::new(col_cfg),
+        basket_check: RefCell::new(None),
+    });
+    ui.status[0].set_text("No downloads");
+    ui.status[2].set_text("Ready");
+
+    let menubar = build_menubar(&ui);
+    let toolbar = build_toolbar(&ui);
+    apply_toolbar(&ui);
+
+    // Keyboard shortcuts (app.js's global keydown): Ctrl+N,
+    // Ctrl+Shift+V, F5, Ctrl+Q, Ctrl+A — inert while a text
+    // field has focus, as in the web UI.
+    {
+        let u = ui.clone();
+        window.connect_key_press_event(move |win, ev| {
+            use gtk::gdk;
+            let focused = win
+                .focused_widget()
+                .map(|w| {
+                    w.is::<gtk::Entry>()
+                        || w.is::<gtk::TextView>()
+                        || w.is::<gtk::SpinButton>()
+                })
+                .unwrap_or(false);
+            if focused {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let ctrl = ev.state().contains(gdk::ModifierType::CONTROL_MASK);
+            let shift = ev.state().contains(gdk::ModifierType::SHIFT_MASK);
+            let kv = ev.keyval();
+            if ctrl && !shift && kv == gdk::keys::constants::n {
+                open_add_dialog(&u);
+            } else if ctrl && shift && kv == gdk::keys::constants::v {
+                video::show(u.clone(), None, None);
+            } else if kv == gdk::keys::constants::F5 {
+                refresh_list(&u);
+                rebuild_category_tree(&u);
+            } else if ctrl && kv == gdk::keys::constants::q {
+                win.close();
+            } else if ctrl && kv == gdk::keys::constants::a {
+                u.list_view.selection().select_all();
+            } else {
+                return gtk::glib::Propagation::Proceed;
+            }
+            gtk::glib::Propagation::Stop
+        });
+    }
+
+    // Category selection filters the list (app.js selectTreeCat
+    // → visibleItems). The Queues header row carries an empty
+    // key and only expands.
+    {
+        let u = ui.clone();
+        cat_view.selection().connect_changed(move |sel| {
+            let Some((model, iter)) = sel.selected() else {
+                return;
+            };
+            let key: String = model
+                .value(&iter, CAT_COL_FILTER as i32)
+                .get()
+                .unwrap_or_default();
+            if key.is_empty() {
+                return;
+            }
+            if *u.filter.borrow() != key {
+                *u.filter.borrow_mut() = key;
+                refresh_list(&u);
+            }
+        });
+    }
+
+    // Right-click on the category pane: "New category…" — the
+    // web UI's prompt caller (app.js inCatAdd → showPrompt): the
+    // name persists as an empty category_exts slot, the same
+    // place the Options editor stores its overrides, so it
+    // survives restarts; an existing name just selects it.
+    {
+        let u = ui.clone();
+        cat_view.connect_button_press_event(move |_, event| {
+            if event.button() != 3 {
+                return gtk::glib::Propagation::Proceed;
+            }
+            let menu = gtk::Menu::new();
+            let item = menu_item("New category…");
+            let u2 = u.clone();
+            item.connect_activate(move |_| {
+                let Some(raw) = dialogs::show_prompt(
+                    &u2.window,
+                    "New category",
+                    "Name for the new category:",
+                    "",
+                ) else {
+                    return;
+                };
+                let name = raw.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                if let Some(existing) = category_names(&u2)
+                    .iter()
+                    .find(|c| c.eq_ignore_ascii_case(&name))
+                    .cloned()
+                {
+                    *u2.filter.borrow_mut() = existing.clone();
+                    refresh_list(&u2);
+                    select_category_row(&u2, &existing);
+                    return;
+                }
+                update_settings(&u2, |obj| {
+                    let exts = obj
+                        .entry("category_exts")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(m) = exts.as_object_mut() {
+                        m.insert(name.clone(), serde_json::json!([]));
+                    }
+                });
+                rebuild_category_tree(&u2);
+                set_notice(&u2, &format!("Category \"{}\" created", name));
+            });
+            menu.add(&item);
+            menu.show_all();
+            menu.popup_at_pointer(Some(event));
+            gtk::glib::Propagation::Stop
+        });
+    }
+
+    // Right-click on a row: select it (when it is not already
+    // part of the selection), then the app context menu.
+    let ui_for_menu = ui.clone();
+    list.connect_button_press_event(move |view, event| {
+        if event.button() == 3 {
+            let mut name = "Download".to_string();
+            let mut row_id: Option<String> = None;
+            let (x, y) = event.position();
+            if let Some((Some(path), _, _, _)) = view.path_at_pos(x as i32, y as i32) {
+                if let Some(model) = view.model() {
+                    if let Some(iter) = model.iter(&path) {
+                        let found: String = model
+                            .value(&iter, COL_NAME as i32)
+                            .get()
+                            .unwrap_or_default();
+                        if !found.is_empty() {
+                            name = found;
+                        }
+                        let id: String = model
+                            .value(&iter, COL_ID as i32)
+                            .get()
+                            .unwrap_or_default();
+                        if !id.is_empty() {
+                            row_id = Some(id);
+                        }
+                        // a right-clicked row outside the current
+                        // selection becomes the selection (the
+                        // web UI's row-menu behaviour)
+                        let sel = view.selection();
+                        if !sel.path_is_selected(&path) {
+                            sel.unselect_all();
+                            sel.select_path(&path);
+                        }
+                    }
+                }
+            }
+            if name.chars().count() > 34 {
+                name = format!("{}…", name.chars().take(34).collect::<String>());
+            }
+            let menu = build_context_menu(&ui_for_menu, &name, row_id);
+            menu.popup_at_pointer(Some(event));
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+
+    // Double-click a row opens the per-download progress
+    // dialog (PROGRESS-DIALOG-SPEC §1.3, NDM's ruling).
+    {
+        let u = ui.clone();
+        list.connect_row_activated(move |_, path, _| {
+            let mut id = String::new();
+            if let Some(model) = u.list_view.model() {
+                if let Some(iter) = model.iter(path) {
+                    id = model.value(&iter, COL_ID as i32).get().unwrap_or_default();
+                }
+            }
+            if !id.is_empty() {
+                open_progress_dialog(&u, &id);
+            }
+        });
+    }
+
+    let cat_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    cat_scroll.add(&cat_view);
+    cat_scroll.set_size_request(200, -1);
+    let list_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+    list_scroll.add(&list);
+
+    let panes = gtk::Paned::new(gtk::Orientation::Horizontal);
+    panes.pack1(&cat_scroll, false, false);
+    panes.pack2(&list_scroll, true, false);
+    panes.set_position(210);
+
+    let statusbar = build_statusbar(&ui.status);
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    root.add(&menubar);
+    root.add(&toolbar);
+    root.pack_start(&panes, true, true, 0);
+    root.add(&statusbar);
+    window.add(&root);
+
+    // Event bridge: core threads → this main thread.
+    let ui_for_events = ui.clone();
+    receiver.attach(move |msg| handle_ui_message(&ui_for_events, msg));
+
+    // First fill from real core state: the category tree from
+    // settings + entries, the list from list_downloads, and the
+    // one-time startup notice (the web UI pulls the same slot
+    // once on load).
+    rebuild_category_tree(&ui);
+    refresh_list(&ui);
+    if let Some(notice) = sink::take_startup_notice(ui.ctx.clone()) {
+        if !notice.trim().is_empty() {
+            set_notice(&ui, &notice);
+        }
+    }
+    // Pull a latched update offer (app.js pulls get_pending_update
+    // on load — the launch check's emit can predate this shell's
+    // listener on a cold start).
+    let pending = sink::get_pending_update(ui.ctx.clone());
+    if pending.get("status").and_then(|x| x.as_str()) == Some("available") {
+        modals::show_update(&ui.window, ui.ctx.clone(), &pending);
+    }
+
+    // State-restored seam (§1.4): init_paths ran in main()
+    // before the app started and the first fill just ran, so
+    // the window may show now.
+    let background = std::env::args().any(|a| a == "--background");
+    on_state_restored(&window, background);
+}
+
+fn main() {
+    // The one channel between core threads and the GTK thread.
+    #[allow(deprecated)]
+    let (sender, receiver) = gtk::glib::MainContext::channel::<UiMessage>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let sink: Arc<dyn sink::EventSink> = Arc::new(GtkEventSink::new(sender));
+
+    // Bootstrap — the Tauri shell's setup() order, verbatim:
+    // AppState::new → Ctx::new(state, sink) → init_paths(dir) →
+    // run_startup_sweeps → check_ext_notice → the background
+    // entry points. The data dir is the Tauri app's own, so a
+    // profile is shared, never forked.
+    let state = Arc::new(AppState::new());
+    let ctx = Ctx::new(state.clone(), sink);
+    let dir = app_data_dir();
+    match state.init_paths(&dir) {
+        Ok(()) => {
+            sink::run_startup_sweeps(&state);
+            sink::check_ext_notice(&ctx, &state);
+            sink::run_launch_update_check(ctx.clone());
+            sink::run_update_recheck_loop(ctx.clone());
+            sink::run_component_warmup(ctx.clone());
+            sink::startup_resume(&ctx);
+            sink::run_scheduler_loop(ctx.clone());
+            sink::run_clipboard_watcher(ctx.clone());
+            sink::run_snapshot_loop(ctx.clone());
+            sink::run_incoming_loop(ctx.clone(), dir);
+        }
+        Err(e) => {
+            // No journal, no honest app: say so on stderr and
+            // still show the window with the failure in the
+            // status bar rather than running against lost state.
+            eprintln!("[ndm-shell-gtk] init_paths({}) failed: {}", dir.display(), e);
+        }
+    }
+
+    let app = gtk::Application::builder()
+        .application_id("tech.zahurul.ndm")
+        .build();
+
+    let receiver = gtksink::ReceiverSlot::new(receiver);
+    app.connect_activate(move |app| {
+        build_ui(app, &ctx, &receiver);
+    });
+    app.run();
+}
