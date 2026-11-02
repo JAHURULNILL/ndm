@@ -2533,8 +2533,15 @@ impl InFlightGuard {
             ),
             // a folder that cannot hold the lock file cannot hold
             // the download either; degrade to the process-local
-            // guard instead of failing a start that used to work
-            Err(_) => File::open(lock_path).map_err(|e| e.to_string()),
+            // guard instead of failing a start that used to work.
+            // The placeholder is the null device, exactly the role
+            // /dev/null plays in the Unix arm: opening the lock
+            // path itself here could only succeed when the file
+            // already existed (the AlreadyExists arm above owns
+            // that case), so every genuine failure — a missing
+            // parent (os error 3), access denied — became a hard
+            // start error instead of the documented degradation.
+            Err(_) => File::open("NUL").map_err(|e| e.to_string()),
         }
     }
 }
