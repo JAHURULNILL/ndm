@@ -4169,6 +4169,9 @@ async function initTauri() {
   // the reveal targets the entry exactly like a manual open.
   await listen('progress_dialog_reveal', e => {
     const id = (e.payload || {}).id;
+    // G7: "minimized" is a no-op in this single-window shell —
+    // native shells honour it by opening the dialog lowered
+    if ((e.payload || {}).view === 'minimized') return;
     if (!id || deletedIds.has(id)) return;
     if (!items.has(id)) {
       // the start's own progress payload may not have landed yet —

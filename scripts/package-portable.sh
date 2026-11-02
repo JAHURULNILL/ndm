@@ -3,14 +3,14 @@
 # distro — no installation, no root. Bundles the app, the browser
 # bridge and every component (yt-dlp, deno, ffmpeg), so video merging
 # works out of the box even where no package manager package exists.
-# The one system requirement is WebKitGTK 4.1 (the GUI library every
-# Tauri app needs); install.sh checks for it and prints the exact
+# The one system requirement is GTK 3 (the GUI library the native
+# shell uses); install.sh checks for it and prints the exact
 # package command for the distro it finds.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-APP=src-tauri/target/release/ndm-app
+APP=shell-gtk/target/release/ndm-shell-gtk
 HOST=target/release/ndm-host
 for f in "$APP" "$HOST" tools/yt-dlp tools/deno tools/ffmpeg; do
   [ -f "$f" ] || { echo "missing $f — build release binaries and fetch tools first" >&2; exit 1; }
@@ -76,13 +76,13 @@ mkdir -p "$HOME/.local/share/applications"
 sed "s|NDM_DIR|$DIR|g" "$DIR/NDM.desktop" > "$HOME/.local/share/applications/ndm.desktop"
 chmod +x "$HOME/.local/share/applications/ndm.desktop"
 echo "menu entry added: Nill Download Manager"
-if ! ldconfig -p 2>/dev/null | grep -q 'libwebkit2gtk-4.1\.so'; then
+if ! ldconfig -p 2>/dev/null | grep -q 'libgtk-3\.so'; then
   echo ""
-  echo "NOTE: the GUI library WebKitGTK 4.1 was not found. Install it once:"
-  echo "  Debian/Ubuntu: sudo apt install libwebkit2gtk-4.1-0"
-  echo "  Fedora:        sudo dnf install webkit2gtk4.1"
-  echo "  Arch:          sudo pacman -S webkit2gtk-4.1"
-  echo "  openSUSE:      sudo zypper install libwebkit2gtk-4_1-0"
+  echo "NOTE: the GUI library GTK 3 was not found. Install it once:"
+  echo "  Debian/Ubuntu: sudo apt install libgtk-3-0"
+  echo "  Fedora:        sudo dnf install gtk3"
+  echo "  Arch:          sudo pacman -S gtk3"
+  echo "  openSUSE:      sudo zypper install libgtk-3-0"
 fi
 echo "Done. Start NDM with: $DIR/ndm-app"
 EOF

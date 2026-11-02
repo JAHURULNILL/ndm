@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Assemble the NDM .deb from the release binary (no cargo-tauri CLI
-# needed). Mirrors the layout Tauri's bundler produces:
+# Assemble the NDM .deb from the release binary. Since 2.1.0 the app
+# is the native GTK shell (shell-gtk crate), installed under the same
+# name and layout as before:
 #   usr/bin/ndm-app, usr/share/applications/NDM.desktop,
 #   usr/share/icons/hicolor/<size>/apps/ndm-app.png
-# Usage: scripts/package-deb.sh [version]   (default: from tauri.conf.json)
+# Usage: scripts/package-deb.sh [version]   (default: from Cargo.toml)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 VERSION="${1:-}"
 if [ -z "$VERSION" ]; then
-  VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+  VERSION=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
 fi
-BIN="src-tauri/target/release/ndm-app"
-[ -x "$BIN" ] || { echo "release binary missing — run: cargo build --release --manifest-path src-tauri/Cargo.toml" >&2; exit 1; }
+BIN="shell-gtk/target/release/ndm-shell-gtk"
+[ -x "$BIN" ] || { echo "release binary missing — run: cargo build --release --manifest-path shell-gtk/Cargo.toml" >&2; exit 1; }
 HOST_BIN="target/release/ndm-host"
 [ -x "$HOST_BIN" ] || { echo "ndm-host missing — run: cargo build --release" >&2; exit 1; }
 
@@ -74,7 +75,7 @@ Architecture: $ARCH
 Installed-Size: $INSTALLED_KB
 Maintainer: Nill
 Priority: optional
-Depends: libwebkit2gtk-4.1-0, libgtk-3-0, ffmpeg
+Depends: libgtk-3-0, ffmpeg
 Description: NDM — fast, resumable downloads for Linux and Windows
  Nill Download Manager: multi-connection downloads with resume,
  browser integration, a video downloader and a site grabber.
