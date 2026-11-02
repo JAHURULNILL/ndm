@@ -2520,26 +2520,64 @@ mod os_file_lock {
     }
 }
 
+/// Race-safe removal of ONE lock file at `path`; returns true
+/// when the file was removed. This is the single implementation
+/// of the removal protocol, shared by the janitorial sweep and
+/// by `InFlightGuard::drop` (release-time cleanup): the file is
+/// removed only when its flock can be acquired (no live download
+/// holds it) AND the opened handle still names the same inode/dev
+/// as a fresh metadata lookup of the path (the path was not
+/// replaced between open and delete). Dropping the handle then
+/// releases the flock on the now unlinked inode, which no future
+/// contender can open. Every error is a silent skip: removal is
+/// janitorial and must never fail a download.
+#[cfg(unix)]
+fn sweep_lock_file(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    // never create: a path that vanished already is gone, and
+    // creating it just to delete it would be litter of our own.
+    let f = match OpenOptions::new().write(true).truncate(false).open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    if !os_file_lock::try_acquire(&f) {
+        // a live download holds this lock — leave it alone.
+        return false;
+    }
+    // identity re-check: the inode we flocked must still be the
+    // inode the path names, or the path was replaced under us and
+    // deleting it could remove a fresh lock.
+    let opened = match f.metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let fresh = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if opened.ino() != fresh.ino() || opened.dev() != fresh.dev() {
+        return false;
+    }
+    std::fs::remove_file(path).is_ok()
+    // dropping `f` here releases the flock.
+}
+
 /// Janitorial sweep of stale `.ndm.lock` litter in `dir`
 /// (non-recursive), returning how many files were removed.
 ///
-/// On Unix the lock FILE is deliberately never unlinked by
-/// `InFlightGuard::drop` (deleting it while a contender holds the
-/// deleted inode open would split the flock — see the Drop impl),
-/// so every finished download leaves a permanent 0-byte
-/// `<name>.ndm.lock` behind. This sweep is the race-safe
-/// counterpart: a lock file is removed only when its flock can be
-/// acquired (no live download holds it) AND the opened handle
-/// still names the same inode/dev as a fresh metadata lookup of
-/// the path (the path was not replaced between open and delete).
-/// Dropping the handle then releases the flock on the now
-/// unlinked inode, which no future contender can open. Every
-/// error is a silent skip: the sweep is janitorial and must never
-/// fail a download.
+/// `InFlightGuard::drop` removes a download's own lock file at
+/// release time (see the Drop impl), so on every clean path —
+/// finish, removal, app exit — the file is already gone. This
+/// sweep is the backstop for the paths Drop cannot reach: a
+/// process killed mid-download (SIGKILL, power loss) leaves the
+/// file behind while its flock dies with the process, and
+/// litter written by older versions predates release-time
+/// removal. A lock file is removed only through
+/// `sweep_lock_file`'s race-safe check (flock-acquirable +
+/// inode identity), so a live download's lock is never touched.
 #[cfg(unix)]
 pub fn sweep_stale_locks(dir: &Path) -> usize {
     use std::os::unix::ffi::OsStrExt as _;
-    use std::os::unix::fs::MetadataExt as _;
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return 0,
@@ -2555,36 +2593,9 @@ pub fn sweep_stale_locks(dir: &Path) -> usize {
         if bytes.len() < 9 || &bytes[bytes.len() - 9..] != b".ndm.lock" {
             continue;
         }
-        let path = entry.path();
-        // never create: a path that vanished since the listing is
-        // already gone, and creating it just to delete it would be
-        // litter of our own.
-        let f = match OpenOptions::new().write(true).truncate(false).open(&path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        if !os_file_lock::try_acquire(&f) {
-            // a live download holds this lock — leave it alone.
-            continue;
-        }
-        // identity re-check: the inode we flocked must still be
-        // the inode the path names, or the path was replaced
-        // under us and deleting it could remove a fresh lock.
-        let opened = match f.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let fresh = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if opened.ino() != fresh.ino() || opened.dev() != fresh.dev() {
-            continue;
-        }
-        if std::fs::remove_file(&path).is_ok() {
+        if sweep_lock_file(&entry.path()) {
             swept += 1;
         }
-        // dropping `f` here releases the flock.
     }
     swept
 }
@@ -2617,8 +2628,9 @@ impl InFlightGuard {
         let lock_path = PathBuf::from(os_str);
         // self-clean this folder's stale lock litter before
         // claiming (N2): every start sweeps the stale `.ndm.lock`
-        // files left by finished downloads — including a previous
-        // run's. Running BEFORE the claim is what makes sweeping
+        // files left behind by processes that died mid-download
+        // (Drop removes the file on every clean release — this is
+        // the backstop for the paths Drop never runs on). Running BEFORE the claim is what makes sweeping
         // this download's own stale lock safe: it is removed
         // unlocked and then recreated fresh by the claim below,
         // while a live contender's lock is never touched (the
@@ -2718,11 +2730,29 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         plock(&IN_FLIGHT).retain(|p| p != &self.key);
-        // Unix: closing the flocked file releases the OS lock; the
-        // (empty) lock file itself stays — deleting it while a
-        // contender holds the deleted inode open would split the
-        // lock. Other platforms: the exclusive-create file is the
-        // lock, so it goes with the guard.
+        // Unix: release the flock first (closing the held file),
+        // then remove the lock file NOW — at release, not at the
+        // next launch — through the sweep's race-safe check
+        // (`sweep_lock_file`: fresh open, flock-acquirable, inode
+        // identity). The fd must close first because the check's
+        // own open would otherwise conflict with our still-held
+        // flock. The old never-unlink rule guarded against
+        // deleting a file a contender holds open on the same
+        // inode; unconditional unlink would still be wrong, but
+        // unlinking only while holding the flock ourselves,
+        // after the identity re-check, is exactly the protocol
+        // the sweep already proves. If another download claimed
+        // the path in the gap, its live flock makes the check
+        // skip and its file stays. A process killed mid-download
+        // never runs Drop — the startup/register sweeps remain
+        // the backstop for that litter. Other platforms: the
+        // exclusive-create file is the lock, so it goes with the
+        // guard, as before.
+        #[cfg(unix)]
+        {
+            self.lock_file = None;
+            let _ = sweep_lock_file(&self.lock_path);
+        }
         #[cfg(not(unix))]
         {
             let _ = std::fs::remove_file(&self.lock_path);
@@ -6331,6 +6361,31 @@ mod audit207_tests {
         assert!(InFlightGuard::register(&alt).is_err());
         drop(g);
         let _g2 = InFlightGuard::register(&out).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guard_drop_removes_the_lock_file_at_release() {
+        let dir = std::env::temp_dir().join(format!("ndm-207-drop-a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("f.bin");
+        let lock = dir.join("f.bin.ndm.lock");
+        let g = InFlightGuard::register(&out).unwrap();
+        assert!(lock.exists(), "the live guard's lock file must exist");
+        drop(g);
+        assert!(
+            !lock.exists(),
+            "release must remove the lock file then and there, not at the next launch"
+        );
+        // a later download of the same path re-creates the lock
+        // and its release removes it again — the lifecycle is
+        // unchanged apart from the cleanup timing.
+        let g2 = InFlightGuard::register(&out).unwrap();
+        assert!(lock.exists(), "the next guard must re-create its lock file");
+        drop(g2);
+        assert!(!lock.exists(), "the second release must remove it too");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- N2: stale `.ndm.lock` sweep ---
