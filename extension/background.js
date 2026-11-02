@@ -475,7 +475,12 @@ function sendToNdm(message) {
   if (message.url && inflightSends.has(key)) {
     return inflightSends.get(key);
   }
-  const msg = { type: 'download', ...message };
+  // Every download submission carries ext_version (E3): the host
+  // stamps ext_seen on the download path, not only on ping — a
+  // download-only session otherwise never refreshes the stamp
+  // and a stale extension stays invisible to the app's notice.
+  // A caller-supplied value (same source) wins via the spread.
+  const msg = { type: 'download', ext_version: chrome.runtime.getManifest().version, ...message };
   const myGen = ++sendGeneration;
   let answered = false;
   const promise = new Promise(resolve => {
@@ -1286,14 +1291,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         pageUrl,
         title,
         cookies,
+        ext_version: chrome.runtime.getManifest().version,
       };
       if (kind === 'video_direct' || kind === 'file_direct') {
         payload.selector = message.selector || '';
         payload.audio = !!message.audio;
+        payload.force = !!message.force;
+      }
+      // 'file' is the in-page "Download Later" kind (E1): its
+      // dir/later/total are the user's actual choices, so they
+      // are forwarded for it too, not only for the *_direct kinds.
+      if (kind === 'video_direct' || kind === 'file_direct' || kind === 'file') {
         payload.dir = message.dir || '~/Downloads';
         payload.later = !!message.later;
         payload.total = Number(message.total) || 0;
-        payload.force = !!message.force;
       }
       const res = await sendToNdm(payload);
       sendResponse(res);
@@ -1487,15 +1498,35 @@ async function findReferrerTab(referrer) {
   try {
     const tabs = await chrome.tabs.query({});
     if (referrer) {
+      const originMatches = t => {
+        try {
+          return t.url && new URL(t.url).origin === new URL(referrer).origin;
+        } catch (e) {
+          return false;
+        }
+      };
+      // Origin-only fallback (E6): prefer a tab in the current
+      // window — the first origin match across ALL windows could
+      // be another window's tab and land the dialog there. Only
+      // when the current window has no origin match does the
+      // fallback widen to every window.
+      let currentWindowId = null;
+      try {
+        const win = await chrome.windows.getCurrent();
+        if (win && win.id != null) currentWindowId = win.id;
+      } catch (e) {}
+      if (currentWindowId == null) {
+        try {
+          const win = await chrome.windows.getLastFocused();
+          if (win && win.id != null) currentWindowId = win.id;
+        } catch (e) {}
+      }
       const t =
         tabs.find(t => t.url === referrer) ||
-        tabs.find(t => {
-          try {
-            return t.url && new URL(t.url).origin === new URL(referrer).origin;
-          } catch (e) {
-            return false;
-          }
-        });
+        (currentWindowId != null
+          ? tabs.find(t => t.windowId === currentWindowId && originMatches(t))
+          : null) ||
+        tabs.find(originMatches);
       if (t) return t;
     }
     return (
@@ -1752,11 +1783,22 @@ async function handleInterceptedDownload(item, suggestedFilename) {
   // pause() lands; the browser then already owns the finished
   // file outright, and offering an app download of it would
   // produce a silent double download. In that case there is
-  // nothing to take over: no hold, no dialog — the browser copy
-  // simply stays the user's completed download.
-  const afterPause = await pauseAndVerify(item.id);
-  if (afterPause && afterPause.state === 'complete') return;
+  // nothing to take over: no dialog — the browser copy simply
+  // stays the user's completed download.
+  // E4: hold BEFORE pausing. The persisted record + alarm must
+  // already exist while pauseAndVerify runs (incl. its 150 ms
+  // re-check), or a worker death in that window strands the
+  // paused copy with nothing persisted to resume it.
   holdTakeover(item.id);
+  const afterPause = await pauseAndVerify(item.id);
+  if (!afterPause || afterPause.state === 'complete') {
+    // Already complete (browser owns it outright) or gone:
+    // clear the early hold via the existing release path — its
+    // resume is a harmless no-op for a complete/gone item and
+    // a safety net if the state read itself failed.
+    await releaseTakeover(item.id);
+    return;
+  }
 
   const url = item.finalUrl || item.url || '';
   const rawName = (suggestedFilename || item.filename || '').split(/[\\/]/).pop() || '';

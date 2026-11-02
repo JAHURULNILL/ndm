@@ -2797,13 +2797,28 @@
         if (!entry.id || terminal) return;
         btnCancel.disabled = true;
         btnPause.disabled = true;
+        let resp = null;
         try {
-          await chrome.runtime.sendMessage({
+          resp = await chrome.runtime.sendMessage({
             action: 'ndm-cancel-entry',
             entry: entry.id,
           });
         } catch (e) {}
         if (closed) return;
+        // The reply is the verdict (sendControl answers ok:false
+        // on host error / app rejection / timeout): only an ok
+        // reply earns the cancelled state below. On failure the
+        // buttons come back, the error shows, and the poll —
+        // never stopped — keeps rendering the entry's real state.
+        if (!resp || !resp.ok) {
+          btnCancel.disabled = false;
+          btnPause.disabled = false;
+          statusEl.textContent =
+            (resp && resp.error) || 'Cancel failed — still active';
+          setStatusLive(false);
+          tick();
+          return;
+        }
         terminal = true;
         stopPoll();
         syncRegistry('cancelled');
@@ -2939,14 +2954,25 @@
           rw.busy = true;
           btnPause.disabled = true;
           btnCancel.disabled = true;
+          let resp = null;
           try {
-            await chrome.runtime.sendMessage({
+            resp = await chrome.runtime.sendMessage({
               action: 'ndm-cancel-entry',
               entry: en.id,
             });
           } catch (e) {}
           rw.busy = false;
           if (closed) return;
+          // Same rule as the single card: a failed cancel (reply
+          // not ok) must not settle the row — restore its live
+          // rendering, show the error, and leave rw.done false so
+          // the tick keeps polling this row's real state.
+          if (!resp || !resp.ok) {
+            applyRowState(rw);
+            rw.pctEl.textContent =
+              (resp && resp.error) || 'Cancel failed — still active';
+            return;
+          }
           rw.done = true;
           rw.lastSt = 'cancelled';
           if (en.regKey) flyEntryRegistry.delete(en.regKey);
@@ -3033,7 +3059,18 @@
           })
         );
         if (!closed && rows.every(rw => rw.done)) {
-          titleEl.textContent = `100% ${entries.length} downloads`;
+          // rw.done only means "terminal": a cancelled row is
+          // done but not finished, so "100%" is honest only when
+          // every row actually finished — otherwise the header
+          // counts the two outcomes separately.
+          const fin = rows.filter(rw => rw.lastSt === 'finished').length;
+          const can = rows.length - fin;
+          titleEl.textContent =
+            can === 0
+              ? `100% ${entries.length} downloads`
+              : fin > 0
+                ? `${fin} of ${entries.length} downloads finished, ${can} cancelled`
+                : `${can} download${can === 1 ? '' : 's'} cancelled`;
           stopPoll();
         } else if (!closed) {
           const tot = rows.reduce((s, rw) => s + (rw.lastTotal || 0), 0);
@@ -3120,13 +3157,17 @@
           // The row carries its size again (restored): the
           // producer's own formatted size when it sent one, else
           // the byte count formatted here. Unknown size stays
-          // absent — never an invented figure.
+          // absent — never an invented figure. An approximate
+          // size (the same q.size_approx flag the picker reads)
+          // is marked "~", never presented as exact — the
+          // picker's sizeLabelFor rule, applied here too.
           const size =
-            String(q.size_text || '').trim() ||
+            String(q.size_text || '').replace('≈', '').trim() ||
             (Number(q.size_bytes) > 0 ? fmtBytes(q.size_bytes) : '');
+          const sizeLabel = q.size_approx && size ? `~${size}` : size;
           sub.textContent =
             `${ext} file, quality ${qualityText(q)}` +
-            (size ? ` • ${size}` : '');
+            (sizeLabel ? ` • ${sizeLabel}` : '');
         }
         row.appendChild(t);
         row.appendChild(sub);
