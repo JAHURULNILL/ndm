@@ -426,9 +426,25 @@ fn cookie_header_from_netscape(text: &str, url: &str) -> Option<String> {
         // Netscape fields: domain, flag, path, secure, expiry, name, value
         if f.len() >= 7 {
             let dom = f[0].trim_start_matches('.').to_ascii_lowercase();
-            let domain_match =
-                !dom.is_empty() && (host == dom || host.ends_with(&format!(".{dom}")));
-            if !domain_match || !path.starts_with(f[2]) {
+            // SW2-3 (second sweep): honour the include-subdomains
+            // flag — TRUE means the cookie was set for the whole
+            // domain, FALSE means host-only. Ignoring it shipped
+            // host-only cookies to every sibling subdomain.
+            let include_subdomains = f[1].trim().eq_ignore_ascii_case("true");
+            let domain_match = !dom.is_empty()
+                && (host == dom
+                    || (include_subdomains && host.ends_with(&format!(".{dom}"))));
+            // SW2-3: RFC 6265 path-match — equal, or the cookie
+            // path is a prefix that ends at a '/' boundary (the
+            // cookie path itself ends with '/', or the next
+            // request-path character is '/'). A raw starts_with
+            // sent /account cookies to /accountevil on the same host.
+            let cookie_path = if f[2].is_empty() { "/" } else { f[2] };
+            let path_match = path == cookie_path
+                || (path.starts_with(cookie_path)
+                    && (cookie_path.ends_with('/')
+                        || path[cookie_path.len()..].starts_with('/')));
+            if !domain_match || !path_match {
                 continue;
             }
             // a Secure cookie must never travel to an http:// target,
@@ -1096,6 +1112,40 @@ mod tests {
             .expect("some cookies must survive for https");
         assert!(https.contains("secure=v2"), "Secure is fine on https: {https}");
         assert!(!https.contains("expired=v3"), "expired dropped on https too: {https}");
+    }
+
+    #[test]
+    fn cookie_conversion_honours_domain_flag_and_path_boundary() {
+        // SW2-3 regression lock: the Netscape flag field decides
+        // subdomain reach, and the cookie path must match at a '/'
+        // boundary (RFC 6265), not by raw prefix.
+        let jar = [
+            "example.com\tFALSE\t/\tFALSE\t0\thostonly\th1",
+            "example.com\tTRUE\t/\tFALSE\t0\tdomainwide\td1",
+            "example.com\tTRUE\t/account\tFALSE\t0\tacct\ta1",
+        ]
+        .join("\n");
+        let exact = cookie_header_from_netscape(&jar, "https://example.com/account")
+            .expect("cookies must survive for the exact host+path");
+        assert!(exact.contains("hostonly=h1"), "exact host: {exact}");
+        assert!(exact.contains("domainwide=d1"), "exact host: {exact}");
+        assert!(exact.contains("acct=a1"), "exact path: {exact}");
+        let sub = cookie_header_from_netscape(&jar, "https://sub.example.com/")
+            .expect("the domain cookie must survive for a subdomain");
+        assert!(
+            !sub.contains("hostonly=h1"),
+            "a host-only (flag FALSE) cookie must never leak to a subdomain: {sub}"
+        );
+        assert!(sub.contains("domainwide=d1"), "flag TRUE covers subdomains: {sub}");
+        let evil = cookie_header_from_netscape(&jar, "https://example.com/accountevil")
+            .expect("the root cookies must survive");
+        assert!(
+            !evil.contains("acct=a1"),
+            "/account must not match /accountevil (no '/' boundary): {evil}"
+        );
+        let nested = cookie_header_from_netscape(&jar, "https://example.com/account/x")
+            .expect("cookies must survive for a nested path");
+        assert!(nested.contains("acct=a1"), "'/' boundary matches: {nested}");
     }
 
     #[test]
