@@ -56,6 +56,8 @@ jobs:
             NDM_*_amd64.deb
             NDM_*_Linux_Portable.tar.xz
             ndm-extension-*.zip
+            - name: Extension version matches app version
+                    run: python3 -c "import json,sys; e=json.load(open('extension/manifest.json'))['version']; t=json.load(open('src-tauri/tauri.conf.json'))['version']; print(f'extension {e} vs app {t}'); sys.exit(0 if e == t else 'extension/manifest.json version != src-tauri/tauri.conf.json version')"
       - name: Build extension ZIP (for the release upload)
         if: github.event_name == 'workflow_dispatch'
         run: |
