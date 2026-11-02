@@ -386,6 +386,26 @@ mod tests {
     }
 
     #[test]
+    fn download_discards_a_package_whose_hash_does_not_match() {
+        // S-F2 regression lock: a staged .part whose digest fails
+        // verification is deleted on the spot — left on disk, every
+        // later check would re-download and re-fail against it
+        let dir = temp_dir("badhash");
+        let dest = dir.join("pkg.bin");
+        let body = b"tampered update package".to_vec();
+        let url = serve_plain(&body, "");
+        let wrong = sha256_hex(b"the genuine article");
+        let err = download_file(&url, &dest, &wrong, &|_, _| {}).unwrap_err();
+        assert!(err.contains("integrity check"), "unexpected error: {err}");
+        assert!(!dest.exists(), "a failed package must not install");
+        assert!(
+            !dest.with_extension("part").exists(),
+            "a failed package must not leave its .part behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn download_rejects_an_encoded_response() {
         // W1 F11: a gzip-labelled body must fail cleanly before a
         // single byte is written, not be saved as the package

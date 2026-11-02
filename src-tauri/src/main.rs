@@ -84,6 +84,17 @@ struct ProgressPayload {
     /// G2: the entry's per-download show-complete-dialog override
     /// (None = follow the global setting)
     show_complete_override: Option<bool>,
+    /// 208B D1: the entry's recorded final file (a video's merged
+    /// output), "" = none recorded. The payload used to carry only
+    /// the save FOLDER for videos, so a finished row could not
+    /// reveal its file even though Entry.final_path is honest.
+    final_path: String,
+    /// 208B 2B: truthful sub-status detail for the phases the
+    /// coarse `status` cannot tell apart ("Probing connection...",
+    /// "Resolving...", "Connecting..."); "" = nothing truthful to
+    /// add. Set at the start/probe seams; the card/app render it
+    /// verbatim. Additive - older readers ignore it.
+    detail: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -369,9 +380,10 @@ struct Settings {
     /// "never" (list only). Browser-takeover starts never open it.
     #[serde(default = "def_progress_view")]
     progress_dialog_view: String,
-    /// EXT §1c: the bundled extension version the user has already
-    /// been shown the "extension update available" notice for;
-    /// the notice is shown at most once per bundled version
+    /// EXT §1c: the notice key the user has already been shown
+    /// the "extension update available" notice for - the bundled
+    /// version and the seen extension version together
+    /// ("bundled|seen", 208B D4); shown at most once per pair
     #[serde(default)]
     ext_notice_for: String,
 }
@@ -1289,6 +1301,10 @@ struct Entry {
     description: Mutex<String>,
     /// this download's own speed limit in bytes/sec, 0 = none
     speed_limit: Mutex<u64>,
+    /// 208B 2B: truthful sub-status detail set at the probe/start
+    /// seams (payload_of falls back to a status-derived string
+    /// when empty)
+    detail: Mutex<String>,
     password: String,
 }
 
@@ -1563,6 +1579,28 @@ fn stamp_last_try(entry: &Entry) {
     *entry.last_try.lock().unwrap() = now_stamp();
 }
 
+/// 208B 2B: record a truthful sub-status detail on an entry at
+/// a probe/start seam; payload_of publishes it as `detail`.
+fn set_detail(entry: &Entry, text: &str) {
+    *entry.detail.lock_ok() = text.to_string();
+}
+
+/// 208B 2B: the detail a payload carries - the explicit seam
+/// text when one is set, else a truthful derivation from the
+/// coarse status (never a fabricated phase name).
+fn detail_of(entry: &Entry, status: &str) -> String {
+    let explicit = entry.detail.lock_ok().clone();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    match status {
+        "starting" => "Probing connection\u{2026}".to_string(),
+        "merging" => "Merging\u{2026}".to_string(),
+        "downloading" => "Receiving data\u{2026}".to_string(),
+        _ => String::new(),
+    }
+}
+
 fn payload_of(entry: &Entry) -> ProgressPayload {
     if let Some(job) = &entry.video {
         let p = job.progress.lock_ok().clone();
@@ -1603,6 +1641,14 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         } else {
             done_bytes
         };
+        // 208B D1: the recorded final file - the job's own record
+        // first, then the entry's journal-carried path
+        let payload_final_path = p
+            .final_path
+            .as_ref()
+            .map(|fp| fp.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| entry.final_path.lock_ok().clone());
         let display_name = p
             .final_path
             .as_ref()
@@ -1660,6 +1706,8 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
             referer: entry.referer.clone(),
             completion_actions: entry.completion_actions.lock_ok().clone(),
             show_complete_override: *entry.show_complete_override.lock_ok(),
+            final_path: payload_final_path,
+            detail: detail_of(entry, &p.status),
         };
     }
     let (
@@ -1795,6 +1843,19 @@ fn payload_of(entry: &Entry) -> ProgressPayload {
         referer: entry.referer.clone(),
         completion_actions: entry.completion_actions.lock_ok().clone(),
         show_complete_override: *entry.show_complete_override.lock_ok(),
+        // 208B D1: a recorded path when one exists, else the
+        // finished entry's own output file
+        final_path: {
+            let recorded = entry.final_path.lock_ok().clone();
+            if !recorded.is_empty() {
+                recorded
+            } else if status == "finished" {
+                entry.out_path.to_string_lossy().to_string()
+            } else {
+                String::new()
+            }
+        },
+        detail: detail_of(entry, &status),
     }
 }
 
@@ -2207,6 +2268,21 @@ fn resolve_video_file(entry: &Entry) -> PathBuf {
         for e in rd.flatten() {
             let p = e.path();
             if !p.is_file() {
+                continue;
+            }
+            // 208B D10: identity before size - the by-size scan may
+            // only bind a file whose name carries THIS entry's stem
+            // (or its uniquified " (n)" form). It used to bind the
+            // first same-size media file in the folder, so a stale
+            // journal could claim another download's file at
+            // startup and later delete it as its own.
+            if stem.is_empty() {
+                continue;
+            }
+            let fname = e.file_name().to_string_lossy().into_owned();
+            if !(fname.starts_with(&format!("{stem}."))
+                || fname.starts_with(&format!("{stem} (")))
+            {
                 continue;
             }
             let ext = p
@@ -2746,6 +2822,13 @@ fn run_open_action(entry: &Entry, action: &str) {
 /// fired (the caller then skips maybe_exit_when_done — the
 /// per-entry action replaces the queue/global one).
 fn run_completion_actions(app: &AppHandle, state: &AppState, entry: &Entry) -> bool {
+    // 208B D5: read the actions from the state's CURRENT entry
+    // for this id when one exists - entry rebuilds (swap_live,
+    // refresh, category moves) supersede Arc copies while other
+    // paths still hold them, and the current entry is the one
+    // whose fields the journal mirrors
+    let current = state.get(&entry.id);
+    let entry = current.as_deref().unwrap_or(entry);
     let actions = completion_actions_of(entry);
     if !actions.is_empty() {
         // audit trail (F-19): the values acted on are THIS
@@ -2874,6 +2957,11 @@ fn spawn_emit_loop(app: AppHandle, entry: Arc<Entry>) {
                         break;
                     }
                     let state = app.state::<AppState>();
+                    // 208B D5: completion behaviour comes from the
+                    // state's current entry for this id (the
+                    // journal-mirrored record), not this loop's
+                    // possibly superseded Arc
+                    let entry = state.get(&entry.id).unwrap_or_else(|| entry.clone());
                     // G2: the entry's completion actions run in
                     // their stored order — opens first, terminal
                     // actions through the drained-queue guard
@@ -3026,6 +3114,7 @@ fn swap_live(
         password: stub.password.clone(),
         description: Mutex::new(stub.description.lock().unwrap().clone()),
         speed_limit: Mutex::new(*stub.speed_limit.lock().unwrap()),
+        detail: Mutex::new(String::new()),
     });
     // re-verify under the SAME lock that inserts: a remove landing in
     // the gap after start_engine's own check must not leave a live
@@ -3160,6 +3249,22 @@ async fn start_engine(app: AppHandle, stub: &Arc<Entry>) -> Result<Arc<Entry>, S
         let state = app.state::<AppState>();
         take_probe_handoff(&state.probe_handoff, &url, &auth, Instant::now())
     };
+    // 208B V1: name the wait truthfully while the (single, bounded)
+    // start probe runs inside start_with_auth_preprobed - a start
+    // that consumed the dialog's probe handoff skips probing
+    // entirely and goes straight to connecting. No second
+    // benchmarking round is run from here: when the engine's
+    // connection-count matrix has already produced a count for
+    // this start, that count is what the start uses.
+    set_detail(
+        stub,
+        if preprobed.is_some() {
+            "Connecting\u{2026}"
+        } else {
+            "Probing connection\u{2026}"
+        },
+    );
+    let _ = app.emit("progress", payload_of(stub));
     let dl = match tauri::async_runtime::spawn_blocking(move || {
         ndm::start_with_auth_preprobed(
             &url,
@@ -3420,6 +3525,7 @@ fn rehome_if_finished_conflict(
         password: stub.password.clone(),
         description: Mutex::new(stub.description.lock().unwrap().clone()),
         speed_limit: Mutex::new(*stub.speed_limit.lock().unwrap()),
+        detail: Mutex::new(String::new()),
     });
     {
         let mut map = state.entries.lock().unwrap();
@@ -3657,6 +3763,7 @@ fn register_http_stub(
         password: password.to_string(),
         description: Mutex::new(String::new()),
         speed_limit: Mutex::new(0),
+        detail: Mutex::new(String::new()),
     });
     state
         .entries
@@ -3753,6 +3860,7 @@ fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<Entr
         password: entry.password.clone(),
         description: Mutex::new(entry.description.lock().unwrap().clone()),
         speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
+        detail: Mutex::new(String::new()),
     });
     let mut entries = state.entries.lock().unwrap();
     let still_current = entries
@@ -3895,6 +4003,10 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 Some(PathBuf::from(fp))
             }
         };
+        // 208B 2B/3a: a fresh video job starts by resolving the
+        // page through yt-dlp - name that wait on the entry
+        set_detail(&entry, "Resolving\u{2026}");
+        let _ = app.emit("progress", payload_of(&entry));
         match video::VideoJob::start_with_recorded_final(
             &entry.url,
             &entry.out_path,
@@ -3959,6 +4071,7 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 password: entry.password.clone(),
                 description: Mutex::new(entry.description.lock().unwrap().clone()),
                 speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
+                detail: Mutex::new(String::new()),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -4600,6 +4713,27 @@ fn pause_all(app: &AppHandle, requeue: bool, queue: Option<&str>) {
 #[tauri::command]
 fn get_settings(state: State<'_, AppState>) -> Settings {
     current_settings(&state)
+}
+
+/// 208B D12: the values the Scheduler / Basket / Categories
+/// dialogs open with, in one payload - the full current settings
+/// (queues carry the Scheduler values; category_dirs and
+/// category_exts the Categories values), the category names in
+/// use, and the basket window's current visibility. The dialogs
+/// used to open from frontend-side snapshots that could predate
+/// the last save.
+#[tauri::command]
+fn dialog_open_values(app: AppHandle, state: State<'_, AppState>) -> serde_json::Value {
+    let s = current_settings(&state);
+    let categories = category_names_in_use(&state, &s);
+    serde_json::json!({
+        "settings": s,
+        "categories": categories,
+        "basket_visible": app
+            .get_webview_window("basket")
+            .map(|w| w.is_visible().unwrap_or(false))
+            .unwrap_or(false),
+    })
 }
 
 #[tauri::command]
@@ -5436,6 +5570,7 @@ async fn resume_download(
                 password: entry.password.clone(),
                 description: Mutex::new(entry.description.lock().unwrap().clone()),
                 speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
+                detail: Mutex::new(String::new()),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -5803,6 +5938,7 @@ fn clone_entry_with_category(e: &Entry, category: &str) -> Arc<Entry> {
         password: e.password.clone(),
         description: Mutex::new(e.description.lock_ok().clone()),
         speed_limit: Mutex::new(*e.speed_limit.lock_ok()),
+        detail: Mutex::new(String::new()),
     })
 }
 
@@ -6719,6 +6855,7 @@ fn refresh_url(app: AppHandle, state: State<'_, AppState>, id: String, new_url: 
         password: entry.password.clone(),
                 description: Mutex::new(entry.description.lock().unwrap().clone()),
                 speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
+                detail: Mutex::new(String::new()),
     });
     state
         .entries
@@ -7163,6 +7300,7 @@ fn do_add_video(
                 password: password.clone(),
                 description: Mutex::new(String::new()),
                 speed_limit: Mutex::new(0),
+                detail: Mutex::new(String::new()),
             })
         };
         if should_wait {
@@ -7277,6 +7415,7 @@ fn do_add_video(
         password: stub.password.clone(),
         description: Mutex::new(String::new()),
         speed_limit: Mutex::new(0),
+        detail: Mutex::new(String::new()),
     });
     {
         // check-and-insert under the SAME lock (the video edition
@@ -7718,6 +7857,7 @@ fn restore_saved(state: &AppState) {
                 password: s.password.clone(),
                 description: Mutex::new(s.description.clone()),
                 speed_limit: Mutex::new(s.speed_limit),
+                detail: Mutex::new(String::new()),
             });
             demote_phantom_finished(&entry);
             state.entries.lock().unwrap().insert(s.id.clone(), entry);
@@ -7815,6 +7955,7 @@ fn restore_saved(state: &AppState) {
             password: s.password.clone(),
                 description: Mutex::new(s.description.clone()),
                 speed_limit: Mutex::new(s.speed_limit),
+                detail: Mutex::new(String::new()),
         });
         demote_phantom_finished(&entry);
         state.entries.lock().unwrap().insert(s.id.clone(), entry);
@@ -7854,17 +7995,29 @@ struct ExtSeen {
     at: i64,
 }
 
+/// 208B D4: the settings key a shown notice is recorded under:
+/// the bundled version AND the seen extension version together.
+/// The old record held only the bundled (= app) version, so one
+/// click-through silenced every future stale-extension notice
+/// until the next app update - a DIFFERENT stale extension (an
+/// older browser profile updated halfway, a second browser)
+/// never notified again. Keyed by the seen version too, a
+/// notice shown for extension X does not suppress extension Y.
+fn ext_notice_key(bundled: &str, seen: Option<&str>) -> String {
+    format!("{bundled}|{}", seen.unwrap_or(""))
+}
+
 /// EXT §1c decision (pure): Some(bundled) = show the notice for
 /// that bundled version now.
 /// - no stamp → None (no evidence any extension runs)
-/// - the notice was already shown for this bundled version → None
+/// - the notice was already shown for this bundled+seen pair → None
 /// - seen == bundled → None
 /// - seen is null (a pre-handshake extension) → show
 /// - seen < bundled → show
 /// - seen > bundled → None (never nag toward a downgrade)
 fn ext_notice_decision(stamp: Option<&ExtSeen>, bundled: &str, shown_for: &str) -> Option<String> {
     let stamp = stamp?;
-    if shown_for == bundled {
+    if shown_for == ext_notice_key(bundled, stamp.ext_version.as_deref()) {
         return None;
     }
     match &stamp.ext_version {
@@ -7908,12 +8061,16 @@ fn check_ext_notice(app: &AppHandle, state: &AppState) {
         .unwrap_or_else(|| "an older version".to_string());
     {
         let mut s = state.settings.lock().unwrap();
-        s.ext_notice_for = bundled.clone();
+        // 208B D4: record the bundled+seen pair, not bundled alone
+        s.ext_notice_for =
+            ext_notice_key(&bundled, stamp.as_ref().and_then(|x| x.ext_version.as_deref()));
     }
     save_settings(state);
     let _ = app.emit(
         "ext_update_notice",
-        serde_json::json!({ "seen_label": seen_label, "bundled": bundled }),
+        // 208B D4: the payload carries the seen extension version
+        // itself, not only a display label for it
+        serde_json::json!({ "seen_label": seen_label, "bundled": bundled, "seen_version": stamp.as_ref().and_then(|x| x.ext_version.clone()) }),
     );
 }
 
@@ -7945,30 +8102,92 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
             check_ext_notice(handle, &state);
         }
     }
+    // 208B F3: the spool dir is created before any path in here
+    // needs it (a fresh/portable run may never have created it),
+    // and no failure in here is silent - a dropped offer leaves a
+    // trace in the log instead of vanishing.
+    if let Err(e) = std::fs::create_dir_all(queue_dir) {
+        eprintln!(
+            "[ndm] incoming queue dir {} could not be created: {e}",
+            queue_dir.display()
+        );
+        return;
+    }
     let queue = queue_dir.join("incoming.jsonl");
     let processing = queue_dir.join("incoming.processing");
-    if !processing.exists() {
-        if !queue.exists() {
-            return;
-        }
-        if std::fs::rename(&queue, &processing).is_err() {
-            return;
-        }
-    }
-    let Ok(text) = std::fs::read_to_string(&processing) else {
+    // 208B F5: the claim is atomic - the spool file is renamed to
+    // a name unique to this process and drain before a single
+    // line is read. Two app instances (the single-instance guard
+    // can fail open) can no longer read and process the same
+    // lines: whoever loses the rename race has nothing to claim.
+    // A leftover claim or `.processing` from a crashed run is
+    // claimed the same way, so at-least-once recovery is unchanged.
+    static CLAIM_SEQ: AtomicU64 = AtomicU64::new(0);
+    let claim = queue_dir.join(format!(
+        "incoming.claim-{}-{}",
+        std::process::id(),
+        CLAIM_SEQ.fetch_add(1, Ordering::SeqCst)
+    ));
+    let leftover_claim = std::fs::read_dir(queue_dir).ok().and_then(|rd| {
+        rd.flatten().map(|e| e.path()).find(|p| {
+            p.file_name()
+                .map(|n| {
+                    let n = n.to_string_lossy();
+                    n.starts_with("incoming.claim-") && !n.ends_with(".tmp")
+                })
+                .unwrap_or(false)
+        })
+    });
+    let claim_result = if let Some(left) = leftover_claim {
+        std::fs::rename(&left, &claim)
+    } else if processing.exists() {
+        std::fs::rename(&processing, &claim)
+    } else if queue.exists() {
+        std::fs::rename(&queue, &claim)
+    } else {
         return;
+    };
+    if let Err(e) = claim_result {
+        eprintln!("[ndm] incoming queue claim failed: {e}");
+        return;
+    }
+    let text = match std::fs::read_to_string(&claim) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[ndm] claimed incoming queue could not be read: {e}");
+            return;
+        }
     };
     let lines: Vec<&str> = text.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
         handle_incoming_line(handle, line);
         // drop the processed line from the file before moving on: a
         // crash mid-drain then re-delivers only unprocessed lines
-        // (at-least-once) instead of losing the rest of the queue
+        // (at-least-once) instead of losing the rest of the queue.
+        // 208B F3: the rewrite lands atomically (temp file +
+        // rename) - the old plain write rewrote the live file in
+        // place, so a crash or power loss mid-write tore it and
+        // lost every unprocessed line behind the tear.
         let remaining = &lines[idx + 1..];
         if remaining.is_empty() {
-            let _ = std::fs::remove_file(&processing);
+            let _ = std::fs::remove_file(&claim);
         } else {
-            let _ = std::fs::write(&processing, remaining.join("\n") + "\n");
+            let tmp = queue_dir.join(format!(
+                "incoming.claim-{}-{}.tmp",
+                std::process::id(),
+                idx
+            ));
+            if std::fs::write(&tmp, remaining.join("\n") + "\n").is_ok() {
+                if std::fs::rename(&tmp, &claim).is_err() {
+                    eprintln!("[ndm] incoming queue rewrite could not be committed");
+                    let _ = std::fs::remove_file(&tmp);
+                }
+            } else {
+                eprintln!(
+                    "[ndm] incoming queue rewrite failed; unprocessed lines stay in {}",
+                    claim.display()
+                );
+            }
         }
     }
 }
@@ -8043,6 +8262,13 @@ fn write_progress_file(handle: &AppHandle, payload: &ProgressPayload) {
     } else {
         0
     };
+    // 208B 2A (V6 writer side): is this ETA credible yet? A first
+    // sample's rate over a nearly-empty transfer produced exact
+    // nonsense ("Time left 2 min 14 sec" for a 24 MB file at
+    // 0.695 KB/s). Below 1 MiB downloaded the rate has not
+    // stabilised, and an unknown ETA (0) is never credible - the
+    // card renders "~" while this is true.
+    let eta_approx = eta_secs == 0 || payload.done_bytes < 1_048_576;
     let body = serde_json::json!({
         "status": payload.status,
         "done_bytes": payload.done_bytes,
@@ -8067,6 +8293,12 @@ fn write_progress_file(handle: &AppHandle, payload: &ProgressPayload) {
         // along. Purely additive — older cards ignore the key, and
         // a card meeting an older app (no key) never shows the tab.
         "speed_limit": payload.speed_limit,
+        // 208B 2A/2B: additive keys - the ETA's credibility flag
+        // (the card renders "~" from it) and the truthful
+        // sub-status detail; final_path rides along for D1
+        "eta_approx": eta_approx,
+        "detail": payload.detail,
+        "final_path": payload.final_path,
     });
     let _ = std::fs::write(dir.join(format!("{id}.json")), body.to_string());
 }
@@ -9184,6 +9416,10 @@ fn main() {
     // before it builds any state — its persist() snapshots would
     // resurrect whatever the real window deletes (see above)
     if matches!(acquire_instance(), Instance::Secondary) {
+        // 208B F3: a forwarding/secondary launch never exits
+        // silently - the trace is the only sign a handed-over
+        // launch ever existed
+        eprintln!("[ndm] another NDM instance is already running; this launch hands over to it and exits");
         return;
     }
     tauri::Builder::default()
@@ -9737,6 +9973,7 @@ fn main() {
             add_video,
             grab_explore,
             get_settings,
+            dialog_open_values,
             set_settings,
             set_entry_queue,
             set_entry_limit,
@@ -10018,6 +10255,7 @@ mod tests {
             password: String::new(),
             description: Mutex::new(String::new()),
             speed_limit: Mutex::new(0),
+            detail: Mutex::new(String::new()),
         });
         state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
         state.order.lock().unwrap().push("dl-1".to_string());
@@ -10280,6 +10518,7 @@ mod tests {
             password: String::new(),
             description: Mutex::new(String::new()),
             speed_limit: Mutex::new(0),
+            detail: Mutex::new(String::new()),
         }
     }
 
@@ -11396,9 +11635,19 @@ mod tests {
         };
         // no stamp → never
         assert_eq!(ext_notice_decision(None, "2.0.8", ""), None);
-        // already shown for this bundled version → never
-        assert_eq!(ext_notice_decision(Some(&stamp(Some("2.0.7"))), "2.0.8", "2.0.8"), None);
-        assert_eq!(ext_notice_decision(Some(&stamp(None)), "2.0.8", "2.0.8"), None);
+        // 208B D4: already shown for this bundled+seen pair → never
+        assert_eq!(ext_notice_decision(Some(&stamp(Some("2.0.7"))), "2.0.8", "2.0.8|2.0.7"), None);
+        assert_eq!(ext_notice_decision(Some(&stamp(None)), "2.0.8", "2.0.8|"), None);
+        // shown for a DIFFERENT stale version does not suppress this one
+        assert_eq!(
+            ext_notice_decision(Some(&stamp(Some("2.0.6"))), "2.0.8", "2.0.8|2.0.7"),
+            Some("2.0.8".to_string())
+        );
+        // a legacy bundled-only record (pre-D4) no longer suppresses
+        assert_eq!(
+            ext_notice_decision(Some(&stamp(Some("2.0.7"))), "2.0.8", "2.0.8"),
+            Some("2.0.8".to_string())
+        );
         // seen == bundled → never
         assert_eq!(ext_notice_decision(Some(&stamp(Some("2.0.8"))), "2.0.8", ""), None);
         // null (pre-handshake extension alive) → show

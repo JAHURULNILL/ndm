@@ -1582,10 +1582,19 @@ const pendingTakeovers = new Map(); // download id -> { timer, deadline, tabId, 
 
 /* Persist writes are chained and snapshot the Map lazily, so a
    write enqueued before a rehydrate/merge still persists the
-   merged state, never a stale partial one. */
+   merged state, never a stale partial one. Each step also waits
+   for the startup rehydration (takeoversReady, below): a hold
+   taken in the same worker wake that is still rehydrating —
+   handleInterceptedDownload does not await takeoversReady —
+   must not let its snapshot reach storage before the persisted
+   holds have merged into the Map, or the write would drop those
+   records and their alarms would later settle nothing. (The
+   rehydration itself never awaits this chain, so the wait
+   cannot deadlock.) */
 let takeoverPersistChain = Promise.resolve();
 function persistTakeovers() {
-  takeoverPersistChain = takeoverPersistChain.then(() => {
+  takeoverPersistChain = takeoverPersistChain.then(async () => {
+    await takeoversReady;
     const arr = [...pendingTakeovers.entries()].map(([itemId, p]) => ({
       itemId,
       tabId: p.tabId != null ? p.tabId : null,

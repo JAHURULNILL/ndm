@@ -4,6 +4,72 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+/// F2: the mandatory-update latch, mirrored from the app's
+/// `do_check_update` (src-tauri/src/main.rs) using the SAME public
+/// feed helpers it uses (`ndm::updater::fetch_release` +
+/// `version_cmp`) — the CLI has no long-lived bootstrap to arm a
+/// latch in, so the decision is recomputed per invocation from
+/// the feed, in the app's own order:
+/// 1. an ill-formed feed version never blocks (the app returns an
+///    error status and leaves the latch as it was — unarmed at
+///    bootstrap);
+/// 2. a feed offering nothing newer than the running copy never
+///    blocks (the app's #19 recompute clears the latch there);
+/// 3. blocking requires a non-empty `min_supported` strictly
+///    above the running version AND a package this platform can
+///    actually install (the app's usable-asset rule; on Windows
+///    the CLI accepts either Windows asset rather than
+///    distinguishing installer vs portable flavour by the
+///    app-only `installed.flag` contract).
+fn version_well_formed(v: &str) -> bool {
+    let v = v.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
+    if v.is_empty() {
+        return false;
+    }
+    v.split('.')
+        .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn mandatory_block(info: &ndm::updater::ReleaseInfo, current: &str) -> bool {
+    if !version_well_formed(&info.version) {
+        return false;
+    }
+    if ndm::updater::version_cmp(&info.version, current) != std::cmp::Ordering::Greater {
+        return false;
+    }
+    if info.min_supported.is_empty()
+        || ndm::updater::version_cmp(current, &info.min_supported)
+            != std::cmp::Ordering::Less
+    {
+        return false;
+    }
+    #[cfg(windows)]
+    return !info.win_url.is_empty() || !info.win_setup_url.is_empty();
+    #[cfg(not(windows))]
+    return !info.deb_url.is_empty();
+}
+
+/// Refuse a download start/resume while the feed's mandatory
+/// update is outstanding. Fail-soft exactly like the app: a feed
+/// that cannot be fetched arms nothing there, so it blocks
+/// nothing here either (an offline machine keeps its CLI).
+fn enforce_mandatory_update() {
+    let Ok(info) = ndm::updater::fetch_release() else {
+        return;
+    };
+    let current = env!("CARGO_PKG_VERSION");
+    if mandatory_block(&info, current) {
+        // the app's own latch wording (LATCH_BLOCKED), verbatim
+        eprintln!("[ndm] downloads are paused until the required update is installed");
+        eprintln!(
+            "[ndm] this copy is {current}; the update feed requires at least {} (latest {}) — update NDM, then run this again",
+            info.min_supported, info.version
+        );
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -60,6 +126,11 @@ fn main() {
             }
         }
     }
+    // F2: every invocation of this CLI is a download start or
+    // resume (there are no read-only subcommands to spare), so
+    // the mandatory-update gate runs here — after usage errors
+    // (exit 2 above) and before the probe/start it protects
+    enforce_mandatory_update();
     let probed = match ndm::probe(&url) {
         Ok(p) => p,
         Err(e) => {
@@ -178,5 +249,57 @@ fn main() {
             std::process::exit(1);
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A feed record; both platforms' assets are filled so the
+    /// usable-asset arm holds on either CI platform.
+    fn info(version: &str, min_supported: &str) -> ndm::updater::ReleaseInfo {
+        ndm::updater::ReleaseInfo {
+            version: version.to_string(),
+            min_supported: min_supported.to_string(),
+            notes: String::new(),
+            deb_url: "https://example.invalid/ndm.deb".to_string(),
+            deb_sha256: String::new(),
+            win_url: "https://example.invalid/ndm.zip".to_string(),
+            win_sha256: String::new(),
+            win_setup_url: String::new(),
+            win_setup_sha256: String::new(),
+        }
+    }
+
+    #[test]
+    fn blocks_when_below_min_and_a_newer_update_is_offered() {
+        assert!(mandatory_block(&info("2.0.9", "2.0.9"), "2.0.8"));
+        assert!(mandatory_block(&info("2.1.0", "2.0.9"), "2.0.8"));
+    }
+
+    #[test]
+    fn does_not_block_at_or_above_the_minimum() {
+        assert!(!mandatory_block(&info("2.0.9", "2.0.8"), "2.0.8"));
+        assert!(!mandatory_block(&info("2.0.9", "2.0.7"), "2.0.8"));
+        assert!(!mandatory_block(&info("2.0.9", ""), "2.0.8"));
+    }
+
+    #[test]
+    fn does_not_block_when_the_feed_offers_nothing_newer() {
+        // the app's #19 rule: no newer version on the feed means
+        // no latch, even against a (stale/contradictory) minimum
+        assert!(!mandatory_block(&info("2.0.8", "2.0.9"), "2.0.8"));
+        assert!(!mandatory_block(&info("2.0.7", "2.0.9"), "2.0.8"));
+    }
+
+    #[test]
+    fn does_not_block_without_a_usable_asset_or_on_garbage() {
+        let mut bare = info("2.0.9", "2.0.9");
+        bare.deb_url.clear();
+        bare.win_url.clear();
+        assert!(!mandatory_block(&bare, "2.0.8"));
+        assert!(!mandatory_block(&info("", "2.0.9"), "2.0.8"));
+        assert!(!mandatory_block(&info("2.x", "2.0.9"), "2.0.8"));
     }
 }

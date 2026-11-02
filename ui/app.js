@@ -75,6 +75,48 @@ function fmtListLeft(sec) {
   if (m < 60) return `${m} min ${s} sec`;
   return `${Math.floor(m / 60)} hour(s) ${m % 60} min`;
 }
+/* ---------- ETA honesty (208B-V6) ----------
+   ONE ETA formatter for every surface (list Time-left cell and
+   the progress dialog alike — they used to each divide the
+   remaining bytes by whatever rate the current frame carried
+   and render the result as an exact fact, so a first sample of
+   0.695 KB/s over a fragment-sized total printed an exact
+   "2 min 14 sec" for a 24 MB file). Rules:
+   - no total (unknown/0) or no live rate or nothing remaining
+     → NO ETA at all (''), never a fabricated number;
+   - the estimate is marked "~" until it is credible: at least
+     ETA_MIN_BYTES downloaded AND at least ETA_MIN_SAMPLES
+     distinct progress samples seen for this entry (the
+     'progress' event handler feeds every payload through
+     noteEtaSample, and render() feeds the current items too —
+     a sample only counts when done_bytes actually changes, so
+     the double feed can never double-count). Only then is the bare,
+     exact-looking figure shown. This is the codebase's "~"
+     estimate convention (the extension picker modal marks
+     estimated sizes the same way). */
+const ETA_MIN_BYTES = 256 * 1024;
+const ETA_MIN_SAMPLES = 3;
+const etaSampleState = new Map(); // id -> { done, count }
+function noteEtaSample(d) {
+  if (!d || !d.id) return;
+  if (d.status !== 'downloading') { etaSampleState.delete(d.id); return; }
+  const prev = etaSampleState.get(d.id);
+  if (!prev) { etaSampleState.set(d.id, { done: d.done_bytes || 0, count: 1 }); return; }
+  if ((d.done_bytes || 0) !== prev.done) { prev.done = d.done_bytes || 0; prev.count++; }
+}
+function etaSamplesFor(id) {
+  const s = etaSampleState.get(id);
+  return s ? s.count : 0;
+}
+function fmtEta(d, samples) {
+  if (!d || d.status !== 'downloading') return '';
+  if (!(d.total > 0) || !(d.speed_bps > 0)) return '';
+  const remaining = d.total - (d.done_bytes || 0);
+  if (remaining <= 0) return '';
+  const credible = (d.done_bytes || 0) >= ETA_MIN_BYTES
+    && (samples | 0) >= ETA_MIN_SAMPLES;
+  return (credible ? '' : '~') + fmtListLeft(remaining / d.speed_bps);
+}
 const IDM_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 /* backend `added`/`last_try` strings arrive as
    "YYYY-MM-DD HH:MM:SS" (W-4: `added` used to stop at the
@@ -105,12 +147,31 @@ const statusText = s => STATUS_TEXT[s] || cap(s);
    active transfer reads "Receiving data…" whatever the kind,
    and an error entry shows the error message itself (IDM
    surfaces errors in the Status line) */
+/* the payload's pre-byte sub-status (208B-V1 app side): IMP-2's
+   additive `detail` field carries truthful strings like
+   "Probing connection…" while an entry is 'starting'
+   (`status_text` accepted as the same seam's earlier name).
+   Absent/blank reads as '' = no sub-status to show. */
+function subStatusOf(d) {
+  const s = d && (d.detail != null ? d.detail : d.status_text);
+  return s && String(s).trim() ? String(s).trim() : '';
+}
 function detailStatusText(d) {
   if (d.status === 'error') return d.error || 'Error';
+  /* Phase labels are purely status-driven (the KNOWN_STATUS
+     vocabulary — there is no merge-progress field in any payload
+     and no 'finishing' status): 'merging' says "Merging…", and
+     "Finishing…" is only the genuine final settle of a download
+     whose bytes are all in (total known and done >= total).
+     While bytes are still arriving the line says so. */
   switch (d.status) {
     case 'queued': return 'Queued';
-    case 'starting': return 'Starting…';
-    case 'downloading': return 'Receiving data…';
+    /* the pre-byte phase shows the backend's own sub-status
+       ("Probing connection…", "Testing speed…" — the payload's
+       detail field) when it carries one, not a bare label */
+    case 'starting': return subStatusOf(d) || 'Starting…';
+    case 'downloading':
+      return (d.total > 0 && (d.done_bytes || 0) >= d.total) ? 'Finishing…' : 'Receiving data…';
     case 'merging': return 'Merging…';
     case 'paused': return 'Paused';
     case 'finished': return 'Finished';
@@ -228,6 +289,29 @@ async function saveSettings() {
   if (!TAURI) return true;
   try { await invoke('set_settings', { settings }); return true; }
   catch (e) { console.error('set_settings failed', e); return false; }
+}
+
+/* 208B-D12: the Scheduler / Categories (Options) / Basket
+   surfaces open from the backend's dialog_open_values payload,
+   NOT from this page's settings snapshot, which can predate the
+   last save: the payload carries the full current settings
+   (its queues carry each queue's name/start/stop/cap for the
+   Scheduler; its category_dirs/category_exts carry the
+   Categories values), the category names actually in use, and
+   the basket window's real visibility. Best-effort: on any
+   failure the dialog opens with the snapshot already in hand.
+   (There is no category colour anywhere in the settings or the
+   payload — categories carry a name, a folder and a type list.) */
+let dialogCategoriesInUse = null; // names from the last D12 payload
+async function refreshDialogOpenValues() {
+  if (!TAURI) return null;
+  try {
+    const v = await invoke('dialog_open_values');
+    if (v && v.settings) settings = { ...DEFAULT_SETTINGS, ...v.settings };
+    if (v && Array.isArray(v.categories)) dialogCategoriesInUse = v.categories;
+    if (v && typeof v.basket_visible === 'boolean') basketShown = v.basket_visible;
+    return v;
+  } catch (e) { console.error('dialog_open_values failed', e); return null; }
 }
 
 /* Last Try Date: the backend stamps every real attempt (fresh
@@ -751,6 +835,10 @@ function cellHtml(colId, d, st, left) {
       // the percentage branch and sit at "0.00%", indistinguishable
       // from a paused entry that simply had not started
       else if (st === 'queued') txt = 'Queued';
+      // 208B-V1: the pre-byte phase shows the backend's own
+      // sub-status (the payload's detail field, e.g. "Probing
+      // connection…") when it carries one
+      else if (st === 'starting' && subStatusOf(d)) txt = subStatusOf(d);
       // A2: the phase labels win over the percentage — a merging
       // row at 100% must say what it is doing, not sit at "100.00%"
       else if (STATUS_TEXT[st]) txt = STATUS_TEXT[st];
@@ -759,7 +847,8 @@ function cellHtml(colId, d, st, left) {
       return '<span class="sdot"></span>' + txt;
     }
     case 'timeleft':
-      return left != null ? fmtListLeft(left) : '';
+      // `left` arrives pre-formatted from fmtEta (208B-V6)
+      return left || '';
     case 'rate':
       return st === 'downloading' ? fmtListRate(d.speed_bps) : '';
     case 'lasttry':
@@ -776,8 +865,11 @@ function cellHtml(colId, d, st, left) {
 }
 
 function updateRowCells(tr, d) {
-  const left = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
-    ? (d.total - d.done_bytes) / d.speed_bps : null;
+  // 208B-V6: the Time-left cell goes through fmtEta like every
+  // other surface — "~"-marked until the rate is credible, and
+  // empty when the total is unknown (never an exact figure
+  // computed from a first sample or a bogus total)
+  const left = fmtEta(d, etaSamplesFor(d.id));
   // status is interpolated into HTML — pin it to the known vocabulary
   const st = KNOWN_STATUS.includes(d.status) ? d.status : 'error';
   // the row's checkbox mirrors the multi-selection set exactly:
@@ -925,6 +1017,7 @@ function render() {
      entry first seen already-finished (present at launch) has no
      recorded previous state and stays silent. */
   for (const d of items.values()) {
+    noteEtaSample(d); // 208B-V6: one credibility sample count per render pass
     const prev = prevStatusById.get(d.id);
     prevStatusById.set(d.id, d.status);
     // a (re)entry into 'downloading' is a try — stamp it for
@@ -1087,8 +1180,9 @@ function renderDetail() {
     : `${fmtSize(d.done_bytes)} (size unknown)`;
   // G6: the dialog's rate unit is "/sec" (was "/s")
   $('dRate').textContent = d.status === 'downloading' ? fmtDetailRate(d.speed_bps) : '—';
-  $('dLeft').textContent = d.status === 'downloading' && d.speed_bps > 0 && d.total > 0
-    ? fmtListLeft((d.total - d.done_bytes) / d.speed_bps) : '—';
+  // 208B-V6: same fmtEta as the list — "~" until credible, and
+  // '—' (no number at all) when the total is unknown/0
+  $('dLeft').textContent = fmtEta(d, etaSamplesFor(d.id)) || '—';
   // G6: Resume capability is a plain Yes/No in THIS dialog (the
   // payload's longer strings stay untouched for other consumers);
   // video entries are resumable by construction (spec §3)
@@ -2470,13 +2564,23 @@ async function fetchVideoInfo() {
       // the job produced an .m4a file, N-09)
       const selExt = /\[ext=([a-z0-9]+)\]/i.exec(o.selector || '');
       const extBadge = (o.ext || (selExt && selExt[1]) || (o.audio ? 'Audio' : 'MP4')).toUpperCase();
-      const sizeStr = o.size_text || (o.size_bytes ? fmtSize(o.size_bytes) : (o.selector === 'best' ? 'Auto' : 'Stream'));
+      // 208B-C: an estimated size (the probe's size_approx flag —
+      // filesize_approx or a bitrate×duration guess) is marked
+      // "~" and must NOT carry the 'exact' styling; only a real
+      // measured size reads as exact. This renderer used to mark
+      // every non-zero size 'exact' and never consulted the flag.
+      const sizeApprox = !!(o.size_approx || o.size_is_estimate);
+      let sizeStr = o.size_text || (o.size_bytes ? fmtSize(o.size_bytes) : (o.selector === 'best' ? 'Auto' : 'Stream'));
+      // mark ANY displayed size string (a size_text can arrive
+      // without size_bytes); the 'Auto'/'Stream' placeholders are
+      // not sizes and never take the mark
+      if (sizeApprox && sizeStr && sizeStr !== 'Auto' && sizeStr !== 'Stream' && !String(sizeStr).startsWith('~')) sizeStr = '~' + sizeStr;
       const noteOnly = (o.note || '').split('•').filter(p => !/MB|GB|KB/i.test(p)).join('•').trim();
       lab.innerHTML = `<input type="radio" name="vq" value="${i}" ${i === preselect ? 'checked' : ''}>
         <span class="q-badge ${o.audio ? 'audio' : ''}">${escapeHtml(extBadge)}</span>
         <span class="q-label">${escapeHtml(o.label)}</span>
         ${noteOnly ? `<span class="q-note">${escapeHtml(noteOnly)}</span>` : ''}
-        <span class="q-size ${o.size_bytes ? 'exact' : ''}">${escapeHtml(sizeStr)}</span>`;
+        <span class="q-size ${o.size_bytes && !sizeApprox ? 'exact' : ''}">${escapeHtml(sizeStr)}</span>`;
       lab.addEventListener('change', () => {
         box.querySelectorAll('label').forEach(el => el.classList.remove('sel'));
         lab.classList.add('sel');
@@ -2722,6 +2826,9 @@ document.querySelectorAll('.cat-types').forEach(t => {
 const BUILTIN_CATEGORIES = ['General', 'Compressed', 'Documents', 'Music', 'Video', 'Programs', 'Grabber'];
 function managedCategoryNames() {
   const names = new Set(categoryNames());
+  // D12: the backend's category-names-in-use list (refreshed on
+  // every Options open) joins the locally derived names
+  if (dialogCategoriesInUse) for (const n of dialogCategoriesInUse) if (n) names.add(n);
   for (const d of items.values()) if (d.category) names.add(d.category);
   return [...names].sort((a, b) => a.localeCompare(b));
 }
@@ -2806,8 +2913,13 @@ async function deleteCategoryUi(name) {
   await refreshAfterCategoryChange();
   toast(`Category "${name}" deleted — its downloads are in General now`, 'info');
 }
-function openOptions() {
+async function openOptions() {
   if (anotherModalOpen('omodal')) return; // one modal layer (N-08)
+  // D12: initialise every field — the Categories editor's
+  // category_dirs/category_exts included — from the backend's
+  // current values, never a snapshot that predates the last save
+  await refreshDialogOpenValues();
+  if (anotherModalOpen('omodal')) return;
   $('oDir').value = settings.default_dir;
   $('oConns').value = settings.max_connections;
   $('oLimitOn').checked = settings.speed_limit_bps > 0;
@@ -3045,8 +3157,13 @@ function renderSchedFiles() {
     box.appendChild(row);
   });
 }
-function openScheduler() {
+async function openScheduler() {
   if (anotherModalOpen('smodal')) return; // one modal layer (N-08); self re-open stays legal
+  // D12: initialise from the backend's current queue values
+  // (name/start/stop/cap arrive in the payload's settings.queues),
+  // never from a settings snapshot that predates the last save
+  await refreshDialogOpenValues();
+  if (anotherModalOpen('smodal')) return;
   fillQueueSelect($('schedQueueSel'), schedSel);
   schedSel = $('schedQueueSel').value || 'Main download queue';
   fillSchedulerFields();
@@ -3089,7 +3206,7 @@ $('schedNew').onclick = async () => {
   await saveSettings();
   schedSel = name;
   $('schedNewName').value = '';
-  openScheduler();
+  await openScheduler();
   $('sStatus').textContent = `Queue "${name}" created`;
 };
 $('schedDelete').onclick = async () => {
@@ -3104,7 +3221,7 @@ $('schedDelete').onclick = async () => {
   };
   await saveSettings();
   schedSel = 'Main download queue';
-  openScheduler();
+  await openScheduler();
   // the sidebar may be filtered to the queue that just vanished —
   // fall back to All Downloads instead of an empty phantom filter
   if (currentCat === 'queue:' + gone) {
@@ -3960,6 +4077,7 @@ async function initTauri() {
   await listen('progress', e => {
     const d = normalize(e.payload);
     if (deletedIds.has(d.id)) return;
+    noteEtaSample(d); // 208B-V6: every payload is an ETA credibility sample
     items.set(d.id, d);
     if (!selectedId) selectedId = d.id;
     scheduleRender();
@@ -4138,6 +4256,7 @@ async function initTauri() {
     const id = e.payload.id;
     deletedIds.add(id);
     items.delete(id);
+    etaSampleState.delete(id);
     render();
   });
   // file downloads caught by the extension open the Add URL dialog
@@ -4658,6 +4777,11 @@ const menuActions = {
   sidebar: () => document.body.classList.toggle('no-side'),
   basket: async () => {
     if (!TAURI) { toast('The drop basket needs the NDM desktop app'); return; }
+    // D12: toggle from the basket window's REAL visibility (the
+    // dialog_open_values payload refreshes basketShown) — the
+    // local flag alone could be stale if the basket window was
+    // shown or hidden by any other path
+    await refreshDialogOpenValues();
     basketShown = !basketShown;
     try { await invoke('set_basket_visible', { visible: basketShown }); }
     catch (e) { basketShown = !basketShown; toast('Could not toggle the basket: ' + e); }

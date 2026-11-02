@@ -48,6 +48,7 @@ const SAVE_EVERY: Duration = Duration::from_secs(1);
 static LIMIT_RATE: AtomicU64 = AtomicU64::new(0); // bytes/sec, 0 = unlimited
 static LIMIT_STATE: Mutex<Option<Instant>> = Mutex::new(None); // next free pacing slot
 static LIMIT_GEN: AtomicU64 = AtomicU64::new(0); // bumped on every limit change
+static LIMIT_OLDEST_LIVE: AtomicU64 = AtomicU64::new(0); // D7-v2 stale gate watermark (see pace_reserve)
 
 /// Set the global download speed limit in bytes/second (0 = unlimited).
 /// Applies to all running and future HTTP-engine downloads in this process.
@@ -55,8 +56,14 @@ pub fn set_global_limit(bytes_per_sec: u64) {
     LIMIT_RATE.store(bytes_per_sec, Ordering::Relaxed);
     // reset the pacing clock so a new rate starts clean, and bump
     // the generation so waits parked under the old rate re-reserve
-    // under the new one instead of sleeping the old slot out (M-14)
+    // under the new one instead of sleeping the old slot out (M-14).
+    // The bump first records its PRE-BUMP generation as the
+    // timeline's oldest-live watermark (D7-v2): only a charge that
+    // predates that watermark is stale enough to earn the re-base
+    // clamp in pace_reserve; a charge made under the watermark
+    // generation itself is live and re-reserves unclamped.
     *plock(&LIMIT_STATE) = None;
+    LIMIT_OLDEST_LIVE.store(LIMIT_GEN.load(Ordering::Relaxed), Ordering::Relaxed);
     LIMIT_GEN.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -317,37 +324,83 @@ fn pace_wait(
 /// its normal paths). A limit change mid-wait loops and
 /// re-reserves under the new rate — the stale charge vanished with
 /// the setter's timeline reset, so nothing is double-charged.
+/// The re-reserve is a RE-BASE, not a fresh queue join (D7), but
+/// ONLY through the stale-generation gate (D7-v2): the clamp keys
+/// on the generation this call's ABANDONED charge was reserved
+/// under, compared against the timeline's oldest-live watermark
+/// (recorded by the setters at every generation bump as the
+/// pre-bump generation). The abandoned charge earns the clamp
+/// only when it PREDATES the watermark — it is stale. A charge
+/// made under the watermark generation itself is live: its
+/// re-reserve takes the normal unclamped path and earns no
+/// credit. Keying on "this call saw a change" instead (v1) let a
+/// waiter clamp again on EVERY bump — under repeated bumps (a
+/// user dragging a limit slider, each set resetting the timeline)
+/// each clamp granted up to one slice-cost of credit, so the
+/// aggregate limit was no longer a bound; the gate grants at
+/// most one clamp per stale epoch. When the clamp does fire the
+/// slot is at most one slice-cost ahead of NOW, so the waiter is
+/// never thrown back behind finish-line debt stacked by peers
+/// re-reserving in the same instant (at low rates that stack is
+/// seconds–minutes of parked wait on an already-open
+/// connection). The stored finish line itself never moves
+/// backward — the clamped slice rides within debt already
+/// reserved, a bounded one-slice credit per stale waiter.
+/// Steady-state reservations (no change seen by this call) are
+/// unclamped, so aggregate pacing is exactly as before.
 fn pace_reserve(
     shared: &Shared,
     state: &Mutex<Option<Instant>>,
     amount: u64,
     rate_now: impl Fn() -> u64,
     gen_now: impl Fn() -> u64,
+    oldest_live_now: impl Fn() -> u64,
 ) -> bool {
     if amount == 0 {
         return true;
     }
+    // the generation the charge this call most recently abandoned
+    // to a limit change is reserved under; None until the first
+    // PaceWait::Changed — a fresh reservation can never clamp
+    let mut abandoned_gen: Option<u64> = None;
     loop {
         let rate = rate_now();
         if rate == 0 {
             return true;
         }
         let gen = gen_now();
+        // D7-v2 gate, read at re-reserve time: clamp only when the
+        // abandoned charge predates the timeline's CURRENT
+        // oldest-live watermark; a charge under a live generation
+        // (abandoned_gen >= watermark) re-reserves unclamped
+        let rebased = matches!(abandoned_gen, Some(g) if g < oldest_live_now());
         let slot = {
             let mut st = plock(state);
             let now = Instant::now();
             // no in-flight credit: an idle timeline starts at NOW,
             // never in the past, so a drained queue grants exactly
             // one slice immediately and paces everything after it
-            let slot = (*st).unwrap_or(now).max(now);
+            let base = (*st).unwrap_or(now).max(now);
             let cost = Duration::from_secs_f64(amount as f64 / rate as f64);
-            *st = Some(slot + cost);
+            let slot = if rebased {
+                base.min(now + cost)
+            } else {
+                base
+            };
+            let finish = slot + cost;
+            *st = Some(match *st {
+                Some(f) if f > finish => f,
+                _ => finish,
+            });
             slot
         };
         match pace_wait(shared, slot, rate, &rate_now, &gen_now, gen) {
             PaceWait::Reached | PaceWait::Cleared => return true,
             PaceWait::Halted => return false,
-            PaceWait::Changed => continue,
+            PaceWait::Changed => {
+                abandoned_gen = Some(gen);
+                continue;
+            }
         }
     }
 }
@@ -386,9 +439,14 @@ fn pace_grant_size(shared: &Shared, want: usize) -> usize {
 fn pace_before_read(shared: &Shared, amount: u64) -> bool {
     let global_rate = LIMIT_RATE.load(Ordering::Relaxed);
     if global_rate > 0
-        && !pace_reserve(shared, &LIMIT_STATE, amount, || LIMIT_RATE.load(Ordering::Relaxed), || {
-            LIMIT_GEN.load(Ordering::Relaxed)
-        })
+        && !pace_reserve(
+            shared,
+            &LIMIT_STATE,
+            amount,
+            || LIMIT_RATE.load(Ordering::Relaxed),
+            || LIMIT_GEN.load(Ordering::Relaxed),
+            || LIMIT_OLDEST_LIVE.load(Ordering::Relaxed),
+        )
     {
         return false;
     }
@@ -399,6 +457,7 @@ fn pace_before_read(shared: &Shared, amount: u64) -> bool {
             amount,
             || shared.own_limit.load(Ordering::Relaxed),
             || shared.own_limit_gen.load(Ordering::Relaxed),
+            || shared.own_limit_oldest_live.load(Ordering::Relaxed),
         )
     {
         // the global timeline keeps a charge for bytes that were
@@ -607,6 +666,14 @@ struct Shared {
     /// pacing wait parked under the old rate re-reserves under the
     /// new one instead of sleeping out the old slot (M-14)
     own_limit_gen: AtomicU64,
+    /// the own timeline's oldest-live watermark for the D7-v2
+    /// stale-generation gate: set_limit records the PRE-BUMP value
+    /// of own_limit_gen here at every bump (the global timeline's
+    /// equivalent is LIMIT_OLDEST_LIVE). A pace_reserve charge
+    /// abandoned from a generation OLDER than this is stale and
+    /// may re-base with the clamp; a charge from this generation
+    /// itself is live and re-reserves unclamped.
+    own_limit_oldest_live: AtomicU64,
     /// the lying-Content-Encoding-header proof passed for this job
     /// (DIAG fix): block runs skip the header veto because the
     /// bodies were proven identity. True encoders never set this —
@@ -2274,6 +2341,15 @@ impl Download {
         // instead of ignoring the change for ≥15 s.
         if bytes_per_sec != old {
             *plock(&self.shared.own_limit_state) = None;
+            // record the PRE-BUMP generation as the oldest-live
+            // watermark BEFORE bumping (D7-v2, mirrored in
+            // set_global_limit): charges from any older generation
+            // are stale; a charge from the watermark generation
+            // itself is live and earns no re-base clamp
+            self.shared.own_limit_oldest_live.store(
+                self.shared.own_limit_gen.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             self.shared.own_limit_gen.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2818,6 +2894,7 @@ fn start_impl(
         conn_phase: (0..max_conn).map(|_| AtomicU8::new(0)).collect(),
         conn_block: (0..max_conn).map(|_| AtomicUsize::new(usize::MAX)).collect(),
         own_limit_gen: AtomicU64::new(0),
+        own_limit_oldest_live: AtomicU64::new(0),
         ignore_encoding: probed.ignore_encoding_header,
         last_data_sync: Mutex::new(Instant::now()),
         bytes_since_sync: AtomicU64::new(0),
@@ -3021,6 +3098,7 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         conn_phase: vec![AtomicU8::new(0)],
         conn_block: vec![AtomicUsize::new(usize::MAX)],
         own_limit_gen: AtomicU64::new(0),
+        own_limit_oldest_live: AtomicU64::new(0),
         ignore_encoding: false,
         last_data_sync: Mutex::new(Instant::now()),
         bytes_since_sync: AtomicU64::new(0),
@@ -3093,6 +3171,7 @@ fn start_single_stream(
         conn_phase: vec![AtomicU8::new(0)],
         conn_block: vec![AtomicUsize::new(usize::MAX)],
         own_limit_gen: AtomicU64::new(0),
+        own_limit_oldest_live: AtomicU64::new(0),
         ignore_encoding: probed.ignore_encoding_header,
         last_data_sync: Mutex::new(Instant::now()),
         bytes_since_sync: AtomicU64::new(0),
@@ -6347,6 +6426,7 @@ mod audit208_tests {
             100_000,
             || dl.shared.own_limit.load(Ordering::Relaxed),
             || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+            || dl.shared.own_limit_oldest_live.load(Ordering::Relaxed),
         ));
         assert!(
             t0.elapsed() < Duration::from_millis(60),
@@ -6360,6 +6440,7 @@ mod audit208_tests {
                 100_000,
                 || dl.shared.own_limit.load(Ordering::Relaxed),
                 || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+                || dl.shared.own_limit_oldest_live.load(Ordering::Relaxed),
             ));
         }
         let elapsed = t0.elapsed();
@@ -6386,6 +6467,7 @@ mod audit208_tests {
             PACE_SLICE,
             || dl.shared.own_limit.load(Ordering::Relaxed),
             || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+            || dl.shared.own_limit_oldest_live.load(Ordering::Relaxed),
         ));
         let dl2 = dl.clone();
         let waiter = std::thread::spawn(move || {
@@ -6396,6 +6478,7 @@ mod audit208_tests {
                 PACE_SLICE,
                 || dl2.shared.own_limit.load(Ordering::Relaxed),
                 || dl2.shared.own_limit_gen.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_oldest_live.load(Ordering::Relaxed),
             );
             (ok, t0.elapsed())
         });
@@ -6415,6 +6498,7 @@ mod audit208_tests {
             PACE_SLICE,
             || dl.shared.own_limit.load(Ordering::Relaxed),
             || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+            || dl.shared.own_limit_oldest_live.load(Ordering::Relaxed),
         ));
         let dl2 = dl.clone();
         let waiter = std::thread::spawn(move || {
@@ -6425,6 +6509,7 @@ mod audit208_tests {
                 PACE_SLICE,
                 || dl2.shared.own_limit.load(Ordering::Relaxed),
                 || dl2.shared.own_limit_gen.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_oldest_live.load(Ordering::Relaxed),
             );
             (ok, t0.elapsed())
         });
@@ -6436,6 +6521,216 @@ mod audit208_tests {
             elapsed < Duration::from_secs(2),
             "raising the limit took {elapsed:?} to reach a parked reservation"
         );
+    }
+
+    #[test]
+    fn pace_reserve_rebase_clamps_stacked_debt() {
+        // D7: a waiter parked at a low rate whose limit changes
+        // mid-flight re-reserves as a RE-BASE — it must not queue
+        // behind finish-line debt stacked onto the fresh timeline
+        // in the same instant (here: a fake 60 s of peer debt,
+        // landed before the waiter's re-reserve in every realistic
+        // interleaving — the waiter needs a 50 ms slice boundary
+        // to even notice the change). Without the clamp its slot
+        // is that 60 s; with it, at most one slice-cost out.
+        // D7-v2 setup note: the stale-generation gate only clamps
+        // a charge that PREDATES the oldest-live watermark, and a
+        // single bump records the waiter's own generation as that
+        // watermark (live, not stale) — so this test now bumps
+        // TWICE back-to-back below, within the waiter's one
+        // notice slice, which is what makes its gen-0 charge
+        // stale. The asserted semantics are unchanged.
+        let dl = shared_with_own_limit(1000);
+        assert!(pace_reserve(
+            &dl.shared,
+            &dl.shared.own_limit_state,
+            PACE_SLICE,
+            || dl.shared.own_limit.load(Ordering::Relaxed),
+            || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+            || dl.shared.own_limit_oldest_live.load(Ordering::Relaxed),
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dl2 = dl.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let ok = pace_reserve(
+                &dl2.shared,
+                &dl2.shared.own_limit_state,
+                PACE_SLICE,
+                || dl2.shared.own_limit.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_gen.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_oldest_live.load(Ordering::Relaxed),
+            );
+            let _ = tx.send((ok, t0.elapsed()));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        dl.set_limit(1_000_000); // changed: timeline reset, gen bumped, watermark = gen 0
+        dl.set_limit(999_999); // bumped again: watermark = gen 1 — the gen-0 charge is now stale
+        *plock(&dl.shared.own_limit_state) =
+            Some(Instant::now() + Duration::from_secs(60));
+        let got = rx.recv_timeout(Duration::from_secs(3));
+        // the clamped re-reserve rides within the stacked debt —
+        // the finish line itself must not have moved backward
+        let finish = (*plock(&dl.shared.own_limit_state))
+            .expect("the stacked timeline must still be armed");
+        assert!(
+            finish > Instant::now() + Duration::from_secs(55),
+            "re-based reservation moved the finish line backward: {finish:?}"
+        );
+        match got {
+            Ok((ok, elapsed)) => {
+                assert!(ok);
+                assert!(
+                    elapsed < Duration::from_secs(3),
+                    "re-based reservation queued behind stacked debt: {elapsed:?}"
+                );
+            }
+            Err(_) => {
+                dl.set_limit(0); // release the parked waiter
+                panic!("re-based reservation stayed parked behind stacked debt");
+            }
+        }
+    }
+
+    #[test]
+    fn pace_reserve_rebase_refused_for_live_generation() {
+        // D7-v2 gate, live side: a waiter whose charge was made
+        // under the CURRENT (live) generation gets NO clamp when
+        // a bump interrupts it. The single bump below records the
+        // waiter's own generation (gen 0) as the oldest-live
+        // watermark, and a charge made under the watermark
+        // generation itself is live — its re-reserve queues
+        // behind stacked debt exactly like a steady-state
+        // reservation. (Under the v1 changed-flag this same
+        // waiter clamped and was granted within milliseconds.)
+        let dl = shared_with_own_limit(1000);
+        assert!(pace_reserve(
+            &dl.shared,
+            &dl.shared.own_limit_state,
+            PACE_SLICE,
+            || dl.shared.own_limit.load(Ordering::Relaxed),
+            || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+            || dl.shared.own_limit_oldest_live.load(Ordering::Relaxed),
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dl2 = dl.clone();
+        std::thread::spawn(move || {
+            let t0 = Instant::now();
+            let ok = pace_reserve(
+                &dl2.shared,
+                &dl2.shared.own_limit_state,
+                PACE_SLICE,
+                || dl2.shared.own_limit.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_gen.load(Ordering::Relaxed),
+                || dl2.shared.own_limit_oldest_live.load(Ordering::Relaxed),
+            );
+            let _ = tx.send((ok, t0.elapsed()));
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        dl.set_limit(1_000_000); // ONE bump: gen 1, watermark = gen 0 (the waiter's charge gen)
+        *plock(&dl.shared.own_limit_state) =
+            Some(Instant::now() + Duration::from_secs(60));
+        // no grant may arrive while the stacked debt stands
+        if let Ok((ok, elapsed)) = rx.recv_timeout(Duration::from_secs(3)) {
+            dl.set_limit(0);
+            panic!(
+                "live-generation re-reserve was clamped (ok={ok}, granted in {elapsed:?})"
+            );
+        }
+        // the refused re-reserve queued behind the debt — the
+        // finish line itself must not have moved backward either
+        let finish = (*plock(&dl.shared.own_limit_state))
+            .expect("the stacked timeline must still be armed");
+        assert!(
+            finish > Instant::now() + Duration::from_secs(55),
+            "finish line moved backward: {finish:?}"
+        );
+        dl.set_limit(0); // release the parked waiter
+        let (ok, _) = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the released waiter must finish");
+        assert!(ok);
+    }
+
+    #[test]
+    fn pace_reserve_rebase_stops_after_first_stale_generation() {
+        // D7-v2 gate, aggregate bound: two successive bump epochs
+        // grant a waiter AT MOST ONE clamp in total. Epoch 1 is a
+        // rapid double bump that makes the waiter's gen-0 charge
+        // stale — the clamp fires and the waiter is granted at
+        // once despite 60 s of stacked debt (that grant is its
+        // one slice of credit). Epoch 2 is a single bump
+        // interrupting the waiter's NEXT charge, made under the
+        // then-live generation (gen 2) — the gate refuses, the
+        // re-reserve queues behind fresh stacked debt, and no
+        // second credit is granted: the waiter's total advance
+        // over the unclamped schedule stays at the one slice.
+        let dl = shared_with_own_limit(1000);
+        assert!(pace_reserve(
+            &dl.shared,
+            &dl.shared.own_limit_state,
+            PACE_SLICE,
+            || dl.shared.own_limit.load(Ordering::Relaxed),
+            || dl.shared.own_limit_gen.load(Ordering::Relaxed),
+            || dl.shared.own_limit_oldest_live.load(Ordering::Relaxed),
+        ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dl2 = dl.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2 {
+                let t0 = Instant::now();
+                let ok = pace_reserve(
+                    &dl2.shared,
+                    &dl2.shared.own_limit_state,
+                    PACE_SLICE,
+                    || dl2.shared.own_limit.load(Ordering::Relaxed),
+                    || dl2.shared.own_limit_gen.load(Ordering::Relaxed),
+                    || dl2.shared.own_limit_oldest_live.load(Ordering::Relaxed),
+                );
+                if tx.send((ok, t0.elapsed())).is_err() {
+                    return;
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        // epoch 1: rapid double bump — the gen-0 charge goes stale
+        dl.set_limit(1_000_000); // gen 1, watermark = gen 0
+        dl.set_limit(999_999); // gen 2, watermark = gen 1 — gen 0 predates it
+        *plock(&dl.shared.own_limit_state) =
+            Some(Instant::now() + Duration::from_secs(60));
+        let (ok, elapsed) = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the stale waiter's clamped grant must land");
+        assert!(ok);
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the one stale clamp must free the waiter at once, took {elapsed:?}"
+        );
+        // the waiter's second call has now charged under the live
+        // generation (gen 2); give it a slice boundary to park
+        std::thread::sleep(Duration::from_millis(300));
+        // epoch 2: a single bump — the watermark becomes gen 2,
+        // the live charge's own generation: the gate must refuse
+        dl.set_limit(2_000_000);
+        *plock(&dl.shared.own_limit_state) =
+            Some(Instant::now() + Duration::from_secs(60));
+        if let Ok((ok, elapsed)) = rx.recv_timeout(Duration::from_secs(3)) {
+            dl.set_limit(0);
+            panic!(
+                "second epoch clamped again (ok={ok}, granted in {elapsed:?}) — credit granted twice"
+            );
+        }
+        let finish = (*plock(&dl.shared.own_limit_state))
+            .expect("the stacked timeline must still be armed");
+        assert!(
+            finish > Instant::now() + Duration::from_secs(55),
+            "finish line moved backward: {finish:?}"
+        );
+        dl.set_limit(0); // release the parked waiter
+        let (ok, _) = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the released waiter must finish");
+        assert!(ok);
     }
 
     // --- item 3: canonical key + symlink guard ---

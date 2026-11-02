@@ -997,8 +997,30 @@ fn read_message(input: &mut impl Read) -> io::Result<Option<Result<Value, String
             format!("message too large: {len} bytes"),
         ));
     }
-    let mut buf = vec![0u8; len as usize];
-    input.read_exact(&mut buf)?;
+    // F6: do NOT pre-allocate the declared length — a lying header
+    // could force the full cap's allocation before a single body
+    // byte arrives. Read in small chunks into a buffer that grows
+    // only with bytes actually delivered, up to the declared
+    // length (itself already capped at MAX_MESSAGE_BYTES above).
+    let len = len as usize;
+    let mut buf = Vec::with_capacity(len.min(8192));
+    let mut chunk = [0u8; 8192];
+    while buf.len() < len {
+        let want = (len - buf.len()).min(chunk.len());
+        match input.read(&mut chunk[..want]) {
+            // EOF mid-frame is the old read_exact behaviour:
+            // an UnexpectedEof error, never a silent short parse
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            }
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
     Ok(Some(
         serde_json::from_slice(&buf).map_err(|e| format!("malformed message: {e}")),
     ))
@@ -1241,6 +1263,45 @@ mod tests {
             "a progress message must not modify an existing stamp"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader that never returns more than 3 bytes per call —
+    /// the chunked frame reader (F6) must assemble a message from
+    /// dribbles exactly as the old one-shot read_exact did.
+    struct Dribble<'a> {
+        data: &'a [u8],
+        pos: usize,
+    }
+
+    impl Read for Dribble<'_> {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            let n = (self.data.len() - self.pos).min(out.len()).min(3);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn framed_message_arriving_in_dribbles_still_parses() {
+        let body = br#"{"type":"ping"}"#;
+        let mut framed = Vec::new();
+        framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        framed.extend_from_slice(body);
+        let mut reader = Dribble { data: &framed, pos: 0 };
+        let v = read_message(&mut reader).unwrap().unwrap().unwrap();
+        assert_eq!(v["type"], json!("ping"));
+        // a header that promises more than ever arrives is
+        // UnexpectedEof, exactly as read_exact reported it
+        let mut short = Vec::new();
+        short.extend_from_slice(&((body.len() + 10) as u32).to_le_bytes());
+        short.extend_from_slice(body);
+        let mut reader = Dribble { data: &short, pos: 0 };
+        let err = read_message(&mut reader).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

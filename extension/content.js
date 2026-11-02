@@ -332,14 +332,19 @@
     return `${(r / 1024).toFixed(3)} KB/sec`;
   }
 
-  function fmtIdmEta(secs) {
+  // approx (V6): the app flags eta_secs as an estimate via the
+  // additive eta_approx field; mark it with the "~ " prefix so a
+  // guess never reads as an exact figure. Absent/false (older
+  // app) keeps the exact rendering.
+  function fmtIdmEta(secs, approx) {
     const s = Math.max(0, Math.round(Number(secs) || 0));
     const h = Math.floor(s / 3600);
     const m = Math.floor((s % 3600) / 60);
     const r = s % 60;
-    if (h > 0) return `${h} hour(s) ${m} min`;
-    if (m > 0) return `${m} min ${r} sec`;
-    return `${r} sec`;
+    const pre = approx ? '~ ' : '';
+    if (h > 0) return `${pre}${h} hour(s) ${m} min`;
+    if (m > 0) return `${pre}${m} min ${r} sec`;
+    return `${pre}${r} sec`;
   }
 
   function cleanPageTitle() {
@@ -2475,6 +2480,12 @@
       let last = null;       // last good progress reply
       let uiPaused = false;  // Pause pressed here (poll may lag/never answer)
       let terminal = false;
+      // V4: previous poll's done/total, for the sustained
+      // done>=total check in render() — a dishonest total can
+      // pin done==total while bytes still arrive, so one poll
+      // of equality must never read as finalizing.
+      let prevDone = null;
+      let prevTotal = null;
 
       /* Keep the reopen-badge registry truthful (R3-EXT-08): a
          cancelled or errored entry is no longer "live" for its
@@ -2530,8 +2541,24 @@
         // there is nothing left to pause or cancel, so those
         // buttons must not stay live in this window.
         const merging = st === 'merging';
-        const finalizing =
-          merging || (st === 'downloading' && total > 0 && done >= total);
+        // V4: the inference must be SUSTAINED, not momentary —
+        // with a dishonest total, done sits clamped at total
+        // while bytes keep arriving, and a single poll of
+        // equality pinned this card at "Finishing..." mid-
+        // transfer. done still changing since the previous
+        // poll means bytes are still arriving: not finalizing,
+        // full stop. Only two consecutive polls at the SAME
+        // done>=total (same total) count.
+        const bytesIn =
+          st === 'downloading' && total > 0 && done >= total;
+        const sustained =
+          bytesIn &&
+          prevDone != null &&
+          done === prevDone &&
+          total === prevTotal;
+        const finalizing = merging || sustained;
+        prevDone = done;
+        prevTotal = total;
         // The "<percent>% <filename>" line belongs to the card's
         // title bar only (IDM's progress-dialog title); the body
         // carries the labelled status rows instead. Printing the
@@ -2541,7 +2568,13 @@
           st === 'paused'
             ? 'Paused'
             : st === 'starting'
-              ? 'Preparing…'
+              ? // V1: the app's additive detail names the actual
+                // start sub-phase ("Probing connection…") when
+                // it sends one; absent/empty (older app) keeps
+                // the bare word.
+                typeof last.detail === 'string' && last.detail
+                ? last.detail
+                : 'Preparing…'
               : merging
                 ? 'Merging video + audio…'
                 : finalizing
@@ -2573,7 +2606,8 @@
         if (active) rateEl.textContent = fmtIdmRate(last.rate_bps);
         const eta = Number(last.eta_secs) || 0;
         rowsEl.time.style.display = active && eta > 0 ? '' : 'none';
-        if (active && eta > 0) timeEl.textContent = fmtIdmEta(eta);
+        if (active && eta > 0)
+          timeEl.textContent = fmtIdmEta(eta, !!last.eta_approx);
         // Resume capability is a property of the download, not
         // of the live transfer: the row stays in every state the
         // poll has spoken for, as long as the app mirrored an

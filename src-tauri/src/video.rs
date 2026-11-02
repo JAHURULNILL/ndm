@@ -368,13 +368,17 @@ struct NdmFileTrack {
     /// largest aggregate downloaded_bytes seen — Aggregate mode
     agg_done: u64,
     exact_total: Option<u64>,
-    /// smallest QUALIFIED estimate reported (see apply): the
-    /// finished: the estimate formula divides the bytes so far by
+    /// latest QUALIFIED estimate reported (see apply): the
+    /// estimate formula divides the bytes so far by
     /// (finished + 1), so with 8 fragments in flight and none
-    /// finished it overshoots wildly; those early spikes must
-    /// never stick (the old parser's monotonic-max total did
-    /// exactly that)
-    estimate_qualified_min: Option<u64>,
+    /// finished it overshoots wildly; those early spikes are
+    /// UNqualified and never land here at all. A qualified
+    /// estimate may refine UP or DOWN as fragments finish — the
+    /// latest one stands (208B total rule ii); it is an estimate,
+    /// never a floor the downloaded count can raise (the old
+    /// monotonic-max / min-sticky treatments both froze a
+    /// transient figure in as the run's total)
+    estimate_qualified: Option<u64>,
     frag_count: Option<u64>,
     finished: bool,
     speed: f64,
@@ -399,10 +403,18 @@ impl NdmFileTrack {
         // nothing.)
         if r.frag_index.is_some() && self.mode == FragMode::Unknown {
             if !r.finished {
-                self.mode = if r.total.is_some() {
-                    FragMode::Fragment
-                } else {
-                    FragMode::Aggregate
+                // 208B classification guard: a report whose
+                // downloaded count EXCEEDS its supposed fragment
+                // total cannot be a per-fragment report — a
+                // fragment never downloads more than its own size.
+                // It is the aggregate state dict (file-cumulative
+                // downloaded_bytes) that happens to carry a
+                // fragment-sized total_bytes, and it decides
+                // Aggregate no matter what else it carries.
+                self.mode = match (r.downloaded, r.total) {
+                    (Some(d), Some(t)) if d > t => FragMode::Aggregate,
+                    (_, Some(_)) => FragMode::Fragment,
+                    _ => FragMode::Aggregate,
                 };
             } else if r.frag_count.map(|c| c > 1).unwrap_or(false) {
                 // a fragment's own 'finished' report arriving
@@ -415,6 +427,25 @@ impl NdmFileTrack {
         }
         if let Some(d) = r.downloaded {
             self.agg_done = self.agg_done.max(d);
+        }
+        // 208B contradiction reclassification: the first report
+        // was ambiguous (downloaded <= its fragment-sized total
+        // fits both readings) and Fragment was chosen, but a later
+        // report proves the aggregate reading the same way as
+        // above — downloaded beyond the fragment's own total.
+        // The slots built so far are sums of cumulative snapshots
+        // (the runaway multiplication behind the 110 MB card), so
+        // they are discarded wholesale; `agg_done` was maintained
+        // from every report's downloaded field all along, and in
+        // the aggregate world that max IS the true byte count, so
+        // done() is correct from this line on.
+        if self.mode == FragMode::Fragment && !r.finished {
+            if let (Some(d), Some(t)) = (r.downloaded, r.total) {
+                if d > t {
+                    self.mode = FragMode::Aggregate;
+                    self.slots.clear();
+                }
+            }
         }
         match self.mode {
             FragMode::Fragment => {
@@ -455,8 +486,19 @@ impl NdmFileTrack {
                 }
             }
             _ => {
+                // 208B: a fragment-bearing report's total is a
+                // FRAGMENT's size, never the file's — taking it as
+                // the file's exact total is how a total of exactly
+                // 82,047 B (fragment 0's content length) could ever
+                // be displayed for a 24.393 MB job. A total counts
+                // as the file's exact total only on a plain
+                // (fragment-less) report, or on the file's own
+                // finished report, whose total is the file's size
+                // by construction.
                 if let Some(t) = r.total {
-                    self.exact_total = Some(t);
+                    if r.frag_index.is_none() || r.finished {
+                        self.exact_total = Some(t);
+                    }
                 }
                 if r.finished {
                     self.finished = true;
@@ -475,11 +517,7 @@ impl NdmFileTrack {
             // one fragment has finished, which tames the fragment
             // formula's denominator
             if r.frag_index.map(|i| i >= 1).unwrap_or(true) {
-                self.estimate_qualified_min = Some(
-                    self.estimate_qualified_min
-                        .map(|m: u64| m.min(e))
-                        .unwrap_or(e),
-                );
+                self.estimate_qualified = Some(e);
             }
         }
         if let Some(s) = r.speed {
@@ -500,8 +538,17 @@ impl NdmFileTrack {
     }
 
     fn total(&self) -> u64 {
+        // V3-a (208B): a total is NEVER derived from the downloaded
+        // count. The pre-fix fallback returned `done()` whenever no
+        // trustworthy figure existed, so the status layer's total
+        // chased its own numerator in lockstep (always exactly
+        // 100%, climbing past the real size as later files reported
+        // in). Unknown is 0; a trustworthy figure (an exact reported
+        // total, the fragments' own totals, or a QUALIFIED estimate)
+        // is returned exactly as reported — never inflated to the
+        // downloaded count either.
         if let Some(t) = self.exact_total {
-            return t.max(self.done());
+            return t;
         }
         let est = match self.mode {
             FragMode::Fragment => {
@@ -530,14 +577,15 @@ impl NdmFileTrack {
                 }
             }
             // only QUALIFIED estimates may stand as a total (see
-            // estimate_qualified_min): an unqualified fragment
-            // estimate is the M-15 spike itself, and showing the
-            // downloaded count as the total for the first moments
-            // of a fragment download is strictly safer than
-            // showing a figure 37× too large
-            _ => self.estimate_qualified_min,
+            // estimate_qualified): an unqualified fragment
+            // estimate is the M-15 spike itself. With no qualified
+            // estimate the total is UNKNOWN (0) — the job-level
+            // seeded total (see NdmProgTracker::set_format_total
+            // and the spawn path) is what the status shows then,
+            // never the downloaded count (V3-a)
+            _ => self.estimate_qualified,
         };
-        est.map(|e| e.max(self.done())).unwrap_or_else(|| self.done())
+        est.unwrap_or(0)
     }
 
     /// The file's final size once its download is over: the exact
@@ -551,7 +599,12 @@ impl NdmFileTrack {
 /// Whole-run NDMPROG accounting: the per-file tracks plus the
 /// format-level size learned from the probe (the selected
 /// formats' `filesize`/`filesize_approx`), which outranks every
-/// fragment estimate as the run's total.
+/// fragment estimate as the run's total. When the probe learned
+/// no format size, the spawn path seeds the tracker's format
+/// total from the job's known total instead — the picked
+/// option's size (`expect_size`, the picker's row total) — so a
+/// trustworthy denominator exists from the first progress line
+/// and is never synthesised from downloaded bytes (V3-a, 208B).
 #[derive(Default)]
 struct NdmProgTracker {
     files: HashMap<String, NdmFileTrack>,
@@ -574,15 +627,18 @@ impl NdmProgTracker {
     }
 
     fn total(&self) -> u64 {
-        let done = self.done();
+        // V3-a (208B): the seeded format/job total stands exactly
+        // as seeded for the whole run (the finish line corrects it
+        // from parts_sum / the merged length at completion); it is
+        // never raised to the downloaded count mid-run, and with no
+        // seeded total the per-file sum is 0 while every file's
+        // total is still unknown — the status layer then keeps the
+        // job's previously seeded total instead of inventing one
+        // from downloaded bytes
         if let Some(f) = self.format_total {
-            return f.max(done);
+            return f;
         }
-        self.files
-            .values()
-            .map(|f| f.total())
-            .sum::<u64>()
-            .max(done)
+        self.files.values().map(|f| f.total()).sum::<u64>()
     }
 
     fn speed(&self) -> f64 {
@@ -597,6 +653,13 @@ impl NdmProgTracker {
     /// downloaded, the finish line's trustworthy baseline.
     fn parts_sum(&self) -> u64 {
         self.files.values().map(|f| f.final_size()).sum()
+    }
+
+    /// True only when at least one file is tracked and EVERY
+    /// tracked file has reported finished (208B: the [Merger]
+    /// branch's licence to claim "merging" / done == total).
+    fn all_finished(&self) -> bool {
+        !self.files.is_empty() && self.files.values().all(|f| f.finished)
     }
 }
 
@@ -1819,7 +1882,17 @@ impl VideoJob {
             audio,
             title: effective_title,
             cookies,
-            progress: Arc::new(Mutex::new(VideoProgress::default())),
+            // V3-a (208B): the progress total is seeded ONCE, here
+            // at job start, from the job's known total — the picked
+            // option's probed size (`expect_size`). No progress
+            // handler may ever (re)derive it from downloaded bytes;
+            // the engine poll loop may only LOCK it to the parts'
+            // probed sum, and the finalize paths may correct it to
+            // the merged file's true length at completion
+            progress: Arc::new(Mutex::new(VideoProgress {
+                total: expect_size,
+                ..VideoProgress::default()
+            })),
             chosen_stem: Mutex::new(initial_stem),
             child: Mutex::new(None),
             active_downloads: Mutex::new(Vec::new()),
@@ -3097,11 +3170,31 @@ impl VideoJob {
             // run. The format-level size learned at resolve time
             // (when the resolve ran) outranks every fragment
             // estimate as the run's total
+            // V3-a (208B): seed the tracker ONCE, before any
+            // progress line is processed — the resolve's format
+            // size when it exists, else the job's known total (the
+            // picked option's size, `expect_size`). The combined
+            // job's progress template carries no explicit total, so
+            // without this seed the denominator would have to be
+            // invented from downloaded bytes — the ratchet this
+            // batch exists to kill. The seeded figure stands for
+            // the whole run; the finish line below corrects the
+            // reported total from the tracker's parts sum (the
+            // per-file exact totals yt-dlp reports as each file
+            // finishes), and the Finished outcome then replaces it
+            // with the merged file's true length
             let mut tracker = NdmProgTracker::default();
-            tracker.set_format_total(
-                *job.format_size.lock().unwrap(),
-                *job.format_size_exact.lock().unwrap(),
-            );
+            {
+                let fmt = *job.format_size.lock().unwrap();
+                let fmt_exact = *job.format_size_exact.lock().unwrap();
+                match fmt {
+                    Some(_) => tracker.set_format_total(fmt, fmt_exact),
+                    None if job.expect_size > 0 => {
+                        tracker.set_format_total(Some(job.expect_size), false)
+                    }
+                    None => {}
+                }
+            }
             let mut detected_final: Option<PathBuf> = None;
 
             for line in BufReader::new(stdout).lines() {
@@ -3125,7 +3218,12 @@ impl VideoJob {
                     // come DOWN as it refines (the pre-fix parser
                     // only ever let the total grow, which locked
                     // the early concurrent-fragment estimate spike
-                    // in for the whole download)
+                    // in for the whole download). V3-a (208B): the
+                    // tracker never returns a downloaded-derived
+                    // figure, and a 0 here (total still unknown at
+                    // tracker level) leaves the job's seeded total
+                    // untouched — the denominator never chases the
+                    // numerator
                     let new_total = tracker.total();
                     if new_total > 0 {
                         p.total = new_total;
@@ -3149,15 +3247,31 @@ impl VideoJob {
                         }
                     }
                     if line.contains("[Merger]") || line.contains("[ExtractAudio]") {
-                        let mut p = job.progress.lock().unwrap();
-                        if p.total > 0 {
-                            p.done = p.total;
+                        // 208B (candidate e): this branch used to
+                        // force `done = total` and claim "merging"
+                        // on ANY merger line. yt-dlp prints a
+                        // [Merger] line per output, and with
+                        // several formats a later file can still be
+                        // downloading — forcing done = total there
+                        // manufactured the recording's false
+                        // "Finishing…" window at a pinned 100%.
+                        // Now the claim is scoped to what the
+                        // tracker can prove: EVERY tracked file has
+                        // reported finished. Until then the line is
+                        // only a path sighting (handled above) and
+                        // the status stays the transfer's own.
+                        if tracker.all_finished() {
+                            let mut p = job.progress.lock().unwrap();
+                            if p.total > 0 {
+                                p.done = p.total;
+                            }
+                            // A2: the merge / audio-extraction
+                            // window — including the ensure_audio
+                            // check that runs after this loop —
+                            // reports as "merging"
+                            p.status = "merging".to_string();
+                            p.speed_bps = 0.0;
                         }
-                        // A2: the merge / audio-extraction window —
-                        // including the ensure_audio check that runs
-                        // after this loop — reports as "merging"
-                        p.status = "merging".to_string();
-                        p.speed_bps = 0.0;
                     }
                 }
             }
@@ -3291,6 +3405,10 @@ impl VideoJob {
                     } else {
                         p.status = "finished".to_string();
                         if flen > 0 {
+                            // completion correction: a seeded /
+                            // estimated total is corrected HERE, to
+                            // the merged file's true length — never
+                            // mid-transfer (208B total rule)
                             p.total = flen;
                             p.done = flen;
                         }
@@ -4105,6 +4223,133 @@ At least one output file must be specified";
         ));
         assert_eq!(tr.total(), 154_471_113);
         assert_eq!(tr.done(), 24_000_000);
+    }
+
+    /// V3-a (208B): with NO trustworthy total anywhere — the
+    /// combined job's template lines carry no explicit total and
+    /// no qualified estimate — the tracker total stays UNKNOWN
+    /// (0) while downloaded climbs. The pre-fix fallback returned
+    /// the downloaded count as the total, so the displayed total
+    /// ratcheted upward in lockstep with downloaded at a pinned
+    /// 100%. A finished report's exact total is the correction
+    /// point, and only there.
+    #[test]
+    fn ndmprog_unknown_total_stays_zero_never_ratchets() {
+        let mut tr = NdmProgTracker::default();
+        for d in [1_000_000u64, 5_000_000, 12_000_000, 20_000_000] {
+            tr.apply(parse_ndmprog(&format!(
+                "{d}|NA|NA|3000000|0|49|downloading|/dl/clip.f137.mp4"
+            )));
+            assert_eq!(tr.done(), d);
+            assert_eq!(
+                tr.total(),
+                0,
+                "unknown total must stay 0, not chase downloaded ({d})"
+            );
+        }
+        // the file finishes and reports its exact total: the
+        // tracker total corrects to it at completion
+        tr.apply(parse_ndmprog(
+            "20000000|20000000|NA|NA|NA|NA|finished|/dl/clip.f137.mp4",
+        ));
+        assert_eq!(tr.total(), 20_000_000);
+        assert_eq!(tr.parts_sum(), 20_000_000);
+    }
+
+    /// V3-a (208B): the seeded job total (the picked option's
+    /// 24,393,000-byte row for the incident video, seeded exactly
+    /// as the spawn path seeds `expect_size` when the resolve
+    /// learned no format size) stands for the whole run over
+    /// interleaved cumulative reports from both formats (video via
+    /// 6 connections, audio via 2) whose template lines carry no
+    /// explicit total — downloaded converges to it, the total
+    /// never moves, and the finished reports' parts sum confirms
+    /// it at completion.
+    #[test]
+    fn ndmprog_seeded_job_total_never_ratchets() {
+        let job_total = 24_393_000u64;
+        let video = 20_000_000u64;
+        let audio = job_total - video;
+        let mut tr = NdmProgTracker::default();
+        tr.set_format_total(Some(job_total), false);
+        for step in 1..=4u64 {
+            let dv = video * step / 4;
+            let da = audio * step / 4;
+            tr.apply(parse_ndmprog(&format!(
+                "{dv}|NA|NA|3000000|0|49|downloading|/dl/clip.f137.mp4"
+            )));
+            tr.apply(parse_ndmprog(&format!(
+                "{da}|NA|NA|500000|0|3|downloading|/dl/clip.f140.m4a"
+            )));
+            assert_eq!(tr.total(), job_total, "total moved at step {step}");
+            assert_eq!(tr.done(), dv + da);
+            assert!(tr.done() <= tr.total());
+        }
+        tr.apply(parse_ndmprog(&format!(
+            "{video}|{video}|NA|NA|NA|NA|finished|/dl/clip.f137.mp4"
+        )));
+        tr.apply(parse_ndmprog(&format!(
+            "{audio}|{audio}|NA|NA|NA|NA|finished|/dl/clip.f140.m4a"
+        )));
+        assert_eq!(tr.done(), job_total);
+        assert_eq!(tr.parts_sum(), job_total);
+        assert_eq!(tr.total(), job_total);
+    }
+
+    /// 208B classification guard, the incident shape: aggregate
+    /// state-dict reports (downloaded_bytes = FILE-cumulative)
+    /// that carry a fragment-sized total_bytes (fragment 0's
+    /// content length, 82,047) plus a fragment index. The first
+    /// report is ambiguous (40,000 <= 82,047 fits both readings),
+    /// but once the cumulative count passes a fragment's own
+    /// total the aggregate reading is PROVEN — the tracker must
+    /// reclassify, discard the snapshot slots, and count bytes
+    /// truthfully from then on. And no fragment-bearing report's
+    /// total may ever stand as the file's total.
+    #[test]
+    fn ndmprog_aggregate_dict_with_fragment_totals_reclassifies() {
+        let mut tr = NdmProgTracker::default();
+        let f = "/dl/clip.f137.mp4";
+        tr.apply(parse_ndmprog(&format!("40000|82047|NA|3000000|0|NA|downloading|{f}")));
+        // ambiguous so far: one slot, no runaway yet
+        assert_eq!(tr.done(), 40_000);
+        tr.apply(parse_ndmprog(&format!("82047|82047|NA|3000000|0|NA|downloading|{f}")));
+        assert_eq!(tr.done(), 82_047);
+        // the cumulative count passes fragment 1's own size:
+        // aggregate is proven, the snapshot sum must die here
+        tr.apply(parse_ndmprog(&format!("2000000|300000|NA|3000000|1|49|downloading|{f}")));
+        assert_eq!(tr.done(), 2_000_000, "done must be the true cumulative count");
+        tr.apply(parse_ndmprog(&format!("9000000|280000|NA|3000000|3|49|downloading|{f}")));
+        assert_eq!(tr.done(), 9_000_000);
+        assert!(
+            tr.total() != 82_047,
+            "a fragment's size must never stand as the file's total"
+        );
+        // the file's own finished report: exact total at last
+        tr.apply(parse_ndmprog(&format!(
+            "20000000|20000000|NA|NA|NA|NA|finished|{f}"
+        )));
+        assert_eq!(tr.done(), 20_000_000);
+        assert_eq!(tr.total(), 20_000_000);
+        assert_eq!(tr.parts_sum(), 20_000_000);
+    }
+
+    /// 208B classification guard, first-report proof: a deciding
+    /// report whose downloaded already exceeds its fragment-sized
+    /// total is Aggregate from the very first line — no slot is
+    /// ever created for it.
+    #[test]
+    fn ndmprog_first_report_downloaded_beyond_fragment_total_is_aggregate() {
+        let mut tr = NdmProgTracker::default();
+        tr.apply(parse_ndmprog(
+            "5000000|300000|NA|3000000|7|49|downloading|/dl/clip.f137.mp4",
+        ));
+        assert_eq!(tr.done(), 5_000_000);
+        assert_eq!(tr.total(), 0, "no trustworthy total exists yet");
+        tr.apply(parse_ndmprog(
+            "9000000|280000|NA|3000000|9|49|downloading|/dl/clip.f137.mp4",
+        ));
+        assert_eq!(tr.done(), 9_000_000, "snapshots must never be summed");
     }
 
     /// Legacy 4-field NDMPROG lines (the pre-M-15 template) still
