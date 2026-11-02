@@ -90,8 +90,21 @@ fn fetch_manifest_body(agent: &ureq::Agent, url: &str) -> Result<String, String>
             "update check failed: server answered with Content-Encoding: {enc}"
         ));
     }
-    resp.into_string()
-        .map_err(|e| format!("update check failed: {e}"))
+    // Read through the same streaming cap discipline as
+    // download_file: a server that keeps sending must not be
+    // read into memory without limit.
+    let mut body = Vec::new();
+    resp.into_reader()
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("update check failed: {e}"))?;
+    if body.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(format!(
+            "update check failed: manifest exceeds the {} MiB size cap",
+            MAX_MANIFEST_BYTES / (1024 * 1024)
+        ));
+    }
+    String::from_utf8(body).map_err(|e| format!("update check failed: {e}"))
 }
 
 pub fn fetch_release() -> Result<ReleaseInfo, String> {
@@ -131,6 +144,16 @@ pub fn fetch_release() -> Result<ReleaseInfo, String> {
 /// update packages are tens of MiB; 2 GiB is generous headroom,
 /// not a limit a genuine release can brush against.
 pub const MAX_UPDATE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The manifest is a small JSON record; anything past 1 MiB is
+/// not a manifest, however it was served.
+pub const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Zip-bomb ceilings for extract_zip: a SHA-verified package can
+/// still decompress without bound, so the entry count and the
+/// total decompressed size are capped while extracting.
+pub const MAX_ZIP_ENTRIES: usize = 10_000;
+pub const MAX_ZIP_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The mid-stream abort threshold for an update download whose
 /// expected size is `expected_total` (the response's
@@ -260,13 +283,33 @@ fn download_file_with_ceiling(
 /// refused — a hostile or corrupt archive must never write outside
 /// the staging folder.
 pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    extract_zip_with_caps(
+        zip_path,
+        dest_dir,
+        MAX_ZIP_ENTRIES,
+        MAX_ZIP_DECOMPRESSED_BYTES,
+    )
+}
+
+fn extract_zip_with_caps(
+    zip_path: &Path,
+    dest_dir: &Path,
+    max_entries: usize,
+    max_decompressed: u64,
+) -> Result<Vec<std::path::PathBuf>, String> {
     let file = std::fs::File::open(zip_path)
         .map_err(|e| format!("cannot read the update package: {e}"))?;
     let mut arch = zip::ZipArchive::new(file)
         .map_err(|e| format!("the update package is unreadable: {e}"))?;
+    if arch.len() > max_entries {
+        return Err(format!(
+            "the update package contains more than the {max_entries} entry cap and was discarded"
+        ));
+    }
     std::fs::create_dir_all(dest_dir)
         .map_err(|e| format!("cannot create the update folder: {e}"))?;
     let mut written = Vec::new();
+    let mut decompressed: u64 = 0;
     for i in 0..arch.len() {
         let mut entry = arch
             .by_index(i)
@@ -287,8 +330,18 @@ pub fn extract_zip(zip_path: &Path, dest_dir: &Path) -> Result<Vec<std::path::Pa
         }
         let mut w = std::fs::File::create(&out)
             .map_err(|e| format!("cannot write file: {e}"))?;
-        std::io::copy(&mut entry, &mut w)
+        // The cap is enforced during the copy, not from the
+        // declared entry size: a lying header must not widen it.
+        let limit = max_decompressed.saturating_sub(decompressed) + 1;
+        let n = std::io::copy(&mut entry.by_ref().take(limit), &mut w)
             .map_err(|e| format!("cannot extract the update package: {e}"))?;
+        decompressed += n;
+        if decompressed > max_decompressed {
+            return Err(format!(
+                "the update package decompresses past the {} MiB cap and was discarded",
+                max_decompressed / (1024 * 1024)
+            ));
+        }
         written.push(rel);
     }
     Ok(written)
@@ -445,6 +498,43 @@ mod tests {
             !dest.with_extension("part").exists(),
             "an aborted download must not leak its .part file"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_zip(dir: &std::path::Path, entries: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let path = dir.join("fixture.zip");
+        let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, body) in entries {
+            let opts = zip::write::SimpleFileOptions::default();
+            w.start_file(name.to_string(), opts).unwrap();
+            w.write_all(body).unwrap();
+        }
+        let cursor = w.finish().unwrap();
+        std::fs::write(&path, cursor.into_inner()).unwrap();
+        path
+    }
+
+    #[test]
+    fn fetch_manifest_body_enforces_the_size_cap() {
+        let agent = crate::build_agent();
+        let body = vec![b'x'; MAX_MANIFEST_BYTES as usize + 1];
+        let url = serve_plain(&body, "");
+        let err = fetch_manifest_body(&agent, &url).unwrap_err();
+        assert!(err.contains("size cap"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn extract_zip_enforces_entry_and_decompressed_caps() {
+        let dir = temp_dir("zipcaps");
+        let zip = make_zip(&dir, &[("a.txt", b"aaaa"), ("b.txt", b"bbbb")]);
+        let out = dir.join("out");
+        let err = extract_zip_with_caps(&zip, &out, 1, 1024).unwrap_err();
+        assert!(err.contains("entry cap"), "unexpected error: {err}");
+        let err = extract_zip_with_caps(&zip, &out, 10, 4).unwrap_err();
+        assert!(err.contains("cap"), "unexpected error: {err}");
+        // under both caps the same archive extracts whole
+        let written = extract_zip_with_caps(&zip, &out, 10, 1024).unwrap();
+        assert_eq!(written.len(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

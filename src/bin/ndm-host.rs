@@ -59,15 +59,29 @@ fn write_private_file(path: &std::path::Path, content: &[u8]) -> io::Result<()> 
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let mut opts = OpenOptions::new();
-    opts.create(true).truncate(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+    // Temp + rename (the save_state pattern in the engine): an
+    // in-place truncate could leave a torn file for a concurrent
+    // reader, and the pid in the temp name keeps two hosts from
+    // sharing one temp.
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+    let result = (|| {
+        let mut opts = OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        {
+            let mut f = opts.open(&tmp)?;
+            f.write_all(content)?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(content)
+    result
 }
 
 fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
@@ -83,8 +97,8 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
     // moment; a bare append from each can interleave bytes and corrupt
     // a queue line (one line can be ~600 KB with cookies — far beyond
     // a single atomic write). Take a small lock file first; the spin
-    // is generous (~15 s) because the unlocked fallback can corrupt
-    // BOTH lines, while a late append only delays this one.
+    // is generous (~15 s) because an unlocked append can corrupt
+    // BOTH lines, while failing this hand-off only delays this one.
     let lock_path = path.with_extension("lock");
     let mut guard: Option<std::fs::File> = None;
     for _ in 0..300 {
@@ -109,9 +123,17 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
         }
     }
     if guard.is_none() && reap_stale_lock(&lock_path) {
-        // one last recovery attempt after the spin before falling
-        // back to the unlocked append
+        // one last recovery attempt after the spin
         guard = acquire_queue_lock(&lock_path);
+    }
+    if guard.is_none() {
+        // No unlocked append: callers answer {ok:false} for this
+        // error, so a hand-off is only ever reported queued when
+        // its line was durably appended under the lock.
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "queue lock could not be acquired",
+        ));
     }
     let result = (|| {
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -324,7 +346,7 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Record what a ping claims the running extension's version is
+/// Record what a message claims the running extension's version is
 /// (EXT-AUTOUPDATE-SPEC §1b): `ext_seen.json` in the data dir,
 /// `{ "ext_version": <string|null>, "at": <unix seconds> }`. A ping
 /// without the field records `null` — that positively means a
@@ -369,16 +391,19 @@ fn handle(message: &Value) -> Value {
 /// tests can observe the stamp without touching the real data dir
 /// (the same injection pattern as the queue-lock tests).
 fn handle_at(message: &Value, stamp_path: Option<&std::path::Path>, now_secs: u64) -> Value {
-    match message.get("type").and_then(Value::as_str) {
-        Some("ping") => {
-            // ONLY the ping arm ever touches the stamp (§1b): a
-            // download from a new extension carries no ext_version
-            // and must not overwrite a good stamp with its absence
-            if let Some(path) = stamp_path {
-                record_ext_seen(path, message, now_secs);
-            }
-            json!({ "ok": true, "pong": true })
+    // Any message carrying ext_version stamps it, so a download-only
+    // session is seen too; a ping stamps even without the field
+    // (null = a pre-handshake extension is alive, §1b). A message
+    // with no field must not overwrite a good stamp with its absence.
+    if let Some(path) = stamp_path {
+        let is_ping = message.get("type").and_then(Value::as_str) == Some("ping");
+        let carries = message.get("ext_version").and_then(Value::as_str).is_some();
+        if is_ping || carries {
+            record_ext_seen(path, message, now_secs);
         }
+    }
+    match message.get("type").and_then(Value::as_str) {
+        Some("ping") => json!({ "ok": true, "pong": true }),
         Some("probe") => handle_probe(message),
         Some("probe_file") => handle_probe_file(message),
         Some("show_app") => handle_show_app(),
@@ -729,6 +754,17 @@ fn handle_download(message: &Value) -> Value {
     let page_url: String = page_url.chars().take(2048).collect();
     let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
     let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
+
+    // A `file` carrying later:true is a queued download, not the
+    // app's file dialog: queue it through the file_direct path so
+    // its dir/total are honoured and it lands as a paused entry.
+    let kind = if kind == "file"
+        && message.get("later").and_then(Value::as_bool).unwrap_or(false)
+    {
+        "file_direct"
+    } else {
+        kind
+    };
 
     let id = new_entry_id();
     let mut obj = json!({
@@ -1292,26 +1328,36 @@ mod tests {
     }
 
     #[test]
-    fn non_ping_message_never_touches_stamp() {
+    fn non_ping_message_stamps_only_when_it_carries_ext_version() {
         let (dir, stamp) = stamp_test_path("nonping");
         let _ = handle_at(
             &json!({ "type": "progress", "id": "abc123" }),
             Some(&stamp),
             1_000,
         );
-        assert!(!stamp.exists(), "a progress message must not create a stamp");
+        assert!(!stamp.exists(), "a message without ext_version must not create a stamp");
         handle_at(&json!({ "type": "ping", "ext_version": "2.0.8" }), Some(&stamp), 1_000);
         let before = std::fs::read_to_string(&stamp).unwrap();
         let _ = handle_at(
-            &json!({ "type": "progress", "id": "abc123", "ext_version": "9.9.9" }),
+            &json!({ "type": "progress", "id": "abc123" }),
             Some(&stamp),
             5_000,
         );
         assert_eq!(
             std::fs::read_to_string(&stamp).unwrap(),
             before,
-            "a progress message must not modify an existing stamp"
+            "a message without ext_version must not modify an existing stamp"
         );
+        // E3: any message carrying the field stamps it, so a
+        // download-only session refreshes the stamp too
+        let _ = handle_at(
+            &json!({ "type": "progress", "id": "abc123", "ext_version": "9.9.9" }),
+            Some(&stamp),
+            5_000,
+        );
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&stamp).unwrap()).unwrap();
+        assert_eq!(v["ext_version"], json!("9.9.9"));
+        assert_eq!(v["at"], json!(5_000));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
