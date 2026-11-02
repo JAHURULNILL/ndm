@@ -2,16 +2,17 @@
 #
 # Linux:   the .deb (Debian/Ubuntu family) and the portable tarball
 #          (any distro) — the same packaging scripts used locally.
+#          Since 2.1.0 the app is the native GTK shell
+#          (shell-gtk crate); there is no WebKit dependency.
 # Windows: a portable ZIP (ndm-app.exe + ndm-host.exe + extension)
 #          AND a per-user NSIS installer
 #          (NDM_<ver>_x64-setup.exe, built from scripts/installer.nsi
 #          over the same assembled tree, silent-install tested in
-#          the job). Both run on any Windows 10/11 PC that has the
-#          WebView2 runtime (preinstalled on Windows 11 and on
-#          updated Windows 10).
+#          the job). Since 2.1.0 ndm-app.exe is the native Win32
+#          shell (shell-win crate) — no WebView2 runtime is needed
+#          on any supported Windows (7/8/8.1/10/11).
 #
-# Runs on version tags (v*) and on manual dispatch. NOTE: prepared
-# ahead of the first push — the first run validates the Windows job.
+# Runs on version tags (v*) and on manual dispatch.
 name: build
 
 on:
@@ -30,8 +31,7 @@ jobs:
       - name: System libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev ffmpeg zip
+          sudo apt-get install -y libgtk-3-dev ffmpeg zip
       - name: Fetch bundled tools (yt-dlp, deno)
         run: bash scripts/fetch-tools.sh
       - name: Fetch portable ffmpeg (BtbN build — the distro static
@@ -44,17 +44,18 @@ jobs:
       - name: Build
         run: |
           cargo build --release
-          cargo build --release --manifest-path src-tauri/Cargo.toml
+          cargo build --release --manifest-path core/Cargo.toml
+          cargo build --release --manifest-path shell-gtk/Cargo.toml
       - name: Test lib on Linux
         run: cargo test --release
-      - name: Test app on Linux
-        run: cargo test --release --manifest-path src-tauri/Cargo.toml
+      - name: Test core on Linux
+        run: cargo test --release --manifest-path core/Cargo.toml
       - name: Package (.deb + portable tarball)
         run: |
           bash scripts/package-deb.sh
           bash scripts/package-portable.sh
       - name: Extension version matches app version
-        run: python3 -c "import json,sys; e=json.load(open('extension/manifest.json'))['version']; t=json.load(open('src-tauri/tauri.conf.json'))['version']; print(f'extension {e} vs app {t}'); sys.exit(0 if e == t else 'extension/manifest.json version != src-tauri/tauri.conf.json version')"
+        run: python3 -c "import json,re,sys; e=json.load(open('extension/manifest.json'))['version']; t=re.search(r'^version = \"(.*)\"', open('Cargo.toml').read(), re.M).group(1); print(f'extension {e} vs app {t}'); sys.exit(0 if e == t else 'extension/manifest.json version != Cargo.toml version')"
       - uses: actions/upload-artifact@v4
         with:
           name: ndm-linux
@@ -91,27 +92,27 @@ jobs:
       - name: Build
         run: |
           cargo build --release
-          cargo build --release --manifest-path src-tauri/Cargo.toml
+          cargo build --release --manifest-path core/Cargo.toml
+          cargo build --release --manifest-path shell-win/Cargo.toml
       # Two separate steps on purpose: in one shared pwsh block the
       # block's exit code is the LAST command's, so a failing lib
       # suite was masked by the passing app suite (build #14 shipped
       # green with a red lib test). Each suite must fail its own step.
       - name: Test lib on Windows
         run: cargo test --release
-      - name: Test app on Windows
-        run: cargo test --release --manifest-path src-tauri/Cargo.toml
+      - name: Test core on Windows
+        run: cargo test --release --manifest-path core/Cargo.toml
       - name: Assemble portable ZIP
         shell: pwsh
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
           $dir = "NDM-Windows-Portable"
           New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item src-tauri/target/release/ndm-app.exe $dir/
+          # The native shell ships AS ndm-app.exe (same installed
+          # name as always — the self-update relaunch, shortcuts
+          # and the uninstall list all key off it).
+          Copy-Item shell-win/target/release/ndm-shell-win.exe $dir/ndm-app.exe
           Copy-Item target/release/ndm-host.exe $dir/
-          # ndm-app.exe links the WebView2 loader DLL (patched
-          # webview2-com-sys) - it must sit beside the exe, in the
-          # portable ZIP and, via SRCROOT, in the NSIS installer.
-          Copy-Item src-tauri/vendor/webview2-com-sys/x64/WebView2Loader.dll $dir/
           # App-local Universal CRT (see .cargo/config.toml):
           # the SDK redist set ships beside the exes so Windows
           # 7/8 resolve ndm-app.exe's remaining api-ms-win-crt-*
@@ -122,6 +123,14 @@ jobs:
           Copy-Item (Join-Path $ucrtBase.DirectoryName "*.dll") $dir/
           Copy-Item extension $dir/extension -Recurse
           Compress-Archive $dir "NDM_${v}_Windows_Portable.zip"
+      # Win7/8 API discipline as a hard gate (NATIVE-PLAN.md
+      # risk #4): the shipped exe must not import any function
+      # newer than Windows 8.0, and its subsystem must stay <= 6.1.
+      - name: PE import audit (Win7/8 API discipline)
+        shell: pwsh
+        run: |
+          python scripts/pe-import-audit.py NDM-Windows-Portable\ndm-app.exe
+          if ($LASTEXITCODE -ne 0) { throw "PE import audit failed" }
       - name: Smoke — host handshake (gate) + app launch (report)
         shell: pwsh
         run: |
@@ -177,7 +186,7 @@ jobs:
           $installDir = "$env:LOCALAPPDATA\Programs\Nill Download Manager"
           Start-Process $setup -ArgumentList "/S" -PassThru | Out-Null
           $want = @(
-            "ndm-app.exe", "ndm-host.exe", "WebView2Loader.dll", "ucrtbase.dll", "installed.flag", "uninstall.exe",
+            "ndm-app.exe", "ndm-host.exe", "ucrtbase.dll", "installed.flag", "uninstall.exe",
             "extension\manifest.json", "extension\background.js"
           )
           $deadline = (Get-Date).AddSeconds(180)
@@ -227,45 +236,11 @@ jobs:
             Write-Host "registered: $($kv.Key) -> $target"
           }
           Write-Host "extension registration verified (Chrome + Firefox)"
-      - name: Create GUI fixture file
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force gui-fixture | Out-Null
-          $bytes = New-Object byte[] (2 * 1024 * 1024)
-          (New-Object System.Random).NextBytes($bytes)
-          [System.IO.File]::WriteAllBytes("$PWD\gui-fixture\ndm-gui-fixture.bin", $bytes)
-          Write-Host "fixture: gui-fixture\ndm-gui-fixture.bin ($($bytes.Length) bytes)"
-      # Report-only by design (continue-on-error): if WebView2
-      # refuses the CDP debugging port in this session the script
-      # exits 2 and prints GUI UNVERIFIED — an honest gap in GUI
-      # coverage, not a fake pass and not a red job. Real GUI
-      # assertion failures (exit 1) are surfaced the same way in
-      # the log; the install + registration gates above stay hard.
-      - name: GUI smoke — drive the installed app via CDP (report-only)
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          # child pwsh process on purpose: the script ends with
-          # `exit <code>`, which would kill THIS step's shell if it
-          # were invoked with & in-process — as a child, the code
-          # lands in $LASTEXITCODE where it belongs
-          & pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\gui-smoke.ps1 `
-            -AppExe "$env:LOCALAPPDATA\Programs\Nill Download Manager\ndm-app.exe" `
-            -FixtureDir "$PWD\gui-fixture" `
-            -FixtureFile "ndm-gui-fixture.bin" `
-            -DownloadDir "$env:USERPROFILE\Downloads" `
-            -ShotsDir "$PWD\gui-shots"
-          $code = $LASTEXITCODE
-          if ($code -eq 2) { Write-Host "::warning::GUI UNVERIFIED on Windows — CDP endpoint never appeared; the GUI layer remains unverified (see GUI-SMOKE lines above)" }
-          elseif ($code -ne 0) { Write-Host "::warning::GUI smoke FAILED with exit code $code (see GUI-SMOKE lines above)" }
-          else { Write-Host "GUI smoke passed (see GUI-SMOKE lines above)" }
-          exit $code
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: ndm-gui-shots
-          path: gui-shots/
-          if-no-files-found: ignore
+      # No CDP GUI smoke any more: that driver spoke to the old
+      # WebView UI. The native shell has no debugging port — its
+      # Windows GUI proof is the install + launch-alive gates
+      # above and the real-machine run, stated honestly rather
+      # than faked here.
       - name: Uninstall (report-only)
         continue-on-error: true
         shell: pwsh
