@@ -3114,7 +3114,11 @@ fn swap_live(
         password: stub.password.clone(),
         description: Mutex::new(stub.description.lock().unwrap().clone()),
         speed_limit: Mutex::new(*stub.speed_limit.lock().unwrap()),
-        detail: Mutex::new(String::new()),
+        // 209 §8: carry the stub's sub-status detail across the
+        // rebuild — resetting it made every seam label survive
+        // exactly one emit before detail_of fell back to the
+        // generic "Probing connection…" for the whole start
+        detail: Mutex::new(stub.detail.lock_ok().clone()),
     });
     // re-verify under the SAME lock that inserts: a remove landing in
     // the gap after start_engine's own check must not leave a live
@@ -4071,7 +4075,10 @@ fn start_entry(app: &AppHandle, entry: Arc<Entry>) {
                 password: entry.password.clone(),
                 description: Mutex::new(entry.description.lock().unwrap().clone()),
                 speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
-                detail: Mutex::new(String::new()),
+                // 209 §8: carry the stub's detail ("Resolving…",
+                // stamped just above) into the live entry — the
+                // reset dropped it after the first emit
+                detail: Mutex::new(entry.detail.lock_ok().clone()),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -5537,6 +5544,10 @@ async fn resume_download(
                     return Err(e);
                 }
             };
+            // 209 §8: the live entry built below must carry the
+            // stub's detail across (see the construction) — this
+            // resume rebuild dropped it exactly like the two
+            // start-path rebuilds did
             let prev_restored = entry.restored.lock().unwrap().clone();
             let live = Arc::new(Entry {
                 id: entry.id.clone(),
@@ -5570,7 +5581,7 @@ async fn resume_download(
                 password: entry.password.clone(),
                 description: Mutex::new(entry.description.lock().unwrap().clone()),
                 speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
-                detail: Mutex::new(String::new()),
+                detail: Mutex::new(entry.detail.lock_ok().clone()),
             });
             {
                 let mut map = state.entries.lock().unwrap();
@@ -8080,6 +8091,169 @@ fn check_ext_notice(app: &AppHandle, state: &AppState) {
 #[tauri::command]
 fn dismiss_ext_notice() {}
 
+/// 209 F5: how untouched a leftover claim must be before it
+/// counts as abandoned even when its owner pid still names a
+/// live process (or no pid can be parsed at all). A drain that
+/// is actually working its claim rewrites the file after every
+/// processed line, so a live claim is never minutes old — the
+/// bound only has to outlast the slowest single line's handling
+/// by a wide margin, and past it a hung or unprobable owner
+/// stops starving the queue behind its debris.
+const CLAIM_STALE_AFTER: Duration = Duration::from_secs(300);
+
+/// 209 F5: the owner pid recorded in a claim file's name
+/// (`incoming.claim-<pid>-<seq>`), when the name carries one.
+fn claim_owner_pid(name: &str) -> Option<u32> {
+    name.strip_prefix("incoming.claim-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Whether this pid currently names a live process. The
+/// pid-liveness pattern from the native host's queue lock
+/// (src/bin/ndm-host.rs), duplicated because the host is a
+/// separate binary the app cannot import from.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    // /proc/<pid> exists for a ZOMBIE too — read the stat state
+    // field instead: state 'Z' is dead, whatever /proc says.
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    match stat.rsplit_once(')') {
+        Some((_, rest)) => !rest.trim_start().starts_with('Z'),
+        // a stat we cannot parse still proves the process
+        // exists; stay conservative and call it alive
+        None => true,
+    }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    // Win32 probe, declared directly so the app needs no extra
+    // dependency for three kernel32 calls. OpenProcess failing
+    // with ERROR_INVALID_PARAMETER names a pid that does not
+    // exist: a DEFINITIVE dead. Every other outcome stays
+    // conservative — ambiguity always reports alive and a live
+    // owner's claim is never stolen.
+    mod win {
+        use std::ffi::c_void;
+        pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        pub const STILL_ACTIVE: u32 = 259;
+        pub const ERROR_INVALID_PARAMETER: u32 = 87;
+        extern "system" {
+            pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            pub fn GetExitCodeProcess(handle: *mut c_void, code: *mut u32) -> i32;
+            pub fn CloseHandle(handle: *mut c_void) -> i32;
+            pub fn GetLastError() -> u32;
+        }
+    }
+    unsafe {
+        let handle = win::OpenProcess(win::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return win::GetLastError() != win::ERROR_INVALID_PARAMETER;
+        }
+        let mut code: u32 = 0;
+        let ok = win::GetExitCodeProcess(handle, &mut code);
+        win::CloseHandle(handle);
+        ok == 0 || code == win::STILL_ACTIVE
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_alive(_pid: u32) -> bool {
+    // no cheap liveness probe on this platform: assume alive
+    // and let the age backstop in leftover_claim_takeable reap
+    // true debris
+    true
+}
+
+/// 209 F5: may THIS drain take over a leftover claim file?
+/// 208B F5's atomic rename protects a claim once taken — but
+/// its recovery scan renamed the FIRST `incoming.claim-*` in
+/// the dir, including a live peer instance's in-progress
+/// claim: the peer recreated its claim path on its next
+/// per-line rewrite and both drains processed the same lines —
+/// duplicate downloads, the exact failure the claim exists to
+/// prevent. A leftover is debris only when its owner pid is
+/// dead, or when it has sat untouched past CLAIM_STALE_AFTER
+/// (a hung owner, an owner the probe cannot judge, or a name
+/// with no parseable pid). A live pid's fresh claim is never
+/// taken.
+fn leftover_claim_takeable(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(pid) = claim_owner_pid(&name) {
+        if pid != std::process::id() && !process_alive(pid) {
+            return true;
+        }
+    }
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age > CLAIM_STALE_AFTER)
+        .unwrap_or(false)
+}
+
+/// One unit of spool work for drain_incoming: rename the next
+/// source — a takeable leftover claim, else `.processing`,
+/// else `incoming.jsonl` — onto `claim` and return its text.
+/// A claimed file with no lines at all is deleted on the spot
+/// and the next source tried instead: the old drain deleted a
+/// claim only from inside its per-line loop, so a zero-line
+/// claim was never deleted, took priority on every tick, and
+/// starved `incoming.jsonl` forever. An unreadable claim is
+/// left in place (returns None) so its lines survive for a
+/// later recovery.
+fn take_spool_claim(queue_dir: &Path, claim: &Path) -> Option<String> {
+    let queue = queue_dir.join("incoming.jsonl");
+    let processing = queue_dir.join("incoming.processing");
+    loop {
+        let leftover = std::fs::read_dir(queue_dir).ok().and_then(|rd| {
+            rd.flatten().map(|e| e.path()).find(|p| {
+                p.file_name()
+                    .map(|n| {
+                        let n = n.to_string_lossy();
+                        n.starts_with("incoming.claim-") && !n.ends_with(".tmp")
+                    })
+                    .unwrap_or(false)
+                    && leftover_claim_takeable(p)
+            })
+        });
+        let claim_result = if let Some(left) = leftover {
+            std::fs::rename(&left, claim)
+        } else if processing.exists() {
+            std::fs::rename(&processing, claim)
+        } else if queue.exists() {
+            std::fs::rename(&queue, claim)
+        } else {
+            return None;
+        };
+        if let Err(e) = claim_result {
+            eprintln!("[ndm] incoming queue claim failed: {e}");
+            return None;
+        }
+        match std::fs::read_to_string(claim) {
+            Ok(t) if !t.is_empty() => return Some(t),
+            Ok(_) => {
+                // zero-line claim: delete it and move on to the
+                // next source within this same drain
+                let _ = std::fs::remove_file(claim);
+            }
+            Err(e) => {
+                eprintln!("[ndm] claimed incoming queue could not be read: {e}");
+                return None;
+            }
+        }
+    }
+}
+
 fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
     // EXT §1c: the extension version stamp is re-checked while
     // the incoming queue is being processed (throttled — the
@@ -8113,8 +8287,6 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
         );
         return;
     }
-    let queue = queue_dir.join("incoming.jsonl");
-    let processing = queue_dir.join("incoming.processing");
     // 208B F5: the claim is atomic - the spool file is renamed to
     // a name unique to this process and drain before a single
     // line is read. Two app instances (the single-instance guard
@@ -8122,41 +8294,17 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
     // lines: whoever loses the rename race has nothing to claim.
     // A leftover claim or `.processing` from a crashed run is
     // claimed the same way, so at-least-once recovery is unchanged.
+    // 209 F5: WHICH leftover may be claimed is selective now —
+    // see take_spool_claim / leftover_claim_takeable.
     static CLAIM_SEQ: AtomicU64 = AtomicU64::new(0);
     let claim = queue_dir.join(format!(
         "incoming.claim-{}-{}",
         std::process::id(),
         CLAIM_SEQ.fetch_add(1, Ordering::SeqCst)
     ));
-    let leftover_claim = std::fs::read_dir(queue_dir).ok().and_then(|rd| {
-        rd.flatten().map(|e| e.path()).find(|p| {
-            p.file_name()
-                .map(|n| {
-                    let n = n.to_string_lossy();
-                    n.starts_with("incoming.claim-") && !n.ends_with(".tmp")
-                })
-                .unwrap_or(false)
-        })
-    });
-    let claim_result = if let Some(left) = leftover_claim {
-        std::fs::rename(&left, &claim)
-    } else if processing.exists() {
-        std::fs::rename(&processing, &claim)
-    } else if queue.exists() {
-        std::fs::rename(&queue, &claim)
-    } else {
-        return;
-    };
-    if let Err(e) = claim_result {
-        eprintln!("[ndm] incoming queue claim failed: {e}");
-        return;
-    }
-    let text = match std::fs::read_to_string(&claim) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("[ndm] claimed incoming queue could not be read: {e}");
-            return;
-        }
+    let text = match take_spool_claim(queue_dir, &claim) {
+        Some(t) => t,
+        None => return,
     };
     let lines: Vec<&str> = text.lines().collect();
     for (idx, line) in lines.iter().enumerate() {
@@ -8190,6 +8338,12 @@ fn drain_incoming(handle: &AppHandle, queue_dir: &Path) {
             }
         }
     }
+    // 209 F5: the exhausted claim is deleted unconditionally at
+    // drain end — the loop's last-line delete is the normal
+    // path; this is the guarantee behind it (a claim whose
+    // lines are done must never survive to take priority over
+    // incoming.jsonl on the next tick).
+    let _ = std::fs::remove_file(&claim);
 }
 
 /// Reliably raise the main NDM window above the browser on X11 & Wayland.
@@ -11668,6 +11822,107 @@ mod tests {
             ext_notice_decision(Some(&stamp(Some("2.0.7"))), "2.0.8", "2.0.7"),
             Some("2.0.8".to_string())
         );
+    }
+
+    #[test]
+    fn claim_owner_pid_parses_the_claim_name() {
+        assert_eq!(claim_owner_pid("incoming.claim-1234-5"), Some(1234));
+        assert_eq!(claim_owner_pid("incoming.jsonl"), None);
+        assert_eq!(claim_owner_pid("incoming.claim--5"), None);
+        assert_eq!(claim_owner_pid("incoming.claim-abc-5"), None);
+    }
+
+    // 209 F5: a live pid's fresh claim is never taken over — the
+    // peer keeps its lines and this drain claims the queue
+    // instead. (This process's own pid stands in for any live
+    // peer: both are alive and freshly written.)
+    #[test]
+    fn spool_claim_never_steals_a_live_pids_claim() {
+        let dir = std::env::temp_dir()
+            .join(format!("ndm-claim-live-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let peer = dir.join(format!("incoming.claim-{}-0", std::process::id()));
+        std::fs::write(&peer, "{\"url\":\"https://peer.example/x\"}\n").unwrap();
+        std::fs::write(
+            dir.join("incoming.jsonl"),
+            "{\"url\":\"https://q.example/y\"}\n",
+        )
+        .unwrap();
+        let claim = dir.join(format!("incoming.claim-{}-99", std::process::id()));
+        let text = take_spool_claim(&dir, &claim).expect("the queue's work must be claimed");
+        assert!(
+            text.contains("q.example"),
+            "the queue, not the peer's claim: {text}"
+        );
+        // the peer's claim is untouched, byte for byte
+        assert_eq!(
+            std::fs::read_to_string(&peer).unwrap(),
+            "{\"url\":\"https://peer.example/x\"}\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 209 F5: a dead pid's leftover claim IS recovered — ahead
+    // of the queue, so at-least-once order is preserved.
+    #[test]
+    fn spool_claim_recovers_a_dead_pids_leftover() {
+        let dir = std::env::temp_dir()
+            .join(format!("ndm-claim-dead-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 999999999 names no live process on any supported OS
+        let dead = dir.join("incoming.claim-999999999-0");
+        std::fs::write(&dead, "{\"url\":\"https://dead.example/z\"}\n").unwrap();
+        std::fs::write(
+            dir.join("incoming.jsonl"),
+            "{\"url\":\"https://q.example/y\"}\n",
+        )
+        .unwrap();
+        let claim = dir.join(format!("incoming.claim-{}-0", std::process::id()));
+        let text = take_spool_claim(&dir, &claim).expect("the leftover must be recovered");
+        assert!(text.contains("dead.example"), "leftover first: {text}");
+        assert!(!dead.exists(), "the leftover was renamed onto the claim");
+        assert!(
+            dir.join("incoming.jsonl").exists(),
+            "the queue waits its turn"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 209 F5: a zero-line claim is deleted on the spot — never
+    // left to take priority on every tick and starve the queue —
+    // and the same drain moves on to the real work.
+    #[test]
+    fn spool_claim_deletes_an_empty_claim_and_moves_on() {
+        let dir = std::env::temp_dir()
+            .join(format!("ndm-claim-empty-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead = dir.join("incoming.claim-999999999-0");
+        std::fs::write(&dead, "").unwrap();
+        std::fs::write(
+            dir.join("incoming.jsonl"),
+            "{\"url\":\"https://q.example/y\"}\n",
+        )
+        .unwrap();
+        let claim = dir.join(format!("incoming.claim-{}-0", std::process::id()));
+        let text = take_spool_claim(&dir, &claim).expect("the queue's work must still be claimed");
+        assert!(text.contains("q.example"), "{text}");
+        assert!(!dead.exists(), "the empty leftover is gone");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // a dir holding ONLY an empty leftover yields no work —
+        // and keeps nothing
+        let dir = std::env::temp_dir()
+            .join(format!("ndm-claim-empty2-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("incoming.claim-999999999-0"), "").unwrap();
+        let claim = dir.join(format!("incoming.claim-{}-0", std::process::id()));
+        assert!(take_spool_claim(&dir, &claim).is_none());
+        assert!(!claim.exists(), "the empty claim was deleted, not kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

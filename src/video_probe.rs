@@ -657,32 +657,60 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
     // Estimate size for a given height `h` by finding the format our selector prefers.
     // Returns (bytes, is_approx): a combined video+audio size is
     // approximate when ANY of its parts is.
+    //
+    // 209 picker honesty (§5 C-F1): the candidates are walked in
+    // selector_for_height's own branch order — the first class
+    // with any candidate is the class the download comes from —
+    // because the old single-pool ranking let a big MUXED format
+    // outrank the DASH pair on raw size within its codec tier:
+    // the 360p row displayed the muxed file's honest size while
+    // the selector's first branch downloaded a different,
+    // smaller pair of streams. Within one class, rank the way
+    // yt-dlp's best-pick does at a fixed height: a direct
+    // protocol before an HLS rendition, higher fps before
+    // lower, and only then the larger size. The selector's
+    // `<= h` tail branches never apply here: `h` itself comes
+    // from the format list, so exact-height candidates exist
+    // by construction.
     let size_for_height = |h: u64| -> (u64, bool) {
-        let mut best_rank = (0u8, 0u8, 0u64);
+        // The candidate's selector class (branch number in
+        // selector_for_height): 1-4 are the video-only branches
+        // (branch 5 differs only in the audio leg, which
+        // audio_bytes already models), 6 is the muxed `b[...]`
+        // fallback. None: not a video format at this height.
+        let class_of = |f: &serde_json::Value| -> Option<u8> {
+            if !format_has_video(f) || f["height"].as_u64() != Some(h) {
+                return None;
+            }
+            let vc = reported_vcodec(f).unwrap_or("");
+            let ext = f["ext"].as_str().unwrap_or("");
+            let avc = vc.starts_with("avc");
+            if reported_acodec(f) == Some("none") {
+                Some(match (avc, ext == "mp4") {
+                    (true, true) => 1,
+                    (true, false) => 2,
+                    (false, true) => 3,
+                    (false, false) => 4,
+                })
+            } else {
+                // a real acodec — or an unknown one (a direct
+                // file is muxed) — makes this a combined
+                // format: only the `b[...]` branch can take it
+                Some(6)
+            }
+        };
+        let mut best_class = u8::MAX;
+        let mut best_rank = (0u8, 0u64, 0u64);
         let mut chosen: Option<&serde_json::Value> = None;
         for f in formats {
-            let vc = reported_vcodec(f).unwrap_or("");
-            if !format_has_video(f) || f["height"].as_u64() != Some(h) {
-                continue;
-            }
-            let ext = f["ext"].as_str().unwrap_or("");
+            let Some(class) = class_of(f) else { continue };
             let proto = f["protocol"].as_str().unwrap_or("");
-            let is_direct = !proto.contains("m3u8");
-            let codec_tier: u8 = if vc.starts_with("avc") && ext == "mp4" && is_direct {
-                5
-            } else if vc.starts_with("avc") && ext == "mp4" {
-                4
-            } else if ext == "mp4" && is_direct {
-                3
-            } else if ext == "mp4" {
-                2
-            } else {
-                1
-            };
+            let is_direct: u8 = if proto.contains("m3u8") { 0 } else { 1 };
+            let fps = f["fps"].as_u64().unwrap_or(0);
             let (sz, _) = format_size_bytes(f, duration_f64);
-            let has_size: u8 = if sz > 0 { 1 } else { 0 };
-            let rank = (codec_tier, has_size, sz);
-            if chosen.is_none() || rank > best_rank {
+            let rank = (is_direct, fps, sz);
+            if class < best_class || (class == best_class && rank > best_rank) {
+                best_class = class;
                 best_rank = rank;
                 chosen = Some(f);
             }
@@ -1457,6 +1485,127 @@ mod tests {
         assert!(!video.size_approx);
         let audio = options.iter().find(|o| o.audio).expect("audio option");
         assert!(!audio.size_approx);
+    }
+
+    // 209 picker honesty (§5 C-F1): the row's size must be the
+    // size of the format the row's selector will fetch FIRST.
+    // The expectations below are hand-computed from
+    // selector_for_height's branch order over each synthetic
+    // table — the estimator's pick must equal the selector's
+    // first match at every height.
+    fn row_at(options: &[QualityOption], h: u64) -> &QualityOption {
+        options
+            .iter()
+            .find(|o| !o.audio && o.height == h)
+            .unwrap_or_else(|| panic!("a video row at {h}p must exist"))
+    }
+
+    #[test]
+    fn picker_size_measures_the_dash_pair_not_the_big_muxed_file() {
+        // The incident shape: at 360p a large MUXED file (the
+        // legacy combined format) coexists with the DASH pair.
+        // selector_for_height(360) matches branch 1 first —
+        // video-only avc/mp4 + m4a — so the row must measure
+        // 4.0 MB + 1.5 MB, never the muxed file's 12.5 MB (the
+        // old pooled ranking displayed 12.5 MB, more than the
+        // 720p row's pair, for a download of 5.5 MB).
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "ext": "mp4",
+                "height": 360, "filesize": 12_500_000, "protocol": "https", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 360, "filesize": 4_000_000, "protocol": "https", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "avc1.640028", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 8_000_000, "protocol": "https", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": 1_500_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 100.0);
+        assert_eq!(row_at(&options, 360).size_bytes, 5_500_000);
+        assert_eq!(row_at(&options, 720).size_bytes, 9_500_000);
+        assert!(
+            row_at(&options, 360).size_bytes < row_at(&options, 720).size_bytes,
+            "the 360p > 720p inversion is gone"
+        );
+    }
+
+    #[test]
+    fn picker_size_uses_the_muxed_format_when_no_dash_stream_exists() {
+        // No video-only stream at 480p: the selector falls
+        // through to its muxed `b[...]` branch, so the row
+        // measures the muxed file itself — with NO audio adder
+        // (its size already covers the audio).
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "ext": "mp4",
+                "height": 480, "filesize": 7_800_000, "protocol": "https", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "avc1.640028", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 8_000_000, "protocol": "https", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": 1_500_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 100.0);
+        assert_eq!(row_at(&options, 480).size_bytes, 7_800_000);
+        assert_eq!(row_at(&options, 720).size_bytes, 9_500_000);
+    }
+
+    #[test]
+    fn picker_size_within_a_class_prefers_the_higher_fps_stream() {
+        // Two video-only avc/mp4 streams at 720p: yt-dlp's
+        // best-pick takes the 60 fps one, so the row measures
+        // it (plus the audio leg), not the 30 fps stream.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.640028", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 8_000_000, "protocol": "https", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "avc1.640028", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 11_000_000, "protocol": "https", "fps": 60
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": 1_500_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 100.0);
+        assert_eq!(row_at(&options, 720).size_bytes, 12_500_000);
+    }
+
+    #[test]
+    fn picker_size_dash_class_wins_even_when_dash_is_hls_only() {
+        // The class order dominates the protocol rank: an
+        // HLS-only DASH stream is still what the selector's
+        // first branches fetch, so it — not the direct muxed
+        // file — is what the row measures.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "none", "ext": "mp4",
+                "height": 360, "filesize": 4_200_000, "protocol": "m3u8_native", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "avc1.64001f", "acodec": "mp4a.40.2", "ext": "mp4",
+                "height": 360, "filesize": 12_500_000, "protocol": "https", "fps": 30
+            }),
+            serde_json::json!({
+                "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a",
+                "filesize": 1_500_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 100.0);
+        assert_eq!(row_at(&options, 360).size_bytes, 5_700_000);
     }
 }
 

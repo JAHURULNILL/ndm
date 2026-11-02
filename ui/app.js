@@ -108,6 +108,29 @@ function etaSamplesFor(id) {
   const s = etaSampleState.get(id);
   return s ? s.count : 0;
 }
+/* 209 §8: the detail dialog's "Finishing…" gets the sustained
+   pair rule the extension card got in 208B — a single payload
+   with done >= total proves nothing (the backend clamps video
+   done to total, and a seeded approximate total can sit at
+   done == total for the whole tail), so the word requires the
+   SAME (done, total) pair on two DISTINCT payloads. Fed
+   exactly like noteEtaSample (event handler + render pass);
+   the payload object itself is kept in the record so a render
+   pass re-feeding the same object can never manufacture the
+   second sample. */
+const finPairState = new Map(); // id -> { done, total, atTotal, still, src }
+function noteFinPair(d) {
+  if (!d || !d.id) return;
+  const prev = finPairState.get(d.id);
+  if (prev && prev.src === d) return; // same payload re-fed: not a new sample
+  const atTotal = d.status === 'downloading' && d.total > 0
+    && (d.done_bytes || 0) >= d.total;
+  const still = atTotal && !!prev && prev.atTotal
+    && prev.done === (d.done_bytes || 0) && prev.total === d.total;
+  finPairState.set(d.id, {
+    done: d.done_bytes || 0, total: d.total || 0, atTotal, still, src: d,
+  });
+}
 function fmtEta(d, samples) {
   if (!d || d.status !== 'downloading') return '';
   if (!(d.total > 0) || !(d.speed_bps > 0)) return '';
@@ -170,8 +193,13 @@ function detailStatusText(d) {
        ("Probing connection…", "Testing speed…" — the payload's
        detail field) when it carries one, not a bare label */
     case 'starting': return subStatusOf(d) || 'Starting…';
-    case 'downloading':
-      return (d.total > 0 && (d.done_bytes || 0) >= d.total) ? 'Finishing…' : 'Receiving data…';
+    case 'downloading': {
+      // 209 §8: "Finishing…" only on the sustained pair — two
+      // distinct payloads at the same done == total (noteFinPair)
+      const fp = d.id ? finPairState.get(d.id) : null;
+      return (d.total > 0 && (d.done_bytes || 0) >= d.total && fp && fp.still)
+        ? 'Finishing…' : 'Receiving data…';
+    }
     case 'merging': return 'Merging…';
     case 'paused': return 'Paused';
     case 'finished': return 'Finished';
@@ -1018,6 +1046,7 @@ function render() {
      recorded previous state and stays silent. */
   for (const d of items.values()) {
     noteEtaSample(d); // 208B-V6: one credibility sample count per render pass
+    noteFinPair(d); // 209 §8: sustained-pair sample for "Finishing…"
     const prev = prevStatusById.get(d.id);
     prevStatusById.set(d.id, d.status);
     // a (re)entry into 'downloading' is a try — stamp it for
@@ -4078,6 +4107,7 @@ async function initTauri() {
     const d = normalize(e.payload);
     if (deletedIds.has(d.id)) return;
     noteEtaSample(d); // 208B-V6: every payload is an ETA credibility sample
+    noteFinPair(d); // 209 §8: sustained-pair sample for "Finishing…"
     items.set(d.id, d);
     if (!selectedId) selectedId = d.id;
     scheduleRender();

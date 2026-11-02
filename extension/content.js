@@ -2484,8 +2484,15 @@
       // done>=total check in render() — a dishonest total can
       // pin done==total while bytes still arrive, so one poll
       // of equality must never read as finalizing.
+      // 209 §8: the pair advances only when a NEW poll has
+      // arrived (pairPoll tracks the poll object last counted)
+      // — the Pause/Resume handlers re-render with the same
+      // `last`, and two renders of one poll must never satisfy
+      // a two-poll rule.
       let prevDone = null;
       let prevTotal = null;
+      let pairPoll = null;
+      let finFired = false;
 
       /* Keep the reopen-badge registry truthful (R3-EXT-08): a
          cancelled or errored entry is no longer "live" for its
@@ -2551,14 +2558,20 @@
         // done>=total (same total) count.
         const bytesIn =
           st === 'downloading' && total > 0 && done >= total;
-        const sustained =
-          bytesIn &&
-          prevDone != null &&
-          done === prevDone &&
-          total === prevTotal;
+        const newPoll = last !== pairPoll;
+        if (newPoll) {
+          const samePair =
+            prevDone != null && done === prevDone && total === prevTotal;
+          if (!samePair) finFired = false; // bytes moved: re-arm
+          if (bytesIn && samePair) finFired = true; // second poll at the pair
+          prevDone = done;
+          prevTotal = total;
+          pairPoll = last;
+        }
+        // once fired for a pair it stays fired for that pair —
+        // a re-render of the firing poll must not un-fire it
+        const sustained = bytesIn && finFired;
         const finalizing = merging || sustained;
-        prevDone = done;
-        prevTotal = total;
         // The "<percent>% <filename>" line belongs to the card's
         // title bar only (IDM's progress-dialog title); the body
         // carries the labelled status rows instead. Printing the
