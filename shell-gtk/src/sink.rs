@@ -25,13 +25,15 @@ pub use ndm_core::{AppEvent, AppState, Ctx, EventSink, ProgressPayload};
 pub use ndm_core::{
     add_download, add_video, basket_add, category_names_in_use, check_ext_notice, check_update,
     components_status, current_settings, delete_category, discard_cookies, display_error, ensure_components,
-    export_downloads, get_pending_update, get_settings, grab_explore, handle_dropped_path,
+    export_downloads, get_pending_update, get_settings, grab_explore, grab_register_run,
+    handle_dropped_path,
     install_update, list_downloads, move_in_queue, open_path, pause_download, probe_file,
     probe_video, refresh_url, remove_downloads, rename_category, resume_download, rt,
     run_clipboard_watcher, run_component_warmup, run_incoming_loop, run_launch_update_check,
     run_scheduler_loop, run_snapshot_loop, run_startup_sweeps, run_update_recheck_loop,
     scheduler_start_now, scheduler_stop_now, set_completion_actions, set_entry_description,
     set_entry_limit, set_entry_queue, set_settings, set_show_complete_override, start_all,
+    today_parts,
     startup_resume, take_startup_notice, Settings,
 };
 

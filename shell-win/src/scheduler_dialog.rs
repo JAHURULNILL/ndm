@@ -47,10 +47,14 @@ const ID_STOP_NOW: i32 = 8315;
 const ID_STATUS: i32 = 8316;
 const ID_SAVE: i32 = 8317;
 const ID_CANCEL: i32 = 8318;
+const ID_DAYS: i32 = 8319; // 8319..=8325, Monday first
+const ID_ONE_TIME: i32 = 8326;
+const ID_SYNC: i32 = 8327;
+const ID_EXPIRED: i32 = 8328;
 
 const CBN_SELCHANGE_VAL: u32 = 1;
 const WIN_W: i32 = 660;
-const WIN_H: i32 = 580;
+const WIN_H: i32 = 660;
 const POWER: [(&str, &str); 6] = [
     ("", "Use the Options power setting"),
     ("shutdown", "Shut down"),
@@ -65,6 +69,10 @@ struct SchedDlg {
     enabled: isize,
     start: isize,
     stop: isize,
+    days: [isize; 7],
+    one_time: isize,
+    expired: isize,
+    sync: isize,
     exit: isize,
     power: isize,
     max: isize,
@@ -180,7 +188,8 @@ fn cfg_of(d: &SchedDlg) -> serde_json::Value {
         .unwrap_or_else(|| {
             serde_json::json!({
                 "name": d.sel, "use_schedule": false, "start": "22:00", "stop": "06:00",
-                "exit_when_done": false, "power_when_done": "", "max_simultaneous": 0
+                "exit_when_done": false, "power_when_done": "", "max_simultaneous": 0,
+                "days": [true, true, true, true, true, true, true], "one_time": "", "sync": false
             })
         })
 }
@@ -206,6 +215,27 @@ fn fill_fields() {
         dlg::set_checked(h(d.enabled), jb(&cfg, "use_schedule"));
         set_window_text(h(d.start), js(&cfg, "start"));
         set_window_text(h(d.stop), js(&cfg, "stop"));
+        let days = cfg.get("days").and_then(|x| x.as_array());
+        for (i, raw_day) in d.days.iter().enumerate() {
+            let on = days
+                .and_then(|a| a.get(i))
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true);
+            dlg::set_checked(h(*raw_day), on);
+        }
+        let one_time = js(&cfg, "one_time");
+        set_window_text(h(d.one_time), one_time);
+        // a one-time date in the past can never fire again — say so
+        let today = ndm_core::today_parts().1;
+        set_window_text(
+            h(d.expired),
+            if !one_time.is_empty() && one_time < today.as_str() {
+                "expired"
+            } else {
+                ""
+            },
+        );
+        dlg::set_checked(h(d.sync), jb(&cfg, "sync"));
         dlg::set_checked(h(d.exit), jb(&cfg, "exit_when_done"));
         let pidx = POWER.iter().position(|(v, _)| *v == js(&cfg, "power_when_done")).unwrap_or(0);
         send(h(d.power), 0x014E, WPARAM(pidx), LPARAM(0));
@@ -320,7 +350,15 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 }
             }
         }
-        ID_ENABLED | ID_START | ID_STOP | ID_EXIT | ID_POWER | ID_MAX => {
+        ID_ENABLED | ID_START | ID_STOP | ID_EXIT | ID_POWER | ID_MAX | ID_ONE_TIME | ID_SYNC => {
+            let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(d) = guard.as_mut() {
+                if !d.filling {
+                    d.dirty = true;
+                }
+            }
+        }
+        x if (ID_DAYS..ID_DAYS + 7).contains(&x) => {
             let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(d) = guard.as_mut() {
                 if !d.filling {
@@ -372,7 +410,8 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
             }
             d.queues.push(serde_json::json!({
                 "name": name, "use_schedule": false, "start": "22:00", "stop": "06:00",
-                "exit_when_done": false, "power_when_done": "", "max_simultaneous": 0
+                "exit_when_done": false, "power_when_done": "", "max_simultaneous": 0,
+                "days": [true, true, true, true, true, true, true], "one_time": "", "sync": false
             }));
             match persist_queues(d) {
                 Ok(()) => {
@@ -488,6 +527,9 @@ fn save(hwnd: HWND) {
             "use_schedule": dlg::is_checked(h(d.enabled)),
             "start": start_s,
             "stop": stop_s,
+            "days": d.days.iter().map(|day| dlg::is_checked(h(*day))).collect::<Vec<_>>(),
+            "one_time": unsafe { window_text(h(d.one_time)) }.trim().to_string(),
+            "sync": dlg::is_checked(h(d.sync)),
             "exit_when_done": dlg::is_checked(h(d.exit)),
             "power_when_done": power_s,
             "max_simultaneous": max.min(10),
@@ -594,26 +636,36 @@ fn build(hwnd: HWND) {
         }
         label("Max simultaneous downloads in this queue (0 = use the Options value)", 16, 163, 470);
         let max = edit(ID_MAX, 490, 160, 60);
-        label("Files in this queue — queued downloads start in this order:", 16, 192, 560);
+        label("On these days", 16, 193, 110);
+        let mut days = [0isize; 7];
+        for (i, name) in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].iter().enumerate() {
+            days[i] = raw(dlg::create_child(hwnd, "BUTTON", name, WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(0x0002), 130 + i as i32 * 72, 190, 68, 22, ID_DAYS + i as i32));
+        }
+        label("Or one-time date", 16, 221, 130);
+        let one_time = edit(ID_ONE_TIME, 150, 218, 120);
+        let expired = dlg::create_child(hwnd, "STATIC", "", WS_CHILD | WS_VISIBLE, 278, 221, 80, 20, ID_EXPIRED);
+        label("(yyyy-mm-dd; empty = the weekly days above)", 360, 221, 280);
+        let sync = dlg::create_child(hwnd, "BUTTON", "Synchronize — re-download finished files when they change on the server", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(0x0002), 16, 244, 600, 22, ID_SYNC);
+        label("Files in this queue — queued downloads start in this order:", 16, 272, 560);
         let files = ListView::create(
             hwnd,
             ID_FILES,
             &[ColumnSpec { label: "File Name", width: 380 }, ColumnSpec { label: "Status", width: 120 }],
         )
         .map(|lv| {
-            let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(lv.hwnd, 16, 216, 520, 150, true);
+            let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(lv.hwnd, 16, 296, 520, 150, true);
             lv.hwnd
         })
         .unwrap_or_default();
-        let up = dlg::create_child(hwnd, "BUTTON", "↑", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 544, 216, 44, 28, ID_UP);
-        let down = dlg::create_child(hwnd, "BUTTON", "↓", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 544, 252, 44, 28, ID_DOWN);
+        let up = dlg::create_child(hwnd, "BUTTON", "↑", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 544, 296, 44, 28, ID_UP);
+        let down = dlg::create_child(hwnd, "BUTTON", "↓", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 544, 332, 44, 28, ID_DOWN);
         let _ = (up, down);
-        let new_name = edit(ID_NEW_NAME, 16, 374, 300);
-        dlg::create_child(hwnd, "BUTTON", "New queue", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 330, 374, 110, 26, ID_NEW);
-        let btn_delete = dlg::create_child(hwnd, "BUTTON", "Delete queue", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 448, 374, 110, 26, ID_DELETE);
-        dlg::create_child(hwnd, "BUTTON", "▶ Start Queue Now", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, 410, 170, 28, ID_START_NOW);
-        dlg::create_child(hwnd, "BUTTON", "⏸ Stop Queue Now", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 194, 410, 170, 28, ID_STOP_NOW);
-        let status = dlg::create_child(hwnd, "STATIC", "", WS_CHILD | WS_VISIBLE, 16, 448, 620, 20, ID_STATUS);
+        let new_name = edit(ID_NEW_NAME, 16, 454, 300);
+        dlg::create_child(hwnd, "BUTTON", "New queue", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 330, 454, 110, 26, ID_NEW);
+        let btn_delete = dlg::create_child(hwnd, "BUTTON", "Delete queue", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 448, 454, 110, 26, ID_DELETE);
+        dlg::create_child(hwnd, "BUTTON", "▶ Start Queue Now", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 16, 490, 170, 28, ID_START_NOW);
+        dlg::create_child(hwnd, "BUTTON", "⏸ Stop Queue Now", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 194, 490, 170, 28, ID_STOP_NOW);
+        let status = dlg::create_child(hwnd, "STATIC", "", WS_CHILD | WS_VISIBLE, 16, 528, 620, 20, ID_STATUS);
         dlg::create_child(hwnd, "BUTTON", "Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP, WIN_W - 208, WIN_H - 44, 92, 28, ID_SAVE);
         dlg::create_child(hwnd, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, WIN_W - 108, WIN_H - 44, 92, 28, ID_CANCEL);
         let state = SchedDlg {
@@ -621,6 +673,10 @@ fn build(hwnd: HWND) {
             enabled: raw(enabled),
             start: raw(start),
             stop: raw(stop),
+            days,
+            one_time: raw(one_time),
+            expired: raw(expired),
+            sync: raw(sync),
             exit: raw(exit),
             power: raw(power),
             max: raw(max),

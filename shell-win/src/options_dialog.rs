@@ -44,7 +44,7 @@ const ID_STATUS: i32 = 8909;
 const FIELD_ID_BASE: i32 = 8100;
 
 const WIN_W: i32 = 680;
-const WIN_H: i32 = 632;
+const WIN_H: i32 = 700;
 const TAB_LABELS: [&str; 5] = ["General", "Connection", "Downloads", "Proxy & Site Logins", "Categories"];
 const CATS: [&str; 6] = ["Compressed", "Documents", "Music", "Video", "Programs", "General"];
 const CATS_WITH_TYPES: [&str; 5] = ["Compressed", "Documents", "Music", "Video", "Programs"];
@@ -328,6 +328,11 @@ fn build(hwnd: HWND, base: serde_json::Value) {
             js(s, "power_when_done"),
         );
         b.check(&mut d, 2, "power_force", "Force running programs to close with the power action", 268, jb(s, "power_force", false));
+        b.label(&mut d, 2, "Run this program when a download completes", 20, 300, 640);
+        b.label(&mut d, 2, "(for example, your antivirus scanner)", 20, 320, 640);
+        b.edit(&mut d, 2, "completion_program", "Program", 344, js(s, "completion_program"), false);
+        b.edit(&mut d, 2, "completion_args", "Arguments", 372, js(s, "completion_args"), false);
+        b.label(&mut d, 2, "{file} = the downloaded file's full path (added at the end when absent)", 20, 400, 640);
 
         // --- Proxy & Site Logins ---
         b.label(&mut d, 3, "Proxy / Socks — how downloads reach the internet", 20, 36, 640);
@@ -398,9 +403,10 @@ fn build(hwnd: HWND, base: serde_json::Value) {
         d.pages[3].push(raw(add));
 
         // --- Categories ---
-        b.label(&mut d, 4, "Each category has its own folder and its own file types.", 20, 40, 640);
+        b.label(&mut d, 4, "Each category has its own folder, its own file types and its own sites (a listed site beats the file types).", 20, 40, 640);
         let dirs = s.get("category_dirs").cloned().unwrap_or(serde_json::json!({}));
         let exts = s.get("category_exts").cloned().unwrap_or(serde_json::json!({}));
+        let sites = s.get("category_sites").cloned().unwrap_or(serde_json::json!({}));
         let mut y = 66;
         for cat in CATS {
             let dir = dirs.get(cat).and_then(|x| x.as_str()).unwrap_or("");
@@ -413,6 +419,16 @@ fn build(hwnd: HWND, base: serde_json::Value) {
                     .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
                     .unwrap_or_else(|| builtin_exts(cat).join(", "));
                 b.edit(&mut d, 4, &format!("cat_ext_{cat}"), &format!("{cat} types"), y, &list, false);
+                y += 26;
+                // site rules, comma-separated like the types
+                // ("*.site.com" = any subdomain, "site.com" =
+                // the host and its subdomains)
+                let site_list = sites
+                    .get(cat)
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                    .unwrap_or_default();
+                b.edit(&mut d, 4, &format!("cat_sites_{cat}"), &format!("{cat} sites"), y, &site_list, false);
                 y += 26;
             }
         }
@@ -635,6 +651,8 @@ fn save(hwnd: HWND) {
             .collect::<Vec<_>>());
         out["power_when_done"] = serde_json::json!(get_combo(d, "power_when_done"));
         out["power_force"] = serde_json::json!(get_check(d, "power_force"));
+        out["completion_program"] = serde_json::json!(get_text(d, "completion_program").trim());
+        out["completion_args"] = serde_json::json!(get_text(d, "completion_args").trim());
         let mut dirs = serde_json::Map::new();
         for cat in CATS {
             let v = get_text(d, &format!("cat_dir_{cat}"));
@@ -669,6 +687,28 @@ fn save(hwnd: HWND) {
             }
         }
         out["category_exts"] = serde_json::Value::Object(exts);
+        // category_sites: non-built-in keys survive; a built-in
+        // is stored only when its field is non-empty (an empty
+        // list is the absence of a rule, not a rule)
+        let mut sites = serde_json::Map::new();
+        if let Some(old) = d.base.get("category_sites").and_then(|x| x.as_object()) {
+            for (k, v) in old {
+                if !CATS_WITH_TYPES.contains(&k.as_str()) {
+                    sites.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        for cat in CATS_WITH_TYPES {
+            let list: Vec<String> = get_text(d, &format!("cat_sites_{cat}"))
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !list.is_empty() {
+                sites.insert(cat.to_string(), serde_json::json!(list));
+            }
+        }
+        out["category_sites"] = serde_json::Value::Object(sites);
         out["conn_exceptions"] = serde_json::json!(get_text(d, "conn_exceptions")
             .split(',')
             .map(|s| s.trim().to_string())
@@ -837,6 +877,7 @@ fn refresh_after_category_change(hwnd: HWND) {
             // field texts stay as typed and Save re-derives them.
             d.base["category_dirs"] = fresh.get("category_dirs").cloned().unwrap_or(serde_json::json!({}));
             d.base["category_exts"] = fresh.get("category_exts").cloned().unwrap_or(serde_json::json!({}));
+            d.base["category_sites"] = fresh.get("category_sites").cloned().unwrap_or(serde_json::json!({}));
         }
     }
     refresh_cats();

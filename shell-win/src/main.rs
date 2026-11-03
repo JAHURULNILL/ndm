@@ -42,13 +42,26 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::core::implement;
+use windows::Win32::Foundation::{
+    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, HWND, LPARAM, LRESULT,
+    POINT, WPARAM,
+};
+use windows::Win32::System::Com::{
+    CoTaskMemFree, IDataObject, IDataObject_Impl, DVASPECT_CONTENT, FORMATETC, STGMEDIUM,
+    STGMEDIUM_0, TYMED_HGLOBAL,
+};
+use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows::Win32::System::Ole::{
+    DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, DROPEFFECT, DROPEFFECT_COPY,
+};
+use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Controls::{
-    NMHDR, NMITEMACTIVATE, NMTREEVIEWW, NM_CUSTOMDRAW, NM_DBLCLK, NM_RCLICK, TVN_SELCHANGEDW,
+    NMHDR, NMITEMACTIVATE, NMLISTVIEW, NMTREEVIEWW, LVN_BEGINDRAG, NM_CUSTOMDRAW, NM_DBLCLK,
+    NM_RCLICK, TVN_SELCHANGEDW,
 };
 use windows::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, FOLDERID_RoamingAppData, HDROP,
+    DragAcceptFiles, DragFinish, DragQueryFileW, DROPFILES, FOLDERID_RoamingAppData, HDROP,
     SHGetKnownFolderPath, KF_FLAG_DEFAULT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -2549,6 +2562,207 @@ fn bootstrap(hwnd: HWND, background: bool) -> bool {
 }
 
 // ----------------------------------------------------------------
+// Drag-out (WS-J): drag a FINISHED row out of the list into
+// Explorer / the desktop and get the actual file — the inverse
+// of the Drop Basket. LVN_BEGINDRAG is only a notification; the
+// shell itself runs the OLE drag (DoDragDrop with a CF_HDROP
+// IDataObject, mirroring basket.rs's OLE idioms from the target
+// side), and only when the dragged row(s) include a finished
+// entry whose file is on disk. Otherwise nothing happens and no
+// drag ever starts.
+// ----------------------------------------------------------------
+
+/// The file a finished entry drags out as — the same rule as
+/// the GTK shell: save_to is core's out_path (the file itself
+/// for plain downloads; for video entries the folder, whose
+/// file is the entry's own name or stem + a media extension).
+fn drag_out_file(p: &ProgressView) -> Option<PathBuf> {
+    let path = PathBuf::from(&p.save_to);
+    if path.is_file() {
+        return Some(path);
+    }
+    if !path.is_dir() || p.name.is_empty() || p.name.contains(['/', '\\']) {
+        return None;
+    }
+    let direct = path.join(&p.name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let stem = p.name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&p.name);
+    ["mp4", "mkv", "webm", "m4a", "mp3"]
+        .iter()
+        .map(|ext| path.join(format!("{stem}.{ext}")))
+        .find(|c| c.is_file())
+}
+
+/// The files a drag starting on `row` would carry: the whole
+/// selection when the row is part of it, else just that row —
+/// finished entries with a file on disk only, in row order.
+fn drag_out_files(row: i32) -> Vec<PathBuf> {
+    let selected = list_view().selected_rows();
+    let rows: Vec<i32> = if selected.contains(&row) { selected } else { vec![row] };
+    let display = DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    rows.iter()
+        .filter_map(|r| display.get(*r as usize))
+        .filter_map(|id| cache.iter().find(|p| &p.id == id))
+        .filter(|p| p.status == "finished")
+        .filter_map(drag_out_file)
+        .collect()
+}
+
+/// A CF_HDROP payload: the DROPFILES header followed by the
+/// double-null-terminated wide path list Explorer expects.
+/// The caller (OLE, via ReleaseStgMedium) owns the HGLOBAL.
+fn hdrop_global(paths: &[PathBuf]) -> windows::Win32::Foundation::HGLOBAL {
+    let header = std::mem::size_of::<DROPFILES>();
+    let mut body: Vec<u16> = Vec::new();
+    for p in paths {
+        body.extend(p.to_string_lossy().encode_utf16());
+        body.push(0);
+    }
+    body.push(0);
+    unsafe {
+        let hg = GlobalAlloc(GMEM_MOVEABLE, header + body.len() * 2).unwrap_or_default();
+        if !hg.is_invalid() {
+            let ptr = GlobalLock(hg) as *mut u8;
+            if !ptr.is_null() {
+                let df = DROPFILES {
+                    pFiles: header as u32,
+                    pt: POINT::default(),
+                    fNC: false.into(),
+                    fWide: true.into(),
+                };
+                std::ptr::copy_nonoverlapping(
+                    &df as *const DROPFILES as *const u8,
+                    ptr,
+                    header,
+                );
+                std::ptr::copy_nonoverlapping(
+                    body.as_ptr() as *const u8,
+                    ptr.add(header),
+                    body.len() * 2,
+                );
+                let _ = GlobalUnlock(hg);
+            }
+        }
+        hg
+    }
+}
+
+#[implement(IDataObject)]
+struct DragFiles {
+    paths: Vec<PathBuf>,
+}
+
+impl IDataObject_Impl for DragFiles_Impl {
+    fn GetData(&self, fmt: *const FORMATETC) -> windows::core::Result<STGMEDIUM> {
+        let f = unsafe { &*fmt };
+        if f.cfFormat != 15 || f.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+            return Err(windows::Win32::Foundation::DV_E_FORMATETC.into());
+        }
+        Ok(STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: hdrop_global(&self.paths) },
+            pUnkForRelease: std::mem::ManuallyDrop::new(None),
+        })
+    }
+    fn GetDataHere(
+        &self,
+        _fmt: *const FORMATETC,
+        _medium: *mut STGMEDIUM,
+    ) -> windows::core::Result<()> {
+        Err(windows::Win32::Foundation::E_NOTIMPL.into())
+    }
+    fn QueryGetData(&self, fmt: *const FORMATETC) -> windows::core::HRESULT {
+        let f = unsafe { &*fmt };
+        if f.cfFormat == 15
+            && f.dwAspect == DVASPECT_CONTENT.0
+            && f.tymed & TYMED_HGLOBAL.0 as u32 != 0
+        {
+            windows::core::HRESULT(0)
+        } else {
+            windows::Win32::Foundation::DV_E_FORMATETC
+        }
+    }
+    fn GetCanonicalFormatEtc(
+        &self,
+        _fin: *const FORMATETC,
+        _fout: *mut FORMATETC,
+    ) -> windows::core::HRESULT {
+        windows::Win32::Foundation::E_NOTIMPL
+    }
+    fn SetData(
+        &self,
+        _fmt: *const FORMATETC,
+        _medium: *const STGMEDIUM,
+        _release: windows::core::BOOL,
+    ) -> windows::core::Result<()> {
+        Err(windows::Win32::Foundation::E_NOTIMPL.into())
+    }
+    fn EnumFormatEtc(
+        &self,
+        _direction: u32,
+    ) -> windows::core::Result<windows::Win32::System::Com::IEnumFORMATETC> {
+        Err(windows::Win32::Foundation::E_NOTIMPL.into())
+    }
+    fn DAdvise(
+        &self,
+        _fmt: *const FORMATETC,
+        _advf: u32,
+        _sink: windows::core::Ref<'_, windows::Win32::System::Com::IAdviseSink>,
+    ) -> windows::core::Result<u32> {
+        Err(windows::Win32::Foundation::E_NOTIMPL.into())
+    }
+    fn DUnadvise(&self, _connection: u32) -> windows::core::Result<()> {
+        Err(windows::Win32::Foundation::E_NOTIMPL.into())
+    }
+    fn EnumDAdvise(
+        &self,
+    ) -> windows::core::Result<windows::Win32::System::Com::IEnumSTATDATA> {
+        Err(windows::Win32::Foundation::E_NOTIMPL.into())
+    }
+}
+
+#[implement(IDropSource)]
+struct DragSource;
+
+impl IDropSource_Impl for DragSource_Impl {
+    fn QueryContinueDrag(
+        &self,
+        escape: windows::core::BOOL,
+        keys: MODIFIERKEYS_FLAGS,
+    ) -> windows::core::HRESULT {
+        if escape.as_bool() {
+            DRAGDROP_S_CANCEL
+        } else if !keys.contains(MK_LBUTTON) {
+            DRAGDROP_S_DROP
+        } else {
+            windows::core::HRESULT(0)
+        }
+    }
+    fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
+        DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+/// Run the OLE drag for a drag begun on `row`; a no-op when no
+/// selected/dragged row is a finished entry with a file on disk.
+fn begin_drag_out(row: i32) {
+    let paths = drag_out_files(row);
+    if paths.is_empty() {
+        return;
+    }
+    unsafe {
+        let _ = OleInitialize(None);
+        let data: IDataObject = DragFiles { paths }.into();
+        let source: IDropSource = DragSource.into();
+        let mut effect = DROPEFFECT::default();
+        let _ = DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect);
+    }
+}
+
+// ----------------------------------------------------------------
 // Window procedure
 // ----------------------------------------------------------------
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -2701,6 +2915,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                         // The closure borrows nothing after this call;
                         // on_custom_draw only invokes it synchronously.
                         return LRESULT(list_view().on_custom_draw(l, has_map));
+                    }
+                    if code == LVN_BEGINDRAG {
+                        // Drag-out (WS-J): a drag begun on a
+                        // finished row runs the OLE drag-out;
+                        // begin_drag_out gates on finished + file
+                        // on disk and is otherwise a no-op.
+                        let nm = l.0 as *const NMLISTVIEW;
+                        let row = if nm.is_null() { -1 } else { (*nm).iItem };
+                        if row >= 0 {
+                            begin_drag_out(row);
+                        }
                     }
                     if code == NM_DBLCLK {
                         // Double-click a row opens the per-download

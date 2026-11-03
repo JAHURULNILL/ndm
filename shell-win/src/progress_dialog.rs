@@ -790,13 +790,18 @@ fn update_bar(d: &mut ProgDlg, view: &ProgressView) {
     let indeterminate = view.status == "downloading" && view.total == 0;
     if indeterminate != d.marquee {
         unsafe {
-            let style = GetWindowLongPtrW(bar, GWL_STYLE);
+            // Widen to isize for the flag arithmetic and let
+            // `new as _` narrow back at the call: on 32-bit
+            // Windows the windows crate aliases the *Ptr APIs
+            // to the i32 Get/SetWindowLongW, on x86_64 they
+            // take isize — the style bits are 32 on both.
+            let style = GetWindowLongPtrW(bar, GWL_STYLE) as isize;
             let new = if indeterminate {
                 style | PBS_MARQUEE as isize
             } else {
                 style & !(PBS_MARQUEE as isize)
             };
-            SetWindowLongPtrW(bar, GWL_STYLE, new);
+            SetWindowLongPtrW(bar, GWL_STYLE, new as _);
             send(bar, PBM_SETMARQUEE, WPARAM(if indeterminate { 1 } else { 0 }), LPARAM(0));
         }
         d.marquee = indeterminate;
@@ -1237,7 +1242,9 @@ unsafe extern "system" fn prog_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
             let args = Box::from_raw((*cs).lpCreateParams as *mut CreateArgs);
             let view = args.view.clone();
             let id = view.id.clone();
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(Box::new(id.clone())) as isize);
+            // `as _`: SetWindowLongPtrW's value is isize on
+            // x86_64 but i32 on 32-bit Windows (see update_bar).
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(Box::new(id.clone())) as _);
             let state = build(hwnd, *args);
             {
                 let mut guard = DLGS.lock().unwrap_or_else(|e| e.into_inner());

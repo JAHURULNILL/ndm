@@ -291,6 +291,8 @@ fn wizard_state(d: &GrabDlg) -> serde_json::Value {
         "save_dir": get_text(d, "dir").trim(),
         "use_subfolders": get_check(d, "subfolders"),
         "add_as_queue": get_check(d, "add_queue"),
+        "convert_links": get_check(d, "convert_links"),
+        "queue": get_combo(d, "queue"),
         "depth_same": num(&get_text(d, "depth_same")).min(10),
         "depth_other": num(&get_text(d, "depth_other")).min(10),
         "whole_site": get_check(d, "mode_whole"),
@@ -319,6 +321,10 @@ fn apply_project(d: &GrabDlg, p: &serde_json::Value) {
     set_text(d, "dir", if dir.is_empty() { &fallback } else { dir });
     set_check(d, "subfolders", p.get("use_subfolders").and_then(|x| x.as_bool()).unwrap_or(false));
     set_check(d, "add_queue", p.get("add_as_queue").and_then(|x| x.as_bool()).unwrap_or(false));
+    // a project saved by an older build has no convert_links:
+    // it migrates OFF (core's serde default)
+    set_check(d, "convert_links", p.get("convert_links").and_then(|x| x.as_bool()).unwrap_or(false));
+    set_combo(d, "queue", js(p, "queue"));
     set_text(d, "depth_same", &p.get("depth_same").and_then(|x| x.as_u64()).unwrap_or(1).to_string());
     set_text(d, "depth_other", &p.get("depth_other").and_then(|x| x.as_u64()).unwrap_or(0).to_string());
     let whole = p.get("whole_site").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -360,6 +366,37 @@ fn fill_projects(d: &GrabDlg) {
         send(h(r), 0x014E, WPARAM(0), LPARAM(0));
     }
     // keep combo_values in step with the combo's rows
+}
+
+fn queue_names() -> Vec<String> {
+    let mut names = vec![String::new()];
+    if let Some(arr) = crate::settings_value().get("queues").and_then(|x| x.as_array()) {
+        for q in arr {
+            names.push(js(q, "name").to_string());
+        }
+    }
+    names
+}
+
+/// The queue dropdown's rows: (no queue) + the settings' queue
+/// names — mirrors fill_projects.
+fn fill_queues(d: &GrabDlg) {
+    let Some(&r) = d.fields.get("queue") else { return };
+    let queues = crate::settings_value()
+        .get("queues")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    unsafe {
+        send(h(r), 0x014B, WPARAM(0), LPARAM(0)); // CB_RESETCONTENT
+        let mut buf = wide("(no queue)");
+        send(h(r), 0x0143, WPARAM(0), LPARAM(buf.as_mut_ptr() as isize));
+        for q in &queues {
+            let mut buf = wide(js(q, "name"));
+            send(h(r), 0x0143, WPARAM(0), LPARAM(buf.as_mut_ptr() as isize));
+        }
+        send(h(r), 0x014E, WPARAM(0), LPARAM(0));
+    }
 }
 
 fn project_names() -> Vec<String> {
@@ -640,6 +677,32 @@ fn download_selected(hwnd: HWND) {
     let total = chosen.len();
     let target = raw(hwnd);
     std::thread::spawn(move || {
+        // F1: with conversion on, the start page itself joins the
+        // run (exploration crawls pages but returns only files)
+        // and the whole run is registered for the post-completion
+        // rewrite
+        let convert = p.get("convert_links").and_then(|x| x.as_bool()).unwrap_or(false);
+        let mut run_urls: Vec<String> = chosen.iter().map(|it| js(it, "url").to_string()).collect();
+        if convert {
+            run_urls.push(start_url.clone());
+            let _ = ndm_core::rt::block_on(ndm_core::add_download(
+                c.clone(),
+                start_url.clone(),
+                base.clone(),
+                Some(later),
+                Some("Grabber".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
         let mut failed = 0usize;
         let mut first_err = String::new();
         for it in &chosen {
@@ -672,6 +735,9 @@ fn download_selected(hwnd: HWND) {
                     first_err = e;
                 }
             }
+        }
+        if convert {
+            ndm_core::grab_register_run(run_urls);
         }
         let text = if failed == 0 {
             String::new()
@@ -809,6 +875,12 @@ fn build(hwnd: HWND, prefill: Option<String>) {
         b.edit(&mut d, 1, "dir", "Save all files to the following folder", 70, &default_dir);
         b.check(&mut d, 1, "subfolders", "Use the original relative subfolders", 130, false);
         b.check(&mut d, 1, "add_queue", "Add the files as a queue (Download Later) instead of starting them at once", 158, false);
+        // F1: on for projects the wizard creates; a loaded project
+        // restores its own saved value (older projects: off)
+        b.check(&mut d, 1, "convert_links", "Convert links in the downloaded pages for offline browsing", 186, true);
+        // F2: the queue whose schedule re-runs this project
+        b.label(&mut d, 1, "Re-run on this queue's schedule", 20, 214, 640);
+        let _ = b.ctl(&mut d, 1, "queue", "COMBOBOX", "", 0x0003, 20, 236, 300, 120);
 
         // Step 3
         let whole = b.ctl(&mut d, 2, "mode_whole", "BUTTON", "Explore the whole site", 0x0009, 20, 70, 500, 22);
@@ -875,11 +947,13 @@ fn build(hwnd: HWND, prefill: Option<String>) {
     }
     // project combo values mirror its rows ("" + names)
     d.combo_values.insert("proj_sel".to_string(), project_names());
+    d.combo_values.insert("queue".to_string(), queue_names());
     *DLG.lock().unwrap_or_else(|e| e.into_inner()) = Some(d);
     {
         let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = guard.as_ref() {
             fill_projects(d);
+            fill_queues(d);
         }
     }
     show_step(1);
