@@ -22,8 +22,8 @@ interrupted downloads exactly where they stopped, takes over downloads from
 your browser, grabs videos and whole sites, and stays out of your way while
 doing it — the app is a single ~3 MB installer with no bundled runtime.
 
-The current release is **2.1.1**. See the
-[release notes](https://github.com/JAHURULNILL/ndm/releases/tag/v2.1.1) for
+The current release is **2.2.0**. See the
+[release notes](https://github.com/JAHURULNILL/ndm/releases/tag/v2.2.0) for
 what changed.
 
 ## Features
@@ -91,8 +91,8 @@ what changed.
 ### Linux (.deb — Debian, Ubuntu and derivatives)
 
 ```bash
-wget https://github.com/JAHURULNILL/ndm/releases/download/v2.1.1/NDM_2.1.1_amd64.deb
-sudo apt install ./NDM_2.1.1_amd64.deb
+wget https://github.com/JAHURULNILL/ndm/releases/download/v2.2.0/NDM_2.2.0_amd64.deb
+sudo apt install ./NDM_2.2.0_amd64.deb
 ```
 
 The package depends on `libgtk-3-0` and `ffmpeg`,

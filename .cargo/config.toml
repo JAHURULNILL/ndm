@@ -27,3 +27,9 @@
 # the forwarders from the app's own folder.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Same static-CRT rule for the 32-bit MSVC target (2.2.0 x86
+# build): without it the x86 exes import the dynamic UCRT and
+# fail to start on Windows 7/8 exactly as the x64 ones did.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

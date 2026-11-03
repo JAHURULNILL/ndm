@@ -503,6 +503,17 @@ pub struct SiteLogin {
     password: String,
 }
 
+/// One file a scheduled Grabber run has seen (F2): the URL and the
+/// size the exploration reported. A later run re-downloads the file
+/// when its size differs from this record (or the URL is absent).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GrabFileRec {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    size: Option<u64>,
+}
+
 /// One saved Site Grabber project (IDM's Grabber projects): the whole
 /// wizard state, restorable from the Grabber dialog and listed under
 /// the sidebar's "Grabber projects".
@@ -538,6 +549,24 @@ pub struct GrabProject {
     min_kb: u64,
     #[serde(default)]
     max_mb: u64,
+    /// F1: rewrite links inside this grab's downloaded HTML pages to
+    /// relative local paths once the run completes, so the grabbed
+    /// site browses offline (IDM's "convert links"). The serde
+    /// default is OFF, so projects saved by older builds migrate
+    /// unconverted; the wizard's checkbox starts ON, so projects
+    /// created (or re-saved) through the wizard convert.
+    #[serde(default)]
+    convert_links: bool,
+    /// F2: the named queue whose schedule runs this project
+    /// ("" = not scheduled). When that queue's window opens, the
+    /// project re-explores and fetches new/changed files.
+    #[serde(default)]
+    queue: String,
+    /// F2: the file set the last scheduled run explored (URL +
+    /// size); the diff against the next exploration decides what
+    /// is new or changed.
+    #[serde(default)]
+    last_run: Vec<GrabFileRec>,
 }
 
 /// User preferences, persisted to <app data>/settings.json. Field names are
@@ -631,6 +660,13 @@ pub struct Settings {
     /// the app's own classification and probing.
     #[serde(default)]
     category_exts: std::collections::HashMap<String, Vec<String>>,
+    /// per-category site rules (Options → Categories): category
+    /// name → host patterns ("*.googlevideo.com" = any subdomain,
+    /// "example.com" = the host and its subdomains). At add time a
+    /// matching site rule beats the extension rules (see
+    /// category_for_url).
+    #[serde(default)]
+    category_sites: std::collections::HashMap<String, Vec<String>>,
     /// IDM-style per-server connection exceptions, one per line as
     /// "host-or-*.domain = max-connections" (see conns_for_url).
     #[serde(default)]
@@ -678,6 +714,16 @@ pub struct Settings {
     /// ("bundled|seen", 208B D4); shown at most once per pair
     #[serde(default)]
     ext_notice_for: String,
+    /// program run on each completed download (IDM's virus-scanner
+    /// hook, in its honest general form); empty = off
+    #[serde(default)]
+    completion_program: String,
+    /// argument template for `completion_program`: the token
+    /// `{file}` is replaced by the downloaded file's full path;
+    /// with no `{file}` in the template the path is appended as a
+    /// final argument (see completion_program_args)
+    #[serde(default)]
+    completion_args: String,
 }
 
 pub fn def_progress_view() -> String {
@@ -732,6 +778,25 @@ pub struct QueueCfg {
     /// the global Options value
     #[serde(default)]
     max_simultaneous: usize,
+    /// days of the week the daily window applies to, Monday first
+    /// (IDM's Scheduler day checkboxes); all true = every day,
+    /// which is the pre-2.2 behaviour
+    #[serde(default = "def_all_days")]
+    days: [bool; 7],
+    /// one-time schedule date "yyyy-mm-dd" ("" = none): when set it
+    /// REPLACES the weekly day mask — the queue runs only on that
+    /// date, and a date in the past never fires again
+    #[serde(default)]
+    one_time: String,
+    /// synchronization mode: while the queue runs, its finished
+    /// entries are re-probed periodically and re-downloaded when
+    /// the remote file changed (see sync_file_changed)
+    #[serde(default)]
+    sync: bool,
+}
+
+pub fn def_all_days() -> [bool; 7] {
+    [true; 7]
 }
 
 impl Default for QueueCfg {
@@ -744,6 +809,9 @@ impl Default for QueueCfg {
             exit_when_done: false,
             power_when_done: String::new(),
             max_simultaneous: 0,
+            days: def_all_days(),
+            one_time: String::new(),
+            sync: false,
         }
     }
 }
@@ -789,6 +857,7 @@ impl Default for Settings {
             grab_projects: Vec::new(),
             category_dirs: std::collections::HashMap::new(),
             category_exts: std::collections::HashMap::new(),
+            category_sites: std::collections::HashMap::new(),
             conn_exceptions: Vec::new(),
             exit_when_done: false,
             sound_events: true,
@@ -799,6 +868,8 @@ impl Default for Settings {
             clipboard_monitor: false,
             progress_dialog_view: def_progress_view(),
             ext_notice_for: String::new(),
+            completion_program: String::new(),
+            completion_args: String::new(),
         }
     }
 }
@@ -854,6 +925,7 @@ impl Settings {
             for p in &mut self.grab_projects {
                 p.name = p.name.trim().to_string();
                 p.start_url = p.start_url.trim().to_string();
+                p.queue = p.queue.trim().to_string();
                 p.depth_same = p.depth_same.min(10);
                 p.depth_other = p.depth_other.min(10);
             }
@@ -884,6 +956,22 @@ impl Settings {
             // the built-in list the user just cleared
             .filter(|(k, _)| !k.is_empty())
             .collect();
+        // site rules: normalize like extensions (trim, lowercase,
+        // no blanks, no duplicates within a category)
+        self.category_sites = self
+            .category_sites
+            .drain()
+            .map(|(k, v)| {
+                let mut seen = std::collections::HashSet::new();
+                let pats: Vec<String> = v
+                    .iter()
+                    .map(|p| p.trim().to_ascii_lowercase())
+                    .filter(|p| !p.is_empty() && seen.insert(p.clone()))
+                    .collect();
+                (k.trim().to_string(), pats)
+            })
+            .filter(|(k, _)| !k.is_empty())
+            .collect();
         self.conn_exceptions = self
             .conn_exceptions
             .iter()
@@ -899,9 +987,7 @@ impl Settings {
                 use_schedule: self.scheduler_enabled,
                 start: self.sched_start.clone(),
                 stop: self.sched_stop.clone(),
-                exit_when_done: false,
-                power_when_done: String::new(),
-                max_simultaneous: 0,
+                ..QueueCfg::default()
             });
         }
         let mut seen = std::collections::HashSet::new();
@@ -917,6 +1003,12 @@ impl Settings {
             q.start = normalize_hhmm(&q.start, def_sched_start());
             q.stop = normalize_hhmm(&q.stop, def_sched_stop());
             q.max_simultaneous = q.max_simultaneous.min(10);
+            // a one-time date that is not a real yyyy-mm-dd date
+            // can never match a real today — drop it rather than
+            // let a typo silently disable the weekly mask forever
+            if !q.one_time.is_empty() && !valid_ymd(&q.one_time) {
+                q.one_time.clear();
+            }
         }
         // keep the legacy global fields mirroring Main, so any reader
         // that still consults them stays consistent
@@ -941,6 +1033,8 @@ impl Settings {
             self.progress_dialog_view = def_progress_view();
         }
         self.ext_notice_for = self.ext_notice_for.trim().to_string();
+        self.completion_program = self.completion_program.trim().to_string();
+        self.completion_args = self.completion_args.trim().to_string();
     }
 }
 
@@ -1298,6 +1392,65 @@ pub fn window_open(start: &str, stop: &str, now: &str) -> bool {
         // overnight window, e.g. 22:00 -> 06:00
         now >= start || now < stop
     }
+}
+
+/// Is `s` a real calendar date in strict "yyyy-mm-dd" shape?
+/// (Shape plus range checks; leap years are honoured so a stored
+/// one-time date can never be a date that does not exist.)
+pub fn valid_ymd(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    let (Ok(y), Ok(m), Ok(d)) = (
+        s[0..4].parse::<u32>(),
+        s[5..7].parse::<u32>(),
+        s[8..10].parse::<u32>(),
+    ) else {
+        return false;
+    };
+    if !(1..=12).contains(&m) || d == 0 {
+        return false;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    d <= dim[(m - 1) as usize]
+}
+
+/// Should this queue be running at a given moment? A pure function
+/// of (cfg, weekday, date, time) so the rule is unit-testable:
+/// the daily window must be open AND the day rule must admit the
+/// day. The day rule is the weekly mask (Monday = weekday 0) —
+/// unless a one-time date is set, which REPLACES the mask: the
+/// queue then runs only on that exact date, so a one-time date in
+/// the past never fires again. (`use_schedule` itself is the
+/// caller's gate, as before.)
+pub fn queue_should_run(cfg: &QueueCfg, weekday: usize, date: &str, now: &str) -> bool {
+    if !window_open(&cfg.start, &cfg.stop, now) {
+        return false;
+    }
+    if !cfg.one_time.is_empty() {
+        return cfg.one_time == date;
+    }
+    cfg.days.get(weekday).copied().unwrap_or(true)
+}
+
+/// A one-time date that has already passed (the UI shows such a
+/// schedule as expired). String order on yyyy-mm-dd is date order.
+pub fn one_time_expired(cfg: &QueueCfg, today: &str) -> bool {
+    !cfg.one_time.is_empty() && cfg.one_time.as_str() < today
+}
+
+/// Today as the scheduler sees it: (weekday with Monday = 0,
+/// "yyyy-mm-dd", "HH:MM"), all local time.
+pub fn today_parts() -> (usize, String, String) {
+    let now = chrono::Local::now();
+    use chrono::Datelike;
+    (
+        now.weekday().num_days_from_monday() as usize,
+        now.format("%Y-%m-%d").to_string(),
+        now.format("%H:%M").to_string(),
+    )
 }
 
 /// The config of one queue by name (the Main queue's config when the
@@ -1806,6 +1959,71 @@ pub fn category_for_with(name: &str, s: &Settings) -> String {
         return "General".to_string();
     }
     builtin.to_string()
+}
+
+/// The host of a URL, lowercased, without port or userinfo —
+/// None when the URL carries no host at all.
+pub fn url_host(url: &str) -> Option<String> {
+    // no scheme = no authority = no host (a bare file name is
+    // not a host, however dotted it looks)
+    let rest = url.trim().split_once("://").map(|(_, r)| r)?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host).trim().to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+/// Does one category site pattern match a host? "*.example.com"
+/// matches any subdomain of example.com but NOT the bare host;
+/// "example.com" matches the host itself and every subdomain.
+/// Both sides are compared case-insensitively.
+pub fn site_pattern_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_lowercase();
+    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || pattern.is_empty() {
+        return false;
+    }
+    if let Some(base) = pattern.strip_prefix("*.") {
+        !base.is_empty() && host.len() > base.len() && host.ends_with(base)
+            && host.as_bytes()[host.len() - base.len() - 1] == b'.'
+    } else {
+        host == pattern
+            || (host.len() > pattern.len()
+                && host.ends_with(&pattern)
+                && host.as_bytes()[host.len() - pattern.len() - 1] == b'.')
+    }
+}
+
+/// The category whose site rules match this URL's host, if any.
+/// Categories are tried in sorted name order so overlapping rules
+/// resolve the same way on every run.
+pub fn category_for_site(url: &str, s: &Settings) -> Option<String> {
+    let host = url_host(url)?;
+    let mut cats: Vec<&String> = s.category_sites.keys().collect();
+    cats.sort();
+    for cat in cats {
+        if s.category_sites[cat]
+            .iter()
+            .any(|p| site_pattern_matches(p, &host))
+        {
+            return Some(cat.clone());
+        }
+    }
+    None
+}
+
+/// Add-time classification: a category site rule matching the
+/// download's host beats the extension rules; with no site match
+/// the extension logic decides, exactly as before.
+pub fn category_for_url(name: &str, url: &str, s: &Settings) -> String {
+    if let Some(cat) = category_for_site(url, s) {
+        return cat;
+    }
+    category_for_with(name, s)
 }
 
 pub fn file_name_for(url: &str) -> String {
@@ -2823,6 +3041,65 @@ pub fn due_retry_action(count: u32, status: &str) -> DueRetry {
     }
 }
 
+/// D3 — the lone-file retry decision, IDM's documented queue
+/// behaviour: while a queue runs, a file that lands in error is
+/// retried on the scheduler's ~30 s cadence until it succeeds or
+/// the queue stops. The gates, in order: a user stop (the pause
+/// latch — Pause on the entry, or Stop Queue Now, which also
+/// clears the registrations) ends the retry outright; a queue
+/// that is not currently running HOLDS the registration (it is
+/// not dropped — the retry fires when the queue next runs);
+/// otherwise the plain due-retry rule decides.
+pub fn lone_retry_action(
+    queue_running: bool,
+    user_stopped: bool,
+    count: u32,
+    status: &str,
+) -> DueRetry {
+    if user_stopped {
+        return DueRetry::Drop;
+    }
+    if !queue_running {
+        return DueRetry::Keep;
+    }
+    due_retry_action(count, status)
+}
+
+/// D2 — has the remote file behind a FINISHED entry changed since
+/// it was downloaded? The Refresh Address rule, as the engine's
+/// resume filter applies it: a different size is a different file,
+/// and a validator (ETag / Last-Modified) that is present on BOTH
+/// sides and differs is a different file; a validator missing on
+/// either side proves nothing. A probe with unknown size cannot
+/// judge, so it counts as unchanged. (Finished entries retain no
+/// stored validators today — the engine journal is deleted on
+/// finish — so callers pass None and the size arm decides; the
+/// validator arms engage wherever a stored pair exists.)
+pub fn sync_file_changed(
+    stored_total: u64,
+    stored_etag: Option<&str>,
+    stored_last_modified: Option<&str>,
+    probe: &ndm::Probe,
+) -> bool {
+    if probe.unknown_size {
+        return false;
+    }
+    if probe.total != stored_total {
+        return true;
+    }
+    if let (Some(a), Some(b)) = (stored_etag, probe.etag.as_deref()) {
+        if a != b {
+            return true;
+        }
+    }
+    if let (Some(a), Some(b)) = (stored_last_modified, probe.last_modified.as_deref()) {
+        if a != b {
+            return true;
+        }
+    }
+    false
+}
+
 /// Total bytes recorded as downloaded across all entries right now.
 /// Snapshots the entry list first: payload_of calls into engine code,
 /// and holding the central entries lock across it stalls every other
@@ -3150,6 +3427,80 @@ pub fn run_open_action(entry: &Entry, action: &str) {
     let _ = open_target(&target);
 }
 
+/// Split an argument string into a vector: whitespace separates
+/// tokens, double quotes group (and are not kept), and a quote
+/// left open simply runs to the end of the string. Backslashes
+/// are ordinary characters, so Windows paths survive untouched.
+pub fn split_completion_args(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut started = false;
+    for c in s.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
+/// Build the argument vector for the completion program from its
+/// template. Substitution happens BEFORE splitting: `{file}` is
+/// replaced by the file's full path first and the result is then
+/// split with quote awareness, so a path containing spaces
+/// survives intact when the template quotes it
+/// (e.g. `--scan "{file}"`). A template with no `{file}` gets the
+/// path appended as a final argument.
+pub fn completion_program_args(template: &str, file: &Path) -> Vec<String> {
+    let path = file.to_string_lossy().into_owned();
+    let has_file = template.contains("{file}");
+    let mut args = split_completion_args(&template.replace("{file}", &path));
+    if !has_file {
+        args.push(path);
+    }
+    args
+}
+
+/// Run the configured completion program (if any) for a finished
+/// entry's file, detached and never waited on. An empty program
+/// is a no-op; a missing or failing program is only logged — it
+/// must never fail or block the download's own completion.
+pub fn run_completion_program(settings: &Settings, file: &Path) {
+    let program = settings.completion_program.trim();
+    if program.is_empty() {
+        return;
+    }
+    let args = completion_program_args(&settings.completion_args, file);
+    // no shell: the program and its arguments go to the OS as-is
+    match std::process::Command::new(program)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        // dropping the Child handle leaves the program running
+        Ok(_) => eprintln!("[ndm] completion program started: {program} (file: {})", file.display()),
+        Err(e) => eprintln!("[ndm] completion program could not start ({program}): {e}"),
+    }
+}
+
 /// G2: run a finished entry's completion actions in their
 /// stored order: the open actions first (in list order), then
 /// the terminal actions (exit_app / turn_off_pc / restart_pc)
@@ -3187,6 +3538,15 @@ pub fn run_completion_actions(app: &Ctx, state: &AppState, entry: &Entry) -> boo
             }
         }
     }
+    // the global completion program (e.g. an antivirus scanner)
+    // runs for every finish — before the terminal handling below,
+    // so a power/exit action cannot pre-empt it
+    let done_path = if entry.kind == "video" {
+        resolve_video_file(entry)
+    } else {
+        entry.out_path.clone()
+    };
+    run_completion_program(&current_settings(state), &done_path);
     // terminal candidates: the finishing entry first, then any
     // other entry whose terminal action is still pending
     let (mut power, mut exit_app) = completion_terminal_of(&actions);
@@ -4092,7 +4452,7 @@ pub fn register_http_stub(
     };
     let category = category
         .map(|c| c.to_string())
-        .unwrap_or_else(|| category_for_with(&base_name, &current_settings(state)));
+        .unwrap_or_else(|| category_for_url(&base_name, url, &current_settings(state)));
     // category routing (IDM-style): the category's own folder applies
     // when the caller asked for the ordinary default folder. An
     // EXPLICIT folder (the Add dialog's field, which already shows
@@ -4581,8 +4941,8 @@ pub fn scheduler_blocks(state: &AppState, queue: &str) -> bool {
     if state.sched_override.lock().unwrap().contains(queue) {
         return false;
     }
-    let now = chrono::Local::now().format("%H:%M").to_string();
-    !window_open(&cfg.start, &cfg.stop, &now)
+    let (weekday, date, now) = today_parts();
+    !queue_should_run(&cfg, weekday, &date, &now)
 }
 
 /// The simultaneous-download cap that applies to one queue: the
@@ -6296,7 +6656,12 @@ pub fn category_is_builtin(name: &str) -> bool {
 /// settings maps' keys, and every entry's category.
 pub fn category_names_in_use(state: &AppState, s: &Settings) -> Vec<String> {
     let mut names: Vec<String> = BUILTIN_CATEGORIES.iter().map(|c| c.to_string()).collect();
-    for k in s.category_exts.keys().chain(s.category_dirs.keys()) {
+    for k in s
+        .category_exts
+        .keys()
+        .chain(s.category_dirs.keys())
+        .chain(s.category_sites.keys())
+    {
         if !names.iter().any(|n| n.eq_ignore_ascii_case(k)) {
             names.push(k.clone());
         }
@@ -6379,6 +6744,9 @@ pub fn rename_category_in(state: &AppState, old: &str, new: &str) -> Result<(), 
     if let Some(v) = s.category_dirs.remove(&canonical) {
         s.category_dirs.insert(new.to_string(), v);
     }
+    if let Some(v) = s.category_sites.remove(&canonical) {
+        s.category_sites.insert(new.to_string(), v);
+    }
     *state.settings.lock().unwrap() = s;
     save_settings(state);
     let ids: Vec<String> = state.order.lock().unwrap().clone();
@@ -6410,6 +6778,7 @@ pub fn delete_category_in(state: &AppState, name: &str) -> Result<(), String> {
     }
     s.category_exts.remove(&canonical);
     s.category_dirs.remove(&canonical);
+    s.category_sites.remove(&canonical);
     *state.settings.lock().unwrap() = s;
     save_settings(state);
     let ids: Vec<String> = state.order.lock().unwrap().clone();
@@ -6468,7 +6837,11 @@ pub fn video_engine_missing(state: &AppState) -> bool {
 /// components folder, verified against pinned hashes.
 pub fn missing_components(state: &AppState) -> Vec<&'static str> {
     let dir = state.components();
-    ndm::components::specs()
+    // effective_specs, not specs: on pre-Windows-10 the legacy
+    // yt-dlp pin applies and deno is not part of the set at all —
+    // reporting it "missing" would keep the engine forever
+    // unready on a machine that can never have it (WS-B).
+    ndm::components::effective_specs()
         .iter()
         .filter(|s| video::find_tool(s.name, &dir).is_none())
         .map(|s| s.name)
@@ -6506,7 +6879,11 @@ pub fn run_component_setup(app: Ctx) {
         // become available until a restart)
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| loop {
             let mut pass: Result<(), String> = Ok(());
-            for spec in ndm::components::specs() {
+            // effective_specs: the fetch set for THIS machine —
+            // pre-Windows-10 gets the legacy yt-dlp pin and skips
+            // deno cleanly, so its first-run setup completes
+            // instead of failing on a component it cannot run (WS-B)
+            for spec in ndm::components::effective_specs() {
                 if video::find_tool(spec.name, &dir).is_some() {
                     continue;
                 }
@@ -6600,14 +6977,35 @@ pub fn windows_is_installer_flavour() -> bool {
 /// for the platform/flavour would strand the user behind a block
 /// with nothing installable (the pre-2.0 Windows dead end, and
 /// the same rule the spec sets for every platform asset).
+/// The Windows update package (url, sha256) for a build of the
+/// given target arch and install flavour. An x86 build reads ONLY
+/// the feed's x86 keys — never the x64 pair: on a real 32-bit
+/// Windows an x64 package cannot start, and a non-empty x64 URL
+/// would arm the mandatory-update latch against an uninstallable
+/// update. Empty x86 keys therefore mean "no usable package",
+/// exactly like an empty asset on any other platform.
+pub fn win_update_package(
+    info: &ndm::updater::ReleaseInfo,
+    arch: &str,
+    installer: bool,
+) -> (String, String) {
+    match (arch == "x86", installer) {
+        (true, true) => (
+            info.win_x86_setup_url.clone(),
+            info.win_x86_setup_sha256.clone(),
+        ),
+        (true, false) => (info.win_x86_url.clone(), info.win_x86_sha256.clone()),
+        (false, true) => (info.win_setup_url.clone(), info.win_setup_sha256.clone()),
+        (false, false) => (info.win_url.clone(), info.win_sha256.clone()),
+    }
+}
+
 pub fn usable_update_asset(info: &ndm::updater::ReleaseInfo) -> bool {
     #[cfg(windows)]
     {
-        if windows_is_installer_flavour() {
-            !info.win_setup_url.is_empty()
-        } else {
-            !info.win_url.is_empty()
-        }
+        !win_update_package(info, std::env::consts::ARCH, windows_is_installer_flavour())
+            .0
+            .is_empty()
     }
     #[cfg(not(windows))]
     {
@@ -6883,19 +7281,8 @@ pub fn run_windows_update(
         .ok_or("cannot locate the app data folder")?
         .join("updates");
     let installer = windows_is_installer_flavour();
-    let (url, sha, fname) = if installer {
-        (
-            info.win_setup_url.clone(),
-            info.win_setup_sha256.clone(),
-            "ndm-setup.exe",
-        )
-    } else {
-        (
-            info.win_url.clone(),
-            info.win_sha256.clone(),
-            "ndm-update.zip",
-        )
-    };
+    let (url, sha) = win_update_package(info, std::env::consts::ARCH, installer);
+    let fname = if installer { "ndm-setup.exe" } else { "ndm-update.zip" };
     if url.is_empty() {
         return Err(
             "this update has no installable package for your copy of NDM".to_string(),
@@ -7138,8 +7525,11 @@ pub fn discard_cookies(ctx: Ctx, token: String) {
 pub fn refresh_url(app: Ctx, id: String, new_url: String) -> Result<(), String> {
     let state = app.state();
     let new_url = new_url.trim().to_string();
-    if !(new_url.starts_with("http://") || new_url.starts_with("https://")) {
-        return Err("the new address must be an http(s) URL".to_string());
+    if !(new_url.starts_with("http://")
+        || new_url.starts_with("https://")
+        || new_url.starts_with("ftp://"))
+    {
+        return Err("the new address must be an http(s) or ftp URL".to_string());
     }
     let entry = state.get(&id).ok_or("unknown download id")?;
     let status = payload_of(&entry).status;
@@ -7290,8 +7680,11 @@ pub async fn probe_file(
 ) -> Result<serde_json::Value, String> {
     let state = ctx.state();
     let url_trimmed = url.trim().to_string();
-    if !(url_trimmed.starts_with("http://") || url_trimmed.starts_with("https://")) {
-        return Err("URL must start with http:// or https://".to_string());
+    if !(url_trimmed.starts_with("http://")
+        || url_trimmed.starts_with("https://")
+        || url_trimmed.starts_with("ftp://"))
+    {
+        return Err("URL must start with http://, https:// or ftp://".to_string());
     }
     let cookie = cookies
         .as_deref()
@@ -7342,7 +7735,7 @@ pub async fn probe_file(
     let suggested = probe
         .suggested_name
         .unwrap_or_else(|| file_name_for(&url_trimmed));
-    let category = category_for_with(&suggested, &current_settings(&state));
+    let category = category_for_url(&suggested, &url_trimmed, &current_settings(&state));
     // W193-3: report the folder the file will ACTUALLY land in
     // (the category's routed folder when the target is the default
     // folder), so the Add dialog can show the truth instead of the
@@ -8013,7 +8406,7 @@ pub async fn grab_explore(
             .items
             .into_iter()
             .map(|it| GrabItemDto {
-                kind: category_for_with(&it.name, &settings),
+                kind: category_for_url(&it.name, &it.url, &settings),
                 url: it.url,
                 name: it.name,
                 size: it.size,
@@ -8021,6 +8414,551 @@ pub async fn grab_explore(
             })
             .collect(),
     })
+}
+
+/// ---- Site Grabber F1/F2: offline link rewriting + schedulable projects ----
+///
+/// F1: when a grab run finishes, the HTML pages it downloaded are
+/// rewritten on disk so links between grabbed files become relative
+/// local paths and the site browses offline (IDM's link conversion).
+/// F2: a project bound to a queue re-explores when that queue's
+/// schedule window opens and fetches only new/changed files.
+
+/// A grab run awaiting link conversion: the URLs that were added to
+/// the download list together. Session-scoped on purpose — a run
+/// interrupted by an app restart is not rewritten (its pages point
+/// at the live site, exactly like a grab with conversion off).
+struct GrabRun {
+    urls: Vec<String>,
+}
+
+static GRAB_RUNS: Mutex<Vec<GrabRun>> = Mutex::new(Vec::new());
+
+/// Register a finished adding pass: once every entry for these
+/// URLs has settled (finished, errored or cancelled), the snapshot
+/// loop converts the links of the HTML pages among them. Called by
+/// the shells after a wizard Download and by scheduled runs.
+pub fn grab_register_run(urls: Vec<String>) {
+    if !urls.is_empty() {
+        GRAB_RUNS.lock_ok().push(GrabRun { urls });
+    }
+}
+
+fn grab_is_html_path(p: &Path) -> bool {
+    matches!(
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("html") | Some("htm")
+    )
+}
+
+/// A downloaded file can BE a page without an .html name (a
+/// file-style endpoint that serves HTML); sniff the head so such
+/// pages are converted too.
+fn grab_looks_like_html(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(1024)];
+    let text = String::from_utf8_lossy(head).to_ascii_lowercase();
+    let t = text.trim_start();
+    t.starts_with("<!doctype html") || t.starts_with("<html")
+}
+
+/// The engine's entity decoding, mirrored for attribute values
+/// (hrefs in the wild carry `&amp;` for `&`).
+fn grab_decode_entities(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
+/// Resolve a link found on `page_url` the way the exploration
+/// parser resolves it (a mirror of the engine's resolve_url):
+/// absolute http(s), scheme-relative, root-relative and
+/// page-relative forms, dot segments folded, query kept. Returns
+/// the resolved URL and the fragment (with its '#', "" when
+/// absent); None for links that cannot point at a grabbed file
+/// (empty, fragment-only, mailto:/javascript:/data:/…).
+fn grab_resolve_link(page_url: &str, link: &str) -> Option<(String, String)> {
+    let link = link.trim();
+    if link.is_empty() || link.starts_with('#') {
+        return None;
+    }
+    let (link, frag) = match link.find('#') {
+        Some(i) => (&link[..i], link[i..].to_string()),
+        None => (link, String::new()),
+    };
+    if link.is_empty() {
+        return None;
+    }
+    // a query-only reference keeps the page's own path
+    if let Some(q) = link.strip_prefix('?') {
+        let base_noq = page_url.split(['?', '#']).next().unwrap_or(page_url);
+        return Some((format!("{base_noq}?{q}"), frag));
+    }
+    // absolute URL with a scheme
+    if let Some(colon) = link.find(':') {
+        let first_sep = link.find(['/', '?']).unwrap_or(usize::MAX);
+        if colon < first_sep {
+            let scheme = link[..colon].to_ascii_lowercase();
+            if scheme == "http" || scheme == "https" {
+                return Some((link.to_string(), frag));
+            }
+            return None;
+        }
+    }
+    // split the page URL into scheme / origin / path
+    let scheme_end = page_url.find("://")?;
+    let scheme = &page_url[..scheme_end];
+    let after = &page_url[scheme_end + 3..];
+    let host_end = after.find(['/', '?']).unwrap_or(after.len());
+    let origin = format!("{scheme}://{}", &after[..host_end]);
+    if let Some(rest) = link.strip_prefix("//") {
+        return Some((format!("{scheme}://{rest}"), frag));
+    }
+    if link.starts_with('/') {
+        return Some((format!("{origin}{link}"), frag));
+    }
+    // relative to the page's directory
+    let base_path = &after[host_end..];
+    let base_path = base_path.split(['?', '#']).next().unwrap_or("");
+    let dir = match base_path.rfind('/') {
+        Some(p) => &base_path[..=p],
+        None => "/",
+    };
+    let joined = format!("{dir}{}", link.split('?').next().unwrap_or(""));
+    let query = link.find('?').map(|p| &link[p..]).unwrap_or("");
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in joined.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            s => stack.push(s),
+        }
+    }
+    Some((format!("{origin}/{}{}", stack.join("/"), query), frag))
+}
+
+/// Find `attr`'s value span inside one tag's text — the engine
+/// parser's find_attr, returning the byte range of the value
+/// (without its quotes) instead of the value itself, so the
+/// rewriter can splice replacements in place.
+fn grab_attr_span(tag: &str, base: usize, attr: &str) -> Option<(usize, usize)> {
+    let bytes = tag.as_bytes();
+    let needle = attr.as_bytes();
+    let mut i = 0;
+    while i + needle.len() < bytes.len() {
+        if bytes[i].eq_ignore_ascii_case(&needle[0])
+            && tag[i..]
+                .get(..attr.len())
+                .map(|w| w.eq_ignore_ascii_case(attr))
+                .unwrap_or(false)
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+        {
+            let mut j = i + needle.len();
+            if j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'-') {
+                i += 1;
+                continue;
+            }
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let q = bytes[j];
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < bytes.len() && bytes[k] != q {
+                        k += 1;
+                    }
+                    return Some((base + start, base + k));
+                }
+                let start = j;
+                let mut k = start;
+                while k < bytes.len() && !bytes[k].is_ascii_whitespace() && bytes[k] != b'>' {
+                    k += 1;
+                }
+                return Some((base + start, base + k));
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Every href/src value span in a page, in document order. Tags
+/// inside HTML comments are skipped (the exploration parser strips
+/// comments too — a commented-out link is not a live link).
+fn grab_link_spans(html: &str) -> Vec<(usize, usize)> {
+    let bytes = html.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if html[i..].starts_with("<!--") {
+                match html[i + 4..].find("-->") {
+                    Some(end) => {
+                        i += 4 + end + 3;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+            let end = html[i..].find('>').map(|e| i + e).unwrap_or(bytes.len());
+            let tag = &html[i..end];
+            for attr in ["href", "src"] {
+                if let Some(sp) = grab_attr_span(tag, i, attr) {
+                    spans.push(sp);
+                }
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    spans.sort_unstable();
+    spans
+}
+
+/// Percent-encode one path segment for a file URL (unreserved
+/// characters pass through; everything else becomes %XX).
+fn grab_pct_encode(seg: &str) -> String {
+    let mut out = String::with_capacity(seg.len());
+    for b in seg.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// The URL a browser needs to reach `to` from a page saved in
+/// `from_dir`: ../ steps plus encoded segments. None when the two
+/// paths share no root (different Windows drives) — the link is
+/// then left untouched.
+fn grab_relative_url(from_dir: &Path, to: &Path) -> Option<String> {
+    let from: Vec<std::path::Component> = from_dir.components().collect();
+    let dest: Vec<std::path::Component> = to.components().collect();
+    let mut i = 0;
+    while i < from.len() && i < dest.len() && from[i] == dest[i] {
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = (i..from.len()).map(|_| "..".to_string()).collect();
+    for c in &dest[i..] {
+        parts.push(grab_pct_encode(&c.as_os_str().to_string_lossy()));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/"))
+}
+
+/// Rewrite one downloaded page: every href/src that resolves to
+/// another file of the same grab (by absolute URL, root-relative
+/// or page-relative reference) becomes a relative local path.
+/// External and ungrabbed links, pure fragments and links to the
+/// page itself are left byte-identical. A kept query is dropped
+/// (a local file has no query semantics); a fragment is kept.
+pub fn grab_rewrite_page(
+    html: &str,
+    page_url: &str,
+    page_path: &Path,
+    map: &std::collections::HashMap<String, PathBuf>,
+) -> String {
+    let spans = grab_link_spans(html);
+    if spans.is_empty() {
+        return html.to_string();
+    }
+    let page_dir = page_path.parent().unwrap_or_else(|| Path::new(""));
+    let mut out = String::with_capacity(html.len());
+    let mut last = 0;
+    for (s, e) in spans {
+        let raw = grab_decode_entities(&html[s..e]);
+        let Some((resolved, frag)) = grab_resolve_link(page_url, &raw) else {
+            continue;
+        };
+        let no_query = resolved.split('?').next().unwrap_or(&resolved);
+        let target = map
+            .get(&resolved)
+            .or_else(|| map.get(no_query))
+            .filter(|t| *t != page_path);
+        let Some(target) = target else { continue };
+        let Some(rel) = grab_relative_url(page_dir, target) else {
+            continue;
+        };
+        out.push_str(&html[last..s]);
+        out.push_str(&rel);
+        out.push_str(&frag);
+        last = e;
+    }
+    out.push_str(&html[last..]);
+    out
+}
+
+/// The on-disk half of F1: rewrite every HTML page in the run's
+/// URL → local-path map. Returns how many pages changed.
+pub fn grab_rewrite_files(map: &std::collections::HashMap<String, PathBuf>) -> usize {
+    let mut changed = 0;
+    for (url, path) in map {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if !grab_is_html_path(path) && !grab_looks_like_html(&bytes) {
+            continue;
+        }
+        let Ok(html) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let new = grab_rewrite_page(&html, url, path, map);
+        if new != html && std::fs::write(path, &new).is_ok() {
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Snapshot-loop tick: settle registered grab runs. A run settles
+/// when every URL's newest entry is finished, errored or cancelled
+/// (or gone from the list); its finished files then form the
+/// rewrite map. Runs with anything still in flight stay queued.
+pub fn grab_rewrite_tick(state: &AppState) {
+    let runs = std::mem::take(&mut *GRAB_RUNS.lock_ok());
+    if runs.is_empty() {
+        return;
+    }
+    let order = state.order.lock().unwrap().clone();
+    let mut pending = Vec::new();
+    for run in runs {
+        let mut settled = true;
+        let mut map: std::collections::HashMap<String, PathBuf> =
+            std::collections::HashMap::new();
+        for url in &run.urls {
+            // the NEWEST entry for the URL speaks for it (a forced
+            // re-download supersedes the older finished copy)
+            let newest = order.iter().rev().find_map(|id| {
+                let e = state.get(id)?;
+                (!e.removed.load(Ordering::Relaxed) && e.kind == "http" && &e.url == url)
+                    .then_some(e)
+            });
+            let Some(e) = newest else { continue };
+            match payload_of(&e).status.as_str() {
+                "finished" => {
+                    if entry_is_finished(&e) {
+                        map.insert(url.clone(), e.out_path.clone());
+                    }
+                }
+                "error" | "cancelled" => {}
+                _ => {
+                    settled = false;
+                    break;
+                }
+            }
+        }
+        if settled {
+            if !map.is_empty() {
+                grab_rewrite_files(&map);
+            }
+        } else {
+            pending.push(run);
+        }
+    }
+    if !pending.is_empty() {
+        GRAB_RUNS.lock_ok().extend(pending);
+    }
+}
+
+/// F2 diff: the explored items a scheduled run must fetch — URLs
+/// the project has never recorded, and URLs whose explored size
+/// differs from the recorded one. An unknown size on either side
+/// cannot prove a change, so the file is left alone.
+pub fn grab_changed_items(last_run: &[GrabFileRec], items: &[GrabItemDto]) -> Vec<GrabItemDto> {
+    items
+        .iter()
+        .filter(|it| match last_run.iter().find(|r| r.url == it.url) {
+            None => true,
+            Some(r) => matches!((r.size, it.size), (Some(a), Some(b)) if a != b),
+        })
+        .cloned()
+        .collect()
+}
+
+/// (host, path segments, trailing slash) of an http(s) URL — the
+/// shells' url_parts, mirrored for scheduled runs.
+fn grab_url_parts(u: &str) -> (String, Vec<String>, bool) {
+    let rest = u.split("://").nth(1).unwrap_or("");
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    let segs: Vec<String> = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    (host.to_string(), segs, path.ends_with('/'))
+}
+
+/// The shells' grabDirFor, mirrored: the file's folders below the
+/// start page's own folder, appended to the save dir.
+pub fn grab_subdir_for(base: &str, start_url: &str, item_url: &str) -> String {
+    let (host, mut parts, _) = grab_url_parts(item_url);
+    if parts.is_empty() {
+        return base.to_string();
+    }
+    parts.pop(); // the file name itself
+    let (shost, ssegs, strailing) = grab_url_parts(start_url);
+    if shost == host {
+        let mut root = ssegs;
+        if !strailing && !root.is_empty() {
+            root.pop(); // the start page itself
+        }
+        if root.iter().enumerate().all(|(i, seg)| parts.get(i) == Some(seg)) {
+            parts.drain(..root.len());
+        }
+    }
+    if parts.is_empty() {
+        return base.to_string();
+    }
+    let mut p = PathBuf::from(base);
+    for seg in parts {
+        p.push(seg);
+    }
+    p.to_string_lossy().to_string()
+}
+
+/// One scheduled run of a queue-bound project: re-explore the
+/// root, fetch what is new or changed into the project's queue,
+/// and record the explored set for the next run's diff.
+async fn grab_scheduled_run(ctx: Ctx, project: GrabProject) {
+    let state = ctx.state();
+    let args = GrabExploreArgs {
+        url: project.start_url.clone(),
+        depth_same: project.depth_same,
+        depth_other: project.depth_other,
+        whole_site: project.whole_site,
+        no_parent: project.no_parent,
+        same_site_files_only: project.same_site_files_only,
+        include_exts: project.include_exts.clone(),
+        exclude_exts: project.exclude_exts.clone(),
+        min_kb: project.min_kb,
+        max_mb: project.max_mb,
+    };
+    let Ok(site) = grab_explore(ctx.clone(), args).await else {
+        return;
+    };
+    let fetch = grab_changed_items(&project.last_run, &site.items);
+    let base = if project.save_dir.trim().is_empty() {
+        current_settings(state).default_dir
+    } else {
+        project.save_dir.clone()
+    };
+    if project.convert_links && !fetch.is_empty() {
+        // the start page itself joins the run (exploration crawls
+        // pages but returns only files — the page is what the
+        // conversion rewrites), and the run is registered with the
+        // WHOLE explored set: pages fetched now must also link to
+        // files an earlier run already downloaded
+        let _ = add_download(
+            ctx.clone(),
+            project.start_url.clone(),
+            base.clone(),
+            None,
+            Some("Grabber".to_string()),
+            None,
+            None,
+            None,
+            None,
+            Some(project.queue.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        let mut urls: Vec<String> = site.items.iter().map(|i| i.url.clone()).collect();
+        urls.push(project.start_url.clone());
+        grab_register_run(urls);
+    }
+    for it in &fetch {
+        let dir = if project.use_subfolders {
+            grab_subdir_for(&base, &project.start_url, &it.url)
+        } else {
+            base.clone()
+        };
+        // a changed file re-downloads as a fresh entry (force
+        // bypasses the finished-duplicate guard); a new file
+        // takes the ordinary path
+        let changed = project.last_run.iter().any(|r| r.url == it.url);
+        let _ = add_download(
+            ctx.clone(),
+            it.url.clone(),
+            dir,
+            None,
+            Some("Grabber".to_string()),
+            None,
+            None,
+            None,
+            Some(changed),
+            Some(project.queue.clone()),
+            None,
+            None,
+            None,
+            it.size,
+            None,
+        )
+        .await;
+    }
+    // record the explored set — the next run diffs against it
+    let mut s = current_settings(state);
+    if let Some(p) = s.grab_projects.iter_mut().find(|p| p.name == project.name) {
+        p.last_run = site
+            .items
+            .iter()
+            .map(|i| GrabFileRec {
+                url: i.url.clone(),
+                size: i.size,
+            })
+            .collect();
+        *state.settings.lock_ok() = s;
+        save_settings(state);
+    }
+}
+
+/// Scheduler hook (window-open edge): start every Grabber project
+/// bound to this queue. There is no separate timer — the queue's
+/// own schedule is the trigger, exactly like its downloads.
+pub fn run_scheduled_grab_projects(ctx: &Ctx, queue: &str) {
+    let s = current_settings(ctx.state());
+    for p in s
+        .grab_projects
+        .iter()
+        .filter(|p| !p.queue.is_empty() && p.queue == queue)
+    {
+        let ctx = ctx.clone();
+        let p = p.clone();
+        crate::rt::spawn(async move {
+            grab_scheduled_run(ctx, p).await;
+        });
+    }
 }
 
 /// Rebuild the in-memory list from downloads.json + engine state files.
@@ -9932,14 +10870,157 @@ pub fn startup_resume(ctx: &Ctx) {
     }
 }
 
+/// D2: reset one finished entry whose remote file changed, so the
+/// pump downloads the new file from byte zero. Modelled on
+/// refresh_url's entry rebuild: the old file (its final path when
+/// completion renamed it) and the engine journal go away first —
+/// a "restart" that kept either would resume or splice the OLD
+/// file, which is exactly what synchronization must not do.
+fn sync_reset_entry(state: &AppState, entry: &Arc<Entry>, probe: &ndm::Probe) -> Arc<Entry> {
+    let recorded = entry.final_path.lock().unwrap().clone();
+    let done_path = if recorded.is_empty() {
+        entry.out_path.clone()
+    } else {
+        PathBuf::from(recorded)
+    };
+    let _ = std::fs::remove_file(&done_path);
+    if done_path != entry.out_path {
+        let _ = std::fs::remove_file(&entry.out_path);
+    }
+    sweep_engine_state_file(entry);
+    let fresh = Arc::new(Entry {
+        id: entry.id.clone(),
+        name: entry.name.clone(),
+        url: entry.url.clone(),
+        out_path: entry.out_path.clone(),
+        category: entry.category.clone(),
+        added: entry.added.clone(),
+        last_try: Mutex::new(entry.last_try.lock().unwrap().clone()),
+        download: None,
+        video: None,
+        kind: entry.kind.clone(),
+        selector: entry.selector.clone(),
+        cookies: entry.cookies.clone(),
+        referer: entry.referer.clone(),
+        audio: entry.audio,
+        restored: Mutex::new(Some(Restored {
+            total: probe.total,
+            done_bytes: 0,
+            blocks: Vec::new(),
+            resumable: probe.range_ok,
+            // flag and record together (M-12), as in mark_requeued
+            status: "queued".to_string(),
+            error: String::new(),
+        })),
+        queued: AtomicBool::new(true),
+        sample: Mutex::new((Instant::now(), 0, 0.0)),
+        emitting: AtomicBool::new(false),
+        starting: AtomicBool::new(false),
+        slot_preclaimed: AtomicBool::new(false),
+        removed: AtomicBool::new(false),
+        pause_requested: AtomicBool::new(false),
+        completion: Mutex::new(entry.completion.lock().unwrap().clone()),
+        completion_actions: Mutex::new(entry.completion_actions.lock().unwrap().clone()),
+        show_complete_override: Mutex::new(*entry.show_complete_override.lock().unwrap()),
+        final_path: Mutex::new(String::new()),
+        queue: Mutex::new(entry_queue(entry)),
+        login: entry.login.clone(),
+        password:
+            entry.password.clone(),
+        description: Mutex::new(entry.description.lock().unwrap().clone()),
+        speed_limit: Mutex::new(*entry.speed_limit.lock().unwrap()),
+        detail: Mutex::new(String::new()),
+    });
+    state
+        .entries
+        .lock()
+        .unwrap()
+        .insert(fresh.id.clone(), fresh.clone());
+    state.retries.lock_ok().remove(&entry.id);
+    fresh
+}
+
+/// D2: one synchronization sweep of a running sync queue — probe
+/// every finished file entry; restart the ones whose remote file
+/// changed, leave the rest finished. An unreachable URL leaves
+/// its entry finished (log only): a server hiccup must never
+/// cost the user a completed download. Runs on its own thread
+/// (spawned by the scheduler loop every ~10 minutes) because the
+/// probes are blocking network I/O.
+pub fn sync_sweep(ctx: &Ctx, queue: &str) {
+    let state = ctx.state();
+    let s = current_settings(state);
+    if !queue_cfg(&s, queue).sync {
+        return;
+    }
+    let entries: Vec<Arc<Entry>> = state
+        .entries
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect();
+    let mut any = false;
+    for e in entries {
+        if entry_queue(&e) != queue || e.kind == "video" || !entry_is_finished(&e) {
+            continue;
+        }
+        // the probe authenticates exactly like the download did
+        // (start_engine's auth build, plus the Site Login fallback
+        // probe_file applies)
+        let (login, password) = if e.login.is_empty() {
+            site_login_for(&s, &e.url)
+                .unwrap_or_else(|| (e.login.clone(), e.password.clone()))
+        } else {
+            (e.login.clone(), e.password.clone())
+        };
+        let auth = ndm::Auth {
+            cookie: state
+                .cookies_path(&e.cookies)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|text| cookie_header_from_netscape(&text)),
+            referer: if e.referer.is_empty() {
+                None
+            } else {
+                Some(e.referer.clone())
+            },
+            authorization: basic_auth_header(&login, &password),
+        };
+        let probe = match ndm::probe_with_auth(&e.url, &auth) {
+            Ok(p) => p,
+            Err(err) => {
+                eprintln!("[ndm] sync check failed for {}: {err}", e.url);
+                continue;
+            }
+        };
+        if sync_file_changed(payload_of(&e).total, None, None, &probe) {
+            eprintln!(
+                "[ndm] sync: {} changed on the server — restarting its download",
+                e.url
+            );
+            let fresh = sync_reset_entry(state, &e, &probe);
+            let _ = ctx.emit(AppEvent::Progress(payload_of(&fresh)));
+            any = true;
+        }
+    }
+    if any {
+        persist(state);
+        pump_queue(ctx);
+    }
+}
+
 /// Scheduler: every 30 s, start the queue inside the configured
 /// window and pause everything when the window ends.
 pub fn run_scheduler_loop(ctx: Ctx) {
     std::thread::spawn(move || {
         let mut was_in_window: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
+        // D2: sync sweeps ride this loop's 30 s tick — every
+        // 20th tick is ~10 minutes, no new timer thread
+        let mut tick: u64 = 0;
         loop {
             std::thread::sleep(Duration::from_secs(30));
+            tick += 1;
             // panic-isolated per tick: a panic here used to
             // kill scheduling AND automatic retries for the
             // whole session with no sign anything was wrong
@@ -9974,7 +11055,19 @@ pub fn run_scheduler_loop(ctx: Ctx) {
                         state.retries.lock_ok().remove(&id);
                         continue;
                     };
-                    match due_retry_action(count, &payload_of(&e).status) {
+                    // D3: the lone-file retry fires only while
+                    // the entry's queue is running, and never
+                    // after the user stopped the entry (the pause
+                    // latch); a stopped queue HOLDS the
+                    // registration instead of dropping it
+                    let queue_running = !scheduler_blocks(state, &entry_queue(&e));
+                    let user_stopped = e.pause_requested.load(Ordering::SeqCst);
+                    match lone_retry_action(
+                        queue_running,
+                        user_stopped,
+                        count,
+                        &payload_of(&e).status,
+                    ) {
                         DueRetry::Drop => {
                             state.retries.lock_ok().remove(&id);
                         }
@@ -10015,14 +11108,16 @@ pub fn run_scheduler_loop(ctx: Ctx) {
             pump_queue(&ctx);
             // per-queue scheduler windows (IDM's Scheduler):
             // each queue starts at its window opening and
-            // pauses (re-queued) at its close
-            let now = chrono::Local::now().format("%H:%M").to_string();
+            // pauses (re-queued) at its close. "In window" is
+            // the full D1 evaluation — daily window AND day
+            // rule (weekly mask / one-time date)
+            let (weekday, date, now) = today_parts();
             for cfg in &s.queues {
                 if !cfg.use_schedule {
                     was_in_window.remove(&cfg.name);
                     continue;
                 }
-                let in_win = window_open(&cfg.start, &cfg.stop, &now);
+                let in_win = queue_should_run(cfg, weekday, &date, &now);
                 // the FIRST observation of a queue seeds
                 // its state from the actual schedule: the
                 // old "unknown = was closed" default
@@ -10044,6 +11139,10 @@ pub fn run_scheduler_loop(ctx: Ctx) {
                     // disk parked, which no add/move/settings
                     // path has touched this session
                     adopt_parked_entries(&ctx, state, &s, &cfg.name, false);
+                    // F2: Grabber projects bound to this queue
+                    // re-explore and fetch new/changed files when
+                    // its window opens
+                    run_scheduled_grab_projects(&ctx, &cfg.name);
                     if effective_cap(&s, &cfg.name) == 0 && !quota_blocks(state) {
                         // start-all respects Download limits:
                         // an exhausted quota is not overridden
@@ -10057,6 +11156,27 @@ pub fn run_scheduler_loop(ctx: Ctx) {
                     pause_all(&ctx, true, Some(&cfg.name));
                 }
                 was_in_window.insert(cfg.name.clone(), in_win);
+            }
+            // D2: synchronization sweeps for sync queues that
+            // are running right now (inside their schedule, or
+            // under a Start Queue Now override)
+            if tick % 20 == 0 {
+                for cfg in &s.queues {
+                    if !cfg.sync {
+                        continue;
+                    }
+                    let running = state
+                        .sched_override
+                        .lock()
+                        .unwrap()
+                        .contains(&cfg.name)
+                        || (cfg.use_schedule && queue_should_run(cfg, weekday, &date, &now));
+                    if running {
+                        let c2 = ctx.clone();
+                        let name = cfg.name.clone();
+                        std::thread::spawn(move || sync_sweep(&c2, &name));
+                    }
+                }
             }
             }));
         }
@@ -10144,6 +11264,9 @@ pub fn run_snapshot_loop(ctx: Ctx) {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let state = ctx.state();
                 persist(state);
+                // F1: convert the links of any grab run whose
+                // downloads have all settled
+                grab_rewrite_tick(state);
                 // #1: a journal that cannot be written is
                 // surfaced in the UI as soon as it is known:
                 // until a save succeeds again, the list on
@@ -10267,6 +11390,65 @@ mod tests {
     }
 
     #[test]
+    fn win_update_package_picks_assets_for_the_builds_own_arch() {
+        let info: ndm::updater::ReleaseInfo = serde_json::from_str(
+            r#"{
+                "version": "2.2.0",
+                "win_url": "https://x/win.zip",
+                "win_sha256": "w",
+                "win_setup_url": "https://x/setup.exe",
+                "win_setup_sha256": "s",
+                "win_x86_url": "https://x/win-x86.zip",
+                "win_x86_sha256": "w86",
+                "win_x86_setup_url": "https://x/setup-x86.exe",
+                "win_x86_setup_sha256": "s86"
+            }"#,
+        )
+        .unwrap();
+        // x86 builds get the x86 pair, both flavours
+        assert_eq!(
+            win_update_package(&info, "x86", true),
+            ("https://x/setup-x86.exe".to_string(), "s86".to_string())
+        );
+        assert_eq!(
+            win_update_package(&info, "x86", false),
+            ("https://x/win-x86.zip".to_string(), "w86".to_string())
+        );
+        // every other arch keeps the x64 pair, unchanged
+        assert_eq!(
+            win_update_package(&info, "x86_64", true),
+            ("https://x/setup.exe".to_string(), "s".to_string())
+        );
+        assert_eq!(
+            win_update_package(&info, "x86_64", false),
+            ("https://x/win.zip".to_string(), "w".to_string())
+        );
+    }
+
+    #[test]
+    fn win_update_package_x86_never_falls_back_to_x64() {
+        // a feed with only x64 assets (every feed before the x86
+        // tier): an x86 build must see NO usable package — falling
+        // back would hand 32-bit Windows an uninstallable update
+        // and arm the mandatory latch against it
+        let info: ndm::updater::ReleaseInfo = serde_json::from_str(
+            r#"{
+                "version": "2.2.0",
+                "win_url": "https://x/win.zip",
+                "win_sha256": "w",
+                "win_setup_url": "https://x/setup.exe",
+                "win_setup_sha256": "s"
+            }"#,
+        )
+        .unwrap();
+        assert!(win_update_package(&info, "x86", true).0.is_empty());
+        assert!(win_update_package(&info, "x86", false).0.is_empty());
+        // …while an x86_64 build still finds its package
+        assert!(!win_update_package(&info, "x86_64", true).0.is_empty());
+        assert!(!win_update_package(&info, "x86_64", false).0.is_empty());
+    }
+
+    #[test]
     fn server_answers_are_translated_not_blamed_on_the_connection() {
         // N-07: the probe's raw wording for a definitive HTTP answer
         let raw = "probe failed: http://127.0.0.1:8951/master.m3u8: status code 404";
@@ -10332,6 +11514,83 @@ mod tests {
         assert_eq!(state.settings.lock().unwrap().max_connections, 16);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_args_substitutes_file_token() {
+        let file = Path::new("/tmp/report.pdf");
+        assert_eq!(
+            completion_program_args("--scan {file} --deep", file),
+            vec!["--scan", "/tmp/report.pdf", "--deep"]
+        );
+        // every occurrence is substituted
+        assert_eq!(
+            completion_program_args("{file} {file}", file),
+            vec!["/tmp/report.pdf", "/tmp/report.pdf"]
+        );
+    }
+
+    #[test]
+    fn completion_args_quoted_path_with_spaces_survives() {
+        let file = Path::new("/tmp/my downloads/big file.iso");
+        assert_eq!(
+            completion_program_args("--scan \"{file}\"", file),
+            vec!["--scan", "/tmp/my downloads/big file.iso"]
+        );
+    }
+
+    #[test]
+    fn completion_args_appends_path_when_no_placeholder() {
+        let file = Path::new("/tmp/x.bin");
+        assert_eq!(
+            completion_program_args("--quiet", file),
+            vec!["--quiet", "/tmp/x.bin"]
+        );
+        // an empty template still hands the program the file
+        assert_eq!(completion_program_args("", file), vec!["/tmp/x.bin"]);
+    }
+
+    #[test]
+    fn completion_program_empty_is_noop() {
+        // no program configured (or only whitespace): returns
+        // without spawning anything and without panicking
+        let s = Settings::default();
+        run_completion_program(&s, Path::new("/tmp/x.bin"));
+        let s = Settings {
+            completion_program: "   ".to_string(),
+            ..Settings::default()
+        };
+        run_completion_program(&s, Path::new("/tmp/x.bin"));
+    }
+
+    #[test]
+    fn completion_program_missing_binary_is_logged_not_fatal() {
+        // a configured program that does not exist must never
+        // fail or block the download's completion
+        let s = Settings {
+            completion_program: "/nonexistent/ndm-no-such-scanner".to_string(),
+            completion_args: "{file}".to_string(),
+            ..Settings::default()
+        };
+        run_completion_program(&s, Path::new("/tmp/x.bin"));
+    }
+
+    #[test]
+    fn completion_args_splitter_edge_cases() {
+        assert!(split_completion_args("").is_empty());
+        assert!(split_completion_args("   ").is_empty());
+        assert_eq!(split_completion_args("a \"b c\" d"), vec!["a", "b c", "d"]);
+        // an empty quoted string is a real (empty) argument
+        assert_eq!(split_completion_args("\"\""), vec![""]);
+        // a quote left open runs to the end of the string
+        assert_eq!(split_completion_args("\"abc def"), vec!["abc def"]);
+        // quotes may sit inside a token
+        assert_eq!(split_completion_args("a\"b c\"d"), vec!["ab cd"]);
+        // backslashes are ordinary: a quoted Windows path survives
+        assert_eq!(
+            split_completion_args("\"C:\\a b\\f.bin\""),
+            vec!["C:\\a b\\f.bin"]
+        );
     }
 
     #[test]
@@ -11200,6 +12459,8 @@ mod tests {
             etag: None,
             last_modified: None,
             ignore_encoding_header: false,
+            cookies: ndm::CookieJar::new(),
+            range_unverified: false,
         };
         let t0 = Instant::now();
         let slot: Mutex<Option<ProbeHandoff>> = Mutex::new(Some(ProbeHandoff {
@@ -11312,6 +12573,177 @@ mod tests {
         }
         let map = state.retries.lock().unwrap();
         assert_eq!(map.get("dl-1").map(|(c, _)| *c), Some(RETRY_MAX));
+    }
+
+    fn sched_cfg(days: [bool; 7], one_time: &str) -> QueueCfg {
+        QueueCfg {
+            name: "T".to_string(),
+            use_schedule: true,
+            start: "22:00".to_string(),
+            stop: "06:00".to_string(),
+            days,
+            one_time: one_time.to_string(),
+            ..QueueCfg::default()
+        }
+    }
+
+    #[test]
+    fn queue_should_run_honours_window_mask_and_one_time() {
+        // 2026-11-02 is a Monday (weekday 0); window 22:00 -> 06:00
+        let all = sched_cfg([true; 7], "");
+        assert!(queue_should_run(&all, 0, "2026-11-02", "23:00"));
+        assert!(queue_should_run(&all, 0, "2026-11-02", "05:59"));
+        // outside the daily window the day rule never gets a say
+        assert!(!queue_should_run(&all, 0, "2026-11-02", "12:00"));
+        assert!(!queue_should_run(&all, 0, "2026-11-02", "06:00"));
+        // the weekly mask: Monday off, Tuesday on
+        let mut days = [true; 7];
+        days[0] = false;
+        let masked = sched_cfg(days, "");
+        assert!(!queue_should_run(&masked, 0, "2026-11-02", "23:00"));
+        assert!(queue_should_run(&masked, 1, "2026-11-03", "23:00"));
+        // a one-time date replaces the mask: it fires on its date
+        // even on a masked-off weekday...
+        let once = sched_cfg(days, "2026-11-02");
+        assert!(queue_should_run(&once, 0, "2026-11-02", "23:00"));
+        // ...and ONLY on its date, even on a masked-on weekday
+        assert!(!queue_should_run(&once, 1, "2026-11-03", "23:00"));
+        // a one-time date in the past never fires, and reads expired
+        let past = sched_cfg([true; 7], "2026-11-01");
+        assert!(!queue_should_run(&past, 0, "2026-11-02", "23:00"));
+        assert!(one_time_expired(&past, "2026-11-02"));
+        assert!(!one_time_expired(&once, "2026-11-02"));
+        assert!(!one_time_expired(&all, "2026-11-02"));
+        // a future one-time date is not expired, just not today
+        let future = sched_cfg([true; 7], "2026-12-25");
+        assert!(!one_time_expired(&future, "2026-11-02"));
+        assert!(!queue_should_run(&future, 0, "2026-11-02", "23:00"));
+    }
+
+    #[test]
+    fn valid_ymd_accepts_only_real_dates() {
+        assert!(valid_ymd("2026-11-02"));
+        assert!(valid_ymd("2028-02-29")); // leap year
+        assert!(!valid_ymd("2026-02-29"));
+        assert!(!valid_ymd("2026-13-01"));
+        assert!(!valid_ymd("2026-11-31"));
+        assert!(!valid_ymd("2026-1-2"));
+        assert!(!valid_ymd("02-11-2026"));
+        assert!(!valid_ymd(""));
+        assert!(!valid_ymd("2026-11-02 "));
+    }
+
+    #[test]
+    fn lone_retry_waits_for_the_queue_and_honours_user_stop() {
+        // D3: running queue + errored entry = retry on cadence
+        assert_eq!(lone_retry_action(true, false, 0, "error"), DueRetry::Requeue);
+        // the queue being stopped HOLDS the registration — the
+        // retry is deferred, not cancelled
+        assert_eq!(lone_retry_action(false, false, 0, "error"), DueRetry::Keep);
+        // a user stop ends it outright, whatever the queue does
+        assert_eq!(lone_retry_action(true, true, 0, "error"), DueRetry::Drop);
+        assert_eq!(lone_retry_action(false, true, 0, "error"), DueRetry::Drop);
+        // the attempt cap still bites while the queue runs
+        assert_eq!(
+            lone_retry_action(true, false, RETRY_MAX, "error"),
+            DueRetry::Drop
+        );
+        // an in-flight attempt is left alone
+        assert_eq!(lone_retry_action(true, false, 2, "downloading"), DueRetry::Keep);
+    }
+
+    fn probe_of(total: u64, etag: Option<&str>, lm: Option<&str>) -> ndm::Probe {
+        ndm::Probe {
+            total,
+            range_ok: true,
+            unknown_size: false,
+            etag: etag.map(|x| x.to_string()),
+            last_modified: lm.map(|x| x.to_string()),
+            suggested_name: None,
+            final_url: String::new(),
+            ignore_encoding_header: false,
+            cookies: ndm::CookieJar::new(),
+            range_unverified: false,
+        }
+    }
+
+    #[test]
+    fn sync_changed_detects_size_and_validator_changes() {
+        // D2: same size, same validators = unchanged
+        assert!(!sync_file_changed(100, Some("v1"), Some("Mon"), &probe_of(100, Some("v1"), Some("Mon"))));
+        // size differs = changed, whatever the validators say
+        assert!(sync_file_changed(100, Some("v1"), None, &probe_of(101, Some("v1"), None)));
+        // same size but a validator present on both sides differs
+        assert!(sync_file_changed(100, Some("v1"), None, &probe_of(100, Some("v2"), None)));
+        assert!(sync_file_changed(100, None, Some("Mon"), &probe_of(100, None, Some("Tue"))));
+        // a validator missing on either side proves nothing —
+        // the engine's resume filter treats it the same way
+        assert!(!sync_file_changed(100, None, None, &probe_of(100, Some("v9"), None)));
+        assert!(!sync_file_changed(100, Some("v1"), None, &probe_of(100, None, None)));
+        // an unknown-size probe cannot judge = unchanged
+        let mut p = probe_of(0, None, None);
+        p.unknown_size = true;
+        assert!(!sync_file_changed(100, None, None, &p));
+    }
+
+    #[test]
+    fn site_rules_match_wildcard_exact_and_subdomains() {
+        // E: "*.googlevideo.com" = any subdomain, never the bare host
+        assert!(site_pattern_matches("*.googlevideo.com", "r1.googlevideo.com"));
+        assert!(site_pattern_matches("*.googlevideo.com", "a.b.googlevideo.com"));
+        assert!(!site_pattern_matches("*.googlevideo.com", "googlevideo.com"));
+        // "example.com" = the host itself and every subdomain
+        assert!(site_pattern_matches("example.com", "example.com"));
+        assert!(site_pattern_matches("example.com", "cdn.example.com"));
+        assert!(site_pattern_matches("example.com", "a.b.example.com"));
+        // a suffix that is not a whole label never matches
+        assert!(!site_pattern_matches("example.com", "notexample.com"));
+        assert!(!site_pattern_matches("example.com", "example.com.evil.net"));
+        assert!(!site_pattern_matches("*.example.com", "notexample.com"));
+        // case-insensitive on both sides
+        assert!(site_pattern_matches("EXAMPLE.com", "CDN.Example.COM"));
+        assert!(site_pattern_matches("*.GoogleVideo.com", "R1.GOOGLEVIDEO.COM"));
+        // empty pattern/host never match
+        assert!(!site_pattern_matches("", "example.com"));
+        assert!(!site_pattern_matches("example.com", ""));
+    }
+
+    #[test]
+    fn category_site_rule_beats_extension_rule() {
+        let mut s = Settings::default();
+        s.category_sites.insert(
+            "Programs".to_string(),
+            vec!["*.googlevideo.com".to_string()],
+        );
+        s.category_sites
+            .insert("Music".to_string(), vec!["example.com".to_string()]);
+        // a video file from a Programs site lands in Programs —
+        // the site rule beats the .mp4 extension rule
+        assert_eq!(
+            category_for_url("movie.mp4", "https://r1.googlevideo.com/movie.mp4", &s),
+            "Programs"
+        );
+        // an archive from the Music site lands in Music
+        assert_eq!(
+            category_for_url("pack.zip", "https://cdn.example.com/pack.zip", &s),
+            "Music"
+        );
+        // no site match = today's extension logic, untouched
+        assert_eq!(
+            category_for_url("movie.mp4", "https://other.net/movie.mp4", &s),
+            "Video"
+        );
+        assert_eq!(
+            category_for_url("pack.zip", "https://other.net/pack.zip", &s),
+            "Compressed"
+        );
+        // a URL without a host cannot match a site rule
+        assert_eq!(category_for_url("movie.mp4", "movie.mp4", &s), "Video");
+        assert_eq!(url_host("movie.mp4"), None);
+        assert_eq!(
+            url_host("https://user@CDN.Example.com:8443/a/b.zip?x=1"),
+            Some("cdn.example.com".to_string())
+        );
     }
 
     #[test]
@@ -12004,6 +13436,331 @@ mod tests {
         assert!(take_spool_claim(&dir, &claim).is_none());
         assert!(!claim.exists(), "the empty claim was deleted, not kept");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- WS-F: grabber offline link rewriting + schedulable projects ----
+
+    fn f_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, PathBuf> {
+        pairs
+            .iter()
+            .map(|(u, p)| (u.to_string(), PathBuf::from(p)))
+            .collect()
+    }
+
+    #[test]
+    fn grab_resolve_link_mirrors_the_explore_parser() {
+        assert_eq!(
+            grab_resolve_link("http://ex.com/a/b.html", "../c.html?x=1#f"),
+            Some(("http://ex.com/c.html?x=1".to_string(), "#f".to_string()))
+        );
+        assert_eq!(
+            grab_resolve_link("http://ex.com/a/b.html", "//cdn.com/x.css"),
+            Some(("http://cdn.com/x.css".to_string(), String::new()))
+        );
+        assert_eq!(
+            grab_resolve_link("https://ex.com/a/", "/root.png"),
+            Some(("https://ex.com/root.png".to_string(), String::new()))
+        );
+        assert_eq!(grab_resolve_link("http://ex.com/a/b.html", "#only"), None);
+        assert_eq!(grab_resolve_link("http://ex.com/a/b.html", "mailto:a@b.c"), None);
+        assert_eq!(grab_resolve_link("http://ex.com/a/b.html", "javascript:void(0)"), None);
+    }
+
+    #[test]
+    fn grab_rewrite_converts_absolute_rootrelative_and_relative_links() {
+        let map = f_map(&[
+            ("http://ex.com/index.html", "/dl/index.html"),
+            ("http://ex.com/a/page2.html", "/dl/a/page2.html"),
+            ("http://ex.com/img/logo.png", "/dl/img/logo.png"),
+            ("http://ex.com/style.css", "/dl/style.css"),
+        ]);
+        let html = concat!(
+            "<html><head><link href=\"http://ex.com/style.css\"></head><body>",
+            "<a href=\"http://ex.com/a/page2.html\">abs</a>",
+            "<a href=\"/a/page2.html\">root</a>",
+            "<a href=\"a/page2.html\">rel</a>",
+            "<img src=\"img/logo.png\">",
+            "<a href=\"https://other.com/a/page2.html\">ext</a>",
+            "<a href=\"#sec\">frag</a>",
+            "<a href=\"mailto:a@b.c\">mail</a>",
+            "</body></html>"
+        );
+        let out = grab_rewrite_page(html, "http://ex.com/index.html", Path::new("/dl/index.html"), &map);
+        assert!(out.contains("href=\"style.css\""), "{out}");
+        assert!(out.contains("href=\"a/page2.html\">abs"), "{out}");
+        assert!(out.contains("href=\"a/page2.html\">root"), "{out}");
+        assert!(out.contains("href=\"a/page2.html\">rel"), "{out}");
+        assert!(out.contains("src=\"img/logo.png\""), "{out}");
+        // external / fragment-only / non-http links stay byte-identical
+        assert!(out.contains("href=\"https://other.com/a/page2.html\""), "{out}");
+        assert!(out.contains("href=\"#sec\""), "{out}");
+        assert!(out.contains("href=\"mailto:a@b.c\""), "{out}");
+    }
+
+    #[test]
+    fn grab_rewrite_handles_fragments_queries_quotes_and_comments() {
+        let map = f_map(&[
+            ("http://ex.com/sub/index.html", "/dl/sub/index.html"),
+            ("http://ex.com/a/page2.html", "/dl/a/page2.html"),
+            ("http://ex.com/a/pic one.png", "/dl/a/pic one.png"),
+        ]);
+        let html = concat!(
+            "<a href='../a/page2.html#top'>up</a>",
+            "<a href=\"../a/page2.html?x=1#top\">q</a>",
+            "<a href=../a/page2.html>bare</a>",
+            "<img src=\"../a/pic one.png\">",
+            "<!-- <a href=\"http://ex.com/a/page2.html\">commented</a> -->",
+            "<a href=\"../a/notgrabbed.html\">miss</a>",
+            "<a href=\"http://ex.com/sub/index.html\">self</a>",
+        );
+        let out = grab_rewrite_page(
+            html,
+            "http://ex.com/sub/index.html",
+            Path::new("/dl/sub/index.html"),
+            &map,
+        );
+        assert!(out.contains("href='../a/page2.html#top'"), "{out}");
+        // the query is dropped for a local file; the fragment is kept
+        assert!(out.contains("href=\"../a/page2.html#top\">q"), "{out}");
+        assert!(out.contains("href=../a/page2.html>bare"), "{out}");
+        assert!(out.contains("src=\"../a/pic%20one.png\""), "{out}");
+        // commented-out and ungrabbed links are not live links
+        assert!(out.contains("<!-- <a href=\"http://ex.com/a/page2.html\">commented</a> -->"), "{out}");
+        assert!(out.contains("href=\"../a/notgrabbed.html\""), "{out}");
+        // a link to the page itself is left alone
+        assert!(out.contains("href=\"http://ex.com/sub/index.html\">self"), "{out}");
+    }
+
+    #[test]
+    fn grab_rewrite_files_rewrites_pages_on_disk() {
+        let dir = std::env::temp_dir().join(format!("ndm-wsf-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<a href=\"http://ex.com/a/two.html\">2</a><img src=\"/a/p.png\">",
+        )
+        .unwrap();
+        std::fs::write(dir.join("a/two.html"), "<a href=\"http://ex.com/index.html\">home</a>").unwrap();
+        std::fs::write(dir.join("a/p.png"), "PNG").unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "http://ex.com/index.html".to_string(),
+            dir.join("index.html"),
+        );
+        map.insert("http://ex.com/a/two.html".to_string(), dir.join("a/two.html"));
+        map.insert("http://ex.com/a/p.png".to_string(), dir.join("a/p.png"));
+        assert_eq!(grab_rewrite_files(&map), 2);
+        let one = std::fs::read_to_string(dir.join("index.html")).unwrap();
+        assert!(one.contains("href=\"a/two.html\""), "{one}");
+        assert!(one.contains("src=\"a/p.png\""), "{one}");
+        let two = std::fs::read_to_string(dir.join("a/two.html")).unwrap();
+        assert!(two.contains("href=\"../index.html\""), "{two}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grab_changed_items_detects_new_and_size_changed() {
+        let dto = |url: &str, size: Option<u64>| GrabItemDto {
+            url: url.to_string(),
+            name: String::new(),
+            kind: String::new(),
+            size,
+            label: String::new(),
+        };
+        let last = vec![
+            GrabFileRec { url: "http://e/a".to_string(), size: Some(10) },
+            GrabFileRec { url: "http://e/b".to_string(), size: Some(20) },
+            GrabFileRec { url: "http://e/c".to_string(), size: None },
+        ];
+        let items = vec![
+            dto("http://e/a", Some(10)),
+            dto("http://e/b", Some(21)),
+            dto("http://e/c", Some(5)),
+            dto("http://e/d", None),
+        ];
+        let changed = grab_changed_items(&last, &items);
+        let got: Vec<&str> = changed.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(got, ["http://e/b", "http://e/d"]);
+    }
+
+    #[test]
+    fn grab_project_migrates_without_convert_or_queue() {
+        // a project saved by an older build: no convert_links, no
+        // queue, no last_run — all default to the safe values
+        let p: GrabProject =
+            serde_json::from_str("{\"name\":\"old\",\"start_url\":\"http://e/\"}").unwrap();
+        assert!(!p.convert_links);
+        assert!(p.queue.is_empty());
+        assert!(p.last_run.is_empty());
+    }
+
+    #[test]
+    fn grab_subdir_for_mirrors_the_wizard_rule() {
+        let dl_img = PathBuf::from("/dl").join("img").to_string_lossy().to_string();
+        assert_eq!(
+            grab_subdir_for("/dl", "http://h/a/index.html", "http://h/a/img/x.png"),
+            dl_img
+        );
+        assert_eq!(
+            grab_subdir_for("/dl", "http://h/a/", "http://h/a/img/x.png"),
+            dl_img
+        );
+        assert_eq!(grab_subdir_for("/dl", "http://h/a/index.html", "http://h/top.png"), "/dl");
+    }
+
+    struct NullSink;
+    impl EventSink for NullSink {
+        fn emit(&self, _event: AppEvent) {}
+    }
+
+    /// F1 end-to-end: a tiny local site (python http.server on
+    /// 8937) is explored and downloaded through the core APIs; once
+    /// the run settles, the pages on disk must reference each other
+    /// relatively — no absolute 127.0.0.1 URL may survive.
+    #[test]
+    fn grab_run_end_to_end_rewrites_downloaded_pages() {
+        let pid = std::process::id();
+        let site_dir = std::env::temp_dir().join(format!("ndm-wsf-site-{pid}"));
+        let dl_dir = std::env::temp_dir().join(format!("ndm-wsf-dl-{pid}"));
+        let _ = std::fs::remove_dir_all(&site_dir);
+        let _ = std::fs::remove_dir_all(&dl_dir);
+        std::fs::create_dir_all(&site_dir).unwrap();
+        std::fs::create_dir_all(&dl_dir).unwrap();
+        std::fs::write(
+            site_dir.join("index.html"),
+            "<link href=\"style.css\"><a href=\"page2.html\">two</a>\
+             <a href=\"http://127.0.0.1:8937/page2.html\">abs</a>",
+        )
+        .unwrap();
+        std::fs::write(
+            site_dir.join("page2.html"),
+            "<a href=\"index.html\">home</a><a href=\"doc.pdf\">doc</a>",
+        )
+        .unwrap();
+        std::fs::write(site_dir.join("style.css"), "body{}").unwrap();
+        std::fs::write(site_dir.join("doc.pdf"), "%PDF-fake").unwrap();
+        let mut server = std::process::Command::new("python3")
+            .args([
+                "-m",
+                "http.server",
+                "8937",
+                "--bind",
+                "127.0.0.1",
+                "--directory",
+                site_dir.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("python3 http.server");
+        // wait for the port
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while std::net::TcpStream::connect("127.0.0.1:8937").is_err() {
+            assert!(Instant::now() < deadline, "the fixture server never came up");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let state = Arc::new(state_with_data_file(dl_dir.join("downloads.json")));
+            let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+            let site = crate::rt::block_on(grab_explore(
+                ctx.clone(),
+                GrabExploreArgs {
+                    url: "http://127.0.0.1:8937/index.html".to_string(),
+                    depth_same: 1,
+                    depth_other: 0,
+                    whole_site: false,
+                    no_parent: false,
+                    same_site_files_only: true,
+                    include_exts: Vec::new(),
+                    exclude_exts: Vec::new(),
+                    min_kb: 0,
+                    max_mb: 0,
+                },
+            ))
+            .expect("explore the fixture site");
+            // exploration returns FILES only (pages are crawled,
+            // not listed): style.css from the start page, doc.pdf
+            // from page2 one level down
+            assert_eq!(site.items.len(), 2, "style.css + doc.pdf: {:?}", site.items.iter().map(|i| &i.url).collect::<Vec<_>>());
+            // the run's pages join it explicitly (the convert flow
+            // adds the start page the same way; here page2 is added
+            // too, so the pair can be checked against each other)
+            let mut run_urls: Vec<String> = site.items.iter().map(|i| i.url.clone()).collect();
+            run_urls.push("http://127.0.0.1:8937/index.html".to_string());
+            run_urls.push("http://127.0.0.1:8937/page2.html".to_string());
+            grab_register_run(run_urls);
+            let dir = dl_dir.to_string_lossy().to_string();
+            for url in [
+                "http://127.0.0.1:8937/index.html",
+                "http://127.0.0.1:8937/page2.html",
+            ] {
+                crate::rt::block_on(add_download(
+                    ctx.clone(),
+                    url.to_string(),
+                    dir.clone(),
+                    None,
+                    Some("Grabber".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
+                .expect("add the page");
+            }
+            for it in &site.items {
+                crate::rt::block_on(add_download(
+                    ctx.clone(),
+                    it.url.clone(),
+                    dir.clone(),
+                    None,
+                    Some("Grabber".to_string()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    it.size,
+                    None,
+                ))
+                .expect("add the explored file");
+            }
+            // settle: tick the rewrite pass until the absolute
+            // self-reference in index.html has been converted
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                grab_rewrite_tick(&state);
+                let page = std::fs::read_to_string(dl_dir.join("index.html"))
+                    .unwrap_or_default();
+                if !page.is_empty() && !page.contains("127.0.0.1") {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the grab run never settled: {page}");
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            let index = std::fs::read_to_string(dl_dir.join("index.html")).unwrap();
+            assert!(index.contains("href=\"page2.html\""), "{index}");
+            assert!(index.contains("href=\"style.css\""), "{index}");
+            let two = std::fs::read_to_string(dl_dir.join("page2.html")).unwrap();
+            assert!(two.contains("href=\"index.html\""), "{two}");
+            assert!(two.contains("href=\"doc.pdf\""), "{two}");
+            assert!(!two.contains("127.0.0.1"), "{two}");
+            assert!(dl_dir.join("style.css").is_file());
+            assert!(dl_dir.join("doc.pdf").is_file());
+        }));
+        let _ = server.kill();
+        let _ = std::fs::remove_dir_all(&site_dir);
+        let _ = std::fs::remove_dir_all(&dl_dir);
+        result.unwrap();
     }
 }
 

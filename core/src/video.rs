@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime};
 
 /// Poison-tolerant lock for the settle/delete paths (mirrors the
@@ -1241,7 +1241,7 @@ struct Resolution {
     format_size_exact: bool,
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(PartialEq, Eq, Clone, Hash)]
 struct ResolutionKey {
     url: String,
     sel: String,
@@ -1318,11 +1318,108 @@ fn resolution_cache_store(key: ResolutionKey, res: Resolution, now: Instant) {
     }
 }
 
+/// Keys with a resolve run currently in flight, plus the condvar
+/// waiters sleep on. The picker seeding, the add flow's warm
+/// thread and the job's own resolve all chase the SAME key in
+/// the seconds around a Download click; without this they could
+/// each spawn their own yt-dlp for it — the exact duplicate the
+/// caches exist to remove, merely raced instead of serialised.
+static RESOLVE_INFLIGHT: (Mutex<Vec<ResolutionKey>>, Condvar) =
+    (Mutex::new(Vec::new()), Condvar::new());
+
+/// Rebuild the probe a cache hit stands for, so a resolve that
+/// waited on another thread's run applies the same learned
+/// fields as one that ran yt-dlp itself.
+fn probe_from_resolution(res: Resolution) -> ResolutionProbe {
+    ResolutionProbe {
+        expect_audio: res.expect_audio,
+        pair_audio_url: res.pair_audio_url,
+        expected_media: res.expected_media,
+        format_size: res.format_size,
+        format_size_exact: res.format_size_exact,
+        resolved: Some((res.title, res.streams)),
+    }
+}
+
+/// RAII: an in-flight claim is released — and its waiters woken —
+/// on every exit path, panic included.
+struct InflightClaim(ResolutionKey);
+
+impl Drop for InflightClaim {
+    fn drop(&mut self) {
+        let (lock, cvar) = &RESOLVE_INFLIGHT;
+        lock.lock().unwrap().retain(|k| k != &self.0);
+        cvar.notify_all();
+    }
+}
+
+/// Run `produce` (one yt-dlp resolve) for `key`, collapsing
+/// concurrent duplicates: a caller that finds the same key
+/// already in flight WAITS for that run and is then served from
+/// the resolution cache it leaves behind, instead of spawning a
+/// second yt-dlp for the same page + selector. A wait that
+/// outlives the resolve budget (the owner died without leaving
+/// a cache entry) falls through and runs the resolve itself —
+/// a duplicate is wasteful, a lost download is worse.
+fn resolve_streams_once(
+    key: &ResolutionKey,
+    produce: impl FnOnce() -> Option<ResolutionProbe>,
+) -> Option<ResolutionProbe> {
+    if let Some(res) = resolution_cache_get(key, Instant::now()) {
+        return Some(probe_from_resolution(res));
+    }
+    let (lock, cvar) = &RESOLVE_INFLIGHT;
+    {
+        let mut inflight = lock.lock().unwrap();
+        let deadline = Instant::now() + RESOLVE_TIMEOUT + std::time::Duration::from_secs(15);
+        while inflight.contains(key) {
+            let (guard, _) = cvar
+                .wait_timeout(inflight, std::time::Duration::from_millis(100))
+                .unwrap();
+            inflight = guard;
+            if let Some(res) = resolution_cache_get(key, Instant::now()) {
+                return Some(probe_from_resolution(res));
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+        if inflight.contains(key) {
+            // the owner overran its budget without producing a
+            // cache entry: take over rather than wait forever
+            inflight.retain(|k| k != key);
+        }
+        inflight.push(key.clone());
+    }
+    let _claim = InflightClaim(key.clone());
+    let probe = produce()?;
+    // Leave the result where a waiter (or the next caller) finds
+    // it — the callers ALSO store it (built from the job's own
+    // fields, identically), which is idempotent.
+    if let Some((title, streams)) = &probe.resolved {
+        resolution_cache_store(
+            key.clone(),
+            Resolution {
+                title: title.clone(),
+                streams: streams.clone(),
+                expect_audio: probe.expect_audio,
+                expected_media: probe.expected_media,
+                pair_audio_url: probe.pair_audio_url.clone(),
+                format_size: probe.format_size,
+                format_size_exact: probe.format_size_exact,
+            },
+            Instant::now(),
+        );
+    }
+    Some(probe)
+}
+
 /// The full outcome of one yt-dlp resolve run. `resolved` is None
 /// when the selection is not eligible for the parallel engine (the
 /// caller then takes the yt-dlp download path) — the learned fields
 /// are still meaningful in that case and the job wrapper applies
 /// them exactly as the inline code did before this split.
+#[derive(Clone)]
 struct ResolutionProbe {
     expect_audio: bool,
     pair_audio_url: Option<String>,
@@ -1401,6 +1498,29 @@ fn resolve_streams_core(
     ytdlp: &Path,
     components_dir: &Path,
 ) -> Option<ResolutionProbe> {
+    // WS-B derivation: when the picker probe already fetched
+    // this page (its `-J` dump sits in the probe cache) and the
+    // page offers exactly ONE format, the selector's outcome is
+    // already known — every picker selector is a fallback chain
+    // whose last resort is that sole format — so the streams are
+    // derived from the cached dump and yt-dlp is NOT spawned a
+    // second time for the same page. This is the common direct-
+    // media / single-file case (a bare .mp4, a page with one
+    // <video>). Multi-format pages keep the real resolve run:
+    // their selectors are yt-dlp filter expressions and picking
+    // from them here would be a fork of yt-dlp's own selection.
+    // A site login gates this out: the picker probe ran WITHOUT
+    // the login, so its dump may describe a different (public)
+    // view of the page than the job's authenticated resolve.
+    if login.is_empty() {
+        if let Some(raw) = ndm::video_probe::cached_probe_json(url, components_dir, cookies) {
+            if single_format_probe(&raw) {
+                if let Some(p) = resolution_from_json(&raw, url, sel, audio) {
+                    return Some(p);
+                }
+            }
+        }
+    }
     let mut args = base_args_for_url(url, components_dir, cookies);
     if !login.is_empty() {
         args.push("--username".into());
@@ -1462,10 +1582,36 @@ fn resolve_streams_core(
         .find(|l| l.trim_start().starts_with('{'))?
         .to_string();
     let v: serde_json::Value = serde_json::from_str(&line).ok()?;
+    resolution_from_json(&v, url, sel, audio)
+}
+
+/// True when a probe dump describes exactly one usable format —
+/// the case where a selector's outcome needs no second yt-dlp
+/// run to know (see the derivation in `resolve_streams_core`).
+/// Storyboards and playlist formats never count: they are not
+/// the page's video, whatever the selector would say.
+fn single_format_probe(v: &serde_json::Value) -> bool {
+    let formats = ndm::video_probe::probe_formats(v);
+    formats.len() == 1
+        && formats[0]["ext"].as_str().unwrap_or("") != "mhtml"
+        && !format_is_playlist(&formats[0])
+}
+
+/// Interpret one yt-dlp JSON dump (a resolve run's `-j` output,
+/// or the picker probe's cached `-J` dump when it suffices) into
+/// a ResolutionProbe: the selected formats' streams when they
+/// are directly downloadable, plus everything learned about the
+/// selection either way.
+fn resolution_from_json(
+    v: &serde_json::Value,
+    url: &str,
+    sel: &str,
+    audio: bool,
+) -> Option<ResolutionProbe> {
     let resolved_title = v["title"].as_str().unwrap_or("").to_string();
     let mut formats: Vec<&serde_json::Value> = match v["requested_formats"].as_array() {
         Some(arr) if !arr.is_empty() => arr.iter().collect(),
-        _ => vec![&v],
+        _ => vec![v],
     };
     // W-2: a page's own direct media source outranks an indirect
     // variant. When the app's best-quality selection resolved to
@@ -1481,7 +1627,7 @@ fn resolve_streams_core(
         let selection_is_playlist =
             !formats.is_empty() && formats.iter().all(|f| format_is_playlist(f));
         if selection_is_playlist {
-            if let Some(direct) = best_direct_format(&v) {
+            if let Some(direct) = best_direct_format(v) {
                 formats = vec![direct];
             }
         }
@@ -1678,39 +1824,25 @@ pub fn warm_resolution(
         cookies_sig: cookies_signature(cookies.as_deref()),
         proxy: ndm::global_proxy(),
     };
-    if resolution_cache_get(&key, Instant::now()).is_some() {
-        return;
-    }
     let Some(ytdlp) = find_tool("yt-dlp", components_dir) else {
         return;
     };
-    let Some(probe) = resolve_streams_core(
-        url,
-        sel,
-        audio,
-        cookies.as_deref(),
-        login,
-        password,
-        &ytdlp,
-        components_dir,
-    ) else {
-        return;
-    };
-    if let Some((title, streams)) = probe.resolved {
-        resolution_cache_store(
-            key,
-            Resolution {
-                title,
-                streams,
-                expect_audio: probe.expect_audio,
-                expected_media: probe.expected_media,
-                pair_audio_url: probe.pair_audio_url,
-                format_size: probe.format_size,
-                format_size_exact: probe.format_size_exact,
-            },
-            Instant::now(),
-        );
-    }
+    // resolve_streams_once owns the cache check, the in-flight
+    // dedup and the store: a warm that races the job's own
+    // resolve (or another warm of the same row) spawns yt-dlp
+    // once between them, never twice.
+    let _ = resolve_streams_once(&key, || {
+        resolve_streams_core(
+            url,
+            sel,
+            audio,
+            cookies.as_deref(),
+            login,
+            password,
+            &ytdlp,
+            components_dir,
+        )
+    });
 }
 
 /// Which picker rows the seeding below warms: the row the picker
@@ -2013,16 +2145,19 @@ impl VideoJob {
         components_dir: &Path,
         sel: &str,
     ) -> Option<(String, Vec<DirectStream>)> {
-        let probe = resolve_streams_core(
-            &self.url,
-            sel,
-            self.audio,
-            self.cookies.as_deref(),
-            &self.login,
-            &self.password,
-            ytdlp,
-            components_dir,
-        )?;
+        let key = self.resolution_key(sel);
+        let probe = resolve_streams_once(&key, || {
+            resolve_streams_core(
+                &self.url,
+                sel,
+                self.audio,
+                self.cookies.as_deref(),
+                &self.login,
+                &self.password,
+                ytdlp,
+                components_dir,
+            )
+        })?;
         // The learned fields are applied even when the selection
         // turns out ineligible for the engine: the yt-dlp fallback
         // downloads this same selection, so its guards still need
@@ -3492,18 +3627,30 @@ impl VideoJob {
                     p.status = "error".to_string();
                     p.speed_bps = 0.0;
                     let eb = err_buf.lock().unwrap();
-                    p.error = eb
-                        .lines()
-                        .rev()
-                        .find(|l| l.contains("ERROR"))
-                        .map(|l| l.trim().to_string())
-                        .or_else(|| {
-                            eb.lines()
-                                .rev()
-                                .find(|l| !l.trim().is_empty())
-                                .map(|l| l.trim().to_string())
-                        })
-                        .or_else(|| Some("yt-dlp failed".to_string()));
+                    // On a machine that cannot run a JavaScript
+                    // runtime, a challenge-gated failure reads in
+                    // plain language instead of as a raw yt-dlp
+                    // line — checked against the whole stderr
+                    // tail, where the JS wording may sit in a
+                    // WARNING above the final ERROR.
+                    let js_plain = if ndm::video_probe::no_js_runtime_mode() {
+                        ndm::video_probe::js_required_error(&eb)
+                    } else {
+                        None
+                    };
+                    p.error = js_plain.or_else(|| {
+                        eb.lines()
+                            .rev()
+                            .find(|l| l.contains("ERROR"))
+                            .map(|l| l.trim().to_string())
+                            .or_else(|| {
+                                eb.lines()
+                                    .rev()
+                                    .find(|l| !l.trim().is_empty())
+                                    .map(|l| l.trim().to_string())
+                            })
+                            .or_else(|| Some("yt-dlp failed".to_string()))
+                    });
                 }
             }
             drop(p);
@@ -3867,6 +4014,155 @@ mod tests {
         assert!(probe.resolved.is_some());
         assert_eq!(runs(), 2, "an expired entry re-resolves exactly once");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn single_format_probe_recognises_only_the_derivable_case() {
+        // a direct media file: the media fields sit on the result
+        // object itself, no formats array — exactly one format
+        let direct: serde_json::Value = serde_json::json!({
+            "id": "clip", "title": "clip",
+            "url": "http://127.0.0.1/clip.mp4", "ext": "mp4", "duration": 12,
+        });
+        assert!(single_format_probe(&direct));
+        // a formats array with exactly one real format
+        let one: serde_json::Value = serde_json::json!({
+            "id": "x", "title": "x",
+            "formats": [{ "format_id": "0", "url": "http://h/v.mp4", "ext": "mp4", "protocol": "https" }],
+        });
+        assert!(single_format_probe(&one));
+        // two formats: a selector's choice is no longer knowable
+        // without yt-dlp — never derivable
+        let two: serde_json::Value = serde_json::json!({
+            "id": "x", "title": "x",
+            "formats": [
+                { "format_id": "0", "url": "http://h/v.mp4", "ext": "mp4", "protocol": "https" },
+                { "format_id": "1", "url": "http://h/a.m4a", "ext": "m4a", "protocol": "https" }
+            ],
+        });
+        assert!(!single_format_probe(&two));
+        // a single PLAYLIST format is not a direct stream either
+        let hls: serde_json::Value = serde_json::json!({
+            "id": "x", "title": "x",
+            "formats": [{ "format_id": "0", "url": "http://h/v.m3u8", "ext": "mp4", "protocol": "m3u8_native" }],
+        });
+        assert!(!single_format_probe(&hls));
+        // a lone storyboard is not the page's video
+        let board: serde_json::Value = serde_json::json!({
+            "id": "x", "title": "x",
+            "formats": [{ "format_id": "sb0", "url": "http://h/s.jpg", "ext": "mhtml", "protocol": "https" }],
+        });
+        assert!(!single_format_probe(&board));
+    }
+
+    /// WS-B derivation, end to end with a counting stub: the
+    /// picker probe runs yt-dlp once; the Download click's
+    /// resolve for a single-format page then runs it ZERO more
+    /// times — the streams come from the probe's cached dump.
+    #[cfg(unix)]
+    #[test]
+    fn click_resolve_derives_from_the_picker_probe_without_a_second_run() {
+        let dir =
+            std::env::temp_dir().join(format!("ndm-derive-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let count_file = dir.join("count.txt");
+        // the generic extractor's shape for a bare .mp4: media
+        // fields on the result object, NO formats array — and the
+        // same body answers a -j resolve, so a run that DID happen
+        // would still succeed (and be counted)
+        let json = "{\"id\":\"clip\",\"title\":\"Clip\",\"url\":\"https://cdn.example/clip.mp4\",\"ext\":\"mp4\",\"protocol\":\"https\",\"vcodec\":\"avc1.640028\",\"acodec\":\"mp4a.40.2\",\"tbr\":800,\"duration\":12}";
+        let script = format!(
+            "#!/bin/sh\necho x >> \"{}\"\nprintf '%s\\n' '{}'\n",
+            count_file.display(),
+            json
+        );
+        let stub = dir.join("yt-dlp");
+        std::fs::write(&stub, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let runs = || -> usize {
+            std::fs::read_to_string(&count_file)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        let url = "https://derive.example/direct/clip.mp4";
+        // the picker's Fetch Info: one run, and it fills the probe cache
+        let info = ndm::video_probe::probe(url, &dir, None).expect("picker probe");
+        assert_eq!(info.title, "Clip");
+        assert_eq!(runs(), 1);
+        // the click's resolve: derived, no second spawn
+        let probe = resolve_streams_core(
+            url,
+            &ndm::video_probe::best_selector(),
+            false,
+            None,
+            "",
+            "",
+            &stub,
+            &dir,
+        )
+        .expect("the resolve must be derived from the probe dump");
+        let (title, streams) = probe.resolved.expect("single format must resolve");
+        assert_eq!(title, "Clip");
+        assert_eq!(streams.len(), 1);
+        assert_eq!(streams[0].url, "https://cdn.example/clip.mp4");
+        assert!(streams[0].has_audio);
+        assert_eq!(runs(), 1, "derivation must not spawn yt-dlp again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS-B in-flight dedup: two callers resolving the same key
+    /// at the same moment share ONE produce run — the second is
+    /// served the first's result from the resolution cache.
+    #[test]
+    fn concurrent_resolves_of_one_key_run_the_resolve_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+        let key = test_key("https://example.com/watch?v=dedup1", "bv*+ba");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mk = |calls: Arc<AtomicUsize>| {
+            move || {
+                calls.fetch_add(1, AOrd::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Some(ResolutionProbe {
+                    expect_audio: true,
+                    pair_audio_url: None,
+                    expected_media: None,
+                    format_size: None,
+                    format_size_exact: false,
+                    resolved: Some((
+                        "t".to_string(),
+                        vec![DirectStream {
+                            url: "https://cdn.example/v.mp4".to_string(),
+                            ext: "mp4".to_string(),
+                            has_audio: true,
+                            cookie: None,
+                            referer: None,
+                        }],
+                    )),
+                })
+            }
+        };
+        let (c1, c2) = (calls.clone(), calls.clone());
+        let k1 = key.clone();
+        let t1 = std::thread::spawn(move || resolve_streams_once(&k1, mk(c1)));
+        // make sure thread 1 holds the claim before thread 2 calls
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let r2 = resolve_streams_once(&key, mk(c2));
+        let r1 = t1.join().unwrap();
+        assert_eq!(
+            calls.load(AOrd::SeqCst),
+            1,
+            "two concurrent resolves of one key must share one run"
+        );
+        assert!(r1.and_then(|p| p.resolved).is_some());
+        let (title, streams) = r2
+            .and_then(|p| p.resolved)
+            .expect("the waiter must be served the shared result");
+        assert_eq!(title, "t");
+        assert_eq!(streams.len(), 1);
     }
 
     #[test]
