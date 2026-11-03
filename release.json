@@ -1,12 +1,16 @@
 {
-  "version": "2.0.9",
-  "min_supported": "2.0.9",
-  "notes": "Nill Download Manager 2.0.9 is a correctness release that grew out of a screen recording of a real 2.0.8 video download whose numbers did not tell the truth. Video progress now counts real bytes: the reported total no longer grows together with the downloaded amount — a 24 MB video could previously sail past 110 MB on the counter while pinned at 100% — and the percentage means what it says in the card, the dialog and the saved journal. Time-left figures are marked \"~\" until at least 256 KB over 10 seconds makes them worth trusting, a starting download shows its steps — resolving, probing, starting — instead of one opaque \"Preparing…\", and the card declares \"Finishing…\" only once the numbers have actually settled. Relaunching inside a scheduled window no longer replays the whole queue on every launch, queued downloads start promptly instead of stalling, and a browser hand-off can no longer be lost if the browser restarts its extension worker at the wrong moment. The native host now follows the browser's own cookie rules — host-only cookies stay on their host and path boundaries are respected — and two running copies of NDM can no longer process the same browser offer twice or splice each other's saved progress into a corrupt file. The quality picker now quotes the size of the format that will actually download, so the size beside a quality is the size of the file you get. A finished video's Open Folder reveals the merged file itself, and the extension-update notice is tied to the version it was dismissed for, so it warns again when it should. 2.0.9 is a required update for older versions.",
-  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.9/NDM_2.0.9_amd64.deb",
-  "deb_sha256": "2876ce69d97002bc43586127273f43cfbb7f14c10ead309f2d88d55fe57da18b",
-  "ext_sha256": "03613555c84b7aa1be6031d378bea1f692ac76fd5cd13cd28197eca4651c0263",
-  "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.9/NDM_2.0.9_Windows_Portable.zip",
-  "win_sha256": "b69d6b41684b91de833e0ca9f77bbb6730f0a0475c627747f977b41a35384187",
-  "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.0.9/NDM_2.0.9_x64-setup.exe",
-  "win_setup_sha256": "94398fbba1a6aacb8359349bf71e2200c336791d0329d65ce7006994bb59f2c9"
+  "version": "2.2.0",
+  "min_supported": "2.2.0",
+  "notes": "Nill Download Manager 2.2.0 closes the remaining measured gaps against IDM-class download managers: cookie-gated sites now download (session cookies are kept), trickling connections are detected and replaced instead of stalling a download forever, one throttled response no longer slows the whole pool, starts take fewer round trips and resume checks run in parallel, downloads survive a server dropping range support mid-download, and FTP downloads are supported with resume where the server allows. Video information loads instantly on repeat lookups, and the pre-Windows-10 video path no longer depends on components those systems may not run. A program such as an antivirus scanner can run automatically when a download completes; the scheduler gains day-of-week, one-time and synchronize modes; categories can match by site; the grabber can rewrite links for offline browsing and run on a schedule; the extension's force/bypass hold-keys are configurable; finished files can be dragged out of the list; and Windows gets a single universal installer that installs the right build for the machine, 64-bit or 32-bit.",
+  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.2.0/NDM_2.2.0_amd64.deb",
+  "deb_sha256": "8cf914dbea88068be6cf26df1e40a9149c8c052c22cd12d99565b6fc2039a2c2",
+  "ext_sha256": "50a54e9efd563279547951ae76925bf84ffe360b23660d762ce28086c3ae6e19",
+  "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.2.0/NDM_2.2.0_Windows_Portable.zip",
+  "win_sha256": "b241c9ba9863af284c22ed5811f53f63a68f9b322fffcbcb60d5927908c79023",
+  "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.2.0/NDM_2.2.0_setup.exe",
+  "win_setup_sha256": "b4c0ba72fbbb141316c05b58046bb9084a2e2904f9dbeb120925c6f613740fe2",
+  "win_x86_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.2.0/NDM_2.2.0_Windows_Portable_x86.zip",
+  "win_x86_sha256": "1aa89e531652ff409539942b56dbf175f7c2bad5d8df4658c3048c7e6d838de5",
+  "win_x86_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.2.0/NDM_2.2.0_setup.exe",
+  "win_x86_setup_sha256": "b4c0ba72fbbb141316c05b58046bb9084a2e2904f9dbeb120925c6f613740fe2"
 }
