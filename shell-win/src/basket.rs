@@ -36,7 +36,7 @@ use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindowVisible, KillTimer, LoadCursorW,
+    CreateWindowExW, DefWindowProcW, IsWindowVisible, KillTimer, LoadCursorW,
     RegisterClassW, SendMessageW, SetTimer, ShowWindow, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, HTCAPTION, IDC_ARROW, SW_HIDE, SW_SHOW, WINDOW_EX_STYLE, WM_CLOSE, WM_COMMAND,
     WM_CREATE, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DROPFILES, WM_LBUTTONDOWN, WM_NCLBUTTONDOWN,

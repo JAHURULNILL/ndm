@@ -164,7 +164,7 @@ fn register_class() {
 }
 
 fn opts_lv(d: &VidDlg) -> ListView {
-    ListView { hwnd: h(d.opts), block_map_column: None }
+    ListView { hwnd: h(d.opts) }
 }
 
 fn routed_dir(cat: &str) -> String {

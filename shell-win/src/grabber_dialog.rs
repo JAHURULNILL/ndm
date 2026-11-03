@@ -436,7 +436,7 @@ fn grab_visible(d: &GrabDlg, it: &serde_json::Value) -> bool {
 }
 
 fn sync_kinds(d: &mut GrabDlg) {
-    let lv = ListView { hwnd: h(d.kinds_lv), block_map_column: None };
+    let lv = ListView { hwnd: h(d.kinds_lv) };
     for (row, kind) in d.kind_rows.clone().iter().enumerate() {
         if lv.is_checked(row as i32) {
             d.kinds_off.remove(kind);
@@ -447,7 +447,7 @@ fn sync_kinds(d: &mut GrabDlg) {
 }
 
 fn sync_results(d: &mut GrabDlg) {
-    let lv = ListView { hwnd: h(d.results_lv), block_map_column: None };
+    let lv = ListView { hwnd: h(d.results_lv) };
     for (row, &idx) in d.visible_rows.clone().iter().enumerate() {
         if lv.is_checked(row as i32) {
             d.unchecked.remove(&idx);
@@ -470,7 +470,7 @@ fn render_kinds() {
         }
     }
     d.kind_rows = counts.iter().map(|(k, _)| k.clone()).collect();
-    let lv = ListView { hwnd: h(d.kinds_lv), block_map_column: None };
+    let lv = ListView { hwnd: h(d.kinds_lv) };
     lv.clear();
     for (i, (kind, n)) in counts.iter().enumerate() {
         lv.insert_row(i as i32, &[format!("{kind} ({n}")]);
@@ -483,7 +483,7 @@ fn render_list() {
         let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
         let Some(d) = guard.as_mut() else { return };
         sync_kinds(d);
-        let lv = ListView { hwnd: h(d.results_lv), block_map_column: None };
+        let lv = ListView { hwnd: h(d.results_lv) };
         lv.clear();
         d.visible_rows.clear();
         for (i, it) in d.items.clone().iter().enumerate() {

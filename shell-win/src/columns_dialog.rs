@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::UI::Controls::NMHDR;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW,
-    RegisterClassW, SetForegroundWindow, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    RegisterClassW, SetForegroundWindow, ShowWindow, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, IDC_ARROW, SW_RESTORE, SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WM_NOTIFY, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX,
     WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
@@ -111,7 +111,7 @@ fn register_class() {
 }
 
 fn lv(d: &ColDlg) -> ListView {
-    ListView { hwnd: h(d.list), block_map_column: None }
+    ListView { hwnd: h(d.list) }
 }
 
 fn label_of(id: &str) -> &'static str {

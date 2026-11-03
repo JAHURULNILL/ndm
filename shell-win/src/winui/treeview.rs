@@ -47,35 +47,6 @@ impl TreeView {
         }
     }
 
-    /// Insert a node. `parent == None` inserts at the root.
-    pub fn insert(&self, parent: Option<HTREEITEM>, text: &str) -> HTREEITEM {
-        let mut buf = wide(text);
-        let item = TVITEMW {
-            mask: TVIF_TEXT,
-            pszText: windows::core::PWSTR(buf.as_mut_ptr()),
-            ..Default::default()
-        };
-        let ins = TVINSERTSTRUCTW {
-            hParent: parent.unwrap_or(TVI_ROOT),
-            hInsertAfter: TVI_LAST,
-            Anonymous: TVINSERTSTRUCTW_0 { item },
-        };
-        unsafe {
-            let r = send(self.hwnd, TVM_INSERTITEMW, WPARAM(0), LPARAM(&ins as *const TVINSERTSTRUCTW as isize));
-            HTREEITEM(r)
-        }
-    }
-
-    /// Insert a root node and its children in one call (the category
-    /// tree's initial shape). Returns the root handle.
-    pub fn insert_with_children(&self, text: &str, children: &[&str]) -> HTREEITEM {
-        let root = self.insert(None, text);
-        for child in children {
-            self.insert(Some(root), child);
-        }
-        root
-    }
-
     /// Insert a node carrying an application tag in its lParam
     /// (TVIF_PARAM) — the category tree's filter keys ride here, so
     /// TVN_SELCHANGEDW's NMTREEVIEWW.itemNew.lParam names the

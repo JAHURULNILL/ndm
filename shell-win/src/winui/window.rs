@@ -20,10 +20,6 @@ pub struct WindowSpec {
     pub ex_style: WINDOW_EX_STYLE,
     pub width: i32,
     pub height: i32,
-    /// Minimum tracking size enforced by the caller on WM_GETMINMAXINFO
-    /// (kept as data here so the spec is the single source of truth).
-    pub min_width: i32,
-    pub min_height: i32,
 }
 
 impl WindowSpec {
@@ -38,8 +34,6 @@ impl WindowSpec {
             ex_style: WINDOW_EX_STYLE(0),
             width: 1120,
             height: 720,
-            min_width: 860,
-            min_height: 540,
         }
     }
 }

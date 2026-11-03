@@ -629,7 +629,7 @@ fn status_text(view: &ProgressView) -> String {
             if view.error.is_empty() {
                 "Error".to_string()
             } else {
-                view.error.clone()
+                ndm_core::display_error(&view.error)
             }
         }
         "cancelled" => "Cancelled".to_string(),
@@ -875,9 +875,13 @@ fn update_table(d: &mut ProgDlg, view: &ProgressView) {
         }
         // §3 Info wording; a finished entry's rows all read
         // "Done" (batch-3's N1 fix — finished workers sit at
-        // phase 0, which must not read as "Waiting…").
+        // phase 0, which must not read as "Waiting…"). A paused
+        // entry's rows read "Paused": the row Info follows the
+        // entry's state, not a stale live code (m3).
         let info = if finished {
             "Done"
+        } else if view.status == "paused" {
+            "Paused"
         } else {
             match view.conns_state.get(i).copied().unwrap_or(0) {
                 1 => "Send GET…",
@@ -890,7 +894,7 @@ fn update_table(d: &mut ProgDlg, view: &ProgressView) {
     if rows == d.table_rows {
         return;
     }
-    let lv = ListView { hwnd: h(d.conns), block_map_column: None };
+    let lv = ListView { hwnd: h(d.conns) };
     let same_shape = rows.len() == d.table_rows.len()
         && rows.iter().zip(&d.table_rows).all(|(a, b)| a[0] == b[0]);
     if same_shape {

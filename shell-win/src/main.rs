@@ -250,11 +250,7 @@ static QUEUE_MENU: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static MAIN_RAW: AtomicIsize = AtomicIsize::new(0);
 
 fn list_view() -> ListView {
-    let sub = *BLOCK_SUBITEM.lock().unwrap_or_else(|e| e.into_inner());
-    ListView {
-        hwnd: unsafe { H_LIST },
-        block_map_column: if sub >= 0 { Some(sub) } else { None },
-    }
+    ListView { hwnd: unsafe { H_LIST } }
 }
 fn status_bar() -> StatusBar {
     StatusBar { hwnd: unsafe { H_STATUS } }
@@ -1312,23 +1308,6 @@ fn show_delete_confirm(hwnd: HWND, ids: &[String]) -> Option<bool> {
         outcome.values.get(1),
         Some(winui::dialog::FieldValue::Checked(true))
     ))
-}
-
-/// The Phase-3 placeholder: a real modal dialog that says plainly
-/// the named dialog is not built yet. Nothing is read or written.
-fn show_phase3_placeholder(hwnd: HWND, name: &str) {
-    let title: &'static str = Box::leak(format!("{name} — under construction").into_boxed_str());
-    let line1: &'static str =
-        Box::leak(format!("The {name} dialog is Phase 3 and is not built yet.").into_boxed_str());
-    let spec = winui::dialog::DialogSpec::new(
-        title,
-        vec![
-            winui::dialog::FieldSpec::label(line1),
-            winui::dialog::FieldSpec::label("Nothing was changed."),
-        ],
-    );
-    let _ = winui::dialog::show_modal(hwnd, &spec);
-    set_status(1, &format!("{name} — Phase 3 dialog, not built yet"));
 }
 
 /// Add New Download (Tasks/File menu, toolbar, incoming offers).

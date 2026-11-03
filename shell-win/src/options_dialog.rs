@@ -509,7 +509,7 @@ fn logins_lv() -> Option<ListView> {
         use windows::Win32::UI::WindowsAndMessaging::GetDlgItem;
         GetDlgItem(Some(h(r)), ID_LOGINS)
             .ok()
-            .map(|hwnd| ListView { hwnd, block_map_column: None })
+            .map(|hwnd| ListView { hwnd })
     }
 }
 
@@ -522,7 +522,7 @@ fn cats_lv() -> Option<ListView> {
         use windows::Win32::UI::WindowsAndMessaging::GetDlgItem;
         GetDlgItem(Some(h(r)), ID_CATS)
             .ok()
-            .map(|hwnd| ListView { hwnd, block_map_column: None })
+            .map(|hwnd| ListView { hwnd })
     }
 }
 

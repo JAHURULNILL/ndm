@@ -9,7 +9,7 @@ use windows::Win32::UI::Controls::{
     LIST_VIEW_ITEM_STATE_FLAGS, LVCOLUMNW, LVCF_SUBITEM, LVCF_TEXT, LVCF_WIDTH, LVIF_TEXT,
     LVIS_SELECTED, LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS, LVM_DELETECOLUMN,
     LVM_DELETEITEM, LVM_GETITEMCOUNT, LVM_GETITEMSTATE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE,
+    LVM_INSERTITEMW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE,
     LVM_SETITEMTEXTW, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
     LVS_EX_GRIDLINES, LVS_REPORT, LVS_SHOWSELALWAYS, LVNI_SELECTED, WC_LISTVIEWW,
 };
@@ -26,10 +26,6 @@ pub struct ColumnSpec {
 
 pub struct ListView {
     pub hwnd: HWND,
-    /// Subitem index that carries the block map, if the row model
-    /// uses one (see customdraw::BLOCK_MAP_SUBITEM). None = custom
-    /// draw still armed for item notifications, no cell painting.
-    pub block_map_column: Option<i32>,
 }
 
 impl ListView {
@@ -61,7 +57,7 @@ impl ListView {
                 extended |= LVS_EX_CHECKBOXES as isize;
             }
             send(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE, WPARAM(0), LPARAM(extended));
-            let lv = Self { hwnd, block_map_column: None };
+            let lv = Self { hwnd };
             for (i, col) in columns.iter().enumerate() {
                 lv.insert_column(i as i32, col);
             }
@@ -90,11 +86,6 @@ impl ListView {
             self.set_cell(row, j as i32, cell, true);
         }
         row
-    }
-
-    /// Append a row at the end; the caller tracks the row count.
-    pub fn append_row(&self, row: i32, cells: &[String]) -> i32 {
-        self.insert_row(row, cells)
     }
 
     /// Update one cell of an existing row.
@@ -221,12 +212,6 @@ impl ListView {
             for _ in 0..count {
                 send(self.hwnd, LVM_DELETECOLUMN, WPARAM(0), LPARAM(0));
             }
-        }
-    }
-
-    pub fn set_column_width(&self, index: i32, width: i32) {
-        unsafe {
-            send(self.hwnd, LVM_SETCOLUMNWIDTH, WPARAM(index as usize), LPARAM(width as isize));
         }
     }
 

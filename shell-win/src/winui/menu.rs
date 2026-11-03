@@ -23,9 +23,6 @@ impl MenuItem {
     pub fn cmd(id: i32, label: &'static str) -> Self {
         MenuItem::Command { id, label, owner_draw: false }
     }
-    pub fn cmd_owner_draw(id: i32, label: &'static str) -> Self {
-        MenuItem::Command { id, label, owner_draw: true }
-    }
     pub fn submenu(label: &'static str, items: Vec<MenuItem>) -> Self {
         MenuItem::Submenu { label, items }
     }

@@ -23,7 +23,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW,
-    RegisterClassW, SetForegroundWindow, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    RegisterClassW, SetForegroundWindow, ShowWindow, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, IDC_ARROW, SW_RESTORE, SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED,
     WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
@@ -237,7 +237,7 @@ fn render_files() {
         .collect();
     mine.sort_by_key(|v| pos.get(v.id.as_str()).copied().unwrap_or(usize::MAX));
     d.staged_order = mine.iter().map(|v| v.id.clone()).collect();
-    let lv = ListView { hwnd: h(d.files), block_map_column: None };
+    let lv = ListView { hwnd: h(d.files) };
     lv.clear();
     if mine.is_empty() {
         lv.insert_row(0, &["No downloads in this queue".to_string(), String::new()]);
@@ -331,7 +331,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
         ID_UP | ID_DOWN => {
             let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
             let Some(d) = guard.as_mut() else { return };
-            let lv = ListView { hwnd: h(d.files), block_map_column: None };
+            let lv = ListView { hwnd: h(d.files) };
             let Some(row) = lv.selected_rows().into_iter().next() else { return };
             let row = row as usize;
             let j = if id == ID_UP {
@@ -346,7 +346,7 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 render_files();
                 let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(d) = guard.as_mut() {
-                    let lv = ListView { hwnd: h(d.files), block_map_column: None };
+                    let lv = ListView { hwnd: h(d.files) };
                     lv.set_selected(j as i32, true);
                 }
             }

@@ -33,7 +33,8 @@ use windows::Win32::UI::Controls::{
 /// dialog's canvas. Phase 2 decides whether the map rides the Status
 /// subitem or a dedicated column; until then custom draw is armed
 /// for this subitem index and paints only when a row model marks
-/// the row as carrying a map (see `ListView::block_map_column`).
+/// the row as carrying a map (the row model's `has_block_map`
+/// answer in `on_custom_draw`).
 pub const BLOCK_MAP_SUBITEM: i32 = 3;
 
 /// Handle one NM_CUSTOMDRAW for the list. Returns the CDRF_* value

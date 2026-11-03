@@ -18,7 +18,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, LoadCursorW,
-    RegisterClassW, SetForegroundWindow, ShowWindow, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW,
+    RegisterClassW, SetForegroundWindow, ShowWindow, CS_HREDRAW, CS_VREDRAW,
     CW_USEDEFAULT, IDC_ARROW, SW_RESTORE, SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CREATE,
     WM_DESTROY, WNDCLASSW, WS_CAPTION, WS_CHILD, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU,
     WS_TABSTOP, WS_VISIBLE,
@@ -106,7 +106,7 @@ fn register_class() {
 fn render(cfg: &ToolbarCfg) {
     let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
     let Some(d) = guard.as_ref() else { return };
-    let lv = ListView { hwnd: h(d.list), block_map_column: None };
+    let lv = ListView { hwnd: h(d.list) };
     lv.clear();
     for (i, (_, dom, label)) in crate::TOOLBAR_DEFS.iter().enumerate() {
         lv.insert_row(i as i32, &[label.to_string()]);
@@ -122,7 +122,7 @@ fn read_back() -> ToolbarCfg {
     let Some(d) = guard.as_ref() else {
         return ToolbarCfg { hidden: Vec::new(), small: false };
     };
-    let lv = ListView { hwnd: h(d.list), block_map_column: None };
+    let lv = ListView { hwnd: h(d.list) };
     let hidden = crate::TOOLBAR_DEFS
         .iter()
         .enumerate()

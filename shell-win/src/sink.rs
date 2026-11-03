@@ -18,15 +18,12 @@
 //!     `ProgressView` — a shell-owned, field-readable decode of
 //!     the payload's own JSON wire shape (the exact
 //!     serialization `AppEvent::payload()` produces).
-//!
-//! `NullSink` stays shell-owned: a drop-everything sink for
-//! headless wiring and tests, implementing core's `EventSink`.
 
 pub use ndm_core::{AppEvent, AppState, Ctx, EventSink, ProgressPayload};
 
 /// Field-readable view of a core `ProgressPayload`, decoded from
-/// its serialized wire shape. Field names, order and types match
-/// core's struct exactly (the old mirror's list); missing keys
+/// its serialized wire shape. Field names and types match core's
+/// struct (the subset this shell reads); missing keys
 /// decode to the type's zero value, matching how the web UI
 /// treated absent fields.
 #[derive(Clone, Debug, Default)]
@@ -60,7 +57,6 @@ pub struct ProgressView {
     /// G2 completion action set + show-complete override
     pub completion_actions: Vec<String>,
     pub show_complete_override: Option<bool>,
-    pub final_path: String,
     /// truthful sub-status ("Probing connection…"); "" = none
     pub detail: String,
 }
@@ -134,14 +130,7 @@ impl From<&ProgressPayload> for ProgressView {
             show_complete_override: v
                 .get("show_complete_override")
                 .and_then(|x| x.as_bool()),
-            final_path: s(&v, "final_path"),
             detail: s(&v, "detail"),
         }
     }
-}
-
-/// A sink that drops everything — for headless wiring and tests.
-pub struct NullSink;
-impl EventSink for NullSink {
-    fn emit(&self, _event: AppEvent) {}
 }
