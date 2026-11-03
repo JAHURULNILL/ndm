@@ -170,7 +170,7 @@ jobs:
           }
           if (-not (Test-Path $makensis)) { throw "makensis not found" }
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
-          & $makensis "/DVERSION=$v" "/DSRCROOT=$PWD\NDM-Windows-Portable" "/DOUTFILE=$PWD\NDM_${v}_x64-setup.exe" "/DICON=$PWD\src-tauri\icons\icon.ico" scripts\installer.nsi
+          & $makensis "/DVERSION=$v" "/DSRCROOT=$PWD\NDM-Windows-Portable" "/DOUTFILE=$PWD\NDM_${v}_x64-setup.exe" "/DICON=$PWD\assets\icon.ico" scripts\installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path "NDM_${v}_x64-setup.exe")) { throw "installer exe was not produced" }
           Write-Host "installer built: NDM_${v}_x64-setup.exe"
