@@ -514,6 +514,44 @@ fn select_id(ui: &Ui, id: &str) {
     }
 }
 
+/// The file a finished entry drags out as (WS-J drag-out).
+/// `save_to` is core's out_path: the file itself for plain
+/// downloads; for video entries it is the folder and the file is
+/// the entry's own name inside it (or stem + a media extension) —
+/// the same resolution core's open_path applies. None when no
+/// real file is on disk.
+fn drag_out_file(d: &ProgressView) -> Option<PathBuf> {
+    let p = PathBuf::from(&d.save_to);
+    if p.is_file() {
+        return Some(p);
+    }
+    if !p.is_dir() || d.name.is_empty() || d.name.contains('/') {
+        return None;
+    }
+    let direct = p.join(&d.name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let stem = d.name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&d.name);
+    ["mp4", "mkv", "webm", "m4a", "mp3"]
+        .iter()
+        .map(|ext| p.join(format!("{stem}.{ext}")))
+        .find(|c| c.is_file())
+}
+
+/// file:// URIs for a drag carrying the given entries: every
+/// FINISHED one whose file exists, in the given order.
+/// Empty = no drag may start.
+fn drag_out_uris(ui: &Ui, ids: &[String]) -> Vec<String> {
+    let entries = ui.entries.borrow();
+    ids.iter()
+        .filter_map(|id| entries.get(id))
+        .filter(|d| d.status == "finished")
+        .filter_map(drag_out_file)
+        .map(|p| gtk::gio::File::for_path(&p).uri().to_string())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Settings accessors. Core's `Settings` fields are private to
 // the core crate, so the shell reads them through the struct's
@@ -2499,6 +2537,74 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
                 return gtk::glib::Propagation::Proceed;
             }
             gtk::glib::Propagation::Stop
+        });
+    }
+
+    // Drag-out (WS-J): drag a FINISHED row out of the list into
+    // a file manager / desktop and get the actual file — the
+    // inverse of the Drop Basket. The entry set is snapshotted
+    // at button-press (this GTK's TreeView collapses a
+    // multi-selection to the pressed row on press, before
+    // drag-begin runs — the snapshot is what keeps a group drag
+    // a group drag). The gate is applied at drag-begin: no
+    // finished entry with a file on disk in the set, no drag.
+    {
+        let u = ui.clone();
+        let press_set: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let stash: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let targets = [gtk::TargetEntry::new(
+            "text/uri-list",
+            gtk::TargetFlags::OTHER_APP,
+            0,
+        )];
+        list.drag_source_set(
+            gtk::gdk::ModifierType::BUTTON1_MASK,
+            &targets,
+            gtk::gdk::DragAction::COPY,
+        );
+        {
+            let u = u.clone();
+            let press_set = press_set.clone();
+            list.connect_button_press_event(move |view, ev| {
+                if ev.button() == 1 {
+                    let (x, y) = ev.position();
+                    let mut set: Vec<String> = Vec::new();
+                    if let Some((Some(path), _, _, _)) =
+                        view.path_at_pos(x as i32, y as i32)
+                    {
+                        if let Some(iter) = u.store.iter(&path) {
+                            let id: String = u
+                                .store
+                                .value(&iter, COL_ID as i32)
+                                .get()
+                                .unwrap_or_default();
+                            let selected = selected_ids(&u);
+                            if selected.iter().any(|s| s == &id) {
+                                set = selected;
+                            } else if !id.is_empty() {
+                                set = vec![id];
+                            }
+                        }
+                    }
+                    *press_set.borrow_mut() = set;
+                }
+                gtk::glib::Propagation::Proceed
+            });
+        }
+        let stash_begin = stash.clone();
+        list.connect_drag_begin(move |_, ctx| {
+            let uris = drag_out_uris(&u, &press_set.borrow());
+            if uris.is_empty() {
+                ctx.drag_abort(0); // GDK_CURRENT_TIME
+            }
+            *stash_begin.borrow_mut() = uris;
+        });
+        list.connect_drag_data_get(move |_, _, data, _, _| {
+            let uris = stash.borrow();
+            if !uris.is_empty() {
+                let refs: Vec<&str> = uris.iter().map(|s| s.as_str()).collect();
+                data.set_uris(&refs);
+            }
         });
     }
 

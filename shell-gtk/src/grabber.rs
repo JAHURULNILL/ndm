@@ -72,6 +72,8 @@ struct GrabDlg {
     dir: gtk::Entry,
     subfolders: gtk::CheckButton,
     add_queue: gtk::CheckButton,
+    convert: gtk::CheckButton,
+    queue_sel: gtk::ComboBoxText,
     // step 3
     mode_whole: gtk::RadioButton,
     depth_same: gtk::SpinButton,
@@ -113,6 +115,8 @@ fn wizard_state(d: &GrabDlg) -> serde_json::Value {
         "save_dir": d.dir.text().trim().to_string(),
         "use_subfolders": d.subfolders.is_active(),
         "add_as_queue": d.add_queue.is_active(),
+        "convert_links": d.convert.is_active(),
+        "queue": combo_text(&d.queue_sel),
         "depth_same": (d.depth_same.value_as_int()).clamp(0, 10),
         "depth_other": (d.depth_other.value_as_int()).clamp(0, 10),
         "whole_site": d.mode_whole.is_active(),
@@ -150,6 +154,25 @@ fn fill_projects(d: &Rc<GrabDlg>) {
     d.proj_sel.set_active(Some(0));
 }
 
+/// The queue dropdown's rows: (no queue) + the settings' queue
+/// names — mirrors fill_projects.
+fn fill_queues(d: &GrabDlg) {
+    d.queue_sel.remove_all();
+    d.queue_sel.append(Some(""), "(no queue)");
+    if let Some(list) = settings_json(&d.ui)
+        .get("queues")
+        .and_then(|x| x.as_array())
+    {
+        for q in list {
+            let name = js(q, "name");
+            if !name.is_empty() {
+                d.queue_sel.append(Some(&name), &name);
+            }
+        }
+    }
+    d.queue_sel.set_active(Some(0));
+}
+
 fn apply_project(d: &GrabDlg, p: &serde_json::Value) {
     d.proj_name.set_text(&js(p, "name"));
     d.url.set_text(&js(p, "start_url"));
@@ -165,6 +188,15 @@ fn apply_project(d: &GrabDlg, p: &serde_json::Value) {
     d.dir.set_text(&dir);
     d.subfolders.set_active(jb(p, "use_subfolders", false));
     d.add_queue.set_active(jb(p, "add_as_queue", false));
+    // a project saved by an older build has no convert_links:
+    // it migrates OFF (core's serde default); the wizard's own
+    // checkbox is what turns it on
+    d.convert.set_active(jb(p, "convert_links", false));
+    fill_queues(d);
+    let q = js(p, "queue");
+    if !q.is_empty() {
+        d.queue_sel.set_active_id(Some(&q));
+    }
     d.depth_same
         .set_value(p.get("depth_same").and_then(|x| x.as_i64()).unwrap_or(1) as f64);
     d.depth_other
@@ -417,6 +449,32 @@ fn download_selected(d: &Rc<GrabDlg>) {
         return;
     }
     d.btn_download.set_sensitive(false);
+    // F1: with conversion on, the start page itself joins the run
+    // (exploration crawls pages but returns only files) and the
+    // whole run is registered for the post-completion rewrite
+    let convert = jb(&p, "convert_links", false);
+    if convert {
+        let _ = sink::rt::block_on(sink::add_download(
+            d.ctx.clone(),
+            start_url.clone(),
+            base.clone(),
+            Some(jb(&p, "add_as_queue", false)),
+            Some("Grabber".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let mut urls: Vec<String> = chosen.iter().map(|it| js(it, "url")).collect();
+        urls.push(start_url.clone());
+        sink::grab_register_run(urls);
+    }
     let mut failed = 0usize;
     let mut first_err = String::new();
     for it in &chosen {
@@ -536,6 +594,13 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
     y = check_row(&g2, y, &subfolders);
     let add_queue = check("Add the files as a queue (Download Later) instead of starting them at once", false);
     y = check_row(&g2, y, &add_queue);
+    // F1: on for projects the wizard creates; a loaded project
+    // restores its own saved value (older projects: off)
+    let convert = check("Convert links in the downloaded pages for offline browsing", true);
+    y = check_row(&g2, y, &convert);
+    // F2: the queue whose schedule re-runs this project
+    let queue_sel = gtk::ComboBoxText::new();
+    y = row(&g2, y, "Re-run on this queue's schedule", &queue_sel);
     let _ = y;
     book.append_page(&g2, Some(&gtk::Label::new(Some("2 · Save files"))));
 
@@ -681,6 +746,8 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
         dir,
         subfolders,
         add_queue,
+        convert,
+        queue_sel,
         mode_whole,
         depth_same,
         depth_other,
@@ -906,6 +973,7 @@ fn reset(d: &Rc<GrabDlg>) {
     render_list(d);
     d.status.set_text("The exploration results will appear here");
     fill_projects(d);
+    fill_queues(d);
     set_step(d, 0);
     d.book.set_page(0);
 }

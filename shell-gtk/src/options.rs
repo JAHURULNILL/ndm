@@ -58,6 +58,8 @@ struct Opt {
     sounds: gtk::CheckButton,
     power: gtk::ComboBoxText,
     power_force: gtk::CheckButton,
+    completion_program: gtk::Entry,
+    completion_args: gtk::Entry,
     proxy_modes: Vec<(String, gtk::RadioButton)>,
     proxy_pac: gtk::Entry,
     proxy_scheme: gtk::ComboBoxText,
@@ -76,6 +78,7 @@ struct Opt {
     login_pass: gtk::Entry,
     cat_dirs: Vec<gtk::Entry>,
     cat_exts: Vec<gtk::Entry>,
+    cat_sites: Vec<gtk::Entry>,
     cat_store: gtk::ListStore,
     cat_names: Rc<RefCell<Vec<String>>>,
     cat_status: gtk::Label,
@@ -222,7 +225,16 @@ pub fn show(ui: &Rc<Ui>) {
     );
     y = row(&g, y, "Computer power action", &power);
     let power_force = check("Force running programs to close with the power action", jb(&s, "power_force", false));
-    check_row(&g, y, &power_force);
+    y = check_row(&g, y, &power_force);
+    y = note(&g, y, "Run this program when a download completes", true);
+    y = note(&g, y, "(for example, your antivirus scanner)", false);
+    let completion_program = entry(&js(&s, "completion_program"));
+    completion_program.set_placeholder_text(Some("Program path — empty means off"));
+    y = row(&g, y, "Program", &completion_program);
+    let completion_args = entry(&js(&s, "completion_args"));
+    completion_args.set_placeholder_text(Some("e.g. --scan \"{file}\""));
+    y = row(&g, y, "Arguments", &completion_args);
+    note(&g, y, "{file} is replaced by the downloaded file's full path; if the arguments contain no {file}, the path is added at the end.", false);
     nb.append_page(&sc, Some(&gtk::Label::new(Some("Downloads"))));
 
     // ---- Proxy & Site Logins ---------------------------------------
@@ -338,11 +350,13 @@ pub fn show(ui: &Rc<Ui>) {
     // ---- Categories --------------------------------------------------
     let (sc, g) = page_scroll();
     let mut y = 0;
-    y = note(&g, y, "Categories — each category has its own folder (used when a download would otherwise go to the default folder) and its own file types, like IDM's category editor. Editing the types changes how the app classifies new downloads; the browser extension keeps the built-in list.", true);
+    y = note(&g, y, "Categories — each category has its own folder (used when a download would otherwise go to the default folder), its own file types and its own sites, like IDM's category editor. A download from a listed site goes to that category whatever its file type. Editing the types changes how the app classifies new downloads; the browser extension keeps the built-in list.", true);
     let dirs_v = s.get("category_dirs").cloned().unwrap_or(serde_json::json!({}));
     let exts_v = s.get("category_exts").cloned().unwrap_or(serde_json::json!({}));
+    let sites_v = s.get("category_sites").cloned().unwrap_or(serde_json::json!({}));
     let mut cat_dirs = Vec::new();
     let mut cat_exts = Vec::new();
+    let mut cat_sites = Vec::new();
     for c in CATS {
         let e = entry(dirs_v.get(c).and_then(|x| x.as_str()).unwrap_or(""));
         e.set_placeholder_text(Some("~/Downloads"));
@@ -357,6 +371,19 @@ pub fn show(ui: &Rc<Ui>) {
             let te = entry(&cur);
             y = row(&g, y, &format!("{c} types"), &te);
             cat_exts.push(te);
+            // site rules for this category: host patterns,
+            // comma-separated like the types above ("*.site.com"
+            // = any subdomain, "site.com" = host + subdomains);
+            // a matching site beats the file types at add time
+            let cur_sites = sites_v
+                .get(c)
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            let se = entry(&cur_sites);
+            se.set_placeholder_text(Some("*.googlevideo.com, example.com"));
+            y = row(&g, y, &format!("{c} sites"), &se);
+            cat_sites.push(se);
         }
     }
     y = note(&g, y, "Manage categories — rename or delete the categories you created. The built-in categories above cannot be renamed or deleted. Deleting a category moves its downloads to General.", true);
@@ -407,10 +434,11 @@ pub fn show(ui: &Rc<Ui>) {
     let o = Rc::new(Opt {
         dir, auto_resume, auto_update, clipboard, exit_done, video_q, conns, conn_exc,
         limit_on, limit_val, quota_mb, quota_hours, simul, complete_dlg, progress_view,
-        sounds, power, power_force, proxy_modes, proxy_pac, proxy_scheme, proxy_host,
+        sounds, power, power_force, completion_program, completion_args,
+        proxy_modes, proxy_pac, proxy_scheme, proxy_host,
         proxy_port, proxy_user, proxy_pass, proxy_http, proxy_https, proxy_ftp, proxy_browser,
         logins: logins.clone(), login_store, login_site, login_user, login_pass,
-        cat_dirs, cat_exts, cat_store, cat_names: Rc::new(RefCell::new(Vec::new())),
+        cat_dirs, cat_exts, cat_sites, cat_store, cat_names: Rc::new(RefCell::new(Vec::new())),
         cat_status, status,
     });
     rebuild_logins(&o);
@@ -629,6 +657,8 @@ fn save(ui: &Rc<Ui>, base: &serde_json::Value, o: &Opt) -> Result<(), String> {
     );
     ins(obj, "power_when_done", serde_json::json!(combo_text(&o.power)));
     ins(obj, "power_force", serde_json::json!(o.power_force.is_active()));
+    ins(obj, "completion_program", serde_json::json!(o.completion_program.text().trim()));
+    ins(obj, "completion_args", serde_json::json!(o.completion_args.text().trim()));
     // category folders: only non-empty entries are stored
     let mut dirs = serde_json::Map::new();
     for (i, c) in CATS.iter().enumerate() {
@@ -659,6 +689,29 @@ fn save(ui: &Rc<Ui>, base: &serde_json::Value, o: &Opt) -> Result<(), String> {
         }
     }
     ins(obj, "category_exts", serde_json::Value::Object(exts));
+    // category sites: stored only when non-empty (unlike types,
+    // an empty list is the absence of a rule, not a rule that
+    // matches nothing); non-built-in keys pass through untouched
+    let mut sites = serde_json::Map::new();
+    if let Some(old) = base.get("category_sites").and_then(|x| x.as_object()) {
+        for (k, val) in old {
+            if !CATS_TYPES.contains(&k.as_str()) {
+                sites.insert(k.clone(), val.clone());
+            }
+        }
+    }
+    for (i, c) in CATS_TYPES.iter().enumerate() {
+        let list: Vec<String> = o.cat_sites[i]
+            .text()
+            .split(',')
+            .map(|x| x.trim().to_ascii_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if !list.is_empty() {
+            sites.insert(c.to_string(), serde_json::json!(list));
+        }
+    }
+    ins(obj, "category_sites", serde_json::Value::Object(sites));
     ins(
         obj,
         "conn_exceptions",

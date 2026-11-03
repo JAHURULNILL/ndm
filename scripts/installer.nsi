@@ -51,7 +51,7 @@
 ; the app supports (7/8/8.1/10/11).
 
 !ifndef VERSION
-  !define VERSION "2.1.1"
+  !define VERSION "2.2.0"
 !endif
 !ifndef SRCROOT
   !define SRCROOT "NDM-Windows-Portable"

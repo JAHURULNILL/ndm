@@ -26,6 +26,10 @@ struct Sched {
     enabled: gtk::CheckButton,
     start: gtk::Entry,
     stop: gtk::Entry,
+    days: Vec<gtk::CheckButton>,
+    one_time: gtk::Entry,
+    expired: gtk::Label,
+    sync: gtk::CheckButton,
     exit_done: gtk::CheckButton,
     power: gtk::ComboBoxText,
     max: gtk::SpinButton,
@@ -44,7 +48,8 @@ fn queue_cfg(base: &serde_json::Value, name: &str) -> serde_json::Value {
         .unwrap_or_else(|| {
             serde_json::json!({
                 "name": name, "use_schedule": false, "start": "22:00", "stop": "06:00",
-                "exit_when_done": false, "power_when_done": "", "max_simultaneous": 0
+                "exit_when_done": false, "power_when_done": "", "max_simultaneous": 0,
+                "days": [true, true, true, true, true, true, true], "one_time": "", "sync": false
             })
         })
 }
@@ -69,6 +74,22 @@ fn fill_fields(s: &Rc<Sched>) {
     s.enabled.set_active(jb(&cfg, "use_schedule", false));
     s.start.set_text(&js(&cfg, "start"));
     s.stop.set_text(&js(&cfg, "stop"));
+    let days = cfg.get("days").and_then(|x| x.as_array());
+    for (i, d) in s.days.iter().enumerate() {
+        d.set_active(
+            days.and_then(|a| a.get(i)).and_then(|x| x.as_bool()).unwrap_or(true),
+        );
+    }
+    let one_time = js(&cfg, "one_time");
+    s.one_time.set_text(&one_time);
+    // a one-time date in the past can never fire again — say so
+    let today = sink::today_parts().1;
+    s.expired.set_text(if !one_time.is_empty() && one_time.as_str() < today.as_str() {
+        "expired"
+    } else {
+        ""
+    });
+    s.sync.set_active(jb(&cfg, "sync", false));
     s.exit_done.set_active(jb(&cfg, "exit_when_done", false));
     s.power.set_active_id(Some(js(&cfg, "power_when_done").as_str()));
     s.max.set_value(ju(&cfg, "max_simultaneous") as f64);
@@ -151,7 +172,7 @@ fn save_base(s: &Rc<Sched>) -> Result<(), String> {
 }
 
 pub fn show(ui: &Rc<Ui>) {
-    let dlg = dialog(&ui.window, "Scheduler", "Save", 620, 560);
+    let dlg = dialog(&ui.window, "Scheduler", "Save", 620, 640);
     let content = dlg.content_area();
     let g = grid();
     content.pack_start(&g, true, true, 0);
@@ -164,6 +185,26 @@ pub fn show(ui: &Rc<Ui>) {
     y = row(&g, y, "Start downloads at", &start);
     let stop = entry("06:00");
     y = row(&g, y, "Stop downloads at", &stop);
+    let days_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let mut days = Vec::new();
+    for d in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"] {
+        let c = check(d, true);
+        days_box.add(&c);
+        days.push(c);
+    }
+    y = row(&g, y, "On these days", &days_box);
+    let one_time = entry("");
+    one_time.set_placeholder_text(Some("yyyy-mm-dd — one single day; empty = weekly days above"));
+    let expired = gtk::Label::new(None);
+    expired.set_halign(gtk::Align::Start);
+    {
+        let bx = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        bx.pack_start(&one_time, true, true, 0);
+        bx.add(&expired);
+        y = row(&g, y, "Or one-time date", &bx);
+    }
+    let sync = check("Synchronize — re-download finished files when they change on the server", false);
+    y = check_row(&g, y, &sync);
     let exit_done = check("Exit NDM when this queue finishes", false);
     y = check_row(&g, y, &exit_done);
     let power = combo(
@@ -245,6 +286,10 @@ pub fn show(ui: &Rc<Ui>) {
         enabled,
         start,
         stop,
+        days,
+        one_time,
+        expired,
+        sync,
         exit_done,
         power,
         max,
@@ -274,6 +319,14 @@ pub fn show(ui: &Rc<Ui>) {
         s.start.connect_changed(move |_| m());
         let m = mark.clone();
         s.stop.connect_changed(move |_| m());
+        for d in &s.days {
+            let m = mark.clone();
+            d.connect_toggled(move |_| m());
+        }
+        let m = mark.clone();
+        s.one_time.connect_changed(move |_| m());
+        let m = mark.clone();
+        s.sync.connect_toggled(move |_| m());
         let m = mark.clone();
         s.exit_done.connect_toggled(move |_| m());
         let m = mark.clone();
@@ -345,7 +398,9 @@ pub fn show(ui: &Rc<Ui>) {
                     qs.push(serde_json::json!({
                         "name": name, "use_schedule": false, "start": "22:00",
                         "stop": "06:00", "exit_when_done": false,
-                        "power_when_done": "", "max_simultaneous": 0
+                        "power_when_done": "", "max_simultaneous": 0,
+                        "days": [true, true, true, true, true, true, true],
+                        "one_time": "", "sync": false
                     }));
                 }
             }
@@ -481,6 +536,15 @@ fn save(s: &Rc<Sched>) -> Result<(), String> {
                             "stop".into(),
                             serde_json::json!(if stop_t.is_empty() { "06:00" } else { &stop_t }),
                         );
+                        o.insert(
+                            "days".into(),
+                            serde_json::json!(s.days.iter().map(|d| d.is_active()).collect::<Vec<_>>()),
+                        );
+                        o.insert(
+                            "one_time".into(),
+                            serde_json::json!(s.one_time.text().trim().to_string()),
+                        );
+                        o.insert("sync".into(), serde_json::json!(s.sync.is_active()));
                         o.insert("exit_when_done".into(), serde_json::json!(s.exit_done.is_active()));
                         o.insert("power_when_done".into(), serde_json::json!(combo_text(&s.power)));
                         o.insert(
