@@ -6380,6 +6380,18 @@ mod tests {
     /// (The byte-0 run is whichever worker claimed it first — the
     /// slow lane is a property of the range, not of a worker.)
     fn het_range_server(body: Vec<u8>, slow_bps: u64) -> u16 {
+        het_range_server_ex(body, slow_bps, 0, Duration::ZERO)
+    }
+
+    /// `tail_hold`: responses to non-zero range starts below
+    /// `tail_hold_below` are held for `tail_hold` before their
+    /// first body byte. Zero disables the hold entirely.
+    fn het_range_server_ex(
+        body: Vec<u8>,
+        slow_bps: u64,
+        tail_hold_below: u64,
+        tail_hold: Duration,
+    ) -> u16 {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6438,6 +6450,9 @@ mod tests {
                         .as_bytes(),
                     );
                     let slow = rs == 0 && slice.len() > 1024 * 1024;
+                    if tail_hold_below > 0 && rs > 0 && rs < tail_hold_below {
+                        std::thread::sleep(tail_hold);
+                    }
                     for piece in slice.chunks(64 * 1024) {
                         if s.write_all(piece).is_err() {
                             return;
@@ -6465,8 +6480,29 @@ mod tests {
         // first blocks of the slow run, and a short claim lets a
         // loaded test machine close that window before any peer
         // goes idle — the engine is not what races there.)
+        // A second race sits AFTER the split, and this one the
+        // claim length cannot fix: the owner hands its tail to the
+        // pool and loops straight back into try_claim, while the
+        // parked peers only poll for work every 100 ms. On a fast
+        // loopback the owner can re-claim its own tail slice by
+        // slice (each a ~10 ms request) inside a single poll gap,
+        // ending with exactly its original claim while stealing
+        // demonstrably worked (finish ~3 s, not ~12 s) — the CI
+        // failure this test once flaked on. The server therefore
+        // holds every tail response for 300 ms: three times the
+        // poll period, so during the owner's first held slice each
+        // parked peer is guaranteed a claim turn, and the pool's
+        // waiting-aware slicing then bounds the owner's total take
+        // (kept share + first slice) far below a full claim while
+        // every peer necessarily ends above one. The hold changes
+        // only timing — bytes, ranges and counts are untouched.
         let body = pattern_body(48 * 1024 * 1024);
-        let port = het_range_server(body.clone(), 1024 * 1024);
+        let port = het_range_server_ex(
+            body.clone(),
+            1024 * 1024,
+            12 * 1024 * 1024,
+            Duration::from_millis(300),
+        );
         let url = format!("http://127.0.0.1:{port}/big.bin");
         let out = std::env::temp_dir().join(format!("ndm-steal-{}.bin", std::process::id()));
         let _ = std::fs::remove_file(&out);
