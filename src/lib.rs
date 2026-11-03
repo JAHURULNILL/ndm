@@ -6705,8 +6705,11 @@ mod tests {
         // QA-220 m2 (2.3.1): the classification itself — an
         // ENOSPC-class write error must come out Permanent (the
         // download fails at once) with the plain sentence; any
-        // other write error stays a retryable block error.
-        let enospc = io::Error::from_raw_os_error(28);
+        // other write error stays a retryable block error. The
+        // raw code is per-platform (ENOSPC 28 / ERROR_DISK_FULL
+        // 112): hardcoding 28 made this test fail on Windows,
+        // where 28 is a different error entirely (CI #67).
+        let enospc = io::Error::from_raw_os_error(if cfg!(windows) { 112 } else { 28 });
         match write_block_error(&enospc) {
             BlockError::Permanent(msg) => {
                 assert!(msg.contains("The disk is full"), "{msg}")
