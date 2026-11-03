@@ -180,13 +180,18 @@ fn register_class() {
 
 fn set_closable(hwnd: HWND, on: bool) {
     unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        // Widen to isize for the flag arithmetic and let
+        // `new as _` narrow back at the call: on 32-bit
+        // Windows the windows crate aliases the *Ptr APIs
+        // to the i32 Get/SetWindowLongW, on x86_64 they
+        // take isize — the style bits are 32 on both.
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as isize;
         let new = if on {
             style | WS_SYSMENU.0 as isize
         } else {
             style & !(WS_SYSMENU.0 as isize)
         };
-        SetWindowLongPtrW(hwnd, GWL_STYLE, new);
+        SetWindowLongPtrW(hwnd, GWL_STYLE, new as _);
         let _ = SetWindowPos(
             hwnd,
             None,

@@ -47,6 +47,17 @@ pub struct ReleaseInfo {
     pub win_setup_url: String,
     #[serde(default)]
     pub win_setup_sha256: String,
+    /// 32-bit Windows portable build (ZIP). Selected only by
+    /// x86 builds; empty in feeds that predate the x86 tier.
+    #[serde(default)]
+    pub win_x86_url: String,
+    #[serde(default)]
+    pub win_x86_sha256: String,
+    /// 32-bit Windows installer (setup .exe)
+    #[serde(default)]
+    pub win_x86_setup_url: String,
+    #[serde(default)]
+    pub win_x86_setup_sha256: String,
 }
 
 fn parse_version(v: &str) -> Vec<u64> {
@@ -412,6 +423,58 @@ mod tests {
         }
         raw.extend_from_slice(b"0\r\n\r\n");
         serve_raw(raw)
+    }
+
+    #[test]
+    fn feed_with_x86_keys_parses_all_fourteen() {
+        let info: ReleaseInfo = serde_json::from_str(
+            r#"{
+                "version": "2.2.0",
+                "min_supported": "2.0.0",
+                "notes": "n",
+                "deb_url": "https://x/ndm.deb",
+                "deb_sha256": "d",
+                "win_url": "https://x/win.zip",
+                "win_sha256": "w",
+                "win_setup_url": "https://x/setup.exe",
+                "win_setup_sha256": "s",
+                "win_x86_url": "https://x/win-x86.zip",
+                "win_x86_sha256": "w86",
+                "win_x86_setup_url": "https://x/setup-x86.exe",
+                "win_x86_setup_sha256": "s86"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(info.win_x86_url, "https://x/win-x86.zip");
+        assert_eq!(info.win_x86_sha256, "w86");
+        assert_eq!(info.win_x86_setup_url, "https://x/setup-x86.exe");
+        assert_eq!(info.win_x86_setup_sha256, "s86");
+        assert_eq!(info.win_url, "https://x/win.zip");
+    }
+
+    #[test]
+    fn feed_without_x86_keys_parses_with_x86_empty() {
+        // a pre-x86 10-key feed must still parse; the x86 fields
+        // default empty, which the per-arch asset rule reads as
+        // "no usable package for an x86 build"
+        let info: ReleaseInfo = serde_json::from_str(
+            r#"{
+                "version": "2.1.1",
+                "min_supported": "2.1.0",
+                "notes": "",
+                "deb_url": "https://x/ndm.deb",
+                "deb_sha256": "d",
+                "win_url": "https://x/win.zip",
+                "win_sha256": "w",
+                "win_setup_url": "https://x/setup.exe",
+                "win_setup_sha256": "s"
+            }"#,
+        )
+        .unwrap();
+        assert!(info.win_x86_url.is_empty());
+        assert!(info.win_x86_sha256.is_empty());
+        assert!(info.win_x86_setup_url.is_empty());
+        assert!(info.win_x86_setup_sha256.is_empty());
     }
 
     #[test]

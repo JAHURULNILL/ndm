@@ -12,7 +12,10 @@
 //! Linux ffmpeg deliberately stays OUT of this table: the .deb
 //! declares it as a package dependency, so `find_tool` picks the
 //! distro's build up from PATH — fetching a second copy would only
-//! shadow it.
+//! shadow it. One exception to "deno on every platform": pre-
+//! Windows-10 Windows gets NO deno — Deno requires Windows 10
+//! (see `effective_specs`) — and yt-dlp runs there in its
+//! no-JavaScript-runtime configuration instead.
 //!
 //! Two support/testing knobs redirect the source (mirrors, offline
 //! tests): in DEBUG builds only, `NDM_COMPONENTS_BASE` replaces the
@@ -217,34 +220,86 @@ fn windows_major_version() -> Option<u32> {
     }
 }
 
-/// The fetch table for THIS machine: `specs()`, except that on
-/// pre-Windows-10 x86_64 Windows the yt-dlp entry is swapped for
-/// the last release that still runs there. Anything that fetches
-/// components or reports them missing must use this rather than
-/// `specs()` — otherwise an old-Windows machine fetches a yt-dlp
-/// that can never start. When the OS version cannot be determined
-/// the modern pin stays: the failure mode is the pre-fix
-/// behaviour, not something worse. (No legacy swap exists for
-/// ARM64 because there is no pre-10 64-bit ARM Windows.)
-#[cfg_attr(
-    not(all(target_os = "windows", target_arch = "x86_64")),
-    allow(unused_mut)
-)]
-pub fn effective_specs() -> Vec<ComponentSpec> {
-    let mut table = specs();
+/// Is this Windows major version one Deno cannot run on?
+/// Deno's official installation docs require Windows 10 version
+/// 1709 or later (the runtime needs IsWow64Process2, which does
+/// not exist before it), so every Deno 2.x build — including the
+/// pinned v2.9.8 in the table above — is dead weight on a
+/// pre-Windows-10 machine: a 60+ MB component that can never
+/// start, whose fetch failure also makes the whole engine setup
+/// look failed.
+#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+fn use_deno(major: u32) -> bool {
+    major >= 10
+}
+
+/// True when this process is running on a Windows older than
+/// 10 — the machines whose fetched set carries no deno and whose
+/// yt-dlp runs must use the no-JavaScript-runtime configuration
+/// (see `ndm::video_probe::no_js_runtime_mode`). False on every
+/// other platform, and false when the version cannot be read
+/// (the modern behaviour stays the fallback, as with the legacy
+/// yt-dlp swap below).
+pub fn pre_win10_windows() -> bool {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
-        if let Some(major) = windows_major_version() {
-            if use_legacy_ytdlp(major) {
-                for spec in table.iter_mut() {
-                    if spec.name == "yt-dlp" {
-                        *spec = ytdlp_legacy_win_x64();
-                    }
-                }
+        windows_major_version()
+            .map(|m| !use_deno(m))
+            .unwrap_or(false)
+    }
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    {
+        false
+    }
+}
+
+/// The fetch table for a Windows of the given major version
+/// (`None` = version unknown, table unchanged): below Windows
+/// 10 the yt-dlp entry is swapped for the last release that
+/// still runs there AND deno is dropped entirely — it cannot
+/// run there (see `use_deno`), and fetching it would hand the
+/// user a broken 60+ MB component and a setup that reports
+/// failure for a component the machine can never use. Pure, so
+/// the per-OS selection is unit-testable off Windows.
+#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+fn effective_for_windows_major(
+    mut table: Vec<ComponentSpec>,
+    major: Option<u32>,
+) -> Vec<ComponentSpec> {
+    let Some(major) = major else { return table };
+    if use_legacy_ytdlp(major) {
+        for spec in table.iter_mut() {
+            if spec.name == "yt-dlp" {
+                *spec = ytdlp_legacy_win_x64();
             }
         }
     }
+    if !use_deno(major) {
+        table.retain(|s| s.name != "deno");
+    }
     table
+}
+
+/// The fetch table for THIS machine: `specs()`, except that on
+/// pre-Windows-10 x86_64 Windows the yt-dlp entry is swapped for
+/// the last release that still runs there and deno is not
+/// fetched at all. Anything that fetches components or reports
+/// them missing must use this rather than `specs()` — otherwise
+/// an old-Windows machine fetches a yt-dlp that can never start
+/// (and a deno that can never run). When the OS version cannot
+/// be determined the modern pin stays: the failure mode is the
+/// pre-fix behaviour, not something worse. (No legacy swap
+/// exists for ARM64 because there is no pre-10 64-bit ARM
+/// Windows — and no pre-10 ARM64 Windows for deno to miss on.)
+pub fn effective_specs() -> Vec<ComponentSpec> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        effective_for_windows_major(specs(), windows_major_version())
+    }
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    {
+        specs()
+    }
 }
 
 /// One of the app-local UCRT files the app ships beside its own
@@ -900,6 +955,48 @@ mod tests {
         assert!(use_legacy_ytdlp(6));
         assert!(!use_legacy_ytdlp(10));
         assert!(!use_legacy_ytdlp(11));
+    }
+
+    /// WS-B: below Windows 10 the fetched set must NOT include
+    /// deno at all (it cannot run there — Deno requires Windows
+    /// 10 version 1709+), while yt-dlp still swaps to the legacy
+    /// pin and the rest of the set (ffmpeg on Windows) survives.
+    /// On Windows 10+ — and when the version is unknown — the
+    /// table is exactly the plain one, deno included.
+    #[test]
+    fn pre_win10_fetch_set_drops_deno_and_swaps_ytdlp() {
+        let plain = specs();
+        for major in [5u32, 6, 7, 8, 9] {
+            let t = effective_for_windows_major(specs(), Some(major));
+            assert!(
+                !t.iter().any(|s| s.name == "deno"),
+                "major {major}: deno must not be fetched below Windows 10"
+            );
+            let yt = t.iter().find(|s| s.name == "yt-dlp").expect("yt-dlp stays");
+            assert_eq!(yt.url, ytdlp_legacy_win_x64().url, "major {major}");
+            assert_eq!(yt.sha256, ytdlp_legacy_win_x64().sha256, "major {major}");
+            // nothing else is dropped: the set only loses deno
+            assert_eq!(t.len(), plain.len() - 1, "major {major}");
+        }
+        for major in [10u32, 11] {
+            let t = effective_for_windows_major(specs(), Some(major));
+            assert_eq!(t.len(), plain.len(), "major {major}: nothing dropped");
+            assert!(t.iter().any(|s| s.name == "deno"), "major {major}: deno stays");
+            for (a, b) in plain.iter().zip(t.iter()) {
+                assert_eq!(a.url, b.url, "major {major}");
+            }
+        }
+        let t = effective_for_windows_major(specs(), None);
+        assert_eq!(t.len(), plain.len(), "unknown version: table unchanged");
+        assert!(t.iter().any(|s| s.name == "deno"));
+    }
+
+    /// This machine is not a pre-Windows-10 Windows (it is not
+    /// Windows at all in the test environment): the runtime-mode
+    /// gate the yt-dlp argument builder reads must be off here.
+    #[test]
+    fn pre_win10_gate_is_off_here() {
+        assert!(!pre_win10_windows());
     }
 
     /// Off pre-10 x86_64 Windows the effective table must be the

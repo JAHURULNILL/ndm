@@ -35,13 +35,61 @@ fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// F8: the plain sentence for a disk-full-class write failure, or
+/// None for any other error. A full disk must SAY it is full — the
+/// raw OS wording ("os error 28") names no action the user can
+/// take. Callers append the original error text after the
+/// sentence, so every substring classification that keys off the
+/// raw wording keeps working exactly as before.
+fn disk_full_sentence(e: &io::Error) -> Option<&'static str> {
+    let raw = e.raw_os_error();
+    #[cfg(unix)]
+    let full = matches!(raw, Some(28) | Some(122) | Some(30)); // ENOSPC, EDQUOT, EROFS
+    #[cfg(windows)]
+    let full = matches!(raw, Some(112) | Some(39)); // ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL
+    #[cfg(not(any(unix, windows)))]
+    let full = false;
+    if full {
+        Some("The disk is full — free some space, then resume the download")
+    } else {
+        None
+    }
+}
+
+/// A write failure in the form the terminal error surfaces:
+/// disk-full errors lead with the plain sentence; every other
+/// error keeps its exact historical `write: {e}` shape.
+fn plain_write_error(e: &io::Error) -> String {
+    match disk_full_sentence(e) {
+        Some(s) => format!("{s} (write: {e})"),
+        None => format!("write: {e}"),
+    }
+}
+
 pub mod components;
+pub mod ftp;
 pub mod updater;
 pub mod video_probe;
 
 pub const DEFAULT_BLOCK: u64 = 1 << 20; // 1 MiB block map, per engine spec A
 const SAVE_EVERY_BYTES: u64 = 4 << 20;
 const SAVE_EVERY: Duration = Duration::from_secs(1);
+/// F7: minimum spacing between PERIODIC journal saves, no matter
+/// how many bytes flowed — the 4 MiB byte trigger alone fires
+/// ~25 saves a second at LAN speed, each cloning and serialising
+/// the whole block map against the same mutex the workers mark
+/// blocks through. Durable/terminal saves are not periodic and
+/// are never delayed by this.
+const SAVE_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Whether a periodic (non-forced) journal save is due, as a pure
+/// decision: never more often than SAVE_MIN_INTERVAL, and beyond
+/// that on the long-standing triggers (SAVE_EVERY elapsed, or
+/// SAVE_EVERY_BYTES of new data).
+fn periodic_save_due(elapsed: Duration, since_save_bytes: u64) -> bool {
+    elapsed >= SAVE_MIN_INTERVAL
+        && (elapsed >= SAVE_EVERY || since_save_bytes >= SAVE_EVERY_BYTES)
+}
 
 // ---------- global speed limit (GCRA pacing clock, shared by every download) ----------
 
@@ -592,7 +640,23 @@ struct Shared {
     last_save: Mutex<Instant>,
     active_limit: AtomicUsize,
     active_workers: AtomicUsize,
-    throttle_events: AtomicU64,
+    /// when each 403/429 landed (F3): the governor shrinks the
+    /// pool only when throttling is BROAD — at least half the
+    /// pool throttled inside the window — while a lone event just
+    /// cools down its own connection in the worker's retry path
+    throttle_times: Mutex<Vec<Instant>>,
+    /// range requests answered 200 since the last validated 206
+    /// (F6): a server that stopped honouring Range mid-download
+    /// surfaces here; at RANGE_LOSS_LIMIT the job restarts its
+    /// transfer in single-stream mode (once, see below)
+    range_200_count: AtomicUsize,
+    /// F6 mode switch: set once range loss is declared; worker 0
+    /// re-fetches the file in one plain stream while the rest of
+    /// the pool stands down
+    single_fallback: AtomicBool,
+    /// F6 once-guard: the single-stream restart may happen at
+    /// most once per job
+    fallback_used: AtomicBool,
     failed: AtomicBool,
     error: Mutex<Option<String>>,
     control: Arc<Control>,
@@ -677,8 +741,14 @@ struct Shared {
     /// the lying-Content-Encoding-header proof passed for this job
     /// (DIAG fix): block runs skip the header veto because the
     /// bodies were proven identity. True encoders never set this —
-    /// their proof fails on the encoded length alone.
-    ignore_encoding: bool,
+    /// their proof fails on the encoded length alone. Atomic
+    /// because a tentative (F5) start runs the same proof in the
+    /// first worker that meets an encoded answer, mid-download.
+    ignore_encoding: AtomicBool,
+    /// the job's session cookie jar (F1): every request of this
+    /// job — probe, verify, workers, single-stream — captures
+    /// Set-Cookie into it and replays it per host (see CookieJar)
+    jar: Arc<CookieJar>,
     /// journal sync policy state (W1 F15): when the data file was
     /// last synced to stable storage, and how many bytes workers
     /// have written since. A periodic journal save may only sync
@@ -871,8 +941,10 @@ fn save_state(shared: &Shared, force: bool, data_file: Option<&File>) {
         }
     };
     if !force
-        && last.elapsed() < SAVE_EVERY
-        && shared.since_save.load(Ordering::Relaxed) < SAVE_EVERY_BYTES
+        && !periodic_save_due(
+            last.elapsed(),
+            shared.since_save.load(Ordering::Relaxed),
+        )
     {
         return;
     }
@@ -974,6 +1046,18 @@ pub struct Probe {
     /// proof in verify_range / probe_once): transfer paths for this
     /// job skip the header veto. Never set for a true encoder.
     pub ignore_encoding_header: bool,
+    /// the session cookies the probe collected on the way (F1):
+    /// a start handed this probe continues the SAME jar, so a
+    /// cookie the probe's redirect chain set is still there when
+    /// the workers ask for the file
+    pub cookies: Arc<CookieJar>,
+    /// the range verdict is TENTATIVE (F5 download probe): the
+    /// server's HEAD claimed range support and no verify GET was
+    /// spent; the first worker responses are the verification,
+    /// with the encoding proof and the single-stream restart as
+    /// the fallbacks on contradiction. Never set by the full
+    /// probe (probe / probe_with_auth).
+    pub range_unverified: bool,
 }
 
 /// Extract a clean filename from a `Content-Disposition` header value
@@ -1135,6 +1219,245 @@ fn apply_auth_scoped(
     req
 }
 
+/// One cookie held by the jar (F1).
+#[derive(Debug, Clone)]
+struct JarCookie {
+    /// host that set the cookie (lower-case, no port)
+    host: String,
+    /// the Domain attribute, when one was sent AND the setter
+    /// belongs to it: delivery widens to that domain and its
+    /// subdomains. Without one the cookie is host-only — it goes
+    /// to the exact host that set it and nowhere else, mirroring
+    /// the cross-host credential scoping of finding #13.
+    domain: Option<String>,
+    path: String,
+    name: String,
+    value: String,
+}
+
+/// Parse one Set-Cookie header value into (name, value, domain,
+/// path, expired). Pure, so the parsing rules are unit-testable
+/// without a fabricated ureq response. `Max-Age=0` (or a negative
+/// age) is the server's delete instruction and reports expired.
+fn parse_set_cookie(raw: &str) -> Option<(String, String, Option<String>, String, bool)> {
+    let mut parts = raw.split(';');
+    let (name, value) = parts.next()?.split_once('=')?;
+    let (name, value) = (name.trim(), value.trim());
+    if name.is_empty() {
+        return None;
+    }
+    let mut domain = None;
+    let mut path = "/".to_string();
+    let mut expired = false;
+    for attr in parts {
+        let attr = attr.trim();
+        if let Some((k, v)) = attr.split_once('=') {
+            let v = v.trim();
+            if k.trim().eq_ignore_ascii_case("domain") {
+                let d = v.trim_start_matches('.').to_ascii_lowercase();
+                if !d.is_empty() {
+                    domain = Some(d);
+                }
+            } else if k.trim().eq_ignore_ascii_case("path") {
+                if v.starts_with('/') {
+                    path = v.to_string();
+                }
+            } else if k.trim().eq_ignore_ascii_case("max-age") {
+                if v.parse::<i64>().map(|n| n <= 0).unwrap_or(false) {
+                    expired = true;
+                }
+            }
+        }
+    }
+    Some((name.to_string(), value.to_string(), domain, path, expired))
+}
+
+/// The per-job session cookie jar (F1). ureq is built without its
+/// cookies feature, so a cookie a host sets — classically on the
+/// redirect that leads to the file — used to be dropped on the
+/// floor, and cookie-gated hosts (302 sets the session cookie,
+/// the target 403s without it) could not even be probed. Every
+/// request of a job runs through `jar_call`, which captures each
+/// response's Set-Cookie headers here (redirect hops included)
+/// and replays the jar per host on the next request.
+#[derive(Debug, Default)]
+pub struct CookieJar {
+    entries: Mutex<Vec<JarCookie>>,
+}
+
+impl CookieJar {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Store every Set-Cookie a response carried, keyed by the
+    /// host of the URL that was actually requested (a redirect
+    /// hop's cookies belong to the hop's host, not the origin's).
+    fn capture(&self, resp: &ureq::Response, url: &str) {
+        let host = host_key(url);
+        if host.is_empty() {
+            return;
+        }
+        for raw in resp.all("Set-Cookie") {
+            let Some((name, value, domain, path, expired)) = parse_set_cookie(raw) else {
+                continue;
+            };
+            // a Domain attribute counts only when the setter
+            // actually belongs to that domain — a host may not
+            // plant cookies for a stranger's domain
+            let domain = domain.filter(|d| host == *d || host.ends_with(&format!(".{d}")));
+            let mut entries = plock(&self.entries);
+            entries.retain(|c| !(c.host == host && c.name == name && c.domain == domain));
+            if !expired {
+                entries.push(JarCookie {
+                    host: host.clone(),
+                    domain,
+                    path,
+                    name,
+                    value,
+                });
+            }
+        }
+    }
+
+    /// The Cookie header value for a request to `url`: cookies
+    /// the URL's own host set (host-only), plus cookies whose
+    /// Domain attribute names the host's parent domain. Nothing
+    /// else — a cookie never crosses to a host that did not set
+    /// it or name it via Domain.
+    fn header_for(&self, url: &str) -> Option<String> {
+        let host = host_key(url);
+        let path = url_path(url);
+        let path = if path.is_empty() { "/".to_string() } else { path };
+        let entries = plock(&self.entries);
+        let pairs: Vec<String> = entries
+            .iter()
+            .filter(|c| {
+                let host_ok = match &c.domain {
+                    Some(d) => host == *d || host.ends_with(&format!(".{d}")),
+                    None => host == c.host,
+                };
+                host_ok && path.starts_with(&c.path)
+            })
+            .map(|c| format!("{}={}", c.name, c.value))
+            .collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            Some(pairs.join("; "))
+        }
+    }
+}
+
+/// The Cookie header for one request: the job jar's cookies for
+/// the target host merged with the static (extension-captured)
+/// Auth cookie. On a name clash the static value wins — it is
+/// the fresher, user-session truth — and the jar adds the rest.
+fn merged_cookie_header(
+    jar: &CookieJar,
+    url: &str,
+    static_cookie: Option<&str>,
+) -> Option<String> {
+    match (static_cookie, jar.header_for(url)) {
+        (None, j) => j,
+        (Some(s), None) => Some(s.to_string()),
+        (Some(s), Some(j)) => {
+            let static_names: Vec<String> = s
+                .split(';')
+                .filter_map(|p| {
+                    p.split_once('=')
+                        .map(|(n, _)| n.trim().to_ascii_lowercase())
+                })
+                .collect();
+            let extra: Vec<&str> = j
+                .split("; ")
+                .filter(|p| {
+                    let n = p.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+                    !static_names.contains(&n)
+                })
+                .collect();
+            if extra.is_empty() {
+                Some(s.to_string())
+            } else {
+                Some(format!("{s}; {}", extra.join("; ")))
+            }
+        }
+    }
+}
+
+/// One request through the job's cookie jar, following redirects
+/// MANUALLY — the probe and transfer agents are built with ureq's
+/// own following disabled, because that follower strips Cookie on
+/// every hop and never exposes a hop's Set-Cookie; the gate
+/// cookie set by a 302 therefore never reached the file it
+/// unlocked (F1). Here each hop captures its response's cookies
+/// into the jar and sends the jar's cookies for ITS OWN host, so
+/// a cross-host hop receives only what that host set itself.
+/// Auth is re-scoped per hop against the job's origin, exactly
+/// as one-shot requests scope it (finding #13), and `headers`
+/// (Range, Accept-Encoding, …) are re-sent verbatim on every
+/// hop, as ureq's follower re-sent them. Only GET and HEAD are
+/// routed here — every engine request is one of the two.
+#[allow(clippy::too_many_arguments)]
+fn jar_call(
+    agent: &ureq::Agent,
+    jar: &CookieJar,
+    auth: &Auth,
+    origin_url: &str,
+    method: &str,
+    start_url: &str,
+    headers: &[(&str, &str)],
+) -> Result<ureq::Response, ureq::Error> {
+    let mut url = start_url.to_string();
+    for hop in 0..=5u32 {
+        let mut req = if method == "HEAD" {
+            agent.head(&url)
+        } else {
+            agent.get(&url)
+        };
+        req = apply_auth_scoped(req, auth, &url, origin_url);
+        // apply_auth_scoped may already have set the static
+        // Cookie (same-host hops); the merged header is the final
+        // word for THIS hop's host
+        let static_cookie = if host_key(&url) == host_key(origin_url) {
+            auth.cookie.as_deref()
+        } else {
+            None
+        };
+        if let Some(c) = merged_cookie_header(jar, &url, static_cookie) {
+            req = req.set("Cookie", &c);
+        }
+        for (k, v) in headers {
+            req = req.set(k, v);
+        }
+        match req.call() {
+            Ok(resp) => {
+                jar.capture(&resp, &url);
+                if !(300..400).contains(&resp.status()) || hop == 5 {
+                    return Ok(resp);
+                }
+                let Some(loc) = resp.header("Location").map(|s| s.to_string()) else {
+                    return Ok(resp);
+                };
+                let Some(next) = resolve_url(&url, &loc) else {
+                    return Ok(resp);
+                };
+                url = next;
+            }
+            Err(e) => {
+                // an HTTP error response can still set cookies the
+                // job needs (a login gate answering 403 with a
+                // fresh session cookie): capture before returning
+                if let ureq::Error::Status(_, resp) = &e {
+                    jar.capture(resp, &url);
+                }
+                return Err(e);
+            }
+        }
+    }
+    unreachable!("the hop loop always returns by hop 5")
+}
+
 /// The response's Content-Encoding when it is a real encoding —
 /// every transfer path in this crate requests `identity`, and ureq
 /// is built without an auto-decode feature, so a server that answers
@@ -1152,8 +1475,13 @@ pub(crate) fn response_encoding(resp: &ureq::Response) -> Option<String> {
 }
 
 fn build_agent_for(url: &str) -> ureq::Agent {
+    // redirects(0): transfer requests follow redirects manually
+    // through jar_call so every hop's cookies are captured and
+    // replayed per host (F1) — ureq's follower strips Cookie on
+    // hops and hides hop Set-Cookie headers entirely
     apply_proxy_for(ureq::AgentBuilder::new()
-        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never), url)
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+        .redirects(0), url)
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(30))
         .timeout_write(Duration::from_secs(30))
@@ -1176,11 +1504,82 @@ fn build_agent() -> ureq::Agent {
 }
 
 pub fn probe(url: &str) -> Result<Probe, String> {
-    probe_with(&probe_agent_for(url), url, &Auth::default())
+    if ftp::is_ftp_url(url) {
+        return ftp::probe_ftp(url, &Auth::default());
+    }
+    probe_with(&probe_agent_for(url), url, &Auth::default(), &CookieJar::new())
 }
 
 pub fn probe_with_auth(url: &str, auth: &Auth) -> Result<Probe, String> {
-    probe_with(&probe_agent_for(url), url, auth)
+    if ftp::is_ftp_url(url) {
+        return ftp::probe_ftp(url, auth);
+    }
+    probe_with(&probe_agent_for(url), url, auth, &CookieJar::new())
+}
+
+/// The probe a DOWNLOAD START runs when the caller has not
+/// already probed (F5): one HEAD, and when that HEAD is a clean
+/// answer — a usable total, no Content-Encoding, an explicit
+/// `Accept-Ranges: bytes` claim — its verdict is taken
+/// tentatively (range_unverified) and the separate verify GET
+/// round trip is skipped: the first worker range responses are
+/// the verification, and a contradiction (200s, an encoding lie)
+/// falls back to the worker-side proof / the single-stream
+/// restart, exactly as a false probe verdict would be handled.
+/// Any HEAD that is missing, unusable or ambiguous defers to the
+/// full probe, retries and encoding proof included — the File
+/// Info dialog's probe (probe / probe_with_auth) is unchanged
+/// and always runs the full path.
+pub fn probe_for_download(url: &str) -> Result<Probe, String> {
+    if ftp::is_ftp_url(url) {
+        // the FTP probe is already the full probe (SIZE + a real
+        // REST check on a disposable connection) — there is no
+        // cheaper tentative variant to prefer here
+        return ftp::probe_ftp(url, &Auth::default());
+    }
+    probe_for_download_with(&probe_agent_for(url), url, &Auth::default(), &CookieJar::new())
+}
+
+fn probe_for_download_with(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: &Auth,
+    jar: &Arc<CookieJar>,
+) -> Result<Probe, String> {
+    if let Ok(resp) = jar_call(
+        agent,
+        jar,
+        auth,
+        url,
+        "HEAD",
+        url,
+        &[("Accept-Encoding", "identity")],
+    ) {
+        let total = resp
+            .header("Content-Length")
+            .and_then(|v| v.parse::<u64>().ok());
+        let header_claim = resp
+            .header("Accept-Ranges")
+            .map(|v| v.eq_ignore_ascii_case("bytes"))
+            .unwrap_or(false);
+        if let Some(total) = total {
+            if total > 0 && header_claim && response_encoding(&resp).is_none() {
+                return Ok(Probe {
+                    total,
+                    range_ok: true,
+                    unknown_size: false,
+                    etag: resp.header("ETag").map(|x| x.to_string()),
+                    last_modified: resp.header("Last-Modified").map(|x| x.to_string()),
+                    suggested_name: extract_suggested_name(&resp, url),
+                    final_url: resp.get_url().to_string(),
+                    ignore_encoding_header: false,
+                    cookies: jar.clone(),
+                    range_unverified: true,
+                });
+            }
+        }
+    }
+    probe_with(agent, url, auth, jar)
 }
 
 /// Probing must not hang a download start for minutes: a dedicated agent
@@ -1190,8 +1589,11 @@ pub fn probe_with_auth(url: &str, auth: &Auth) -> Result<Probe, String> {
 /// deadline, and DNS stalls are not covered by the read/write
 /// timeouts at all (M5).
 fn probe_agent_for(url: &str) -> ureq::Agent {
+    // redirects(0) for the same reason as build_agent_for (F1):
+    // probe requests follow redirects manually through jar_call
     apply_proxy_for(ureq::AgentBuilder::new()
-        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never), url)
+        .redirect_auth_headers(ureq::RedirectAuthHeaders::Never)
+        .redirects(0), url)
         .timeout(Duration::from_secs(15))
         .timeout_connect(Duration::from_secs(10))
         .user_agent(BROWSER_UA)
@@ -1234,13 +1636,19 @@ fn prove_encoding_lie(
     url: &str,
     auth: &Auth,
     origin_url: &str,
+    jar: &CookieJar,
     verify_byte: u8,
     known_total: Option<u64>,
 ) -> bool {
-    let Ok(plain) = apply_auth_scoped(agent.get(url), auth, url, origin_url)
-        .set("Accept-Encoding", "identity")
-        .call()
-    else {
+    let Ok(plain) = jar_call(
+        agent,
+        jar,
+        auth,
+        origin_url,
+        "GET",
+        url,
+        &[("Accept-Encoding", "identity")],
+    ) else {
         return false;
     };
     if let Some(t) = known_total {
@@ -1275,15 +1683,20 @@ fn verify_range(
     header_claim: bool,
     auth: &Auth,
     origin_url: &str,
+    jar: &CookieJar,
 ) -> (bool, bool) {
     // `url` is the HEAD's post-redirect address: if that is another
     // host than the one the credentials belong to, they are scoped
     // out (finding #13)
-    match apply_auth_scoped(agent.get(url), auth, url, origin_url)
-        .set("Range", "bytes=0-0")
-        .set("Accept-Encoding", "identity")
-        .call()
-    {
+    match jar_call(
+        agent,
+        jar,
+        auth,
+        origin_url,
+        "GET",
+        url,
+        &[("Range", "bytes=0-0"), ("Accept-Encoding", "identity")],
+    ) {
         Ok(resp) => {
             if resp.status() != 206 {
                 return (false, false);
@@ -1318,7 +1731,9 @@ fn verify_range(
                 .into_reader()
                 .read_exact(&mut byte)
                 .is_ok();
-            if read_ok && prove_encoding_lie(agent, url, auth, origin_url, byte[0], Some(total)) {
+            if read_ok
+                && prove_encoding_lie(agent, url, auth, origin_url, jar, byte[0], Some(total))
+            {
                 (true, true)
             } else {
                 (false, false)
@@ -1350,11 +1765,16 @@ enum ProbeFail {
 /// exactly as the single-attempt probe did.
 const PROBE_ATTEMPTS: usize = 3;
 
-fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, String> {
+fn probe_with(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: &Auth,
+    jar: &Arc<CookieJar>,
+) -> Result<Probe, String> {
     let started = Instant::now();
     let mut attempt = 0usize;
     loop {
-        match probe_once(agent, url, auth) {
+        match probe_once(agent, url, auth, jar) {
             Ok(p) => return Ok(p),
             Err(ProbeFail::Definitive(m)) => return Err(m),
             Err(ProbeFail::Transient(m)) => {
@@ -1378,9 +1798,22 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
     }
 }
 
-fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, ProbeFail> {
+fn probe_once(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: &Auth,
+    jar: &Arc<CookieJar>,
+) -> Result<Probe, ProbeFail> {
     let mut head_suggested: Option<String> = None;
-    if let Ok(resp) = apply_auth(agent.head(url), auth).set("Accept-Encoding", "identity").call() {
+    if let Ok(resp) = jar_call(
+        agent,
+        jar,
+        auth,
+        url,
+        "HEAD",
+        url,
+        &[("Accept-Encoding", "identity")],
+    ) {
         let resolved = resp.get_url().to_string();
         let etag = resp.header("ETag").map(|x| x.to_string());
         let last_modified = resp.header("Last-Modified").map(|x| x.to_string());
@@ -1399,7 +1832,7 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                     .map(|v| v.eq_ignore_ascii_case("bytes"))
                     .unwrap_or(false);
                 let (range_ok, ignore_encoding_header) =
-                    verify_range(agent, &resolved, total, header_claim, auth, url);
+                    verify_range(agent, &resolved, total, header_claim, auth, url, jar);
                 return Ok(Probe {
                     total,
                     range_ok,
@@ -1409,16 +1842,22 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                     suggested_name,
                     final_url: resolved,
                     ignore_encoding_header,
+                    cookies: jar.clone(),
+                    range_unverified: false,
                 });
             }
         }
         head_suggested = suggested_name;
     }
-    let resp = match apply_auth(agent.get(url), auth)
-        .set("Range", "bytes=0-0")
-        .set("Accept-Encoding", "identity")
-        .call()
-    {
+    let resp = match jar_call(
+        agent,
+        jar,
+        auth,
+        url,
+        "GET",
+        url,
+        &[("Range", "bytes=0-0"), ("Accept-Encoding", "identity")],
+    ) {
         Ok(r) => r,
         Err(ureq::Error::Status(416, _)) => {
             // A 416 to `bytes=0-0` proves only that THIS range was
@@ -1430,10 +1869,15 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
             // real file answers with its size, and a server that
             // refuses the plain request too is a clean error — the
             // target is never touched on a guess.
-            match apply_auth(agent.get(url), auth)
-                .set("Accept-Encoding", "identity")
-                .call()
-            {
+            match jar_call(
+                agent,
+                jar,
+                auth,
+                url,
+                "GET",
+                url,
+                &[("Accept-Encoding", "identity")],
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!(
@@ -1486,7 +1930,7 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                     // comparison against the resolved address
                     let mut byte = [0u8; 1];
                     if resp.into_reader().read_exact(&mut byte).is_ok()
-                        && prove_encoding_lie(agent, &resolved, auth, url, byte[0], t)
+                        && prove_encoding_lie(agent, &resolved, auth, url, jar, byte[0], t)
                     {
                         proven = true;
                     }
@@ -1500,6 +1944,8 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                             suggested_name,
                             final_url: resolved,
                             ignore_encoding_header: true,
+                            cookies: jar.clone(),
+                            range_unverified: false,
                         });
                     }
                 }
@@ -1541,6 +1987,8 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
             suggested_name,
             final_url: resolved,
             ignore_encoding_header: false,
+            cookies: jar.clone(),
+            range_unverified: false,
         });
     }
     let etag = resp.header("ETag").map(|s| s.to_string());
@@ -1560,6 +2008,8 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
                 suggested_name,
                 final_url: resolved,
                 ignore_encoding_header: false,
+                cookies: jar.clone(),
+                range_unverified: false,
             });
         }
     };
@@ -1572,7 +2022,79 @@ fn probe_once(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Prob
         suggested_name,
         final_url: resolved,
         ignore_encoding_header: false,
+        cookies: jar.clone(),
+        range_unverified: false,
     })
+}
+
+/// The worker-side lying-header proof (F5): a tentative start
+/// never ran the probe's proof, so the first worker to meet a
+/// Content-Encoding header runs it here — fetch the 1-byte range
+/// answer, then let `prove_encoding_lie` compare it against a
+/// plain identity fetch. On success the job's veto is lifted for
+/// every connection, exactly as a probe verdict would have done.
+fn worker_proves_encoding_lie(
+    agent: &ureq::Agent,
+    shared: &Shared,
+    url: &str,
+    total: u64,
+) -> bool {
+    let origin_url = plock(&shared.state).url.clone();
+    let Ok(resp) = jar_call(
+        agent,
+        &shared.jar,
+        &shared.auth,
+        &origin_url,
+        "GET",
+        url,
+        &[("Range", "bytes=0-0"), ("Accept-Encoding", "identity")],
+    ) else {
+        return false;
+    };
+    if resp.status() != 206 {
+        return false;
+    }
+    let cl_ok = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|cl| cl == 1)
+        .unwrap_or(false);
+    if !cl_ok {
+        return false;
+    }
+    let mut byte = [0u8; 1];
+    if resp.into_reader().read_exact(&mut byte).is_err() {
+        return false;
+    }
+    let proven = prove_encoding_lie(
+        agent,
+        url,
+        &shared.auth,
+        &origin_url,
+        &shared.jar,
+        byte[0],
+        Some(total),
+    );
+    if proven {
+        shared.ignore_encoding.store(true, Ordering::Relaxed);
+    }
+    proven
+}
+
+/// F6 accounting: a range request answered 200 after the job
+/// started. Three in a row (a validated 206 resets the count)
+/// mean the server stopped honouring Range — signed-URL hosts do
+/// exactly this when the signature rots — so the job restarts its
+/// transfer in single-stream mode, once, instead of retrying
+/// ranges until the stall policy fails it.
+const RANGE_LOSS_LIMIT: usize = 3;
+
+fn note_range_loss(shared: &Shared) {
+    if shared.range_200_count.fetch_add(1, Ordering::Relaxed) + 1 >= RANGE_LOSS_LIMIT
+        && !shared.fallback_used.swap(true, Ordering::Relaxed)
+    {
+        shared.single_fallback.store(true, Ordering::Relaxed);
+    }
 }
 
 enum BlockError {
@@ -1583,6 +2105,11 @@ enum BlockError {
     Permanent(String),
     Paused,
     Cancelled,
+    /// this connection fell below the per-connection progress
+    /// floor (F2): it is recycled — the worker drops it and
+    /// re-requests the sub-run from the current offset on a new
+    /// connection. Not a failure.
+    Recycle,
     /// the run reached a work-stealing split boundary: this worker
     /// stops here on purpose, mid-response, so its claim's
     /// unstarted tail can be handed to idle peers. Not an error —
@@ -1631,10 +2158,10 @@ fn download_block_run(
         url.to_string()
     };
     let origin_url = plock(&shared.state).url.clone();
-    let mut req = apply_auth_scoped(agent.get(&req_url), &shared.auth, &req_url, &origin_url)
-        .set("Accept-Encoding", "identity");
+    let range_header = format!("bytes={req_start}-{end}");
+    let mut headers: Vec<(&str, &str)> = vec![("Accept-Encoding", "identity")];
     if !is_gvideo {
-        req = req.set("Range", &format!("bytes={req_start}-{end}"));
+        headers.push(("Range", &range_header));
     }
     // G1: the request is being sent — the dialog's Info column
     // shows "Send GET…" until the headers are in and the body
@@ -1645,9 +2172,24 @@ fn download_block_run(
     if let Some(b) = shared.conn_block.get(worker_id) {
         b.store(*cur_block, Ordering::Relaxed);
     }
-    let resp = req.call().map_err(|e| {
+    let resp = jar_call(
+        agent,
+        &shared.jar,
+        &shared.auth,
+        &origin_url,
+        "GET",
+        &req_url,
+        &headers,
+    )
+    .map_err(|e| {
         if matches!(e, ureq::Error::Status(403, _) | ureq::Error::Status(429, _)) {
-            shared.throttle_events.fetch_add(1, Ordering::Relaxed);
+            // F3: a throttle lands on THIS connection only — its
+            // timestamp feeds the governor's broad-throttling
+            // test, and the connection itself cools down here
+            // before the worker's retry backoff even starts. The
+            // pool as a whole no longer pays for one sick range.
+            plock(&shared.throttle_times).push(Instant::now());
+            std::thread::sleep(Duration::from_millis(900));
         }
         if matches!(e, ureq::Error::Status(404, _) | ureq::Error::Status(410, _)) {
             BlockError::Permanent(format!("http: {e}"))
@@ -1655,7 +2197,7 @@ fn download_block_run(
             BlockError::Retry(format!("http: {e}"))
         }
     })?;
-    if !shared.ignore_encoding {
+    if !shared.ignore_encoding.load(Ordering::Relaxed) {
         if let Some(enc) = response_encoding(&resp) {
             // encoded bytes written at file offsets would assemble a
             // corrupt "finished" file; the server was asked for identity
@@ -1663,9 +2205,16 @@ fn download_block_run(
             // Skipped only when the job's bodies were proven identity
             // despite the header (the DIAG lying-header proof) — the
             // bytes written are still exactly the bytes received.
-            return Err(BlockError::Permanent(format!(
-                "server answered with Content-Encoding: {enc} despite an identity request"
-            )));
+            // A TENTATIVE start (F5) never ran that proof in the
+            // probe: run it here, on the first encoded answer —
+            // a proven lie lifts the veto for the whole job and
+            // THIS identity body is used; anything else keeps the
+            // veto, exactly as the probe verdict would have.
+            if !worker_proves_encoding_lie(agent, shared, &req_url, total) {
+                return Err(BlockError::Permanent(format!(
+                    "server answered with Content-Encoding: {enc} despite an identity request"
+                )));
+            }
         }
     }
     let status = resp.status();
@@ -1693,6 +2242,9 @@ fn download_block_run(
             ));
         }
     } else if status == 206 {
+        // a validated range answer clears the range-loss count
+        // (F6): only PERSISTENT 200s declare the loss
+        shared.range_200_count.store(0, Ordering::Relaxed);
         // RFC 7233 lets a server return FEWER bytes than requested.
         // Accept a shorter range that starts at the right offset:
         // this call fills only up to resp_end and returns Ok with
@@ -1715,6 +2267,9 @@ fn download_block_run(
             "server answered {status} to a range request"
         )));
     } else {
+        if status == 200 {
+            note_range_loss(shared);
+        }
         return Err(BlockError::Retry(format!(
             "server answered {status} to a range request"
         )));
@@ -1735,7 +2290,28 @@ fn download_block_run(
     // which this run has not written a single byte of — are
     // fetched fresh by whoever claims them
     let mut cap_block: Option<usize> = None;
+    // F2 per-connection progress watermark — the single-stream
+    // rule (STALL_PROGRESS_BYTES / STALL_LIMIT) applied to THIS
+    // connection: the pool-wide clock is refreshed by any chunk
+    // of any size, so one connection dribbling a byte every
+    // couple of seconds (inside every read timeout) used to hold
+    // the whole download at ~0 B/s forever. Here, a connection
+    // that has not delivered STALL_PROGRESS_BYTES of new bytes
+    // within STALL_LIMIT is recycled by the worker.
+    let mut wm_pos = *pos;
+    let mut wm_clock = Instant::now();
     loop {
+        if shared.single_fallback.load(Ordering::Relaxed) {
+            // F6: the job switched to single-stream mode — this
+            // run stops here; worker 0 takes over the transfer,
+            // every other worker stands down (Cancelled settles
+            // nothing by itself: the control flags stay clear)
+            return Err(if worker_id == 0 {
+                BlockError::Recycle
+            } else {
+                BlockError::Cancelled
+            });
+        }
         if shared.superseded.load(Ordering::Relaxed) {
             // the supervisor settled without this worker (C-2): it
             // must never write again — the file may already belong
@@ -1800,7 +2376,7 @@ fn download_block_run(
         if shared.control.paused.load(Ordering::Relaxed) {
             return Err(BlockError::Paused);
         }
-        write_at(file, &buf[..n], *pos).map_err(|e| BlockError::Retry(format!("write: {e}")))?;
+        write_at(file, &buf[..n], *pos).map_err(|e| BlockError::Retry(plain_write_error(&e)))?;
         *pos += n as u64;
         shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
         {
@@ -1816,6 +2392,17 @@ fn download_block_run(
         }
         shared.since_save.fetch_add(n as u64, Ordering::Relaxed);
         shared.bytes_since_sync.fetch_add(n as u64, Ordering::Relaxed);
+        // F2: this connection's own watermark — crossing 256 KiB
+        // of delivered bytes resets its clock; a full STALL_LIMIT
+        // below that floor recycles the connection (the worker
+        // drops it and re-requests the sub-run from the current
+        // offset: bytes already written stay written and are
+        // never re-fetched)
+        if !note_stall_progress(*pos, &mut wm_pos, &mut wm_clock)
+            && wm_clock.elapsed() > STALL_LIMIT
+        {
+            return Err(BlockError::Recycle);
+        }
 
         // Mark any completed blocks in this contiguous run immediately
         while *cur_block < b_end_excl {
@@ -1944,6 +2531,9 @@ fn worker(
             }
             continue;
         }
+        if route_fallback(id, &agent, &url, &file, &shared) {
+            return;
+        }
         let active = shared.active_limit.load(Ordering::Relaxed).max(1);
         if id >= active {
             // gated by the adaptive connection limit. This worker
@@ -1951,6 +2541,9 @@ fn worker(
             // claim wait below) — and the stall policy is evaluated
             // here too, so a pool whose eligible workers have all
             // stopped moving bytes still settles as an error.
+            if route_fallback(id, &agent, &url, &file, &shared) {
+                return;
+            }
             if fail_if_stalled(&shared, total_blocks) {
                 return;
             }
@@ -1992,6 +2585,9 @@ fn worker(
                     }
                     continue;
                 }
+                if route_fallback(id, &agent, &url, &file, &shared) {
+                    return;
+                }
                 if fail_if_stalled(&shared, total_blocks) {
                     return;
                 }
@@ -2002,6 +2598,9 @@ fn worker(
         // Process any undone sub-runs inside [claim_start, claim_end)
         let mut cursor = claim_start;
         while cursor < claim_end {
+            if shared.single_fallback.load(Ordering::Relaxed) {
+                break; // F6: the loop head routes the fallback
+            }
             // Between sub-runs the same split check as inside a run:
             // a fragmented claim's later sub-runs are unstarted work
             // an idle peer could be doing. The owner executes the
@@ -2045,6 +2644,9 @@ fn worker(
             }
 
             loop {
+                if shared.single_fallback.load(Ordering::Relaxed) {
+                    break; // F6: the loop head routes the fallback
+                }
                 // A run that "succeeds" without moving the cursor —
                 // a server answering a range request with an empty
                 // 206 range does exactly this — is not progress:
@@ -2111,6 +2713,21 @@ fn worker(
                             *plock(&shared.last_split) = Some(Instant::now());
                         }
                         break;
+                    }
+                    Err(BlockError::Recycle) => {
+                        // F2: this connection fell below the
+                        // progress floor — drop it and re-request
+                        // the SAME sub-run from the CURRENT offset
+                        // (cur_pos is preserved: no byte already
+                        // written is lost or re-fetched, which is
+                        // what lets a server that dribbles EVERY
+                        // connection still be finished — each new
+                        // connection's fast burst lands further
+                        // along the block). The worker keeps the
+                        // claim; idle peers can still split its
+                        // unstarted blocks. Not a failure: no
+                        // attempt counted, no error recorded.
+                        continue;
                     }
                     Err(BlockError::Paused) => {
                         if cur_block < b_last {
@@ -2186,10 +2803,203 @@ fn worker(
     }
 }
 
+/// F6 routing, callable from every worker wait point (loop
+/// head, connection-limit gate, claim wait): when range loss
+/// has been declared, worker 0 runs the single-stream restart
+/// and every other worker simply stands down. Returns true when
+/// the caller must return — the fallback owns the job now.
+fn route_fallback(
+    id: usize,
+    agent: &ureq::Agent,
+    url: &str,
+    file: &Arc<File>,
+    shared: &Arc<Shared>,
+) -> bool {
+    if !shared.single_fallback.load(Ordering::Relaxed) {
+        return false;
+    }
+    if id == 0 {
+        single_fallback_download(agent, url, file, shared);
+    }
+    true
+}
+
+/// The F6 single-stream restart, run by worker 0 inside the
+/// ranged job's own Shared when range support is lost
+/// mid-download: one plain GET streamed over the file from byte
+/// 0. Writing in place is safe here precisely because this is
+/// the SAME file the ranges were fetching — every byte the
+/// stream lands is that file's byte at that offset, the sealed
+/// blocks the journal holds stay true throughout, and only a
+/// verified-complete stream marks the job done. (The demoted
+/// resume path in start_single_stream spools instead because
+/// there the file identity itself is in question.) Pacing,
+/// pause/cancel and the 256 KiB stall watermark all apply
+/// exactly as on the dedicated single-stream path.
+fn single_fallback_download(
+    agent: &ureq::Agent,
+    url: &str,
+    file: &Arc<File>,
+    shared: &Arc<Shared>,
+) {
+    let (total, total_blocks) = {
+        let st = plock(&shared.state);
+        (st.total, st.done.len())
+    };
+    let origin_url = plock(&shared.state).url.clone();
+    let attempt = || -> Result<bool, String> {
+        // Ok(true) = the file is complete; Ok(false) = a cancel
+        // landed mid-stream and the supervisor settles it
+        let resp = jar_call(
+            agent,
+            &shared.jar,
+            &shared.auth,
+            &origin_url,
+            "GET",
+            url,
+            &[("Accept-Encoding", "identity")],
+        )
+        .map_err(|e| format!("http: {e}"))?;
+        if resp.status() != 200 {
+            return Err(format!(
+                "server answered {} to the single-stream restart",
+                resp.status()
+            ));
+        }
+        if !shared.ignore_encoding.load(Ordering::Relaxed) {
+            if let Some(enc) = response_encoding(&resp) {
+                return Err(format!(
+                    "server answered with Content-Encoding: {enc} despite an identity request"
+                ));
+            }
+        }
+        if let Some(p) = shared.conn_phase.first() {
+            p.store(2, Ordering::Relaxed);
+        }
+        let mut reader = resp.into_reader();
+        let mut buf = vec![0u8; 512 * 1024];
+        let mut pos = 0u64;
+        let mut stall_watermark = 0u64;
+        let mut stall_clock = Instant::now();
+        loop {
+            if shared.control.cancelled.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            if shared.control.paused.load(Ordering::Relaxed) {
+                if !wait_while_paused(shared) {
+                    return Ok(false);
+                }
+                stall_watermark = pos;
+                stall_clock = Instant::now();
+            }
+            if stall_clock.elapsed() > STALL_LIMIT {
+                return Err(format!(
+                    "no progress for {}s — the server stopped sending data",
+                    STALL_LIMIT.as_secs()
+                ));
+            }
+            let grant = pace_grant_size(shared, buf.len());
+            if !pace_before_read(shared, grant as u64) {
+                continue; // a halt landed; the checks above settle it
+            }
+            let n = reader.read(&mut buf[..grant]).map_err(|e| {
+                pace_refund_both(shared, grant as u64);
+                format!("read: {e}")
+            })?;
+            if (n as u64) < grant as u64 {
+                pace_refund_both(shared, grant as u64 - n as u64);
+            }
+            if n == 0 {
+                break;
+            }
+            if shared.control.cancelled.load(Ordering::Relaxed) {
+                return Ok(false);
+            }
+            write_at(file, &buf[..n], pos).map_err(|e| plain_write_error(&e))?;
+            pos += n as u64;
+            if note_stall_progress(pos, &mut stall_watermark, &mut stall_clock) {
+                *plock(&shared.last_progress) = stall_clock;
+            }
+            if pos > total {
+                return Err(format!(
+                    "server sent more data than the probed size ({total} bytes)"
+                ));
+            }
+            shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
+            if let Some(cb) = shared.conn_bytes.first() {
+                cb.fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+        if pos != total {
+            return Err(format!(
+                "short download: got {pos} of {total} bytes"
+            ));
+        }
+        Ok(true)
+    };
+    match attempt() {
+        Ok(true) => {
+            {
+                let mut st = plock(&shared.state);
+                for b in st.done.iter_mut() {
+                    *b = 1;
+                }
+            }
+            for b in &shared.block_state {
+                b.store(1, Ordering::Relaxed);
+            }
+            shared
+                .done_count
+                .store(total_blocks, Ordering::Relaxed);
+            save_state(shared, true, Some(file));
+        }
+        Ok(false) => {}
+        Err(e) => {
+            let mut err = plock(&shared.error);
+            *err = Some(e);
+            shared.failed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The governor's decision for one tick, as a pure function
+/// (F3). The pool shrinks ONLY on broad throttling: at least
+/// half the pool's connections throttled inside the recent
+/// window. A lone 403/429 — an expired signed range, one
+/// rate-limited CDN edge — used to halve every connection in
+/// the job; now it costs only its own connection a cooldown
+/// (the worker's throttle path), and the pool halves solely
+/// when the throttling is demonstrably pool-wide.
+#[derive(Debug, PartialEq, Eq)]
+enum GovDecision {
+    Shrink,
+    Grow,
+    Hold,
+}
+
+fn governor_decision(
+    recent_throttles: usize,
+    pool_size: usize,
+    limit: usize,
+    max_conn: usize,
+    rate: f64,
+) -> GovDecision {
+    if recent_throttles > 0 && recent_throttles * 2 >= pool_size.max(1) && limit > 1 {
+        return GovDecision::Shrink;
+    }
+    if limit < max_conn && rate > 0.0 {
+        return GovDecision::Grow;
+    }
+    GovDecision::Hold
+}
+
+/// How far back a throttle event still counts as part of the
+/// current episode for the governor's broad-throttling test.
+const THROTTLE_WINDOW: Duration = Duration::from_secs(5);
+
 fn governor(shared: Arc<Shared>, max_conn: usize, total_blocks: usize) {
     let mut last_bytes = 0u64;
     let mut last_check = Instant::now();
-    let mut last_throttles = 0u64;
     loop {
         std::thread::sleep(Duration::from_millis(1500));
         if shared.done_count.load(Ordering::Relaxed) >= total_blocks
@@ -2202,17 +3012,27 @@ fn governor(shared: Arc<Shared>, max_conn: usize, total_blocks: usize) {
         let rate = (now_bytes - last_bytes) as f64 / last_check.elapsed().as_secs_f64();
         last_bytes = now_bytes;
         last_check = Instant::now();
-        let throttles = shared.throttle_events.load(Ordering::Relaxed);
         let limit = shared.active_limit.load(Ordering::Relaxed);
-        if throttles > last_throttles {
-            last_throttles = throttles;
-            if limit > 1 {
-                shared.active_limit.store((limit / 2).max(1), Ordering::Relaxed);
+        let recent_throttles = {
+            let mut times = plock(&shared.throttle_times);
+            times.retain(|t| t.elapsed() <= THROTTLE_WINDOW);
+            times.len()
+        };
+        match governor_decision(recent_throttles, limit, limit, max_conn, rate) {
+            GovDecision::Shrink => {
+                shared
+                    .active_limit
+                    .store((limit / 2).max(1), Ordering::Relaxed);
+                // the episode is spent: one broad burst halves
+                // the pool once, not once per governor tick
+                plock(&shared.throttle_times).clear();
             }
-        } else if limit < max_conn && rate > 0.0 {
-            shared
-                .active_limit
-                .store((limit * 2).min(max_conn), Ordering::Relaxed);
+            GovDecision::Grow => {
+                shared
+                    .active_limit
+                    .store((limit * 2).min(max_conn), Ordering::Relaxed);
+            }
+            GovDecision::Hold => {}
         }
     }
 }
@@ -2419,6 +3239,7 @@ fn verify_block_bytes(
     url: &str,
     auth: &Auth,
     origin_url: &str,
+    jar: &CookieJar,
     out: &Path,
     start: u64,
     end: u64,
@@ -2429,11 +3250,19 @@ fn verify_block_bytes(
     if want == 0 {
         return true;
     }
-    let Ok(resp) = apply_auth_scoped(agent.get(url), auth, url, origin_url)
-        .set("Accept-Encoding", "identity")
-        .set("Range", &format!("bytes={start}-{}", end - 1))
-        .call()
-    else {
+    if ftp::is_ftp_url(url) {
+        return ftp::verify_block_ftp(url, auth, out, start, end);
+    }
+    let range_header = format!("bytes={start}-{}", end - 1);
+    let Ok(resp) = jar_call(
+        agent,
+        jar,
+        auth,
+        origin_url,
+        "GET",
+        url,
+        &[("Accept-Encoding", "identity"), ("Range", &range_header)],
+    ) else {
         return false;
     };
     if resp.status() != 206 || (!ignore_encoding && response_encoding(&resp).is_some()) {
@@ -2837,9 +3666,34 @@ fn start_impl(
     // and hand the guard to whichever thread settles this download
     let in_flight = InFlightGuard::register(out)?;
     let agent = build_agent_for(url);
+    // F1: the job's cookie jar — inherited from the caller's
+    // probe when there is one (its redirect chain may have set
+    // the very cookie the file is gated behind), otherwise the
+    // start probe below fills it and the workers share it
+    let jar = pre_probed
+        .as_ref()
+        .map(|p| p.cookies.clone())
+        .unwrap_or_else(CookieJar::new);
     let probed = match pre_probed {
         Some(p) => p,
-        None => probe_with(&probe_agent_for(url), url, auth)?,
+        // F5: a start that was not already probed by the caller
+        // runs the download probe (HEAD + tentative verdict),
+        // not the dialog's full HEAD + verify-GET probe — but
+        // ONLY when nothing is at stake: a tentative verdict is
+        // acted on by preallocating and writing the target, so a
+        // start over an EXISTING file or journal (a resume, a
+        // pre-existing target a failed probe must leave
+        // byte-identical) still pays for the full probe whose
+        // verify GET can demote or veto before any byte moves.
+        None => {
+            if ftp::is_ftp_url(url) {
+                ftp::probe_ftp(url, auth)?
+            } else if out.exists() || state_path_for(out).exists() {
+                probe_with(&probe_agent_for(url), url, auth, &jar)?
+            } else {
+                probe_for_download_with(&probe_agent_for(url), url, auth, &jar)?
+            }
+        }
     };
     let state_path = state_path_for(out);
 
@@ -2855,6 +3709,9 @@ fn start_impl(
     }
 
     if !probed.range_ok {
+        if ftp::is_ftp_url(url) {
+            return ftp::start_ftp_single_stream(url, out, probed, control, state_path, auth, in_flight);
+        }
         return start_single_stream(url, out, probed, control, state_path, auth, in_flight);
     }
 
@@ -2890,12 +3747,16 @@ fn start_impl(
     // be spliced with the old blocks and reported Finished. When
     // neither validator pair is usable, prove the splice first:
     // byte-compare a sample of the completed blocks against fresh
-    // range GETs — the first, the last and a deterministic spread
-    // between them (all of them when there are only a few, which is
-    // the common case). Checking only the first block, as this once
-    // did, lets a replacement that differs anywhere later splice
-    // through. Anything but an exact match on every sampled block
-    // discards the state and starts over.
+    // range GETs — the first, the last and two spread between them
+    // (all of them when there are fewer). Checking only the first
+    // block, as this once did, lets a replacement that differs
+    // anywhere later splice through. Anything but an exact match
+    // on every sampled block discards the state and starts over.
+    // F4: beyond the sample, the journal's done map is TRUSTED —
+    // done ranges are never re-fetched on a resume — and the
+    // sample itself (up to 8 sequential full-block GETs before
+    // this change: up to 8 RTT and 8 blocks of pure start delay)
+    // is now at most 4 blocks fetched in PARALLEL, one round trip.
     if let Some(s) = &existing_state {
         let validators_usable = (s.etag.is_some() && probed.etag.is_some())
             || (s.last_modified.is_some() && probed.last_modified.is_some());
@@ -2908,28 +3769,46 @@ fn start_impl(
                 .map(|(i, _)| i)
                 .collect();
             if !done_idx.is_empty() {
+                let last = done_idx.len() - 1;
                 let mut picks: Vec<usize> = Vec::new();
-                for k in 0..=7usize {
-                    let idx = done_idx[(done_idx.len() - 1) * k / 7];
+                for &at in &[0usize, last / 3, (2 * last) / 3, last] {
+                    let idx = done_idx[at];
                     if !picks.contains(&idx) {
                         picks.push(idx);
                     }
                 }
                 let bs = s.block_size;
                 let total = s.total;
-                let all_match = picks.iter().all(|&b| {
-                    let start = b as u64 * bs;
-                    let end = ((b as u64 + 1) * bs).min(total);
-                    verify_block_bytes(
-                        &agent,
-                        &probed.final_url,
-                        auth,
-                        url,
-                        out,
-                        start,
-                        end,
-                        probed.ignore_encoding_header,
-                    )
+                let agent_ref = &agent;
+                let jar_ref = &jar;
+                let final_url_ref = &probed.final_url;
+                let ignore_enc = probed.ignore_encoding_header;
+                let all_match = std::thread::scope(|scope| {
+                    let handles: Vec<_> = picks
+                        .iter()
+                        .map(|&b| {
+                            let start = b as u64 * bs;
+                            let end = ((b as u64 + 1) * bs).min(total);
+                            scope.spawn(move || {
+                                verify_block_bytes(
+                                    agent_ref,
+                                    final_url_ref,
+                                    auth,
+                                    url,
+                                    jar_ref,
+                                    out,
+                                    start,
+                                    end,
+                                    ignore_enc,
+                                )
+                            })
+                        })
+                        .collect();
+                    // a panicked verifier is a failed verification:
+                    // the safe direction is the fresh start
+                    handles
+                        .into_iter()
+                        .all(|h| h.join().unwrap_or(false))
                 });
                 if !all_match {
                     existing_state = None;
@@ -2991,8 +3870,10 @@ fn start_impl(
         .open(out)
         .map_err(|e| format!("cannot open output file: {e}"))?;
     if file.metadata().map(|m| m.len()).unwrap_or(0) != probed.total {
-        file.set_len(probed.total)
-            .map_err(|e| format!("cannot preallocate file: {e}"))?;
+        file.set_len(probed.total).map_err(|e| match disk_full_sentence(&e) {
+            Some(s) => format!("{s} (cannot preallocate file: {e})"),
+            None => format!("cannot preallocate file: {e}"),
+        })?;
     }
     let file = Arc::new(file);
 
@@ -3012,7 +3893,10 @@ fn start_impl(
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(max_conn.min(total_blocks).max(1)),
         active_workers: AtomicUsize::new(0),
-        throttle_events: AtomicU64::new(0),
+        throttle_times: Mutex::new(Vec::new()),
+        range_200_count: AtomicUsize::new(0),
+        single_fallback: AtomicBool::new(false),
+        fallback_used: AtomicBool::new(false),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
         control: control.clone(),
@@ -3034,10 +3918,11 @@ fn start_impl(
         conn_block: (0..max_conn).map(|_| AtomicUsize::new(usize::MAX)).collect(),
         own_limit_gen: AtomicU64::new(0),
         own_limit_oldest_live: AtomicU64::new(0),
-        ignore_encoding: probed.ignore_encoding_header,
+        ignore_encoding: AtomicBool::new(probed.ignore_encoding_header),
         last_data_sync: Mutex::new(Instant::now()),
         bytes_since_sync: AtomicU64::new(0),
         auth: auth.clone(),
+        jar,
     });
 
     let download = Arc::new(Download {
@@ -3048,6 +3933,17 @@ fn start_impl(
         started: Instant::now(),
     });
 
+    // FTP jobs run the parallel FTP worker loop against the same
+    // Shared (src/ftp.rs); HTTP jobs run the ureq worker below.
+    // The governor, supervisor and status tracker after this are
+    // shared verbatim. Parsed before any thread spawns so a parse
+    // failure (impossible after a successful probe) cannot strand
+    // the governor.
+    let ftp_target = if ftp::is_ftp_url(url) {
+        Some(ftp::parse_target(url, auth)?)
+    } else {
+        None
+    };
     {
         let s = shared.clone();
         std::thread::spawn(move || governor(s, max_conn, total_blocks));
@@ -3056,6 +3952,12 @@ fn start_impl(
     for id in 0..max_conn.max(1) {
         let s = shared.clone();
         let f = file.clone();
+        if let Some(t) = ftp_target.clone() {
+            handles.push(std::thread::spawn(move || {
+                ftp::ftp_worker(id, t, f, s, total_blocks)
+            }));
+            continue;
+        }
         let u = probed.final_url.clone();
         let a = agent.clone();
         handles.push(std::thread::spawn(move || worker(id, a, u, f, s, total_blocks)));
@@ -3216,7 +4118,10 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(1),
         active_workers: AtomicUsize::new(0),
-        throttle_events: AtomicU64::new(0),
+        throttle_times: Mutex::new(Vec::new()),
+        range_200_count: AtomicUsize::new(0),
+        single_fallback: AtomicBool::new(false),
+        fallback_used: AtomicBool::new(false),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
         control: control.clone(),
@@ -3238,10 +4143,11 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         conn_block: vec![AtomicUsize::new(usize::MAX)],
         own_limit_gen: AtomicU64::new(0),
         own_limit_oldest_live: AtomicU64::new(0),
-        ignore_encoding: false,
+        ignore_encoding: AtomicBool::new(false),
         last_data_sync: Mutex::new(Instant::now()),
         bytes_since_sync: AtomicU64::new(0),
         auth: Auth::default(),
+        jar: CookieJar::new(),
     });
     Arc::new(Download {
         control,
@@ -3306,7 +4212,10 @@ fn start_single_stream(
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(1),
         active_workers: AtomicUsize::new(1),
-        throttle_events: AtomicU64::new(0),
+        throttle_times: Mutex::new(Vec::new()),
+        range_200_count: AtomicUsize::new(0),
+        single_fallback: AtomicBool::new(false),
+        fallback_used: AtomicBool::new(false),
         failed: AtomicBool::new(false),
         error: Mutex::new(None),
         control: control.clone(),
@@ -3328,10 +4237,11 @@ fn start_single_stream(
         conn_block: vec![AtomicUsize::new(usize::MAX)],
         own_limit_gen: AtomicU64::new(0),
         own_limit_oldest_live: AtomicU64::new(0),
-        ignore_encoding: probed.ignore_encoding_header,
+        ignore_encoding: AtomicBool::new(probed.ignore_encoding_header),
         last_data_sync: Mutex::new(Instant::now()),
         bytes_since_sync: AtomicU64::new(0),
         auth: auth.clone(),
+        jar: probed.cookies.clone(),
     });
     let download = Arc::new(Download {
         control,
@@ -3366,11 +4276,17 @@ fn start_single_stream(
             if let Some(p) = shared.conn_phase.first() {
                 p.store(1, Ordering::Relaxed);
             }
-            let resp = apply_auth(agent.get(&url), &auth)
-                .set("Accept-Encoding", "identity")
-                .call()
-                .map_err(|e| format!("http: {e}"))?;
-            if !shared.ignore_encoding {
+            let resp = jar_call(
+                &agent,
+                &shared.jar,
+                &auth,
+                &url,
+                "GET",
+                &url,
+                &[("Accept-Encoding", "identity")],
+            )
+            .map_err(|e| format!("http: {e}"))?;
+            if !shared.ignore_encoding.load(Ordering::Relaxed) {
                 if let Some(enc) = response_encoding(&resp) {
                     return Err(format!(
                         "server answered with Content-Encoding: {enc} despite an identity request"
@@ -3382,7 +4298,10 @@ fn start_single_stream(
             }
             let mut reader = resp.into_reader();
             let write_path: &Path = if spool { &spool_path } else { &out };
-            let f = File::create(write_path).map_err(|e| format!("create: {e}"))?;
+            let f = File::create(write_path).map_err(|e| match disk_full_sentence(&e) {
+                Some(s) => format!("{s} (create: {e})"),
+                None => format!("create: {e}"),
+            })?;
             let mut buf = vec![0u8; 512 * 1024];
             let mut pos = 0u64;
             // bytes read from the stream but not yet written: a
@@ -3451,7 +4370,7 @@ fn start_single_stream(
                 }
                 let n = held;
                 held = 0;
-                write_at(&f, &buf[..n], pos).map_err(|e| format!("write: {e}"))?;
+                write_at(&f, &buf[..n], pos).map_err(|e| plain_write_error(&e))?;
                 pos += n as u64;
                 if note_stall_progress(pos, &mut stall_watermark, &mut stall_clock) {
                     *plock(&shared.last_progress) = stall_clock;
@@ -8185,5 +9104,625 @@ mod audit208_tests {
         assert_eq!(pk.blocks, vec![1u8, 1, 0, 0]);
         let _ = std::fs::remove_file(&out);
         let _ = std::fs::remove_file(state_path_for(&out));
+    }
+}
+
+// ---------- 2.2.0 workstream A (engine performance): F1 cookie
+// jar, F2 per-connection watermark, F3 governor backoff, F4
+// resume fast-path, F5 download probe, F6 range-loss restart,
+// F7 journal batching, F8 disk-full wording ----------
+
+#[cfg(test)]
+mod perf220_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    fn pattern_body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
+    }
+
+    fn wait_terminal(dl: &Download, deadline: Duration) -> Option<Status> {
+        let t0 = Instant::now();
+        loop {
+            if dl.is_terminal() {
+                return Some(dl.status());
+            }
+            if t0.elapsed() > deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn tmp_out(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ndm-220-{}-{}.bin", tag, std::process::id()))
+    }
+
+    struct Req {
+        method: String,
+        path: String,
+        range: Option<String>,
+        headers: Vec<(String, String)>,
+    }
+
+    impl Req {
+        fn header(&self, name: &str) -> Option<String> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
+        }
+    }
+
+    /// audit207-style handler server that also logs every
+    /// request it receives (method, path, range, headers).
+    fn logged_server<F>(handler: F) -> (u16, Arc<Mutex<Vec<Req>>>)
+    where
+        F: Fn(&Req) -> Vec<u8> + Send + Sync + 'static,
+    {
+        logged_server_on("127.0.0.1", handler)
+    }
+
+    fn logged_server_on<F>(bind: &str, handler: F) -> (u16, Arc<Mutex<Vec<Req>>>)
+    where
+        F: Fn(&Req) -> Vec<u8> + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind(format!("{bind}:0")).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = Arc::new(handler);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let handler = handler.clone();
+                let log = log2.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("/").to_string();
+                    let mut headers = Vec::new();
+                    let mut range = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                if let Some((k, v)) = h.split_once(':') {
+                                    let v = v.trim().to_string();
+                                    if k.trim().eq_ignore_ascii_case("range") {
+                                        range = Some(v.clone());
+                                    }
+                                    headers.push((k.trim().to_string(), v));
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let req = Req { method, path, range, headers };
+                    let resp = handler(&req);
+                    log.lock().unwrap().push(req);
+                    let _ = s.write_all(&resp);
+                });
+            }
+        });
+        (port, log)
+    }
+
+    fn http_resp(status: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+        let mut out = format!("HTTP/1.1 {status}\r\n").into_bytes();
+        for (k, v) in headers {
+            out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+        }
+        out.extend_from_slice(b"Connection: close\r\n\r\n");
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A plain range-capable file serve for one request.
+    fn serve_range(body: &[u8], req: &Req) -> Vec<u8> {
+        let total = body.len() as u64;
+        if req.method == "HEAD" {
+            return http_resp(
+                "200 OK",
+                &[
+                    ("Content-Length", total.to_string()),
+                    ("Accept-Ranges", "bytes".to_string()),
+                ],
+                &[],
+            );
+        }
+        if let Some(r) = &req.range {
+            let r = r.trim().strip_prefix("bytes=").unwrap_or(r);
+            let (a, b) = r.split_once('-').unwrap_or(("0", ""));
+            let a: u64 = a.parse().unwrap_or(0);
+            let b: u64 = if b.is_empty() { total - 1 } else { b.parse().unwrap_or(total - 1) };
+            let end = b.min(total - 1);
+            let slice = &body[a as usize..=end as usize];
+            return http_resp(
+                "206 Partial Content",
+                &[
+                    ("Content-Range", format!("bytes {a}-{end}/{total}")),
+                    ("Content-Length", slice.len().to_string()),
+                ],
+                slice,
+            );
+        }
+        http_resp("200 OK", &[("Content-Length", total.to_string())], body)
+    }
+
+    // --- F1: cookie parsing, scoping and merge rules ---
+
+    #[test]
+    fn set_cookie_parsing_rules() {
+        let (n, v, d, p, x) = parse_set_cookie("gate=1; Path=/").unwrap();
+        assert_eq!((n.as_str(), v.as_str(), d, p.as_str(), x), ("gate", "1", None, "/", false));
+        let (_, _, d, _, _) = parse_set_cookie("a=b; Domain=.Example.COM; Path=/dl").unwrap();
+        assert_eq!(d.as_deref(), Some("example.com"));
+        let (_, _, _, _, x) = parse_set_cookie("a=b; Max-Age=0").unwrap();
+        assert!(x, "Max-Age=0 is a delete instruction");
+        assert!(parse_set_cookie("noequals").is_none());
+        assert!(parse_set_cookie("=v").is_none());
+    }
+
+    #[test]
+    fn jar_scoping_is_host_only_unless_domain_names_the_parent() {
+        let jar = CookieJar::default();
+        let push = |host: &str, domain: Option<&str>, path: &str, name: &str, value: &str| {
+            jar.entries.lock().unwrap().push(JarCookie {
+                host: host.to_string(),
+                domain: domain.map(|d| d.to_string()),
+                path: path.to_string(),
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        };
+        push("example.com", None, "/", "host_only", "1");
+        push("sub.example.com", Some("example.com"), "/", "wide", "2");
+        push("example.com", None, "/dl", "pathscoped", "3");
+
+        let h = jar.header_for("http://example.com/f").unwrap();
+        assert!(h.contains("host_only=1"), "{h}");
+        assert!(jar.header_for("http://other.com/f").is_none());
+        let h = jar.header_for("http://sub.example.com/f").unwrap();
+        assert!(!h.contains("host_only"), "host-only cookie widened: {h}");
+        assert!(h.contains("wide=2"), "{h}");
+        let h = jar.header_for("http://example.com/f").unwrap();
+        assert!(h.contains("wide=2"), "{h}");
+        let h = jar.header_for("http://example.com/other").unwrap();
+        assert!(!h.contains("pathscoped"), "{h}");
+        let h = jar.header_for("http://example.com/dl/x").unwrap();
+        assert!(h.contains("pathscoped=3"), "{h}");
+    }
+
+    #[test]
+    fn jar_merge_lets_the_static_cookie_win_name_clashes() {
+        let jar = CookieJar::default();
+        for (name, value) in [("gate", "old"), ("extra", "1")] {
+            jar.entries.lock().unwrap().push(JarCookie {
+                host: "example.com".to_string(),
+                domain: None,
+                path: "/".to_string(),
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+        let merged = merged_cookie_header(&jar, "http://example.com/f", Some("gate=new")).unwrap();
+        assert!(merged.contains("gate=new"), "{merged}");
+        assert!(!merged.contains("gate=old"), "{merged}");
+        assert!(merged.contains("extra=1"), "{merged}");
+    }
+
+    // --- F1: the cookie gate downloads end to end ---
+
+    #[test]
+    fn cookie_gated_host_downloads_byte_identical() {
+        let body = pattern_body(600_000);
+        let body2 = body.clone();
+        let (port, log) = logged_server(move |req| {
+            if req.path == "/cookieredir" {
+                return http_resp(
+                    "302 Found",
+                    &[
+                        ("Location", "/gated.bin".to_string()),
+                        ("Set-Cookie", "gate=1; Path=/".to_string()),
+                        ("Content-Length", "0".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if req.path == "/gated.bin" {
+                let ok = req.header("Cookie").map(|c| c.contains("gate=1")).unwrap_or(false);
+                if !ok {
+                    return http_resp(
+                        "403 Forbidden",
+                        &[("Content-Length", "9".to_string())],
+                        b"forbidden",
+                    );
+                }
+                return serve_range(&body2, req);
+            }
+            http_resp("404 Not Found", &[("Content-Length", "0".to_string())], &[])
+        });
+        let url = format!("http://127.0.0.1:{port}/cookieredir");
+        let out = tmp_out("cookie");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().any(|r| r.path == "/gated.bin"
+                && r.method == "GET"
+                && r.header("Cookie").map(|c| c.contains("gate=1")).unwrap_or(false)),
+            "no worker request carried the gate cookie"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn jar_cookie_never_leaks_to_a_cross_host_redirect_target() {
+        let body = pattern_body(300_000);
+        let body2 = body.clone();
+        let (port_b, log_b) = logged_server_on("127.0.0.2", move |req| serve_range(&body2, req));
+        let (port_a, _log_a) = logged_server(move |req| {
+            if req.path == "/redir" {
+                return http_resp(
+                    "302 Found",
+                    &[
+                        ("Location", format!("http://127.0.0.2:{port_b}/gated.bin")),
+                        ("Set-Cookie", "gate=1; Path=/".to_string()),
+                        ("Content-Length", "0".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            http_resp("404 Not Found", &[("Content-Length", "0".to_string())], &[])
+        });
+        let url = format!("http://127.0.0.1:{port_a}/redir");
+        let out = tmp_out("xhost");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let log_b = log_b.lock().unwrap();
+        assert!(!log_b.is_empty());
+        for r in log_b.iter() {
+            let c = r.header("Cookie").unwrap_or_default();
+            assert!(!c.contains("gate=1"), "the gate cookie leaked cross-host in {} {}", r.method, r.path);
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- F2: a dribbling connection is recycled, not wedging ---
+
+    /// First range GET: 4 KiB fast, then 1 byte every 50 ms for
+    /// ~35 s (inside every read timeout — the live wedge shape).
+    /// Every later GET serves its slice at full speed, as a fresh
+    /// connection to a healthy route would.
+    fn dribble_once_server(body: Vec<u8>) -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let gets2 = gets.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                let gets = gets2.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = range.unwrap_or((0, total - 1));
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                        .as_bytes(),
+                    );
+                    if gets.fetch_add(1, Ordering::Relaxed) == 0 {
+                        if s.write_all(&slice[..4096.min(slice.len())]).is_err() {
+                            return;
+                        }
+                        for i in 4096..slice.len().min(4096 + 700) {
+                            std::thread::sleep(Duration::from_millis(50));
+                            if s.write_all(&slice[i..i + 1]).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        let _ = s.write_all(slice);
+                    }
+                });
+            }
+        });
+        (port, gets)
+    }
+
+    #[test]
+    fn dribbling_connection_is_recycled_and_the_download_completes() {
+        let body = pattern_body(300_000);
+        let (port, gets) = dribble_once_server(body.clone());
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("dribble");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 1, 256 * 1024).unwrap();
+        assert_eq!(
+            wait_terminal(&dl, Duration::from_secs(90)),
+            Some(Status::Finished),
+            "a dribbling connection must be recycled, not wedge the download"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert!(gets.load(Ordering::Relaxed) >= 2, "the tail was never re-requested on a fresh connection");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- F3: governor decision logic ---
+
+    #[test]
+    fn governor_shrinks_only_on_broad_throttling() {
+        assert_eq!(governor_decision(1, 8, 8, 8, 0.0), GovDecision::Hold);
+        assert_eq!(governor_decision(4, 8, 8, 8, 0.0), GovDecision::Shrink);
+        assert_eq!(governor_decision(2, 3, 3, 8, 0.0), GovDecision::Shrink);
+        assert_eq!(governor_decision(1, 1, 1, 8, 0.0), GovDecision::Hold);
+        assert_eq!(governor_decision(0, 8, 4, 8, 5.0), GovDecision::Grow);
+        assert_eq!(governor_decision(1, 8, 4, 8, 5.0), GovDecision::Grow);
+    }
+
+    // --- F4: resume trusts the done map; sample is ≤4 ---
+
+    #[test]
+    fn validator_less_resume_samples_at_most_four_done_blocks() {
+        let block = 256 * 1024u64;
+        let body = pattern_body((8 * block) as usize);
+        let body2 = body.clone();
+        let (port, log) = logged_server(move |req| serve_range(&body2, req));
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("resume4");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        {
+            let f = File::create(&out).unwrap();
+            f.set_len(8 * block).unwrap();
+            for b in 0..7u64 {
+                let off = b * block;
+                write_at(&f, &body[off as usize..(off + block) as usize], off).unwrap();
+            }
+        }
+        let state = State {
+            url: url.clone(),
+            total: 8 * block,
+            block_size: block,
+            etag: None,
+            last_modified: None,
+            done: vec![1, 1, 1, 1, 1, 1, 1, 0],
+        };
+        std::fs::write(state_path_for(&out), serde_json::to_vec(&state).unwrap()).unwrap();
+        let dl = start(&url, &out, 2, block).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let log = log.lock().unwrap();
+        // full-BLOCK range GETs into the sealed region are the
+        // resume re-fetch traffic this test bounds (the probe's
+        // own 1-byte verify GET is not a done-range re-fetch)
+        let sealed_gets: Vec<&Req> = log
+            .iter()
+            .filter(|r| r.method == "GET" && r.range.is_some())
+            .filter(|r| {
+                let rng = r.range.as_ref().unwrap();
+                let rng = rng.trim().strip_prefix("bytes=").unwrap_or(rng);
+                let (a, b) = rng.split_once('-').unwrap_or(("0", "0"));
+                let a: u64 = a.parse().unwrap_or(0);
+                let b: u64 = b.parse().unwrap_or(0);
+                a < 7 * block && b + 1 - a == block
+            })
+            .collect();
+        assert!(
+            sealed_gets.len() <= 4,
+            "resume re-fetched {} sealed ranges (sample must be ≤4)",
+            sealed_gets.len()
+        );
+        for r in log.iter().filter(|r| r.method == "GET") {
+            let rng = r.range.clone().unwrap_or_default();
+            for b in [1u64, 3, 5] {
+                assert_ne!(
+                    rng,
+                    format!("bytes={}-{}", b * block, (b + 1) * block - 1),
+                    "unsampled sealed block {b} was re-fetched on resume"
+                );
+            }
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- F5: the download probe skips the verify GET ---
+
+    #[test]
+    fn download_probe_skips_the_verify_round_trip() {
+        let body = pattern_body(300_000);
+        let body2 = body.clone();
+        let (port, log) = logged_server(move |req| serve_range(&body2, req));
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let p = probe_for_download(&url).unwrap();
+        assert!(p.range_ok);
+        assert!(p.range_unverified, "a clean HEAD claim must be taken tentatively by the download probe");
+        {
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 1, "the download probe must be ONE request");
+            assert_eq!(log[0].method, "HEAD");
+        }
+        let out = tmp_out("f5");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let log = log.lock().unwrap();
+        assert!(
+            log.iter().all(|r| r.range.as_deref() != Some("bytes=0-0")),
+            "a verify GET (bytes=0-0) was issued"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn tentative_start_proves_a_lying_encoding_header_in_the_worker() {
+        // HEAD is clean, but every GET answer is stamped
+        // Content-Encoding: gzip while carrying identity bytes:
+        // the tentative start's first worker must run the proof
+        // and keep its connections, as the probe verdict would
+        let body = pattern_body(400_000);
+        let body2 = body.clone();
+        let (port, _log) = logged_server(move |req| {
+            let total = body2.len() as u64;
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            let resp = serve_range(&body2, req);
+            let head_end = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 2;
+            let mut out = resp[..head_end].to_vec();
+            out.extend_from_slice(b"Content-Encoding: gzip\r\n");
+            out.extend_from_slice(&resp[head_end..]);
+            out
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("f5lie");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(30)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- F6: persistent range loss restarts single-stream ---
+
+    #[test]
+    fn persistent_range_loss_restarts_in_single_stream_mode() {
+        let body = pattern_body(700_000);
+        let body2 = body.clone();
+        let range_gets = Arc::new(AtomicUsize::new(0));
+        let range_gets2 = range_gets.clone();
+        let (port, log) = logged_server(move |req| {
+            let total = body2.len() as u64;
+            if req.method == "HEAD" {
+                return http_resp(
+                    "200 OK",
+                    &[
+                        ("Content-Length", total.to_string()),
+                        ("Accept-Ranges", "bytes".to_string()),
+                    ],
+                    &[],
+                );
+            }
+            if req.range.is_some() {
+                if range_gets2.fetch_add(1, Ordering::Relaxed) == 0 {
+                    return serve_range(&body2, req);
+                }
+                return http_resp("200 OK", &[("Content-Length", total.to_string())], &body2);
+            }
+            http_resp("200 OK", &[("Content-Length", total.to_string())], &body2)
+        });
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("f6");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        assert_eq!(
+            wait_terminal(&dl, Duration::from_secs(60)),
+            Some(Status::Finished),
+            "persistent 200s must restart the job single-stream, not stall-fail it"
+        );
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let log = log.lock().unwrap();
+        let plain_gets = log.iter().filter(|r| r.method == "GET" && r.range.is_none()).count();
+        assert_eq!(plain_gets, 1, "expected exactly one single-stream restart GET");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- F7: periodic save cadence ---
+
+    #[test]
+    fn periodic_save_never_fires_inside_the_minimum_interval() {
+        assert!(!periodic_save_due(Duration::from_millis(100), 100 << 20));
+        assert!(!periodic_save_due(Duration::from_millis(249), 4 << 20));
+        assert!(periodic_save_due(Duration::from_millis(250), 4 << 20));
+        assert!(!periodic_save_due(Duration::from_millis(300), 0));
+        assert!(periodic_save_due(Duration::from_secs(1), 0));
+    }
+
+    // --- F8: disk-full wording ---
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_full_write_error_says_so_in_plain_words() {
+        let e = io::Error::from_raw_os_error(28); // ENOSPC
+        let s = plain_write_error(&e);
+        assert!(s.contains("The disk is full"), "{s}");
+        assert!(s.contains("write:"), "the historical prefix must survive: {s}");
+        assert!(s.contains("os error 28"), "the raw error must survive: {s}");
+        let other = io::Error::from_raw_os_error(2);
+        let s = plain_write_error(&other);
+        assert!(!s.contains("disk is full"), "{s}");
+        assert!(s.starts_with("write: "), "{s}");
     }
 }

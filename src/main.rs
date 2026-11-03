@@ -131,7 +131,10 @@ fn main() {
     // the mandatory-update gate runs here — after usage errors
     // (exit 2 above) and before the probe/start it protects
     enforce_mandatory_update();
-    let probed = match ndm::probe(&url) {
+    // a CLI invocation IS a download start, not the File Info
+    // dialog: it runs the engine's download probe (F5 — one HEAD,
+    // tentative range verdict, no separate verify round trip)
+    let probed = match ndm::probe_for_download(&url) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("[ndm] {e}");
@@ -269,6 +272,10 @@ mod tests {
             win_sha256: String::new(),
             win_setup_url: String::new(),
             win_setup_sha256: String::new(),
+            win_x86_url: String::new(),
+            win_x86_sha256: String::new(),
+            win_x86_setup_url: String::new(),
+            win_x86_setup_sha256: String::new(),
         }
     }
 

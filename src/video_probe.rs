@@ -5,7 +5,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QualityOption {
@@ -183,7 +184,74 @@ pub fn cookie_file_has_real_session(file: &Path) -> bool {
     cookie_file_usable_for_url("", file)
 }
 
+/// True when yt-dlp must run with NO JavaScript runtime on this
+/// machine: a pre-Windows-10 Windows, where the fetched component
+/// set deliberately carries no deno — Deno's own installation docs
+/// require Windows 10 version 1709 or later (it needs
+/// IsWow64Process2), and the newest Node yt-dlp accepts (22+) has
+/// the same Windows 10 floor, so no supported runtime can run
+/// there at all. Everywhere else this is false and the runtime
+/// found on disk is passed exactly as before.
+pub fn no_js_runtime_mode() -> bool {
+    crate::components::pre_win10_windows()
+}
+
+/// The YouTube player clients a no-JS-runtime run may use: the
+/// clients from the normal list that answer from the embedded/TV
+/// player responses, WITHOUT `default` — `default` expands to the
+/// web clients whose formats are gated behind the JavaScript
+/// challenge (n/sig) that only a JS runtime can solve (yt-dlp's
+/// EJS wiki). Embedded/TV/mweb responses expose their formats
+/// without that challenge, which is what maximises what still
+/// works on a machine that cannot run a runtime.
+fn youtube_clients_no_js() -> &'static str {
+    "youtube:player_client=tv_embedded,web_embedded,mweb"
+}
+
+fn youtube_clients_default() -> &'static str {
+    "youtube:player_client=default,tv_embedded,web_embedded,mweb"
+}
+
+/// The plain-language form of a yt-dlp failure that happened
+/// because the site needs JavaScript challenge solving and this
+/// machine cannot run a JS runtime (see `no_js_runtime_mode`).
+/// Callers apply it ONLY in no-JS mode; anywhere else the raw
+/// error stands. Returns None when the error is not of that kind.
+/// Recognised shapes are yt-dlp's own: its "No supported
+/// JavaScript runtime could be found" / EJS wording, and the
+/// downstream symptom on challenge-gated sites — the requested
+/// format (or every format) never materialising.
+pub fn js_required_error(err: &str) -> Option<String> {
+    let l = err.to_lowercase();
+    let js_named = l.contains("javascript")
+        || l.contains("js runtime")
+        || l.contains("yt-dlp-ejs")
+        || l.contains("no supported js");
+    let formats_starved = l.contains("requested format is not available")
+        || l.contains("only images are available")
+        || l.contains("no video formats found");
+    if js_named || formats_starved {
+        Some(
+            "This site needs a JavaScript tool to unlock its videos, and that tool \
+             can't run on this version of Windows — it needs Windows 10 or newer. \
+             Videos from most other sites, and direct video links, still work on this PC."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
 pub fn base_args_for_url(url: &str, components_dir: &Path, cookies: Option<&Path>) -> Vec<String> {
+    base_args_for_url_mode(url, components_dir, cookies, no_js_runtime_mode())
+}
+
+fn base_args_for_url_mode(
+    url: &str,
+    components_dir: &Path,
+    cookies: Option<&Path>,
+    no_js: bool,
+) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "--newline".into(),
         "--no-playlist".into(),
@@ -191,7 +259,12 @@ pub fn base_args_for_url(url: &str, components_dir: &Path, cookies: Option<&Path
         "--socket-timeout".into(),
         "15".into(),
         "--extractor-args".into(),
-        "youtube:player_client=default,tv_embedded,web_embedded,mweb".into(),
+        if no_js {
+            youtube_clients_no_js()
+        } else {
+            youtube_clients_default()
+        }
+        .into(),
     ];
     if cfg!(debug_assertions) && std::env::var("NDM_INSECURE").is_ok() {
         args.push("--no-check-certificates".into());
@@ -207,7 +280,13 @@ pub fn base_args_for_url(url: &str, components_dir: &Path, cookies: Option<&Path
             args.push(file.to_string_lossy().into_owned());
         }
     }
-    if let Some(deno) = find_tool("deno", components_dir) {
+    if no_js {
+        // --no-js-runtimes clears every runtime, including the
+        // deno yt-dlp enables by default when it merely FINDS one
+        // on PATH — a stray broken runtime must never be tried on
+        // a machine whose OS cannot run it.
+        args.push("--no-js-runtimes".into());
+    } else if let Some(deno) = find_tool("deno", components_dir) {
         args.push("--js-runtimes".into());
         args.push(format!("deno:{}", deno.display()));
     } else if let Some(node) = find_tool("node", components_dir) {
@@ -555,7 +634,7 @@ fn format_is_audio_only(f: &serde_json::Value) -> bool {
 /// audio-only .m4a (M3). A result that carries its own media URL
 /// and is not a playlist IS its own single format — the same
 /// fallback core's resolver applies to `requested_formats`.
-fn probe_formats(v: &serde_json::Value) -> Vec<serde_json::Value> {
+pub fn probe_formats(v: &serde_json::Value) -> Vec<serde_json::Value> {
     let formats = v["formats"].as_array().cloned().unwrap_or_default();
     if !formats.is_empty() {
         return formats;
@@ -899,11 +978,131 @@ fn tool_cmd<S: AsRef<std::ffi::OsStr>>(prog: S) -> Command {
     c
 }
 
+/// How long a probe result stays reusable. A probe is one full
+/// yt-dlp process spawn plus the page fetch — the single most
+/// expensive step in the whole add flow — and the picker's data
+/// (title, formats, sizes) does not change second to second, so a
+/// repeated Fetch Info on the same page, and the resolve the
+/// Download click runs a moment later, must not pay it again.
+/// Two minutes is deliberately short: signed stream URLs inside
+/// the cached raw dump stay far inside their real lifetimes, and
+/// the resolution cache in core applies its own longer TTL to the
+/// streams it derives from this dump.
+pub const PROBE_TTL: Duration = Duration::from_secs(120);
+const PROBE_CACHE_CAP: usize = 32;
+
+/// Everything that can change a probe's result, as a cache key:
+/// the full page URL, a signature of the effective yt-dlp base
+/// arguments (which already encode the proxy, the JS-runtime
+/// mode and the cookie file's path), and a signature of the
+/// cookie file's BYTES — a re-login changes the bytes under the
+/// same path, and a resolution made under the old session must
+/// never be served to the new one.
+#[derive(PartialEq, Eq, Clone)]
+struct ProbeKey {
+    url: String,
+    args_sig: u64,
+    cookies_sig: u64,
+}
+
+struct ProbeEntry {
+    key: ProbeKey,
+    at: Instant,
+    info: VideoInfo,
+    raw: serde_json::Value,
+}
+
+static PROBE_CACHE: Mutex<Vec<ProbeEntry>> = Mutex::new(Vec::new());
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Content signature of a cookie file (FNV-1a over its bytes);
+/// no file and an unreadable file get distinct sentinels so
+/// neither can alias a real file's hash. Mirrors the resolution
+/// cache's signature in core's video module.
+fn probe_cookies_signature(cookies: Option<&Path>) -> u64 {
+    let Some(p) = cookies else { return 0 };
+    let Ok(bytes) = std::fs::read(p) else {
+        return u64::MAX;
+    };
+    fnv1a(&bytes)
+}
+
+fn probe_key(url: &str, components_dir: &Path, cookies: Option<&Path>) -> ProbeKey {
+    let args = base_args_for_url(url, components_dir, cookies);
+    ProbeKey {
+        url: url.to_string(),
+        args_sig: fnv1a(args.join("\u{1}").as_bytes()),
+        cookies_sig: probe_cookies_signature(cookies),
+    }
+}
+
+fn probe_cache_lock() -> std::sync::MutexGuard<'static, Vec<ProbeEntry>> {
+    PROBE_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn probe_cache_get(key: &ProbeKey, now: Instant) -> Option<(VideoInfo, serde_json::Value)> {
+    let mut cache = probe_cache_lock();
+    cache.retain(|e| now.duration_since(e.at) < PROBE_TTL);
+    cache
+        .iter()
+        .find(|e| &e.key == key)
+        .map(|e| (e.info.clone(), e.raw.clone()))
+}
+
+fn probe_cache_store(key: ProbeKey, info: VideoInfo, raw: serde_json::Value, now: Instant) {
+    let mut cache = probe_cache_lock();
+    cache.retain(|e| e.key != key && now.duration_since(e.at) < PROBE_TTL);
+    cache.push(ProbeEntry {
+        key,
+        at: now,
+        info,
+        raw,
+    });
+    while cache.len() > PROBE_CACHE_CAP {
+        cache.remove(0);
+    }
+}
+
+/// The raw yt-dlp `-J` dump behind a fresh cached probe of this
+/// exact URL + options, if one exists. Core's stream resolver
+/// derives a single-format page's streams from this dump instead
+/// of spawning yt-dlp a second time (see core::video).
+pub fn cached_probe_json(
+    url: &str,
+    components_dir: &Path,
+    cookies: Option<&Path>,
+) -> Option<serde_json::Value> {
+    let key = probe_key(url, components_dir, cookies);
+    probe_cache_get(&key, Instant::now()).map(|(_, raw)| raw)
+}
+
 pub fn probe(
     url: &str,
     components_dir: &Path,
     cookies: Option<&Path>,
 ) -> Result<VideoInfo, String> {
+    let key = probe_key(url, components_dir, cookies);
+    if let Some((info, _)) = probe_cache_get(&key, Instant::now()) {
+        return Ok(info);
+    }
+    let (info, raw) = probe_uncached(url, components_dir, cookies)?;
+    probe_cache_store(key, info.clone(), raw, Instant::now());
+    Ok(info)
+}
+
+fn probe_uncached(
+    url: &str,
+    components_dir: &Path,
+    cookies: Option<&Path>,
+) -> Result<(VideoInfo, serde_json::Value), String> {
     let ytdlp = find_tool("yt-dlp", components_dir)
         .ok_or("yt-dlp not found — the video component is not installed yet")?;
     let mut cmd = tool_cmd(&ytdlp);
@@ -966,6 +1165,16 @@ pub fn probe(
     let stderr = err_thread.join().unwrap_or_default();
     if !status.success() {
         let err = String::from_utf8_lossy(&stderr);
+        // On a machine that cannot run a JavaScript runtime, a
+        // challenge-gated site must fail in plain language, not
+        // as a raw yt-dlp line (see js_required_error). Checked
+        // against the whole stderr: the JS wording often rides
+        // in a WARNING above the final ERROR line.
+        if no_js_runtime_mode() {
+            if let Some(m) = js_required_error(&err) {
+                return Err(m);
+            }
+        }
         let last = err
             .lines()
             .rev()
@@ -1000,13 +1209,14 @@ pub fn probe(
 
     let options = build_options(&formats, duration_f64);
 
-    Ok(VideoInfo {
+    let info = VideoInfo {
         title,
         duration,
         thumbnail,
         uploader,
         options,
-    })
+    };
+    Ok((info, v))
 }
 
 #[cfg(test)]
@@ -1692,6 +1902,158 @@ mod tests {
         ];
         let options = build_options(&formats, 100.0);
         assert_eq!(row_at(&options, 360).size_bytes, 5_700_000);
+    }
+
+    // ---------- WS-B: no-JS-runtime mode (pre-Windows-10) ----------
+
+    #[test]
+    fn no_js_args_disable_every_runtime_and_skip_default_client() {
+        // On a machine whose OS cannot run any supported JS
+        // runtime, yt-dlp must be told so explicitly: every
+        // runtime cleared (a stray deno on PATH must not be
+        // tried), and the YouTube clients restricted to the ones
+        // that answer without the JS challenge — `default` (the
+        // web clients) must not appear.
+        let dir = std::env::temp_dir();
+        let args = base_args_for_url_mode("https://www.youtube.com/watch?v=x", &dir, None, true);
+        assert!(args.iter().any(|a| a == "--no-js-runtimes"), "args: {args:?}");
+        assert!(!args.iter().any(|a| a == "--js-runtimes"), "args: {args:?}");
+        let clients = args
+            .iter()
+            .find(|a| a.starts_with("youtube:player_client="))
+            .expect("extractor args must carry the client list");
+        assert!(!clients.contains("default"), "clients: {clients}");
+        assert!(clients.contains("tv_embedded"), "clients: {clients}");
+        assert!(clients.contains("web_embedded"), "clients: {clients}");
+        assert!(clients.contains("mweb"), "clients: {clients}");
+    }
+
+    #[test]
+    fn js_mode_args_keep_the_runtime_and_default_client() {
+        // The control case: with a runtime available the args are
+        // exactly what they were before the no-JS mode existed.
+        let dir = std::env::temp_dir();
+        let args = base_args_for_url_mode("https://www.youtube.com/watch?v=x", &dir, None, false);
+        assert!(!args.iter().any(|a| a == "--no-js-runtimes"), "args: {args:?}");
+        let clients = args
+            .iter()
+            .find(|a| a.starts_with("youtube:player_client="))
+            .expect("extractor args must carry the client list");
+        assert!(clients.contains("default"), "clients: {clients}");
+    }
+
+    #[test]
+    fn js_required_error_maps_yt_dlp_js_failures_to_plain_language() {
+        // yt-dlp's own phrasings when challenge solving is
+        // impossible without a runtime.
+        for raw in [
+            "WARNING: [youtube] No supported JavaScript runtime could be found. \
+             YouTube extraction without a JS runtime has been deprecated, and some formats may be missing.",
+            "ERROR: [youtube] abc123: Requested format is not available. Use --list-formats for a list of available formats",
+            "ERROR: [youtube] abc123: Only images are available for download. use --list-formats to see them",
+        ] {
+            let m = js_required_error(raw).unwrap_or_else(|| panic!("must map: {raw}"));
+            assert!(m.contains("JavaScript tool"), "message: {m}");
+            assert!(m.contains("Windows 10"), "message: {m}");
+            assert!(!m.contains("yt-dlp"), "no raw tool wording: {m}");
+        }
+        // unrelated failures keep their raw text (None = no mapping)
+        assert!(js_required_error("ERROR: [generic] could not resolve host").is_none());
+        assert!(js_required_error("ERROR: HTTP Error 404: Not Found").is_none());
+    }
+
+    // ---------- WS-B: probe cache ----------
+
+    fn cache_test_info(title: &str) -> VideoInfo {
+        VideoInfo {
+            title: title.to_string(),
+            duration: 12,
+            thumbnail: String::new(),
+            uploader: String::new(),
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn probe_cache_hit_miss_and_expiry() {
+        // unique URLs per test: the cache is process-global and
+        // cargo runs tests on parallel threads
+        let dir = std::env::temp_dir();
+        let url = "https://probe-cache.example/watch?v=pc1";
+        let key = probe_key(url, &dir, None);
+        let now = Instant::now();
+        assert!(probe_cache_get(&key, now).is_none());
+        probe_cache_store(
+            key.clone(),
+            cache_test_info("Cached Clip"),
+            serde_json::json!({ "id": "pc1" }),
+            now,
+        );
+        let (info, raw) = probe_cache_get(&key, now).expect("fresh entry must hit");
+        assert_eq!(info.title, "Cached Clip");
+        assert_eq!(raw["id"], "pc1");
+        // a different URL is a different probe
+        let other = probe_key("https://probe-cache.example/watch?v=pc2", &dir, None);
+        assert!(probe_cache_get(&other, now).is_none());
+        // an entry older than the TTL is never served
+        assert!(
+            probe_cache_get(&key, now + PROBE_TTL + Duration::from_secs(1)).is_none(),
+            "an entry older than the TTL must miss"
+        );
+    }
+
+    #[test]
+    fn probe_cache_key_changes_with_cookie_bytes() {
+        // same URL, same cookie PATH, different session bytes:
+        // the second session must never be served the first
+        // session's probe.
+        let dir = std::env::temp_dir();
+        let url = "https://probe-cache.example/watch?v=pc3";
+        let f1 = write_temp_cookies("pc-a", ".example.com\tTRUE\t/\tTRUE\t1999999999\tSID\tone\n");
+        let k1 = probe_key(url, &dir, Some(&f1));
+        probe_cache_store(k1, cache_test_info("One"), serde_json::json!({}), Instant::now());
+        std::fs::write(&f1, ".example.com\tTRUE\t/\tTRUE\t1999999999\tSID\ttwo\n").unwrap();
+        let k2 = probe_key(url, &dir, Some(&f1));
+        assert!(probe_cache_get(&k2, Instant::now()).is_none());
+        let _ = std::fs::remove_file(&f1);
+    }
+
+    /// With a counting stub yt-dlp, two probes of the same page
+    /// run the process exactly ONCE — the second Fetch Info is
+    /// served from the probe cache. This is the add→picker
+    /// latency fix measured end to end at unit level.
+    #[cfg(unix)]
+    #[test]
+    fn repeated_probe_spawns_ytdlp_once() {
+        let dir = std::env::temp_dir().join(format!("ndm-probe-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let count_file = dir.join("count.txt");
+        let json = "{\"id\":\"clip\",\"title\":\"Clip\",\"url\":\"http://127.0.0.1:9/clip.mp4\",\"ext\":\"mp4\",\"duration\":12}";
+        let script = format!(
+            "#!/bin/sh\necho x >> \"{}\"\nprintf '%s\\n' '{}'\n",
+            count_file.display(),
+            json
+        );
+        let stub = dir.join("yt-dlp");
+        std::fs::write(&stub, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let url = "https://probe-cache.example/direct/clip.mp4";
+        let first = probe(url, &dir, None).expect("first probe");
+        let second = probe(url, &dir, None).expect("second probe");
+        assert_eq!(first.title, "Clip");
+        assert_eq!(second.title, "Clip");
+        let runs = std::fs::read_to_string(&count_file)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        assert_eq!(runs, 1, "a repeated probe must not spawn yt-dlp again");
+        // the raw dump the click's resolver derives from is cached too
+        let raw = cached_probe_json(url, &dir, None).expect("raw dump must be cached");
+        assert_eq!(raw["id"], "clip");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
