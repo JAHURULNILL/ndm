@@ -12,10 +12,12 @@
 //! Linux ffmpeg deliberately stays OUT of this table: the .deb
 //! declares it as a package dependency, so `find_tool` picks the
 //! distro's build up from PATH — fetching a second copy would only
-//! shadow it. One exception to "deno on every platform": pre-
+//! shadow it. Two exceptions to "deno on every platform": pre-
 //! Windows-10 Windows gets NO deno — Deno requires Windows 10
-//! (see `effective_specs`) — and yt-dlp runs there in its
-//! no-JavaScript-runtime configuration instead.
+//! (see `effective_specs`) — and 32-bit Windows gets NO deno at
+//! ANY Windows version — Deno publishes no 32-bit build at all.
+//! On both, yt-dlp runs in its no-JavaScript-runtime configuration
+//! instead (see `no_js_runtime_here`).
 //!
 //! Two support/testing knobs redirect the source (mirrors, offline
 //! tests): in DEBUG builds only, `NDM_COMPONENTS_BASE` replaces the
@@ -124,10 +126,47 @@ pub fn specs() -> Vec<ComponentSpec> {
     ]
 }
 
+// 32-bit Windows. yt-dlp ships an official x86 build of the same
+// pinned release (hash verified against that release's own
+// SHA2-256SUMS file). There is NO deno entry and never can be:
+// Deno publishes no 32-bit Windows build at any version, so video
+// on this architecture always runs in the no-JavaScript-runtime
+// configuration (see `no_js_runtime_here`) — on Windows 10/11
+// exactly as below them. ffmpeg is the ffbinaries build: Gyan
+// (the x86_64 pin's source) and BtbN publish no 32-bit Windows
+// build at all, and yt-dlp's own FFmpeg-Builds exist only as
+// rolling or pruned autobuild tags, which a baked-in hash cannot
+// survive — 4.2.1 is the newest 32-bit Windows ffmpeg published
+// as a permanent versioned release. It is a static build and the
+// zip holds ffmpeg.exe at its root, where extract_binary's exact
+// path match finds it. Hash computed from a local download of
+// this byte-identical file (ffbinaries publishes no checksum
+// file for it).
+#[cfg(all(target_os = "windows", target_arch = "x86"))]
+pub fn specs() -> Vec<ComponentSpec> {
+    vec![
+        ComponentSpec {
+            name: "yt-dlp",
+            asset: "yt-dlp_x86.exe",
+            url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.26/yt-dlp_x86.exe",
+            sha256: "c0407c66361f50a99e10949ae882ea2ad7de9086b75d226d8fd88da4f74828fa",
+            zipped: false,
+        },
+        ComponentSpec {
+            name: "ffmpeg",
+            asset: "ffmpeg-4.2.1-win-32.zip",
+            url: "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.2.1/ffmpeg-4.2.1-win-32.zip",
+            sha256: "0756d28826d7f89afff43fb831b4452eac745d12868cf988a09be8052c564215",
+            zipped: true,
+        },
+    ]
+}
+
 // No ffmpeg entry here: there is no permanently-hosted ARM64
 // Windows ffmpeg build to pin (Gyan ships x86_64 only; the ARM64
-// builds elsewhere are rolling-only). x86_64 is the shipped
-// Windows target — this table is completeness, like it was before.
+// builds elsewhere are rolling-only). x86_64 and x86 are the
+// shipped Windows targets — this table is completeness, like it
+// was before.
 #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
 pub fn specs() -> Vec<ComponentSpec> {
     vec![
@@ -152,6 +191,7 @@ pub fn specs() -> Vec<ComponentSpec> {
     all(not(target_os = "windows"), target_arch = "x86_64"),
     all(not(target_os = "windows"), target_arch = "aarch64"),
     all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "x86"),
     all(target_os = "windows", target_arch = "aarch64"),
 )))]
 pub fn specs() -> Vec<ComponentSpec> {
@@ -177,9 +217,50 @@ fn ytdlp_legacy_win_x64() -> ComponentSpec {
     }
 }
 
+/// The 32-bit twin of the pin above: the same last pre-Windows-10
+/// release (2026.10.21), its official x86 build. Hash taken from
+/// that release's own SHA2-256SUMS file.
+#[cfg(any(all(target_os = "windows", target_arch = "x86"), test))]
+fn ytdlp_legacy_win_x86() -> ComponentSpec {
+    ComponentSpec {
+        name: "yt-dlp",
+        asset: "yt-dlp_x86.exe",
+        url: "https://github.com/yt-dlp/yt-dlp/releases/download/2026.10.21/yt-dlp_x86.exe",
+        sha256: "7ce38c77db13db50c64e656b1056a0448e6c38ec0f0ccf28e30dd5271c008850",
+        zipped: false,
+    }
+}
+
+/// The legacy pin for THIS architecture — the pre-Windows-10
+/// swap must never install a 64-bit yt-dlp on a 32-bit machine
+/// (or the reverse).
+#[cfg(any(
+    all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ),
+    test
+))]
+fn ytdlp_legacy_win() -> ComponentSpec {
+    #[cfg(target_arch = "x86")]
+    {
+        ytdlp_legacy_win_x86()
+    }
+    #[cfg(not(target_arch = "x86"))]
+    {
+        ytdlp_legacy_win_x64()
+    }
+}
+
 /// Windows 10 is where the modern yt-dlp pin starts working;
 /// below it the legacy pin above is the newest yt-dlp that runs.
-#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+#[cfg(any(
+    all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ),
+    test
+))]
 fn use_legacy_ytdlp(windows_major: u32) -> bool {
     windows_major < 10
 }
@@ -189,7 +270,10 @@ fn use_legacy_ytdlp(windows_major: u32) -> bool {
 /// 6.2 to any process whose manifest declares no supportedOS —
 /// which includes this app — so the usual version APIs cannot be
 /// trusted to make the pin decision above.
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+#[cfg(all(
+    target_os = "windows",
+    any(target_arch = "x86_64", target_arch = "x86")
+))]
 fn windows_major_version() -> Option<u32> {
     #[repr(C)]
     struct OsVersionInfoW {
@@ -228,7 +312,13 @@ fn windows_major_version() -> Option<u32> {
 /// pre-Windows-10 machine: a 60+ MB component that can never
 /// start, whose fetch failure also makes the whole engine setup
 /// look failed.
-#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+#[cfg(any(
+    all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ),
+    test
+))]
 fn use_deno(major: u32) -> bool {
     major >= 10
 }
@@ -241,13 +331,19 @@ fn use_deno(major: u32) -> bool {
 /// (the modern behaviour stays the fallback, as with the legacy
 /// yt-dlp swap below).
 pub fn pre_win10_windows() -> bool {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
     {
         windows_major_version()
             .map(|m| !use_deno(m))
             .unwrap_or(false)
     }
-    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    #[cfg(not(all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
     {
         false
     }
@@ -261,7 +357,13 @@ pub fn pre_win10_windows() -> bool {
 /// user a broken 60+ MB component and a setup that reports
 /// failure for a component the machine can never use. Pure, so
 /// the per-OS selection is unit-testable off Windows.
-#[cfg(any(all(target_os = "windows", target_arch = "x86_64"), test))]
+#[cfg(any(
+    all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ),
+    test
+))]
 fn effective_for_windows_major(
     mut table: Vec<ComponentSpec>,
     major: Option<u32>,
@@ -270,7 +372,7 @@ fn effective_for_windows_major(
     if use_legacy_ytdlp(major) {
         for spec in table.iter_mut() {
             if spec.name == "yt-dlp" {
-                *spec = ytdlp_legacy_win_x64();
+                *spec = ytdlp_legacy_win();
             }
         }
     }
@@ -281,25 +383,47 @@ fn effective_for_windows_major(
 }
 
 /// The fetch table for THIS machine: `specs()`, except that on
-/// pre-Windows-10 x86_64 Windows the yt-dlp entry is swapped for
-/// the last release that still runs there and deno is not
-/// fetched at all. Anything that fetches components or reports
-/// them missing must use this rather than `specs()` — otherwise
-/// an old-Windows machine fetches a yt-dlp that can never start
-/// (and a deno that can never run). When the OS version cannot
-/// be determined the modern pin stays: the failure mode is the
-/// pre-fix behaviour, not something worse. (No legacy swap
-/// exists for ARM64 because there is no pre-10 64-bit ARM
-/// Windows — and no pre-10 ARM64 Windows for deno to miss on.)
+/// pre-Windows-10 Windows the yt-dlp entry is swapped for the
+/// last release that still runs there — the build of THIS
+/// architecture (see `ytdlp_legacy_win`) — and on x86_64 deno is
+/// not fetched at all. Anything that fetches components or
+/// reports them missing must use this rather than `specs()` —
+/// otherwise an old-Windows machine fetches a yt-dlp that can
+/// never start (and a deno that can never run). When the OS
+/// version cannot be determined the modern pin stays: the
+/// failure mode is the pre-fix behaviour, not something worse.
+/// (No legacy swap exists for ARM64 because there is no pre-10
+/// 64-bit ARM Windows — and no pre-10 ARM64 Windows for deno to
+/// miss on. The 32-bit table needs no deno handling here: it
+/// never carries deno in the first place.)
 pub fn effective_specs() -> Vec<ComponentSpec> {
-    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    #[cfg(all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    ))]
     {
         effective_for_windows_major(specs(), windows_major_version())
     }
-    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    #[cfg(not(all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "x86")
+    )))]
     {
         specs()
     }
+}
+
+/// True when yt-dlp on this machine must run with NO JavaScript
+/// runtime — derived from the fetch set itself: the table
+/// `effective_specs` installs carries no deno. Two roads lead
+/// there: pre-Windows-10 x86_64, where the set drops deno
+/// because it cannot run there, and 32-bit Windows at ANY
+/// version, whose table never carries deno because Deno
+/// publishes no 32-bit build. Deriving the answer from the
+/// fetch set keeps the argument builder from ever disagreeing
+/// with the installer about whether a runtime exists.
+pub fn no_js_runtime_here() -> bool {
+    !effective_specs().iter().any(|s| s.name == "deno")
 }
 
 /// One of the app-local UCRT files the app ships beside its own
@@ -649,9 +773,15 @@ mod tests {
                 s.name
             );
         }
-        // the two core components are fetched on every platform
+        // yt-dlp is fetched on every platform. Deno is fetched on
+        // every platform EXCEPT 32-bit Windows, for which Deno
+        // publishes no build at all — the x86 table must never
+        // gain one (see the table's own comment).
         assert!(specs.iter().any(|s| s.name == "yt-dlp"));
+        #[cfg(not(all(target_os = "windows", target_arch = "x86")))]
         assert!(specs.iter().any(|s| s.name == "deno"));
+        #[cfg(all(target_os = "windows", target_arch = "x86"))]
+        assert!(!specs.iter().any(|s| s.name == "deno"));
     }
 
     /// The Linux contract the slim-Windows work must not break:
@@ -669,11 +799,22 @@ mod tests {
     /// The Windows engine set is the whole engine: nothing may be
     /// dropped from the table or the slim packages lose a capability
     /// the bundled ones had. (Runs in the Windows CI test steps.)
+    /// 32-bit Windows is the one arch exception: Deno publishes no
+    /// 32-bit build, so the whole engine there is yt-dlp + ffmpeg —
+    /// and the yt-dlp must be the x86 build, not the x64 one.
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_specs_cover_the_whole_engine() {
         let mut names: Vec<&str> = specs().iter().map(|s| s.name).collect();
         names.sort_unstable();
+        #[cfg(target_arch = "x86")]
+        {
+            assert_eq!(names, ["ffmpeg", "yt-dlp"]);
+            let table = specs();
+            let yt = table.iter().find(|s| s.name == "yt-dlp").unwrap();
+            assert_eq!(yt.asset, "yt-dlp_x86.exe");
+        }
+        #[cfg(not(target_arch = "x86"))]
         assert_eq!(names, ["deno", "ffmpeg", "yt-dlp"]);
     }
 
@@ -926,24 +1067,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The pre-Windows-10 fallback pin must be as well-formed as
-    /// any table entry — it is verified against its hash on real
-    /// machines exactly like the modern pin is.
+    /// The pre-Windows-10 fallback pins must be as well-formed as
+    /// any table entry — they are verified against their hashes
+    /// on real machines exactly like the modern pins are. Both
+    /// architectures' pins are checked: the swap installs the
+    /// build of the machine's own architecture.
     #[test]
     fn legacy_ytdlp_pin_is_well_formed() {
-        let s = ytdlp_legacy_win_x64();
-        assert_eq!(s.name, "yt-dlp");
-        assert_eq!(s.asset, "yt-dlp.exe");
-        assert!(!s.zipped);
-        assert_eq!(s.sha256.len(), 64);
-        assert!(
-            s.sha256
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-            "pinned hash must be lowercase hex"
-        );
-        assert!(s.url.starts_with("https://"));
-        assert!(s.url.ends_with(s.asset));
+        for (s, asset) in [
+            (ytdlp_legacy_win_x64(), "yt-dlp.exe"),
+            (ytdlp_legacy_win_x86(), "yt-dlp_x86.exe"),
+        ] {
+            assert_eq!(s.name, "yt-dlp");
+            assert_eq!(s.asset, asset);
+            assert!(!s.zipped);
+            assert_eq!(s.sha256.len(), 64);
+            assert!(
+                s.sha256
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "pinned hash must be lowercase hex"
+            );
+            assert!(s.url.starts_with("https://"));
+            assert!(s.url.ends_with(s.asset));
+        }
     }
 
     /// The legacy pin takes over strictly below Windows 10 — the
@@ -960,12 +1107,17 @@ mod tests {
     /// WS-B: below Windows 10 the fetched set must NOT include
     /// deno at all (it cannot run there — Deno requires Windows
     /// 10 version 1709+), while yt-dlp still swaps to the legacy
-    /// pin and the rest of the set (ffmpeg on Windows) survives.
-    /// On Windows 10+ — and when the version is unknown — the
-    /// table is exactly the plain one, deno included.
+    /// pin of THIS architecture and the rest of the set (ffmpeg
+    /// on Windows) survives. On Windows 10+ — and when the
+    /// version is unknown — the table is exactly the plain one.
+    /// 32-bit Windows differs by contract, not by accident: its
+    /// plain table carries no deno at ANY version (no 32-bit
+    /// Deno build exists), so below 10 nothing is dropped, and
+    /// above 10 deno stays absent rather than "staying".
     #[test]
     fn pre_win10_fetch_set_drops_deno_and_swaps_ytdlp() {
         let plain = specs();
+        let has_deno = plain.iter().any(|s| s.name == "deno");
         for major in [5u32, 6, 7, 8, 9] {
             let t = effective_for_windows_major(specs(), Some(major));
             assert!(
@@ -973,22 +1125,28 @@ mod tests {
                 "major {major}: deno must not be fetched below Windows 10"
             );
             let yt = t.iter().find(|s| s.name == "yt-dlp").expect("yt-dlp stays");
-            assert_eq!(yt.url, ytdlp_legacy_win_x64().url, "major {major}");
-            assert_eq!(yt.sha256, ytdlp_legacy_win_x64().sha256, "major {major}");
-            // nothing else is dropped: the set only loses deno
-            assert_eq!(t.len(), plain.len() - 1, "major {major}");
+            assert_eq!(yt.url, ytdlp_legacy_win().url, "major {major}");
+            assert_eq!(yt.sha256, ytdlp_legacy_win().sha256, "major {major}");
+            // nothing else is dropped: the set only loses deno,
+            // and only where the plain set had one to lose
+            let dropped = if has_deno { 1 } else { 0 };
+            assert_eq!(t.len(), plain.len() - dropped, "major {major}");
         }
         for major in [10u32, 11] {
             let t = effective_for_windows_major(specs(), Some(major));
             assert_eq!(t.len(), plain.len(), "major {major}: nothing dropped");
-            assert!(t.iter().any(|s| s.name == "deno"), "major {major}: deno stays");
+            assert_eq!(
+                t.iter().any(|s| s.name == "deno"),
+                has_deno,
+                "major {major}: deno presence matches the plain table"
+            );
             for (a, b) in plain.iter().zip(t.iter()) {
                 assert_eq!(a.url, b.url, "major {major}");
             }
         }
         let t = effective_for_windows_major(specs(), None);
         assert_eq!(t.len(), plain.len(), "unknown version: table unchanged");
-        assert!(t.iter().any(|s| s.name == "deno"));
+        assert_eq!(t.iter().any(|s| s.name == "deno"), has_deno);
     }
 
     /// This machine is not a pre-Windows-10 Windows (it is not
@@ -997,6 +1155,35 @@ mod tests {
     #[test]
     fn pre_win10_gate_is_off_here() {
         assert!(!pre_win10_windows());
+    }
+
+    /// The JS-runtime gate follows the fetch set on the machine
+    /// running the tests: deno is in this platform's table, so
+    /// the gate is off here. (On a table without deno it reads
+    /// on — the 32-bit test below pins that side where it can
+    /// run.)
+    #[test]
+    fn no_js_gate_follows_the_fetch_set_here() {
+        assert_eq!(
+            no_js_runtime_here(),
+            !specs().iter().any(|s| s.name == "deno")
+        );
+    }
+
+    /// 32-bit Windows: the fetch table is yt-dlp + ffmpeg only —
+    /// Deno publishes no 32-bit Windows build, so no deno entry
+    /// may ever appear here, and the JS-runtime gate must read
+    /// "no runtime" on this architecture at any Windows version:
+    /// the gate follows the fetch set, and this set has no
+    /// runtime in it. (Runs in the windows-i686 CI test step.)
+    #[cfg(all(target_os = "windows", target_arch = "x86"))]
+    #[test]
+    fn windows_x86_table_has_no_js_runtime() {
+        let specs = specs();
+        assert!(specs.iter().any(|s| s.name == "yt-dlp"));
+        assert!(specs.iter().any(|s| s.name == "ffmpeg"));
+        assert!(!specs.iter().any(|s| s.name == "deno"));
+        assert!(no_js_runtime_here());
     }
 
     /// Off pre-10 x86_64 Windows the effective table must be the

@@ -185,15 +185,20 @@ pub fn cookie_file_has_real_session(file: &Path) -> bool {
 }
 
 /// True when yt-dlp must run with NO JavaScript runtime on this
-/// machine: a pre-Windows-10 Windows, where the fetched component
-/// set deliberately carries no deno — Deno's own installation docs
+/// machine: the fetched component set carries no deno. That is
+/// a pre-Windows-10 Windows — Deno's own installation docs
 /// require Windows 10 version 1709 or later (it needs
-/// IsWow64Process2), and the newest Node yt-dlp accepts (22+) has
-/// the same Windows 10 floor, so no supported runtime can run
-/// there at all. Everywhere else this is false and the runtime
-/// found on disk is passed exactly as before.
+/// IsWow64Process2), and the newest Node yt-dlp accepts (22+)
+/// has the same Windows 10 floor, so no supported runtime can
+/// run there at all — and it is ANY 32-bit Windows, for which
+/// Deno publishes no build at any version. The decision follows
+/// the fetch set itself (see
+/// `ndm::components::no_js_runtime_here`), so it cannot drift
+/// from what was actually installed. Everywhere else this is
+/// false and the runtime found on disk is passed exactly as
+/// before.
 pub fn no_js_runtime_mode() -> bool {
-    crate::components::pre_win10_windows()
+    crate::components::no_js_runtime_here()
 }
 
 /// The YouTube player clients a no-JS-runtime run may use: the
@@ -233,7 +238,7 @@ pub fn js_required_error(err: &str) -> Option<String> {
     if js_named || formats_starved {
         Some(
             "This site needs a JavaScript tool to unlock its videos, and that tool \
-             can't run on this version of Windows — it needs Windows 10 or newer. \
+             can't run on this PC — it needs 64-bit Windows 10 or newer. \
              Videos from most other sites, and direct video links, still work on this PC."
                 .to_string(),
         )

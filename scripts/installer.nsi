@@ -43,6 +43,14 @@
 ;   makensis /DVERSION=<x.y.z> /DSRCROOT=<assembled portable dir> \
 ;            /DOUTFILE=<NDM_<x.y.z>_x64-setup.exe> scripts\installer.nsi
 ;
+; Universal build (CI): with /DUNIVERSAL=1, SRCROOT instead holds
+; both arch payloads as subfolders (SRCROOT\x64, SRCROOT\x86 —
+; each a complete portable tree) and the installer extracts the
+; one matching the machine at install time: one setup for 32-bit
+; and 64-bit Windows alike. Everything past extraction — file
+; names, installed.flag, shortcuts, registry, uninstall list —
+; is identical to a plain single-arch build.
+;
 ; Native shell: the app window is drawn by raw Win32 controls
 ; (the windows crate) — there is no WebView, no WebView2
 ; runtime and no webview2-setup.ps1 step anywhere in this
@@ -85,6 +93,12 @@ VIAddVersionKey "CompanyName" "Nill"
 VIAddVersionKey "LegalCopyright" ""
 
 !include "LogicLib.nsh"
+!ifdef UNIVERSAL
+  ; ${RunningX64} — the runtime machine-arch test for the payload
+  ; pick below. Included only in universal builds; a plain build
+  ; never sees it.
+  !include "x64.nsh"
+!endif
 !include "MUI2.nsh"
 
 !define MUI_ICON "${ICON}"
@@ -115,6 +129,26 @@ Function .onInstSuccess
   ${EndIf}
 FunctionEnd
 
+; Payload extraction for the files that land flat in $INSTDIR.
+; A plain build reads them from the flat SRCROOT, unchanged. A
+; UNIVERSAL build carries both arch payloads under SRCROOT and
+; extracts the one matching the machine: ${RunningX64} asks the
+; OS (the installer itself is a 32-bit process, so on 64-bit
+; Windows this is the WOW64 answer — exactly "this machine is
+; 64-bit"). The extracted names in $INSTDIR are identical either
+; way, so nothing after extraction can tell the modes apart.
+!macro NDM_PAYLOAD_FILE _file
+  !ifdef UNIVERSAL
+    ${If} ${RunningX64}
+      File "${SRCROOT}\x64\${_file}"
+    ${Else}
+      File "${SRCROOT}\x86\${_file}"
+    ${EndIf}
+  !else
+    File "${SRCROOT}\${_file}"
+  !endif
+!macroend
+
 Section "Install"
   SetOutPath "$INSTDIR"
 
@@ -130,12 +164,12 @@ Section "Install"
     Delete "$INSTDIR\ndm-app.exe.old"
     Rename "$INSTDIR\ndm-app.exe" "$INSTDIR\ndm-app.exe.old"
   ${EndIf}
-  File "${SRCROOT}\ndm-app.exe"
+  !insertmacro NDM_PAYLOAD_FILE ndm-app.exe
   ${If} ${FileExists} "$INSTDIR\ndm-host.exe"
     Delete "$INSTDIR\ndm-host.exe.old"
     Rename "$INSTDIR\ndm-host.exe" "$INSTDIR\ndm-host.exe.old"
   ${EndIf}
-  File "${SRCROOT}\ndm-host.exe"
+  !insertmacro NDM_PAYLOAD_FILE ndm-host.exe
   ; no WebView2Loader.dll File line here: the native shell
   ; the native shell does not link the WebView2 loader, so the
   ; loader DLL is not in SRCROOT and is not installed.
@@ -146,11 +180,19 @@ Section "Install"
   ; SRCROOT by CI's Assemble step and lands beside the exes, so
   ; the loader resolves the forwarders from the app's own
   ; folder; on Windows 10/11 nothing changes in practice.
-  File "${SRCROOT}\ucrtbase.dll"
-  File "${SRCROOT}\api-ms-win-*.dll"
+  !insertmacro NDM_PAYLOAD_FILE ucrtbase.dll
+  !insertmacro NDM_PAYLOAD_FILE api-ms-win-*.dll
 
   SetOutPath "$INSTDIR\extension"
-  File /r "${SRCROOT}\extension\*.*"
+  !ifdef UNIVERSAL
+    ${If} ${RunningX64}
+      File /r "${SRCROOT}\x64\extension\*.*"
+    ${Else}
+      File /r "${SRCROOT}\x86\extension\*.*"
+    ${EndIf}
+  !else
+    File /r "${SRCROOT}\extension\*.*"
+  !endif
 
   SetOutPath "$INSTDIR"
   ; Flavour marker: exact file name is a contract with the app —
