@@ -453,80 +453,104 @@ fn download_selected(d: &Rc<GrabDlg>) {
     // (exploration crawls pages but returns only files) and the
     // whole run is registered for the post-completion rewrite
     let convert = jb(&p, "convert_links", false);
+    let add_as_queue = jb(&p, "add_as_queue", false);
     if convert {
-        let _ = sink::rt::block_on(sink::add_download(
-            d.ctx.clone(),
-            start_url.clone(),
-            base.clone(),
-            Some(jb(&p, "add_as_queue", false)),
-            Some("Grabber".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ));
         let mut urls: Vec<String> = chosen.iter().map(|it| js(it, "url")).collect();
         urls.push(start_url.clone());
         sink::grab_register_run(urls);
     }
-    let mut failed = 0usize;
-    let mut first_err = String::new();
-    for it in &chosen {
-        let dir = if jb(&p, "use_subfolders", false) {
-            grab_dir_for(&base, &start_url, &js(it, "url"))
-        } else {
-            base.clone()
-        };
-        let r = sink::rt::block_on(sink::add_download(
-            d.ctx.clone(),
-            js(it, "url"),
-            dir,
-            Some(jb(&p, "add_as_queue", false)),
-            Some("Grabber".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ));
-        if let Err(e) = r {
-            failed += 1;
-            if first_err.is_empty() {
-                first_err = e;
+    // Snapshot the (url, dir) pairs here; the adds themselves
+    // run on a worker thread — each can probe its server, and a
+    // long grab list used to freeze the wizard once per file.
+    let jobs: Vec<(String, String)> = chosen
+        .iter()
+        .map(|it| {
+            let dir = if jb(&p, "use_subfolders", false) {
+                grab_dir_for(&base, &start_url, &js(it, "url"))
+            } else {
+                base.clone()
+            };
+            (js(it, "url"), dir)
+        })
+        .collect();
+    let total = jobs.len();
+    let (tx, rx) = gtk::glib::MainContext::channel::<(usize, String)>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let ctx = d.ctx.clone();
+    std::thread::spawn(move || {
+        if convert {
+            let _ = sink::rt::block_on(sink::add_download(
+                ctx.clone(),
+                start_url,
+                base,
+                Some(add_as_queue),
+                Some("Grabber".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+        }
+        let mut failed = 0usize;
+        let mut first_err = String::new();
+        for (url, dir) in jobs {
+            let r = sink::rt::block_on(sink::add_download(
+                ctx.clone(),
+                url,
+                dir,
+                Some(add_as_queue),
+                Some("Grabber".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ));
+            if let Err(e) = r {
+                failed += 1;
+                if first_err.is_empty() {
+                    first_err = e;
+                }
             }
         }
-    }
-    if failed > 0 {
-        // plain language, wizard stays open (app.js)
-        let why = if first_err.starts_with("duplicate") {
-            "already in the download list".to_string()
-        } else if first_err.chars().count() > 90 {
-            format!("{}…", first_err.chars().take(90).collect::<String>())
+        let _ = tx.send((failed, first_err));
+    });
+    let d2 = d.clone();
+    rx.attach(None, move |(failed, first_err)| {
+        if failed > 0 {
+            // plain language, wizard stays open (app.js)
+            let why = if first_err.starts_with("duplicate") {
+                "already in the download list".to_string()
+            } else if first_err.chars().count() > 90 {
+                format!("{}…", first_err.chars().take(90).collect::<String>())
+            } else {
+                first_err
+            };
+            d2.status.set_text(&format!(
+                "{} of {} could not be added — {}",
+                failed,
+                total,
+                why
+            ));
+            d2.btn_download.set_sensitive(true);
         } else {
-            first_err
-        };
-        d.status.set_text(&format!(
-            "{} of {} could not be added — {}",
-            failed,
-            chosen.len(),
-            why
-        ));
-        d.btn_download.set_sensitive(true);
-        return;
-    }
-    refresh_list(&d.ui);
-    d.window.hide();
+            refresh_list(&d2.ui);
+            d2.window.hide();
+        }
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {

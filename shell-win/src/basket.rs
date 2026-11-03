@@ -162,7 +162,10 @@ fn start_drag(hwnd: HWND) {
 /// The OLE side of basket.js's drop handler.
 fn accept_text(text: &str) {
     let cand = text.trim();
-    if !(cand.starts_with("http://") || cand.starts_with("https://")) {
+    if !(cand.starts_with("http://")
+        || cand.starts_with("https://")
+        || cand.starts_with("ftp://"))
+    {
         show_note("That was not a web link");
         return;
     }

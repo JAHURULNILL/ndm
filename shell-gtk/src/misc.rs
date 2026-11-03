@@ -134,11 +134,16 @@ fn build_column_rows(rows_box: &gtk::Box, edit: &Rc<RefCell<Vec<prefs::ColumnCfg
 // each named with its reason (duplicates in plain language).
 
 pub fn show_batch(ui: &Rc<Ui>) {
+    batch_dialog(ui, String::new(), String::new(), None);
+}
+
+/// One round of the batch dialog. Validation failures reopen
+/// it in place (the loop); add outcomes settle in batch_finish,
+/// which reopens it here carrying only the failed lines.
+fn batch_dialog(ui: &Rc<Ui>, mut text: String, mut status: String, dir_in: Option<String>) {
     use crate::dialogs::{run_dialog, FieldSpec, FieldValue};
-    let mut text = String::new();
-    let mut status = String::new();
     let dir0 = crate::form::js(&crate::settings_json(ui), "default_dir");
-    let mut dir = dir0.clone();
+    let mut dir = dir_in.unwrap_or_else(|| dir0.clone());
     loop {
         let mut fields = Vec::new();
         if !status.is_empty() {
@@ -161,15 +166,16 @@ pub fn show_batch(ui: &Rc<Ui>) {
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
             .collect();
-        let urls: Vec<&String> = raw.iter().filter(|l| l.starts_with("http")).collect();
-        let invalid: Vec<&String> = raw.iter().filter(|l| !l.starts_with("http")).collect();
+        let urls: Vec<&String> = raw.iter().filter(|l| crate::is_download_url(l)).collect();
+        let invalid: Vec<&String> =
+            raw.iter().filter(|l| !crate::is_download_url(l)).collect();
         if raw.is_empty() {
-            status = "Paste the links first — one http(s) link per line.".to_string();
+            status = "Paste the links first — one link per line (http, https or ftp).".to_string();
             continue;
         }
         if urls.is_empty() {
             status = format!(
-                "No valid links found — {} line{} not a link. One http(s) link per line.",
+                "No valid links found — {} line{} not a link. One link per line (http, https or ftp).",
                 invalid.len(),
                 if invalid.len() == 1 { " is" } else { "s are" }
             );
@@ -177,71 +183,112 @@ pub fn show_batch(ui: &Rc<Ui>) {
             continue;
         }
         let dir_use = if dir.trim().is_empty() { dir0.clone() } else { dir.trim().to_string() };
-        let mut ok = 0usize;
-        let mut failed: Vec<(String, String)> = Vec::new();
-        for url in &urls {
-            let r = crate::sink::rt::block_on(crate::sink::add_download(
-                ui.ctx.clone(),
-                (*url).clone(),
-                dir_use.clone(),
-                Some(false),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            ));
-            match r {
-                Ok(_) => ok += 1,
-                Err(e) => {
-                    let reason = if e.starts_with("duplicate:") {
-                        "already in the download list".to_string()
-                    } else if e.chars().count() > 140 {
-                        format!("{}…", e.chars().take(140).collect::<String>())
-                    } else {
-                        e
-                    };
-                    failed.push(((*url).clone(), reason));
-                }
+        // The adds run on a worker thread: each add can probe
+        // its server, and a list of slow links used to freeze
+        // the window once per line. batch_finish settles the
+        // round when the results land.
+        let (tx, rx) = gtk::glib::MainContext::channel::<Vec<(String, Result<String, String>)>>(
+            gtk::glib::Priority::DEFAULT,
+        );
+        let ctx = ui.ctx.clone();
+        let batch: Vec<String> = urls.iter().map(|u| (*u).clone()).collect();
+        std::thread::spawn(move || {
+            let mut results = Vec::new();
+            for url in batch {
+                let r = crate::sink::rt::block_on(crate::sink::add_download(
+                    ctx.clone(),
+                    url.clone(),
+                    dir_use.clone(),
+                    Some(false),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ));
+                results.push((url, r));
             }
-        }
-        if failed.is_empty() && invalid.is_empty() {
-            crate::refresh_list(ui);
-            crate::set_notice(ui, &format!("Added {} of {} downloads", ok, urls.len()));
-            return;
-        }
-        let failed_urls: Vec<&str> = failed.iter().map(|(u, _)| u.as_str()).collect();
-        text = raw
-            .iter()
-            .filter(|l| failed_urls.contains(&l.as_str()) || !l.starts_with("http"))
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut s = format!("Added {} of {} lines", ok, raw.len());
-        if !failed.is_empty() {
-            s += &format!(" — {} failed:\n", failed.len());
-            for (u, r) in failed.iter().take(12) {
-                s += &format!("• {} — {}\n", u, r);
+            let _ = tx.send(results);
+        });
+        let ui2 = ui.clone();
+        let invalid: Vec<String> = invalid.iter().map(|s| (*s).clone()).collect();
+        let mut payload = Some((raw.clone(), invalid, dir.clone()));
+        rx.attach(None, move |results| {
+            if let Some((r, i, dd)) = payload.take() {
+                batch_finish(&ui2, r, i, results, dd);
             }
-            if failed.len() > 12 {
-                s += &format!("…and {} more", failed.len() - 12);
-            }
-        }
-        if !invalid.is_empty() {
-            s += &format!(
-                "\n{} line{} not a link and could not be added.",
-                invalid.len(),
-                if invalid.len() == 1 { " is" } else { "s are" }
-            );
-        }
-        status = s.trim_end().to_string();
+            gtk::glib::ControlFlow::Break
+        });
+        return;
     }
+}
+
+/// Settle one batch round on the GTK thread: all-clean closes
+/// the flow with the summary notice; failures reopen the
+/// dialog carrying only the failed + non-link lines, each
+/// named with its reason (the loop's original tail, verbatim).
+fn batch_finish(
+    ui: &Rc<Ui>,
+    raw: Vec<String>,
+    invalid: Vec<String>,
+    results: Vec<(String, Result<String, String>)>,
+    dir: String,
+) {
+    let total_links = results.len();
+    let mut ok = 0usize;
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for (url, r) in results {
+        match r {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                let reason = if e.starts_with("duplicate:") {
+                    "already in the download list".to_string()
+                } else if e.chars().count() > 140 {
+                    format!("{}…", e.chars().take(140).collect::<String>())
+                } else {
+                    e
+                };
+                failed.push((url, reason));
+            }
+        }
+    }
+    if failed.is_empty() && invalid.is_empty() {
+        crate::refresh_list(ui);
+        crate::set_notice(ui, &format!("Added {} of {} downloads", ok, total_links));
+        return;
+    }
+    let failed_urls: Vec<&str> = failed.iter().map(|(u, _)| u.as_str()).collect();
+    let text = raw
+        .iter()
+        .filter(|l| failed_urls.contains(&l.as_str()) || !crate::is_download_url(l))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut s = format!("Added {} of {} lines", ok, raw.len());
+    if !failed.is_empty() {
+        s += &format!(" — {} failed:\n", failed.len());
+        for (u, r) in failed.iter().take(12) {
+            s += &format!("• {} — {}\n", u, r);
+        }
+        if failed.len() > 12 {
+            s += &format!("…and {} more", failed.len() - 12);
+        }
+    }
+    if !invalid.is_empty() {
+        s += &format!(
+            "\n{} line{} not a link and could not be added.",
+            invalid.len(),
+            if invalid.len() == 1 { " is" } else { "s are" }
+        );
+    }
+    let status = s.trim_end().to_string();
+    batch_dialog(ui, text, status, Some(dir));
 }
 
 // ---- Shortcuts (app.js kmodal, static list verbatim) ------------

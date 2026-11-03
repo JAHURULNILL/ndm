@@ -18,6 +18,10 @@
 //                         Speed Limiter tab
 // - `type: "progress"` -> reads the app's per-entry progress file
 //                         (progress/<id>.json) for the panel's live card
+// - `type: "captured_streams"` -> queues the browser-capture door's
+//                         stream set (the streams the browser itself
+//                         played, sent only at the user's click) for
+//                         the app to store and open its picker on
 
 use serde_json::{json, Value};
 use std::fs::OpenOptions;
@@ -414,6 +418,7 @@ fn handle_at(message: &Value, stamp_path: Option<&std::path::Path>, now_secs: u6
         Some("resume_entry") => handle_entry_control(message, "resume_entry"),
         Some("set_speed_limit") => handle_set_speed_limit(message),
         Some("progress") => handle_progress(message),
+        Some("captured_streams") => handle_captured_streams(message),
         Some(other) => json!({ "ok": false, "error": format!("unknown type: {other}") }),
         None => json!({ "ok": false, "error": "missing type" }),
     }
@@ -734,6 +739,97 @@ fn handle_warm(message: &Value) -> Value {
     // no ensure_app_running here (m-3): the gate above already
     // established the app is running and will drain the queue
     json!({ "ok": true, "queued": queued })
+}
+
+/// Validate a `captured_streams` message and build its queue
+/// object — pure, so the shape is testable without a queue on
+/// disk. The browser-capture door's one message: the streams the
+/// browser itself played on one page, sent only when the user
+/// clicked the capture action. The app stores the set and opens
+/// its video picker on the page; the streams' own validation
+/// (http(s), bounded) happens here so a malformed send can never
+/// reach the queue.
+fn captured_queue_object(message: &Value) -> Result<Value, String> {
+    let page_url = message
+        .get("pageUrl")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if !(page_url.starts_with("http://") || page_url.starts_with("https://")) {
+        return Err("pageUrl must be a non-empty http(s) URL".to_string());
+    }
+    let title = message.get("title").and_then(Value::as_str).unwrap_or("");
+    if title.contains(['\r', '\n']) {
+        return Err("title must not contain line breaks".to_string());
+    }
+    let title: String = title.chars().take(300).collect();
+    let raw = message
+        .get("streams")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "streams must be an array".to_string())?;
+    if raw.is_empty() || raw.len() > 32 {
+        return Err("streams must hold between 1 and 32 entries".to_string());
+    }
+    let mut streams = Vec::new();
+    for s in raw {
+        let url = s.get("url").and_then(Value::as_str).unwrap_or("").trim();
+        if !(url.starts_with("http://") || url.starts_with("https://"))
+            || url.len() > 8192
+            || url.contains(['\r', '\n'])
+        {
+            return Err("stream url must be a non-empty http(s) URL".to_string());
+        }
+        let mime: String = s
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .chars()
+            .take(128)
+            .collect();
+        let quality = s
+            .get("qualityLabel")
+            .and_then(Value::as_str)
+            .map(|q| q.chars().take(64).collect::<String>());
+        streams.push(json!({
+            "url": url,
+            "mimeType": mime,
+            "qualityLabel": quality,
+            "hasAudio": s.get("hasAudio").and_then(Value::as_bool).unwrap_or(false),
+            "hasVideo": s.get("hasVideo").and_then(Value::as_bool).unwrap_or(false),
+        }));
+    }
+    Ok(json!({
+        "kind": "captured_streams",
+        "url": page_url,
+        "pageUrl": page_url,
+        "title": title,
+        "streams": streams,
+    }))
+}
+
+/// Queue one captured stream set for the app, with the same
+/// ack discipline as a download: the reply is the app's own
+/// verdict on the drain (stored + picker opened), or the queued
+/// truth when the ack outruns the wait.
+fn handle_captured_streams(message: &Value) -> Value {
+    let mut obj = match captured_queue_object(message) {
+        Ok(o) => o,
+        Err(e) => return json!({ "ok": false, "error": e }),
+    };
+    let raw_cookies = message.get("cookies").and_then(Value::as_str).unwrap_or("");
+    let cookies = if raw_cookies.len() <= 600_000 { raw_cookies } else { "" };
+    let id = new_entry_id();
+    obj["id"] = json!(id);
+    match append_to_queue(obj, cookies) {
+        Ok(()) => {
+            ensure_app_running(true);
+            wait_for_ack_and_result(&id, 15, true)
+        }
+        Err(e) => {
+            eprintln!("ndm-host: cannot write queue: {e}");
+            json!({ "ok": false, "error": "cannot write queue file" })
+        }
+    }
 }
 
 fn handle_download(message: &Value) -> Value {
@@ -1104,6 +1200,60 @@ mod tests {
         let len = u32::from_le_bytes(written[0..4].try_into().unwrap()) as usize;
         assert_eq!(written.len(), 4 + len, "frame must be exactly one message");
         serde_json::from_slice(&written[4..]).unwrap()
+    }
+
+    #[test]
+    fn captured_streams_object_is_validated_and_normalized() {
+        // the browser-capture door's message: a well-formed send
+        // becomes the queue object the app drains
+        let msg = json!({
+            "type": "captured_streams",
+            "pageUrl": "https://www.youtube.com/watch?v=abcDEF123_-",
+            "title": "A Video",
+            "streams": [
+                { "url": "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=136",
+                  "mimeType": "video/mp4", "qualityLabel": "720p",
+                  "hasAudio": false, "hasVideo": true },
+                { "url": "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=140",
+                  "mimeType": "audio/mp4",
+                  "hasAudio": true, "hasVideo": false }
+            ]
+        });
+        let obj = captured_queue_object(&msg).expect("a valid capture is accepted");
+        assert_eq!(obj["kind"], json!("captured_streams"));
+        assert_eq!(obj["url"], json!("https://www.youtube.com/watch?v=abcDEF123_-"));
+        let streams = obj["streams"].as_array().unwrap();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0]["qualityLabel"], json!("720p"));
+        assert_eq!(streams[1]["qualityLabel"], Value::Null);
+        assert_eq!(streams[1]["hasAudio"], json!(true));
+
+        // refusals: no page, no streams, a flood of streams, a
+        // non-http stream, a title with a line break
+        let bad_page = json!({ "pageUrl": "about:blank", "streams": [ { "url": "https://x/y.mp4" } ] });
+        assert!(captured_queue_object(&bad_page).is_err());
+        let no_streams = json!({ "pageUrl": "https://x/watch", "streams": [] });
+        assert!(captured_queue_object(&no_streams).is_err());
+        let flood = json!({
+            "pageUrl": "https://x/watch",
+            "streams": (0..33).map(|i| json!({ "url": format!("https://x/{i}.mp4") })).collect::<Vec<_>>()
+        });
+        assert!(captured_queue_object(&flood).is_err());
+        let bad_stream = json!({
+            "pageUrl": "https://x/watch",
+            "streams": [ { "url": "file:///etc/passwd" } ]
+        });
+        assert!(captured_queue_object(&bad_stream).is_err());
+        let bad_title = json!({
+            "pageUrl": "https://x/watch", "title": "a\nb",
+            "streams": [ { "url": "https://x/y.mp4" } ]
+        });
+        assert!(captured_queue_object(&bad_title).is_err());
+
+        // dispatch reaches the handler: an invalid message is a
+        // clean {ok:false}, never a queue write or a panic
+        let reply = handle_at(&bad_stream, None, 0);
+        assert_eq!(reply["ok"], json!(false));
     }
 
     #[test]

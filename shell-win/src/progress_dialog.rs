@@ -165,6 +165,23 @@ struct ProgDlg {
 
 static DLGS: std::sync::LazyLock<Mutex<HashMap<String, ProgDlg>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Entries whose progress dialog the user has closed: a
+/// background reveal must not rebuild it (QA-220 m3 — the GTK
+/// shell keeps the same mark). An explicit open clears it.
+static USER_CLOSED: std::sync::LazyLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Whether the user has closed this entry's progress dialog
+/// and no explicit open has happened since.
+pub fn user_closed(id: &str) -> bool {
+    USER_CLOSED.lock().unwrap_or_else(|e| e.into_inner()).contains(id)
+}
+
+/// An explicit open (double-click / "Show progress") clears
+/// the user-closed mark.
+pub fn note_explicit_open(id: &str) {
+    USER_CLOSED.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+}
 /// The dialog whose payload currently feeds the (single) strip
 /// snapshot in winui::customdraw — set on apply/activation.
 static STRIP_OWNER: Mutex<String> = Mutex::new(String::new());
@@ -1328,6 +1345,10 @@ unsafe extern "system" fn prog_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
             if let Some(id) = id_of(hwnd) {
                 DLGS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                USER_CLOSED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id.clone());
                 let mut owner = STRIP_OWNER.lock().unwrap_or_else(|e| e.into_inner());
                 if *owner == id {
                     owner.clear();

@@ -212,12 +212,226 @@ async function pickMasterStream(tabId, preferPage, preferKey) {
   return chosen;
 }
 
+/* ------------------------------------------------------------------ */
+/* Browser-capture door (2.3.0): passively record the media streams  */
+/* the browser itself plays, per tab, and hand them to the app ONLY  */
+/* when the user clicks the capture action. The yt-dlp sniffer above */
+/* deliberately skips googlevideo (yt-dlp resolves those pages       */
+/* itself); this registry exists for the opposite case — pages the  */
+/* browser can play but yt-dlp cannot fully read (above all          */
+/* pre-Windows-10, where no JS runtime can run). Nothing is sent     */
+/* anywhere from here on its own: recording is memory-only.          */
+/* ------------------------------------------------------------------ */
+
+const tabCaptured = new Map(); // tabId -> { page, streams: Map<url, stream> }
+const CAPTURE_TTL_MS = 30 * 60 * 1000;
+const CAPTURE_PER_TAB = 24;
+
+/* YouTube format ids (itag) → [quality label, kind], kind being
+   'av' (progressive: audio+video), 'v' (video only) or 'a' (audio
+   only). Unknown itags fall back to the stream's own mime param. */
+const CAPTURE_ITAGS = {
+  18: ['360p', 'av'], 22: ['720p', 'av'], 37: ['1080p', 'av'],
+  59: ['480p', 'av'], 78: ['270p', 'av'],
+  133: ['240p', 'v'], 134: ['360p', 'v'], 135: ['480p', 'v'],
+  136: ['720p', 'v'], 137: ['1080p', 'v'], 160: ['144p', 'v'],
+  264: ['1440p', 'v'], 266: ['2160p', 'v'],
+  242: ['240p', 'v'], 243: ['360p', 'v'], 244: ['480p', 'v'],
+  247: ['720p', 'v'], 248: ['1080p', 'v'], 278: ['144p', 'v'],
+  394: ['144p', 'v'], 395: ['240p', 'v'], 396: ['360p', 'v'],
+  397: ['480p', 'v'], 398: ['720p', 'v'], 399: ['1080p', 'v'],
+  400: ['1440p', 'v'], 401: ['2160p', 'v'],
+  139: ['', 'a'], 140: ['', 'a'], 141: ['', 'a'],
+  171: ['', 'a'], 172: ['', 'a'],
+  249: ['', 'a'], 250: ['', 'a'], 251: ['', 'a'],
+};
+
+const CAPTURE_EXT_MIME = {
+  mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+  m4v: 'video/mp4', mkv: 'video/x-matroska',
+  m4a: 'audio/mp4', mp3: 'audio/mpeg', ogg: 'audio/ogg',
+  opus: 'audio/ogg', aac: 'audio/aac', flac: 'audio/flac', wav: 'audio/wav',
+};
+
+/* One stream URL names ONE stream: the player re-requests it per
+   chunk with per-request range parameters that are not part of
+   the signed identity — strip exactly those, so the chunks of a
+   stream dedupe to a single entry (and the URL the app downloads
+   carries no stale chunk window). */
+function canonicalStreamUrl(raw) {
+  try {
+    const u = new URL(raw);
+    for (const p of ['range', 'rn', 'rbuf']) u.searchParams.delete(p);
+    return u.toString();
+  } catch (e) {
+    return raw;
+  }
+}
+
+function recordCapturedStream(tabId, rawUrl, reqType) {
+  if (tabId == null || tabId < 0 || !rawUrl) return;
+  if (!/^https?:\/\//i.test(rawUrl)) return;
+  const page = tabPageUrls.get(tabId) || '';
+  // DRM pages: never record (the same rule as every other layer).
+  if (isDrmUrl(page)) return;
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch (e) {
+    return;
+  }
+  let stream = null;
+  const host = parsed.hostname.toLowerCase();
+  if (
+    (host === 'googlevideo.com' || host.endsWith('.googlevideo.com')) &&
+    parsed.pathname.includes('/videoplayback')
+  ) {
+    // A sequenced (SABR) fetch is one segment of a stream that is
+    // not directly downloadable as a whole — the honest answer
+    // for those videos stays the yt-dlp door, so they are not
+    // recorded here.
+    if (parsed.searchParams.has('sq')) return;
+    const mime = parsed.searchParams.get('mime') || '';
+    const itag = Number(parsed.searchParams.get('itag') || 0);
+    const known = CAPTURE_ITAGS[itag];
+    let hasVideo;
+    let hasAudio;
+    let label = '';
+    if (known) {
+      label = known[0];
+      hasVideo = known[1] !== 'a';
+      hasAudio = known[1] !== 'v';
+    } else if (mime.startsWith('audio/')) {
+      hasVideo = false;
+      hasAudio = true;
+    } else if (mime.startsWith('video/')) {
+      hasVideo = true;
+      hasAudio = false;
+    } else {
+      return;
+    }
+    stream = {
+      url: canonicalStreamUrl(rawUrl),
+      mimeType: mime,
+      qualityLabel: label,
+      hasAudio,
+      hasVideo,
+      ts: Date.now(),
+    };
+  } else if (reqType === 'media') {
+    // A media element playing a direct file: the element plays
+    // it whole, so it carries its audio (when it has any) with
+    // it; an audio-file extension is an audio-only stream.
+    const clean = rawUrl.split(/[?#]/)[0].toLowerCase();
+    const m = clean.match(/\.(mp4|webm|mov|m4v|mkv|m4a|mp3|ogg|opus|aac|flac|wav)$/);
+    if (!m) return;
+    const audioOnly = ['m4a', 'mp3', 'ogg', 'opus', 'aac', 'flac', 'wav'].includes(m[1]);
+    stream = {
+      url: rawUrl,
+      mimeType: CAPTURE_EXT_MIME[m[1]] || '',
+      qualityLabel: '',
+      hasAudio: true,
+      hasVideo: !audioOnly,
+      ts: Date.now(),
+    };
+  }
+  if (!stream) return;
+  let rec = tabCaptured.get(tabId);
+  if (!rec || rec.page !== page) rec = { page, streams: new Map() };
+  for (const [k, v] of rec.streams) {
+    if (Date.now() - v.ts > CAPTURE_TTL_MS) rec.streams.delete(k);
+  }
+  rec.streams.set(stream.url, stream);
+  while (rec.streams.size > CAPTURE_PER_TAB) {
+    rec.streams.delete(rec.streams.keys().next().value);
+  }
+  tabCaptured.set(tabId, rec);
+}
+
+/* The tab's captured set as the popup / send path consumes it:
+   live entries only, wire-shaped (no timestamps). */
+function capturedStateForTab(tabId) {
+  const rec = tabCaptured.get(tabId);
+  if (!rec) return { count: 0, pageUrl: '', streams: [] };
+  const now = Date.now();
+  const streams = [...rec.streams.values()]
+    .filter(s => now - s.ts < CAPTURE_TTL_MS)
+    .map(s => ({
+      url: s.url,
+      mimeType: s.mimeType || '',
+      qualityLabel: s.qualityLabel || '',
+      hasAudio: !!s.hasAudio,
+      hasVideo: !!s.hasVideo,
+    }));
+  return { count: streams.length, pageUrl: rec.page || '', streams };
+}
+
+/* Send one tab's captured set to the app through the host — the
+   popup's capture click lands here. Nothing downloads yet: the
+   app stores the set and opens its picker on the page. */
+async function ndmSendCapturedForTab(tabId) {
+  const state = capturedStateForTab(tabId);
+  if (!state.count) {
+    return { ok: false, error: 'Nothing captured on this tab yet — play the video first.' };
+  }
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch (e) {}
+  const pageUrl = (tab && tab.url) || state.pageUrl;
+  const title = (tab && tab.title) || '';
+  const cookies = await captureCookies(pageUrl, pageUrl);
+  return sendCapturedNative({
+    type: 'captured_streams',
+    pageUrl,
+    title,
+    streams: state.streams,
+    cookies,
+    ext_version: chrome.runtime.getManifest().version,
+  });
+}
+
+function sendCapturedNative(msg) {
+  const attempt = new Promise(resolve => {
+    try {
+      chrome.runtime.sendNativeMessage(HOST_NAME, msg, response => {
+        if (chrome.runtime.lastError) {
+          const text = chrome.runtime.lastError.message || '';
+          const missing = /not found|No such native/i.test(text);
+          setHostStatus(missing ? 'host-missing' : 'fail');
+          resolve({
+            ok: false,
+            error: missing
+              ? 'NDM native host is not registered. Open the NDM desktop app once to register it.'
+              : text || 'Could not reach NDM native host.',
+          });
+          return;
+        }
+        const ok = !!(response && response.ok);
+        setHostStatus(ok ? 'ok' : 'fail');
+        resolve({
+          ok,
+          error: ok ? '' : (response && response.error) || 'NDM rejected the capture.',
+        });
+      });
+    } catch (e) {
+      setHostStatus('host-missing');
+      resolve({ ok: false, error: String(e) });
+    }
+  });
+  const timeout = new Promise(r =>
+    setTimeout(() => r({ ok: false, error: 'Timed out waiting for NDM.' }), 20000)
+  );
+  return Promise.race([attempt, timeout]);
+}
+
 if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
   chrome.webRequest.onBeforeRequest.addListener(
     details => {
       if (details.tabId < 0) return;
       if (details.type === 'main_frame') {
         tabMediaStreams.delete(details.tabId);
+        tabCaptured.delete(details.tabId);
         tabPageUrls.set(details.tabId, details.url || '');
         return;
       }
@@ -233,6 +447,9 @@ if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
       ) {
         recordTabStream(details.tabId, u);
       }
+      // The capture door records what the sniffer above does
+      // not: the actual media streams (googlevideo included).
+      recordCapturedStream(details.tabId, u, details.type);
     },
     { urls: ['<all_urls>'] }
   );
@@ -240,6 +457,7 @@ if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
 
 chrome.tabs.onRemoved.addListener(tabId => {
   tabMediaStreams.delete(tabId);
+  tabCaptured.delete(tabId);
   tabPageUrls.delete(tabId);
   tabHasMedia.delete(tabId);
   clearTabFrameMedia(tabId);
@@ -987,6 +1205,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = sender && sender.tab ? sender.tab.id : null;
     if (tabId != null) {
       tabMediaStreams.delete(tabId);
+      tabCaptured.delete(tabId);
       for (const k of [...masterPickCache.keys()]) {
         if (k.startsWith(tabId + '|')) masterPickCache.delete(k);
       }
@@ -994,6 +1213,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
     return false;
+  }
+
+  if (message.action === 'ndm-captured-state') {
+    // The popup asks how much this tab has captured, so it can
+    // offer the capture action only when there is something to
+    // send (and so the proof harness can read the same state).
+    const tabId =
+      message.tabId != null
+        ? message.tabId
+        : sender && sender.tab
+          ? sender.tab.id
+          : null;
+    if (tabId == null) {
+      sendResponse({ count: 0 });
+      return false;
+    }
+    sendResponse({ count: capturedStateForTab(tabId).count });
+    return false;
+  }
+
+  if (message.action === 'ndm-send-captured') {
+    // The popup's capture click: hand this tab's captured set to
+    // the app (which stores it and opens the picker). This is
+    // the ONLY way a capture leaves the browser — a user's click,
+    // never a background send.
+    const tabId =
+      message.tabId != null
+        ? message.tabId
+        : sender && sender.tab
+          ? sender.tab.id
+          : null;
+    if (tabId == null) {
+      sendResponse({ ok: false, error: 'No tab to capture from.' });
+      return false;
+    }
+    ndmSendCapturedForTab(tabId)
+      .then(r => sendResponse(r))
+      .catch(() => sendResponse({ ok: false, error: 'Could not send the capture.' }));
+    return true;
   }
 
   if (message.action === 'ndm-note-prevent') {

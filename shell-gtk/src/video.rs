@@ -505,13 +505,27 @@ fn selected_index(d: &Rc<VideoDlg>) -> Option<usize> {
         .or(Some(0))
 }
 
-fn add_one(
-    d: &Rc<VideoDlg>,
-    opt: &serde_json::Value,
+/// Everything one video add needs, snapshotted from the
+/// widgets on the GTK thread so the add itself can run on a
+/// worker — add_video starts a download (probe, session), and
+/// on this thread a slow host froze the picker behind Download.
+#[derive(Clone)]
+struct VideoAddArgs {
+    url: String,
+    dir: String,
+    selector: String,
+    audio: bool,
+    title: String,
+    cookies: Option<String>,
     later: bool,
-    force: bool,
-) -> Result<String, String> {
-    let info = d.info.borrow().clone().ok_or("no probe")?;
+    size_bytes: u64,
+    duration: f64,
+    queue: Option<String>,
+    description: Option<String>,
+}
+
+fn add_args(d: &Rc<VideoDlg>, opt: &serde_json::Value, later: bool) -> VideoAddArgs {
+    let info = d.info.borrow().clone().unwrap_or(serde_json::Value::Null);
     let dir = {
         let t = d.dir.text().trim().to_string();
         if t.is_empty() { "~/Downloads".to_string() } else { t }
@@ -520,23 +534,39 @@ fn add_one(
         let t = d.title.text().trim().to_string();
         if t.is_empty() { js(&info, "title") } else { t }
     };
-    sink::rt::block_on(sink::add_video(
-        d.ctx.clone(),
-        d.url.text().trim().to_string(),
+    VideoAddArgs {
+        url: d.url.text().trim().to_string(),
         dir,
-        js(opt, "selector"),
-        jb(opt, "audio", false),
+        selector: js(opt, "selector"),
+        audio: jb(opt, "audio", false),
         title,
-        d.cookies.borrow().clone(),
-        Some(later),
-        Some(ju(opt, "size_bytes")),
-        Some(ju(&info, "duration") as f64),
-        Some(force),
-        Some(combo_text(&d.queue)),
-        {
+        cookies: d.cookies.borrow().clone(),
+        later,
+        size_bytes: ju(opt, "size_bytes"),
+        duration: ju(&info, "duration") as f64,
+        queue: Some(combo_text(&d.queue)),
+        description: {
             let t = d.desc.text().trim().to_string();
             if t.is_empty() { None } else { Some(t) }
         },
+    }
+}
+
+fn run_video_add(ctx: sink::Ctx, a: VideoAddArgs, force: bool) -> Result<String, String> {
+    sink::rt::block_on(sink::add_video(
+        ctx,
+        a.url,
+        a.dir,
+        a.selector,
+        a.audio,
+        a.title,
+        a.cookies,
+        Some(a.later),
+        Some(a.size_bytes),
+        Some(a.duration),
+        Some(force),
+        a.queue,
+        a.description,
         Some(true), // the shown folder is final (W193-3)
     ))
 }
@@ -551,21 +581,45 @@ fn submit(d: &Rc<VideoDlg>, later: bool) {
     let Some(idx) = selected_index(d) else { return };
     let Some(opt) = options.get(idx).cloned() else { return };
     set_start_enabled(d, false);
-    let result = match add_one(d, &opt, later, false) {
-        Err(e) if e.starts_with("duplicate:") => {
-            if crate::dialogs::show_confirm(
-                &d.ui.window,
-                "Download again",
-                "This video quality is already in the download list.\nDownload it again as a new copy?",
-                "Download again",
-            ) {
-                add_one(d, &opt, later, true)
-            } else {
-                Ok(String::new()) // user kept the existing entry
+    let args = Rc::new(add_args(d, &opt, later));
+    spawn_video_add(d, args, false, true);
+}
+
+/// Run one video add on a worker thread and settle its verdict
+/// on the GTK thread. A duplicate gets the "download again as
+/// a new copy?" confirm here, and the force retry re-enters
+/// with the same snapshotted arguments.
+fn spawn_video_add(d: &Rc<VideoDlg>, args: Rc<VideoAddArgs>, force: bool, may_confirm: bool) {
+    let (tx, rx) = gtk::glib::MainContext::channel::<Result<String, String>>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let ctx = d.ctx.clone();
+    let a = (*args).clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_video_add(ctx, a, force));
+    });
+    let d2 = d.clone();
+    rx.attach(None, move |result| {
+        match result {
+            Err(e) if may_confirm && e.starts_with("duplicate:") => {
+                if crate::dialogs::show_confirm(
+                    &d2.ui.window,
+                    "Download again",
+                    "This video quality is already in the download list.\nDownload it again as a new copy?",
+                    "Download again",
+                ) {
+                    spawn_video_add(&d2, args.clone(), true, false);
+                } else {
+                    settle_video_add(&d2, Ok(String::new())); // user kept the existing entry
+                }
             }
+            other => settle_video_add(&d2, other),
         }
-        other => other,
-    };
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn settle_video_add(d: &Rc<VideoDlg>, result: Result<String, String>) {
     match result {
         Ok(_) => {
             if d.cookies.borrow().is_some() {
@@ -594,32 +648,43 @@ fn submit_all(d: &Rc<VideoDlg>) {
         return;
     }
     // app.js: the dialog closes first, then every quality is
-    // added; ones already in the list are skipped, not duplicated
+    // added; ones already in the list are skipped, not duplicated.
+    // The arguments are snapshotted from the widgets before the
+    // close; the adds themselves run on a worker thread.
     if d.cookies.borrow().is_some() {
         d.token_consumed.set(true);
     }
-    let (mut sent, mut skipped) = (0usize, 0usize);
-    // add through a shallow copy of the dialog state: reuse add_one
-    // before closing (it reads the widgets, which still exist)
-    for opt in &options {
-        match add_one(d, opt, false, false) {
-            Ok(_) => sent += 1,
-            Err(_) => skipped += 1,
-        }
-    }
+    let batch: Vec<VideoAddArgs> = options.iter().map(|opt| add_args(d, opt, false)).collect();
     let ui = d.ui.clone();
+    let ctx = d.ctx.clone();
     close(d);
-    refresh_list(&ui);
-    set_notice(
-        &ui,
-        &format!(
-            "Download all: {} qualities added{}",
-            sent,
-            if skipped > 0 {
-                format!(", {} skipped", skipped)
-            } else {
-                String::new()
-            }
-        ),
+    let (tx, rx) = gtk::glib::MainContext::channel::<(usize, usize)>(
+        gtk::glib::Priority::DEFAULT,
     );
+    std::thread::spawn(move || {
+        let (mut sent, mut skipped) = (0usize, 0usize);
+        for a in batch {
+            match run_video_add(ctx.clone(), a, false) {
+                Ok(_) => sent += 1,
+                Err(_) => skipped += 1,
+            }
+        }
+        let _ = tx.send((sent, skipped));
+    });
+    rx.attach(None, move |(sent, skipped)| {
+        refresh_list(&ui);
+        set_notice(
+            &ui,
+            &format!(
+                "Download all: {} qualities added{}",
+                sent,
+                if skipped > 0 {
+                    format!(", {} skipped", skipped)
+                } else {
+                    String::new()
+                }
+            ),
+        );
+        gtk::glib::ControlFlow::Break
+    });
 }

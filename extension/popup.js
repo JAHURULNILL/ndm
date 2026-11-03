@@ -11,6 +11,7 @@ async function init() {
   const chkTabOff = document.getElementById('chkTabOff');
   const btnSite = document.getElementById('btnSite');
   const btn = document.getElementById('btnVideo');
+  const btnCapture = document.getElementById('btnCapture');
   const selForceKey = document.getElementById('selForceKey');
   const selPreventKey = document.getElementById('selPreventKey');
 
@@ -152,6 +153,19 @@ async function init() {
       if (q && q.hasMedia) hasMedia = true;
     } catch (e) {}
   }
+  // The browser-capture door (2.3.0): the background passively
+  // recorded the streams this tab's browser actually played.
+  // When any are on hand, the capture action below is offered —
+  // and their existence is itself proof the page has media.
+  let capturedCount = 0;
+  try {
+    const cs = await chrome.runtime.sendMessage({
+      action: 'ndm-captured-state',
+      tabId: tab.id,
+    });
+    capturedCount = (cs && cs.count) || 0;
+  } catch (e) {}
+  if (capturedCount > 0) hasMedia = true;
   if (!hasMedia) {
     // No detected media → no video offer at all (R2-EXT-08):
     // offering one led to a flyout that probed the page itself
@@ -194,6 +208,37 @@ async function init() {
       btn.textContent = 'NDM is not reachable — open the app';
     }
   });
+
+  // The capture action: send the streams this tab's browser
+  // played to the app as a second picker source. It never
+  // replaces the yt-dlp offer above — it is the extra door for
+  // pages yt-dlp cannot read (and the only door where no JS
+  // runtime can run). Sending opens the app's picker; the user
+  // still chooses the quality there, so this click downloads
+  // nothing by itself.
+  if (capturedCount > 0) {
+    btnCapture.style.display = '';
+    btnCapture.textContent = 'Send playing video to NDM (from this browser tab)';
+    btnCapture.addEventListener('click', async () => {
+      btnCapture.disabled = true;
+      let ok = false;
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: 'ndm-send-captured',
+          tabId: tab.id,
+        });
+        ok = !!(resp && resp.ok);
+      } catch (e) {}
+      if (ok) {
+        btnCapture.classList.add('sent');
+        btnCapture.textContent = 'Sent to NDM ✓ — pick the quality there';
+        setTimeout(() => window.close(), 900);
+      } else {
+        btnCapture.disabled = false;
+        btnCapture.textContent = 'Could not send — open NDM and try again';
+      }
+    });
+  }
 }
 
 init().catch(e => console.warn('NDM popup failed:', e));

@@ -38,7 +38,7 @@ mod sink;
 mod video;
 
 use gtk::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -74,7 +74,9 @@ const COL_FRACTION: u32 = 12; // f64 — done/total (renderer fallback)
 const COL_DONE: u32 = 13; // u64 — raw done bytes
 const COL_TOTAL: u32 = 14; // u64 — raw total bytes
 const COL_SPEED: u32 = 15; // f64 — raw speed B/s
-const NCOLS: usize = 16;
+const COL_ADDED_RAW: u32 = 16; // String — ISO added stamp (hidden sort key)
+const COL_STATUS_RAW: u32 = 17; // String — raw status word (hidden sort key)
+const NCOLS: usize = 18;
 
 // Category-tree model columns: the row label plus the filter
 // key the selection applies (app.js visibleItems semantics:
@@ -172,13 +174,16 @@ fn pct_of(total: u64, done: u64) -> f64 {
 }
 
 /// The list's Status cell text (app.js cellHtml 'status'):
-/// "Complete" / "Error" / "Queued" / phase labels, else the
-/// bare 2-decimal percentage.
+/// "Complete" / "Error" / "Queued" / "Paused" / phase labels,
+/// else the bare 2-decimal percentage. (QA-220 m5: a paused
+/// row used to fall through to the percentage, so nothing in
+/// the list said the download was paused.)
 fn status_text(d: &ProgressView) -> String {
     match d.status.as_str() {
         "finished" => "Complete".to_string(),
         "error" => "Error".to_string(),
         "queued" => "Queued".to_string(),
+        "paused" => "Paused".to_string(),
         "starting" => {
             if d.detail.trim().is_empty() {
                 "Starting…".to_string()
@@ -361,6 +366,8 @@ fn apply_progress(ui: &Ui, d: &ProgressView) {
             (COL_DONE, &d.done_bytes as &dyn gtk::glib::ToValue),
             (COL_TOTAL, &d.total as &dyn gtk::glib::ToValue),
             (COL_SPEED, &d.speed_bps as &dyn gtk::glib::ToValue),
+            (COL_ADDED_RAW, &d.added as &dyn gtk::glib::ToValue),
+            (COL_STATUS_RAW, &d.status as &dyn gtk::glib::ToValue),
         ],
     );
     refresh_status_counts(ui);
@@ -458,6 +465,7 @@ fn refresh_list(ui: &Ui) {
         }
     }
     refresh_status_counts(ui);
+    refresh_toolbar_states(ui);
 }
 
 /// One live payload: update the mirror, then the row — creating
@@ -478,6 +486,7 @@ fn upsert_entry(ui: &Ui, d: &ProgressView) {
         ui.eta_samples.borrow_mut().remove(&d.id);
         refresh_status_counts(ui);
     }
+    refresh_toolbar_states(ui);
 }
 
 fn remove_entry_local(ui: &Ui, id: &str) {
@@ -488,6 +497,7 @@ fn remove_entry_local(ui: &Ui, id: &str) {
         ui.store.remove(&mut iter);
     }
     refresh_status_counts(ui);
+    refresh_toolbar_states(ui);
 }
 
 /// The ids the list selection currently names, in row order.
@@ -511,6 +521,72 @@ fn select_id(ui: &Ui, id: &str) {
         sel.unselect_all();
         sel.select_path(&path);
         ui.list_view.scroll_to_cell(Some(&path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
+    }
+}
+
+thread_local! {
+    /// Last applied toolbar sensitivity bitmask — progress
+    /// events recompute states at event rate, and the buttons
+    /// are only touched when the mask actually changes. Starts
+    /// at an impossible value so the first recompute always
+    /// lands (an empty list must grey the buttons at startup).
+    static TOOLBAR_MASK: Cell<u8> = const { Cell::new(0xFF) };
+}
+
+/// IDM toolbar logic: the command buttons mirror the
+/// selection and the list's state instead of sitting lit at
+/// all times. Nothing selected ⇒ Resume/Stop/Delete off; a
+/// stoppable selection (downloading/starting/merging/queued)
+/// lights Stop; a selection with anything not actively
+/// transferring lights Resume (paused, error, finished,
+/// queued); Stop All only while something is downloading;
+/// Delete Completed only while a finished row exists. Add
+/// URL / Options / Scheduler / Grabber / queue buttons are
+/// state-independent and stay sensitive.
+pub(crate) fn refresh_toolbar_states(ui: &Ui) {
+    let sel = selected_ids(ui);
+    let entries = ui.entries.borrow();
+    let mut any_stoppable = false;
+    let mut any_resumable = false;
+    for id in &sel {
+        if let Some(d) = entries.get(id) {
+            if matches!(
+                d.status.as_str(),
+                "downloading" | "starting" | "merging" | "queued"
+            ) {
+                any_stoppable = true;
+            }
+            if !matches!(d.status.as_str(), "downloading" | "starting" | "merging") {
+                any_resumable = true;
+            }
+        }
+    }
+    let any_downloading = entries.values().any(|d| d.status == "downloading");
+    let any_finished = entries.values().any(|d| d.status == "finished");
+    let states: [(&str, bool); 5] = [
+        ("btnResume", any_resumable),
+        ("btnStop", any_stoppable),
+        ("btnStopAll", any_downloading),
+        ("btnDelete", !sel.is_empty()),
+        ("btnDelDone", any_finished),
+    ];
+    let mask: u8 = states
+        .iter()
+        .enumerate()
+        .fold(0u8, |m, (i, (_, on))| if *on { m | (1 << i) } else { m });
+    let changed = TOOLBAR_MASK.with(|c| {
+        let old = c.get();
+        c.set(mask);
+        old != mask
+    });
+    if !changed {
+        return;
+    }
+    let buttons = ui.toolbar_buttons.borrow();
+    for (id, on) in states {
+        if let Some(b) = buttons.get(id) {
+            b.set_sensitive(on);
+        }
     }
 }
 
@@ -634,6 +710,14 @@ fn update_settings(ui: &Ui, mutate: impl Fn(&mut serde_json::Map<String, serde_j
 /// is the final word, exactly as in submitAdd. A duplicate
 /// answer from core gets the web UI's "download again as a new
 /// copy?" confirm and the force retry.
+/// The schemes the add paths accept: the engine downloads
+/// over HTTP, HTTPS and FTP (2.2.0's FTP support was real, but
+/// the shells' http(s)-only validation kept every FTP link out
+/// — QA finding B1).
+pub(crate) fn is_download_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://") || url.starts_with("ftp://")
+}
+
 fn open_add_dialog(ui: &Rc<Ui>) {
     open_file_dialog(ui, None);
 }
@@ -649,6 +733,55 @@ fn open_add_dialog(ui: &Rc<Ui>) {
 /// discards the token, so a session the user did not use
 /// never lingers on disk (app.js closeFileDialog).
 fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
+    open_file_dialog_flow(ui, offer, Rc::new(|| {}));
+}
+
+thread_local! {
+    /// One add flow at a time. A flow spans its address stage,
+    /// the (now asynchronous) probe and the add itself; while
+    /// one is in flight, incoming file offers wait in their
+    /// queue (pump_file_offers checks this) and a second manual
+    /// Add is turned away — without the gate, two File Info
+    /// dialogs could stack once the probe stopped freezing the
+    /// window.
+    static ADD_FLOW_ACTIVE: Cell<bool> = Cell::new(false);
+}
+
+/// What one add flow carries from its address stage to its
+/// settled add, snapshotted off the offer (or the typed
+/// address) before any worker thread is spawned.
+struct AddFlow {
+    url: String,
+    cookies: Option<String>,
+    referer: Option<String>,
+    /// The offered file title ("" for a typed address).
+    title: String,
+    /// The offered source tag ("" for a typed address).
+    source: String,
+}
+
+/// The File Info dialog's answers, snapshotted for the add —
+/// the add itself runs on a worker thread.
+struct AddArgs {
+    dir: String,
+    later: bool,
+    category: Option<String>,
+    name: Option<String>,
+    queue: Option<String>,
+    description: Option<String>,
+    total_arg: Option<u64>,
+}
+
+fn open_file_dialog_flow(
+    ui: &Rc<Ui>,
+    offer: Option<&serde_json::Value>,
+    on_done: Rc<dyn Fn()>,
+) {
+    if ADD_FLOW_ACTIVE.with(|f| f.get()) {
+        set_notice(ui, "Finish the current add first");
+        on_done();
+        return;
+    }
     let offer_str = |key: &str| {
         offer
             .and_then(|v| v.get(key))
@@ -671,6 +804,7 @@ fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
         let Some(values) =
             dialogs::run_dialog(&ui.window, "Add New Download", &url_fields, "Continue")
         else {
+            on_done();
             return;
         };
         values
@@ -684,24 +818,59 @@ fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
         if offer.is_none() {
             set_notice(ui, "Enter a download address first");
         }
+        on_done();
         return;
     }
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        set_notice(ui, "The address must start with http:// or https://");
+    if !is_download_url(&url) {
+        set_notice(ui, "The address must start with http://, https:// or ftp://");
+        on_done();
         return;
     }
 
-    // Probe (core probe_file). A failed probe does not block
-    // the add — the web UI shows "—" and still lets the user
-    // start — but the failure is shown in the dialog, not hidden.
-    let probe = sink::rt::block_on(sink::probe_file(
-        ui.ctx.clone(),
-        url.clone(),
-        cookies.clone(),
-        referer.clone(),
-        None,
-        None,
-    ));
+    // Probe (core probe_file) on a worker thread. Run on this
+    // thread it froze the whole window behind any slow or
+    // redirecting server — proven on the user's own laptop
+    // with a real GitHub release URL (paste → Continue →
+    // "not responding" → force quit). The File Info dialog
+    // opens from the channel callback when the probe lands.
+    ADD_FLOW_ACTIVE.with(|f| f.set(true));
+    set_notice(ui, "Checking the address…");
+    let flow = Rc::new(AddFlow {
+        title: offer_str("title"),
+        source: offer_str("source"),
+        url,
+        cookies,
+        referer,
+    });
+    let (tx, rx) = gtk::glib::MainContext::channel::<Result<serde_json::Value, String>>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    {
+        let ctx = ui.ctx.clone();
+        let (u2, c2, r2) = (flow.url.clone(), flow.cookies.clone(), flow.referer.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(sink::rt::block_on(sink::probe_file(ctx, u2, c2, r2, None, None)));
+        });
+    }
+    let ui2 = ui.clone();
+    rx.attach(None, move |probe| {
+        show_file_info(&ui2, &flow, probe, on_done.clone());
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+/// The File Info stage of the add flow: runs on the GTK thread
+/// from the probe's channel callback, with the probe's verdict
+/// in hand. A failed probe does not block the add — the web UI
+/// shows "—" and still lets the user start — but the failure
+/// is shown in the dialog, not hidden.
+fn show_file_info(
+    ui: &Rc<Ui>,
+    flow: &Rc<AddFlow>,
+    probe: Result<serde_json::Value, String>,
+    on_done: Rc<dyn Fn()>,
+) {
+    let url = flow.url.clone();
     let (total, size_text, resume_text, probed_category, probed_dir, suggested, probe_note) =
         match &probe {
             Ok(info) => {
@@ -760,31 +929,10 @@ fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
     } else {
         probed_dir
     };
-    let mut fields = vec![
-        dialogs::FieldSpec::readonly("url", "Address", &url),
-        dialogs::FieldSpec::readonly("size", "File size", &size_text),
-        dialogs::FieldSpec::readonly("resume", "Resume support", &resume_text),
-    ];
-    if !probe_note.is_empty() {
-        fields.push(dialogs::FieldSpec::readonly("note", "Note", &probe_note));
-    }
-    fields.push(dialogs::FieldSpec::entry("dir", "Save to", &dir_initial));
-    fields.push(dialogs::FieldSpec::combo(
-        "category",
-        "Category",
-        category_names(ui),
-        &probed_category,
-    ));
-    fields.push(dialogs::FieldSpec::combo(
-        "queue",
-        "Queue",
-        queue_names(ui),
-        &pick_queue_name(ui),
-    ));
     // app.js: the offered title's basename is the name; the
     // probe's suggested name only fills a name left empty.
     let name_initial = {
-        let title = offer_str("title");
+        let title = &flow.title;
         let base = title
             .rsplit(['/', '\\'])
             .next()
@@ -793,100 +941,254 @@ fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
             .to_string();
         if base.is_empty() { suggested.clone() } else { base }
     };
-    fields.push(dialogs::FieldSpec::entry("name", "File name", &name_initial));
-    fields.push(dialogs::FieldSpec::entry("description", "Description", ""));
-    fields.push(dialogs::FieldSpec::check("later", "Download later", false));
 
-    let info_title = match offer_str("source").as_str() {
+    let info_title = match flow.source.as_str() {
         "clipboard" => "Download link was found in clipboard. Do you want to download it?",
-        "basket" => "Link dropped on the basket — download it?",
-        "drop" => "Link dropped — download it?",
+        "basket" => "Link dropped on the basket \u{2014} download it?",
+        "drop" => "Link dropped \u{2014} download it?",
         _ => "Download File Info",
     };
-    let Some(values) = dialogs::run_dialog(&ui.window, info_title, &fields, "Start Download")
-    else {
+
+    // M1 (the user's standing rule): a file add gets the same
+    // card treatment the video picker has \u{2014} a header naming
+    // the file, its address under it, and the probe facts in
+    // an inset panel \u{2014} instead of the plain form grid this
+    // step used to be. Every field below is the same field
+    // with the same value semantics as before: address, file
+    // size, resume support, save-to, category, queue, file
+    // name, description, Download later.
+    let dlg = form::dialog(&ui.window, info_title, "Start Download", 640, -1);
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    body.set_margin_start(14);
+    body.set_margin_end(14);
+    body.set_margin_top(12);
+    body.set_margin_bottom(6);
+
+    let header = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let title_lbl = gtk::Label::new(None);
+    title_lbl.set_markup(&format!(
+        "<span size=\"large\"><b>{}</b></span>",
+        gtk::glib::markup_escape_text(if name_initial.is_empty() {
+            "New download"
+        } else {
+            &name_initial
+        })
+    ));
+    title_lbl.set_halign(gtk::Align::Start);
+    title_lbl.set_line_wrap(true);
+    title_lbl.set_max_width_chars(72);
+    header.pack_start(&title_lbl, false, false, 0);
+    let addr_lbl = gtk::Label::new(Some(&url));
+    addr_lbl.set_halign(gtk::Align::Start);
+    addr_lbl.set_line_wrap(true);
+    addr_lbl.set_max_width_chars(72);
+    addr_lbl.set_selectable(true);
+    header.pack_start(&addr_lbl, false, false, 0);
+    body.pack_start(&header, false, false, 0);
+
+    let card = gtk::Frame::new(None);
+    card.set_shadow_type(gtk::ShadowType::In);
+    let facts = gtk::Grid::builder()
+        .row_spacing(4)
+        .column_spacing(12)
+        .margin_start(10)
+        .margin_end(10)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    let mut fy = 0;
+    for (label, value) in [("File size", &size_text), ("Resume support", &resume_text)] {
+        let l = gtk::Label::new(Some(label));
+        l.set_halign(gtk::Align::Start);
+        let v = gtk::Label::new(Some(value.as_str()));
+        v.set_halign(gtk::Align::Start);
+        v.set_hexpand(true);
+        facts.attach(&l, 0, fy, 1, 1);
+        facts.attach(&v, 1, fy, 1, 1);
+        fy += 1;
+    }
+    if !probe_note.is_empty() {
+        let n = gtk::Label::new(Some(&probe_note));
+        n.set_halign(gtk::Align::Start);
+        n.set_line_wrap(true);
+        n.set_max_width_chars(64);
+        facts.attach(&n, 0, fy, 2, 1);
+    }
+    card.add(&facts);
+    body.pack_start(&card, false, false, 0);
+
+    let g = gtk::Grid::builder().row_spacing(6).column_spacing(12).build();
+    let dir_e = form::entry(&dir_initial);
+    let mut y = form::row(&g, 0, "Save to", &dir_e);
+    let cat_names: Vec<String> = category_names(ui);
+    let category_c = form::combo(
+        &cat_names
+            .iter()
+            .map(|n| (n.as_str(), n.as_str()))
+            .collect::<Vec<_>>(),
+        &probed_category,
+    );
+    y = form::row(&g, y, "Category", &category_c);
+    let queue_list: Vec<String> = queue_names(ui);
+    let queue_c = form::combo(
+        &queue_list
+            .iter()
+            .map(|n| (n.as_str(), n.as_str()))
+            .collect::<Vec<_>>(),
+        &pick_queue_name(ui),
+    );
+    y = form::row(&g, y, "Queue", &queue_c);
+    let name_e = form::entry(&name_initial);
+    y = form::row(&g, y, "File name", &name_e);
+    let desc_e = form::entry("");
+    desc_e.set_placeholder_text(Some("(optional note)"));
+    y = form::row(&g, y, "Description", &desc_e);
+    let later_c = form::check("Download later", false);
+    form::check_row(&g, y, &later_c);
+    body.pack_start(&g, false, false, 0);
+    dlg.content_area().pack_start(&body, false, false, 0);
+    dlg.show_all();
+    name_e.grab_focus();
+
+    if form::run(&dlg) != gtk::ResponseType::Ok {
         // Cancel / close: the captured session is discarded,
         // never left behind for a download nobody confirmed.
-        if let Some(token) = &cookies {
+        if let Some(token) = &flow.cookies {
             sink::discard_cookies(ui.ctx.clone(), token.clone());
         }
+        dlg.close();
+        finish_add_flow(&on_done);
         return;
-    };
-    let text = |key: &str| {
-        values
-            .get(key)
-            .and_then(|v| v.as_text())
-            .unwrap_or("")
-            .trim()
-            .to_string()
-    };
+    }
     let dir = {
-        let d = text("dir");
-        if d.is_empty() { dir_initial } else { d }
+        let d = dir_e.text().trim().to_string();
+        if d.is_empty() { dir_initial.clone() } else { d }
     };
     let category = {
-        let c = text("category");
+        let c = form::combo_text(&category_c);
         if c.is_empty() { None } else { Some(c) }
     };
     let queue = {
-        let q = text("queue");
+        let q = form::combo_text(&queue_c);
         if q.is_empty() { None } else { Some(q) }
     };
     let name = {
-        let n = text("name");
+        let n = name_e.text().trim().to_string();
         if n.is_empty() { None } else { Some(n) }
     };
     let description = {
-        let d = text("description");
+        let d = desc_e.text().trim().to_string();
         if d.is_empty() { None } else { Some(d) }
     };
-    let later = values.get("later").and_then(|v| v.as_bool()).unwrap_or(false);
+    let later = later_c.is_active();
+    dlg.close();
     let total_arg = if total > 0 { Some(total) } else { None };
 
-    let before: std::collections::HashSet<String> = ui.entries.borrow().keys().cloned().collect();
-    let add = |force: bool| {
-        sink::rt::block_on(sink::add_download(
-            ui.ctx.clone(),
-            url.clone(),
-            dir.clone(),
-            Some(later),
-            category.clone(),
-            name.clone(),
-            cookies.clone(),
-            referer.clone(),
-            Some(force),
-            queue.clone(),
-            None,
-            None,
-            description.clone(),
-            total_arg,
-            Some(true),
-        ))
-    };
-    let result = match add(false) {
-        Err(e) if e.starts_with("duplicate:") => {
-            // IDM asks what to do about a duplicate link — so
-            // does the web UI (W193-17), and so does this shell.
-            if confirm_dialog(
-                ui,
-                "Download again",
-                "This file is already in the download list.\nDownload it again as a new copy?",
-                "Download again",
-            ) {
-                add(true)
-            } else {
-                // the user chose to keep the existing entry —
-                // done, not an error
-                return;
+    let before: Rc<std::collections::HashSet<String>> =
+        Rc::new(ui.entries.borrow().keys().cloned().collect());
+    let args = Rc::new(AddArgs {
+        dir,
+        later,
+        category,
+        name,
+        queue,
+        description,
+        total_arg,
+    });
+    spawn_add(ui, flow, &args, false, before, on_done, true);
+}
+
+/// Run one add_download on a worker thread and settle its
+/// verdict back on the GTK thread. A duplicate answer gets the
+/// web UI's "download again as a new copy?" confirm (W193-17)
+/// and the force retry — confirm and retry both live here, on
+/// the GTK side of the channel, exactly as the synchronous
+/// flow sequenced them.
+fn spawn_add(
+    ui: &Rc<Ui>,
+    flow: &Rc<AddFlow>,
+    args: &Rc<AddArgs>,
+    force: bool,
+    before: Rc<std::collections::HashSet<String>>,
+    on_done: Rc<dyn Fn()>,
+    may_confirm: bool,
+) {
+    let (tx, rx) = gtk::glib::MainContext::channel::<Result<String, String>>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    {
+        let ctx = ui.ctx.clone();
+        let (url, cookies, referer) =
+            (flow.url.clone(), flow.cookies.clone(), flow.referer.clone());
+        // owned field copies cross to the worker — never the Rc
+        let (dir, later, category, name, queue, description, total_arg) = (
+            args.dir.clone(),
+            args.later,
+            args.category.clone(),
+            args.name.clone(),
+            args.queue.clone(),
+            args.description.clone(),
+            args.total_arg,
+        );
+        std::thread::spawn(move || {
+            let _ = tx.send(sink::rt::block_on(sink::add_download(
+                ctx,
+                url,
+                dir,
+                Some(later),
+                category,
+                name,
+                cookies,
+                referer,
+                Some(force),
+                queue,
+                None,
+                None,
+                description,
+                total_arg,
+                Some(true),
+            )));
+        });
+    }
+    let ui2 = ui.clone();
+    let flow2 = flow.clone();
+    let args2 = args.clone();
+    rx.attach(None, move |result| {
+        match result {
+            Err(e) if may_confirm && e.starts_with("duplicate:") => {
+                // IDM asks what to do about a duplicate link — so
+                // does the web UI, and so does this shell.
+                if confirm_dialog(
+                    &ui2,
+                    "Download again",
+                    "This file is already in the download list.\nDownload it again as a new copy?",
+                    "Download again",
+                ) {
+                    spawn_add(&ui2, &flow2, &args2, true, before.clone(), on_done.clone(), false);
+                } else {
+                    // the user chose to keep the existing entry —
+                    // done, not an error
+                    finish_add_flow(&on_done);
+                }
             }
+            result => settle_add(&ui2, result, before.as_ref(), &on_done),
         }
-        other => other,
-    };
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+/// Land a settled add on the GTK thread: refresh the list,
+/// select the just-added entry (IDM behaviour, app.js F-07) or
+/// narrate the failure — then close the flow out.
+fn settle_add(
+    ui: &Rc<Ui>,
+    result: Result<String, String>,
+    before: &std::collections::HashSet<String>,
+    on_done: &Rc<dyn Fn()>,
+) {
     match result {
         Ok(_) => {
             refresh_list(ui);
-            // the just-added entry becomes the selection (IDM
-            // behaviour, app.js F-07)
             let fresh = ui
                 .order
                 .borrow()
@@ -896,10 +1198,23 @@ fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
             if let Some(id) = fresh {
                 select_id(ui, &id);
             }
+            // the selection-changed recompute can race the
+            // status landing in the entry map; settle the
+            // toolbar once more with the final state
+            refresh_toolbar_states(ui);
             set_notice(ui, "Download added");
         }
         Err(e) => set_notice(ui, &format!("Could not add the download: {}", e)),
     }
+    finish_add_flow(on_done);
+}
+
+/// Close an add flow out: release the one-at-a-time gate and
+/// run the caller's continuation (the file-offer pump's next
+/// presentation, on the offer path).
+fn finish_add_flow(on_done: &Rc<dyn Fn()>) {
+    ADD_FLOW_ACTIVE.with(|f| f.set(false));
+    on_done();
 }
 
 // ---------------------------------------------------------------------------
@@ -934,7 +1249,7 @@ fn queue_incoming_file(ui: &Rc<Ui>, payload: serde_json::Value) {
         .and_then(|x| x.as_str())
         .unwrap_or("")
         .to_string();
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
+    if !is_download_url(&url) {
         set_notice(ui, "Incoming file without an address");
         return;
     }
@@ -953,9 +1268,11 @@ fn queue_incoming_file(ui: &Rc<Ui>, payload: serde_json::Value) {
 }
 
 /// Present the next waiting offer, if the way is clear: no
-/// modal dialog up and no offer already on screen.
+/// modal dialog up, no add flow in flight and no offer
+/// already on screen.
 pub fn pump_file_offers() {
     if dialogs::modal_open()
+        || ADD_FLOW_ACTIVE.with(|f| f.get())
         || FILE_OFFER_PRESENTED.with(|p| p.borrow().is_some())
     {
         return;
@@ -977,29 +1294,49 @@ pub fn pump_file_offers() {
         .unwrap_or("")
         .to_string();
     FILE_OFFER_PRESENTED.with(|p| *p.borrow_mut() = Some(url));
-    open_file_dialog(&ui, Some(&next));
-    FILE_OFFER_PRESENTED.with(|p| *p.borrow_mut() = None);
-    // The dialog this offer opened has closed — the next
-    // waiting offer gets its turn (app.js: every modal-close
-    // path calls pumpFileLinks back).
-    pump_file_offers();
+    // The flow is asynchronous (probe + add on worker threads):
+    // this presentation ends when the flow settles, and only
+    // then does the next waiting offer get its turn (app.js:
+    // every modal-close path calls pumpFileLinks back).
+    let on_done = Rc::new(move || {
+        FILE_OFFER_PRESENTED.with(|p| *p.borrow_mut() = None);
+        pump_file_offers();
+    });
+    open_file_dialog_flow(&ui, Some(&next), on_done);
 }
 
+/// Resume the given entries. A resume is a download START
+/// (the scheduler/quota gate, a revalidation probe), so the
+/// calls run on a worker thread — on this thread a slow
+/// server froze the window behind the click. The first
+/// failure, if any, is narrated when the batch lands.
 fn resume_ids(ui: &Rc<Ui>, ids: &[String]) {
     if ids.is_empty() {
         set_notice(ui, "Select a download first");
         return;
     }
-    let mut errors = Vec::new();
-    for id in ids {
-        let r = sink::rt::block_on(sink::resume_download(ui.ctx.clone(), id.clone()));
-        if let Err(e) = r {
-            errors.push(e);
+    let (tx, rx) = gtk::glib::MainContext::channel::<Vec<String>>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let ctx = ui.ctx.clone();
+    let ids: Vec<String> = ids.to_vec();
+    std::thread::spawn(move || {
+        let mut errors = Vec::new();
+        for id in &ids {
+            let r = sink::rt::block_on(sink::resume_download(ctx.clone(), id.clone()));
+            if let Err(e) = r {
+                errors.push(e);
+            }
         }
-    }
-    if let Some(e) = errors.into_iter().next() {
-        set_notice(ui, &format!("Could not resume: {}", e));
-    }
+        let _ = tx.send(errors);
+    });
+    let ui2 = ui.clone();
+    rx.attach(None, move |errors| {
+        if let Some(e) = errors.into_iter().next() {
+            set_notice(&ui2, &format!("Could not resume: {}", e));
+        }
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 fn pause_ids(ui: &Rc<Ui>, ids: &[String]) {
@@ -1095,10 +1432,32 @@ fn delete_ids(ui: &Rc<Ui>, ids: Vec<String>) {
 }
 
 fn run_delete(ui: &Rc<Ui>, ids: Vec<String>, delete_file: bool) {
-    let results = sink::remove_downloads(ui.ctx.clone(), ids, Some(delete_file));
+    // The removal runs on a worker thread: core settles the
+    // entry's engine before touching files, and a wedged
+    // download (retry-spinning against a dead server) takes
+    // seconds to settle. On this thread that wait froze the
+    // window — and a force-quit inside it leaked the partial
+    // file the user had asked to delete (QA-220 M2). The
+    // per-id results land back here and are handled exactly
+    // as the synchronous version handled them.
+    let (tx, rx) = gtk::glib::MainContext::channel::<Vec<serde_json::Value>>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let ctx = ui.ctx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(sink::remove_downloads(ctx, ids, Some(delete_file)));
+    });
+    let ui2 = ui.clone();
+    rx.attach(None, move |results| {
+        settle_delete(&ui2, &results);
+        gtk::glib::ControlFlow::Break
+    });
+}
+
+fn settle_delete(ui: &Rc<Ui>, results: &[serde_json::Value]) {
     let mut removed = 0usize;
     let mut failures: Vec<String> = Vec::new();
-    for r in &results {
+    for r in results {
         let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("");
         if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
             removed += 1;
@@ -1180,27 +1539,52 @@ fn stop_queue_now(ui: &Rc<Ui>) {
     set_notice(ui, &format!("Queue \"{}\" stopped", name));
 }
 
+thread_local! {
+    /// A manual update check is in flight. The check now runs
+    /// on a worker thread (below); a second click while one is
+    /// running must not start a duplicate — the running check's
+    /// verdict serves both.
+    static UPDATE_CHECK_RUNNING: Cell<bool> = Cell::new(false);
+}
+
 /// Help → Check for Updates (app.js manualUpdateCheck): the
 /// verdict stays on screen — an offer opens the Update dialog,
 /// "current" and failures land in the status bar. The check
-/// itself is core's check_update; it runs on this thread after
-/// painting the "Checking…" notice, so the wait is visible.
+/// itself is core's check_update, and it runs on a WORKER
+/// thread: it used to block_on here, and on a slow or blackholed
+/// network the feed fetch froze the whole window for minutes
+/// (the user's "not responding" at launch). The result rides
+/// the main-context channel back, the same pattern as the
+/// video probe (video.rs); the automatic launch check and the
+/// Win32 shell's manual check were already threaded this way.
 fn manual_update_check(ui: &Rc<Ui>) {
+    if UPDATE_CHECK_RUNNING.with(|r| r.get()) {
+        return;
+    }
+    UPDATE_CHECK_RUNNING.with(|r| r.set(true));
     set_notice(ui, "Checking for updates…");
-    while gtk::events_pending() {
-        gtk::main_iteration_do(false);
-    }
-    let r = sink::rt::block_on(sink::check_update(ui.ctx.clone()));
-    match r {
-        Ok(v) if v.get("status").and_then(|x| x.as_str()) == Some("available") => {
-            modals::show_update(&ui.window, ui.ctx.clone(), &v);
+    let (tx, rx) = gtk::glib::MainContext::channel::<Result<serde_json::Value, String>>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let ctx = ui.ctx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(sink::rt::block_on(sink::check_update(ctx)));
+    });
+    let ui2 = ui.clone();
+    rx.attach(None, move |r| {
+        UPDATE_CHECK_RUNNING.with(|r| r.set(false));
+        match r {
+            Ok(v) if v.get("status").and_then(|x| x.as_str()) == Some("available") => {
+                modals::show_update(&ui2.window, ui2.ctx.clone(), &v);
+            }
+            Ok(v) if v.get("status").and_then(|x| x.as_str()) == Some("current") => {
+                let ver = v.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                set_notice(&ui2, &format!("NDM is up to date ({})", ver));
+            }
+            _ => set_notice(&ui2, "Could not reach the update server — try again later"),
         }
-        Ok(v) if v.get("status").and_then(|x| x.as_str()) == Some("current") => {
-            let ver = v.get("version").and_then(|x| x.as_str()).unwrap_or("");
-            set_notice(ui, &format!("NDM is up to date ({})", ver));
-        }
-        _ => set_notice(ui, "Could not reach the update server — try again later"),
-    }
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 fn open_selected(ui: &Rc<Ui>, folder: bool) {
@@ -1321,7 +1705,19 @@ fn import_downloads(ui: &Rc<Ui>) {
     let str_of = |v: &serde_json::Value, key: &str| {
         v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
     };
-    let (mut ok, mut err) = (0usize, 0usize);
+    // Snapshot every row's add arguments here, then run the
+    // adds on a worker thread: each add can probe its server,
+    // and a pasted list of slow links used to freeze the window
+    // once per row. The counts and the closing notice are
+    // unchanged, delivered when the batch lands.
+    let mut rows: Vec<(
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<u64>,
+    )> = Vec::new();
     for row in items {
         let url = str_of(row, "url").unwrap_or_default();
         let save_to = str_of(row, "save_to")
@@ -1341,38 +1737,60 @@ fn import_downloads(ui: &Rc<Ui>) {
             }
         };
         let total = row.get("total").and_then(|t| t.as_u64()).filter(|t| *t > 0);
-        let added = sink::rt::block_on(sink::add_download(
-            ui.ctx.clone(),
+        rows.push((
             url,
             dir,
-            Some(true),
             str_of(row, "category"),
             str_of(row, "name"),
-            None,
-            None,
-            None,
             str_of(row, "queue"),
-            None,
-            None,
-            None,
             total,
-            None,
         ));
-        if added.is_ok() {
-            ok += 1;
-        } else {
-            err += 1;
-        }
     }
-    refresh_list(ui);
-    let msg = if ok > 0 && err > 0 {
-        format!("Imported {ok} download(s), {err} failed — the rest were skipped")
-    } else if ok > 0 {
-        format!("Imported {ok} download(s) (paused — start them when ready)")
-    } else {
-        "Import failed: nothing could be imported from that list".to_string()
-    };
-    set_notice(ui, &msg);
+    let (tx, rx) = gtk::glib::MainContext::channel::<(usize, usize)>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let ctx = ui.ctx.clone();
+    std::thread::spawn(move || {
+        let (mut ok, mut err) = (0usize, 0usize);
+        for (url, dir, category, name, queue, total) in rows {
+            let added = sink::rt::block_on(sink::add_download(
+                ctx.clone(),
+                url,
+                dir,
+                Some(true),
+                category,
+                name,
+                None,
+                None,
+                None,
+                queue,
+                None,
+                None,
+                None,
+                total,
+                None,
+            ));
+            if added.is_ok() {
+                ok += 1;
+            } else {
+                err += 1;
+            }
+        }
+        let _ = tx.send((ok, err));
+    });
+    let ui2 = ui.clone();
+    rx.attach(None, move |(ok, err)| {
+        refresh_list(&ui2);
+        let msg = if ok > 0 && err > 0 {
+            format!("Imported {ok} download(s), {err} failed — the rest were skipped")
+        } else if ok > 0 {
+            format!("Imported {ok} download(s) (paused — start them when ready)")
+        } else {
+            "Import failed: nothing could be imported from that list".to_string()
+        };
+        set_notice(&ui2, &msg);
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 /// Move the entry to another queue (app.js ctx menu "Move to
@@ -1419,18 +1837,25 @@ fn stub_action(ui: &Rc<Ui>, label: &str) -> impl Fn() + 'static {
 /// entry (PROGRESS-DIALOG-SPEC §1.3: row double-click, the row
 /// menu's "Show progress", and core's ProgressDialogReveal).
 /// Seeded from the shell's mirror; live payloads keep it current
-/// through the dispatcher's progress routing.
+/// through the dispatcher's progress routing. The user's own
+/// opens are explicit (always present); core's reveal is not —
+/// a dialog the user closed stays closed (QA-220 m3).
 fn open_progress_dialog(ui: &Rc<Ui>, id: &str) {
-    open_progress_dialog_view(ui, id, false);
+    open_progress_dialog_view(ui, id, false, true);
 }
 
 /// G7: the "minimized" reveal — the dialog opens lowered
 /// (iconified), its live state running from the start.
 fn open_progress_dialog_lowered(ui: &Rc<Ui>, id: &str) {
-    open_progress_dialog_view(ui, id, true);
+    open_progress_dialog_view(ui, id, true, false);
 }
 
-fn open_progress_dialog_view(ui: &Rc<Ui>, id: &str, minimized: bool) {
+/// Core's start reveal ("show" view): background, not explicit.
+fn open_progress_dialog_reveal(ui: &Rc<Ui>, id: &str) {
+    open_progress_dialog_view(ui, id, false, false);
+}
+
+fn open_progress_dialog_view(ui: &Rc<Ui>, id: &str, minimized: bool, explicit: bool) {
     let view = ui.entries.borrow().get(id).cloned();
     let Some(view) = view else {
         set_notice(ui, "That download is no longer in the list");
@@ -1448,7 +1873,7 @@ fn open_progress_dialog_view(ui: &Rc<Ui>, id: &str, minimized: bool) {
             .and_then(|x| x.as_bool())
             .unwrap_or(true),
     };
-    progress::open_or_raise(&ui.window, ui.ctx.clone(), &view, info, minimized);
+    progress::open_or_raise(&ui.window, ui.ctx.clone(), &view, info, minimized, explicit);
 }
 
 fn menu_item(label: &str) -> gtk::MenuItem {
@@ -1463,12 +1888,6 @@ fn build_menubar(ui: &Rc<Ui>) -> gtk::MenuBar {
         build(&menu);
         root.set_submenu(Some(&menu));
         bar.add(&root);
-    };
-    let stub_item = |menu: &gtk::Menu, title: &str, label: &str| {
-        let item = menu_item(label);
-        let f = stub_action(ui, &format!("{} → {}", title, label));
-        item.connect_activate(move |_| f());
-        menu.add(&item);
     };
     let real_item = |menu: &gtk::Menu, label: &str, f: Box<dyn Fn()>| {
         let item = menu_item(label);
@@ -1640,13 +2059,14 @@ fn build_menubar(ui: &Rc<Ui>) -> gtk::MenuBar {
             menu.add(&item);
         }
         menu.add(&gtk::SeparatorMenuItem::new());
-        for label in [
-            "Sort by Name",
-            "Sort by Date Added",
-            "Sort by Size",
-            "Sort by Status",
+        for (label, key) in [
+            ("Sort by Name", "name"),
+            ("Sort by Date Added", "added"),
+            ("Sort by Size", "size"),
+            ("Sort by Status", "status"),
         ] {
-            stub_item(&menu, "View", label);
+            let u = ui.clone();
+            real_item(&menu, label, Box::new(move || apply_menu_sort(&u, key)));
         }
         menu.add(&gtk::SeparatorMenuItem::new());
         let u = ui.clone();
@@ -1926,6 +2346,47 @@ fn column_model(id: &str) -> u32 {
     }
 }
 
+/// The model column a "Sort by …" key sorts on — the same keys
+/// the column headers use (see populate_columns).
+fn sort_key_column(key: &str) -> u32 {
+    match key {
+        "size" => COL_TOTAL,
+        "added" => COL_ADDED_RAW,
+        "status" => COL_STATUS_RAW,
+        _ => COL_NAME,
+    }
+}
+
+/// View → Sort by …: sort the list by the key; choosing the
+/// same key again flips the direction (the header-click
+/// behaviour, mirrored in the menu). QA-220 m1: these were
+/// "not yet available" stubs and the headers were inert.
+fn apply_menu_sort(ui: &Rc<Ui>, key: &str) {
+    let col = sort_key_column(key);
+    let current = ui.store.sort_column_id();
+    let order = match current {
+        Some((gtk::SortColumn::Index(c), gtk::SortType::Ascending)) if c == col => {
+            gtk::SortType::Descending
+        }
+        _ => gtk::SortType::Ascending,
+    };
+    ui.store
+        .set_sort_column_id(gtk::SortColumn::Index(col), order);
+    set_notice(
+        ui,
+        &format!(
+            "Sorted by {} ({})",
+            match key {
+                "size" => "size",
+                "added" => "date added",
+                "status" => "status",
+                _ => "name",
+            },
+            if order == gtk::SortType::Ascending { "ascending" } else { "descending" }
+        ),
+    );
+}
+
 pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
     for col in view.columns() {
         view.remove_column(&col);
@@ -1940,6 +2401,21 @@ pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
         let col = gtk::TreeViewColumn::new();
         col.set_title(title);
         col.set_resizable(true);
+        // Sortable headers (QA-220 m1): Name sorts on its text,
+        // Size on the raw byte count, Date Added on the ISO
+        // stamp, Status on the raw status word — the ListStore's
+        // own comparisons over the (hidden) key columns.
+        let sort_col = match c.id.as_str() {
+            "name" => Some(COL_NAME),
+            "size" => Some(COL_TOTAL),
+            "added" => Some(COL_ADDED_RAW),
+            "status" => Some(COL_STATUS_RAW),
+            _ => None,
+        };
+        if let Some(sc) = sort_col {
+            col.set_sort_column_id(sc as i32);
+            col.set_clickable(true);
+        }
         if c.width > 0 {
             col.set_fixed_width(c.width);
             col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
@@ -2233,6 +2709,7 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                     progress::update(&d);
                 }
             }
+            refresh_toolbar_states(ui);
             let name = v
                 .get("name")
                 .and_then(|x| x.as_str())
@@ -2379,7 +2856,7 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                 if v.get("view").and_then(|x| x.as_str()) == Some("minimized") {
                     open_progress_dialog_lowered(ui, id);
                 } else {
-                    open_progress_dialog(ui, id);
+                    open_progress_dialog_reveal(ui, id);
                 }
             }
         }
@@ -2450,6 +2927,8 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
         gtk::glib::types::Type::U64,    // COL_DONE
         gtk::glib::types::Type::U64,    // COL_TOTAL
         gtk::glib::types::Type::F64,    // COL_SPEED
+        gtk::glib::types::Type::STRING, // COL_ADDED_RAW
+        gtk::glib::types::Type::STRING, // COL_STATUS_RAW
     ]);
     debug_assert_eq!(store.n_columns() as usize, NCOLS);
 
@@ -2605,6 +3084,15 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
                 let refs: Vec<&str> = uris.iter().map(|s| s.as_str()).collect();
                 data.set_uris(&refs);
             }
+        });
+    }
+
+    // Toolbar sensitivity follows the list selection (IDM
+    // logic — see refresh_toolbar_states).
+    {
+        let u = ui.clone();
+        ui.list_view.selection().connect_changed(move |_| {
+            refresh_toolbar_states(&u);
         });
     }
 

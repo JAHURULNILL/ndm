@@ -10,6 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// The manifest travels WITH each release as an asset, fetched via
 /// GitHub's always-latest download route — plain github.com, which
@@ -84,15 +85,47 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     std::cmp::Ordering::Equal
 }
 
-/// Fetch one manifest URL's body as text. A response carrying a
-/// real Content-Encoding is rejected (W1 F11): the update paths
-/// request `identity` and ureq here does not decode, so a gzipped
-/// manifest would otherwise be parsed as garbage — or, worse on
-/// the download path, saved as the package — instead of failing
-/// cleanly like every other transfer path in the crate.
-fn fetch_manifest_body(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+/// Overall budget for ONE whole manifest check, across every
+/// route it tries. The shared agent's per-operation timeouts
+/// (15 s connect / 30 s per read) cannot bound a check on their
+/// own: DNS resolution is untimed there, a server that dribbles
+/// one byte at a time never trips a per-read timeout, and two
+/// routes are tried back to back — on a blackholed network the
+/// launch check once froze the app's window for minutes. The
+/// manifest fetch therefore runs on its OWN agent and every
+/// request carries the time left from this single budget, so no
+/// caller of fetch_release can hang past it.
+pub const MANIFEST_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The manifest fetch's dedicated agent — same shape as the
+/// shared build_agent (proxy, UA, per-op timeouts) but private
+/// to this module, so the deadline discipline below can never
+/// leak into the download engine's agent.
+fn manifest_agent() -> ureq::Agent {
+    crate::apply_proxy(
+        ureq::AgentBuilder::new().redirect_auth_headers(ureq::RedirectAuthHeaders::Never),
+    )
+    .timeout_connect(Duration::from_secs(15))
+    .timeout_read(Duration::from_secs(30))
+    .timeout_write(Duration::from_secs(30))
+    .user_agent(crate::BROWSER_UA)
+    .build()
+}
+
+/// Fetch one manifest URL's body as text. `timeout` is the
+/// request's overall deadline (DNS through the last body byte),
+/// not a per-operation budget — a dribbling body fails on it
+/// even though every individual read succeeds. A response
+/// carrying a real Content-Encoding is rejected (W1 F11): the
+/// update paths request `identity` and ureq here does not
+/// decode, so a gzipped manifest would otherwise be parsed as
+/// garbage — or, worse on the download path, saved as the
+/// package — instead of failing cleanly like every other
+/// transfer path in the crate.
+fn fetch_manifest_body(agent: &ureq::Agent, url: &str, timeout: Duration) -> Result<String, String> {
     let resp = agent
         .get(url)
+        .timeout(timeout)
         .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| format!("update check failed: {e}"))?;
@@ -129,12 +162,27 @@ pub fn fetch_release() -> Result<ReleaseInfo, String> {
     }
     urls.push(MANIFEST_URL.to_string());
     urls.push(MANIFEST_URL_FALLBACK.to_string());
+    fetch_release_within(&urls, MANIFEST_DEADLINE)
+}
+
+/// fetch_release against an explicit route list under one
+/// overall budget shared by every route: each request gets the
+/// time still left, and once the budget is spent no further
+/// route is even attempted. Split out so the deadline is
+/// testable against local servers.
+fn fetch_release_within(urls: &[String], budget: Duration) -> Result<ReleaseInfo, String> {
     // Try each route in turn: one unreachable host must not silently
     // kill the update check when the other route works.
-    let agent = crate::build_agent();
+    let agent = manifest_agent();
+    let started = Instant::now();
     let mut last_err = String::new();
-    for url in &urls {
-        let fetched = fetch_manifest_body(&agent, url);
+    for url in urls {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            last_err = "update check failed: timed out".to_string();
+            break;
+        }
+        let fetched = fetch_manifest_body(&agent, url, remaining);
         match fetched {
             Ok(body) => match serde_json::from_str(&body) {
                 Ok(info) => return Ok(info),
@@ -582,7 +630,7 @@ mod tests {
         let agent = crate::build_agent();
         let body = vec![b'x'; MAX_MANIFEST_BYTES as usize + 1];
         let url = serve_plain(&body, "");
-        let err = fetch_manifest_body(&agent, &url).unwrap_err();
+        let err = fetch_manifest_body(&agent, &url, Duration::from_secs(30)).unwrap_err();
         assert!(err.contains("size cap"), "unexpected error: {err}");
     }
 
@@ -601,6 +649,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A server that answers the headers (promising a full
+    /// manifest-sized body) and then dribbles one byte every
+    /// 200 ms forever: no single read ever stalls, so only an
+    /// OVERALL deadline can end the fetch.
+    fn serve_dribble() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_MANIFEST_BYTES
+            );
+            if sock.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            loop {
+                if sock.write_all(b"x").is_err() {
+                    return; // the client hung up — the deadline did its job
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        format!("http://127.0.0.1:{port}/release.json")
+    }
+
+    #[test]
+    fn manifest_fetch_fails_within_its_deadline_against_a_dribble_server() {
+        // Regression lock for the launch-freeze: per-read
+        // timeouts can never fire here (a byte lands every
+        // 200 ms), so without the overall deadline this fetch
+        // would run for the body's full dribble — hours.
+        let agent = manifest_agent();
+        let url = serve_dribble();
+        let t0 = Instant::now();
+        let err = fetch_manifest_body(&agent, &url, Duration::from_secs(2)).unwrap_err();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "dribble fetch must die on its 2 s deadline, took {elapsed:?} ({err})"
+        );
+    }
+
+    #[test]
+    fn manifest_check_budget_is_shared_across_routes() {
+        // Two dribbling routes under one 3 s budget: the second
+        // route must not get a fresh budget of its own — the
+        // whole check is bounded by the one deadline.
+        let urls = vec![serve_dribble(), serve_dribble()];
+        let t0 = Instant::now();
+        let err = fetch_release_within(&urls, Duration::from_secs(3)).unwrap_err();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "two-route check must stay inside its shared budget, took {elapsed:?} ({err})"
+        );
+    }
+
     #[test]
     fn fetch_manifest_body_rejects_an_encoded_response() {
         // W1 F11: fetch_release's body fetch must reject a real
@@ -608,11 +722,11 @@ mod tests {
         let agent = crate::build_agent();
         let body = br#"{"version":"9.9.9"}"#;
         let url = serve_plain(body, "Content-Encoding: gzip\r\n");
-        let err = fetch_manifest_body(&agent, &url).unwrap_err();
+        let err = fetch_manifest_body(&agent, &url, Duration::from_secs(30)).unwrap_err();
         assert!(err.contains("Content-Encoding"), "unexpected error: {err}");
         // the same body unencoded passes through untouched
         let url = serve_plain(body, "");
-        let text = fetch_manifest_body(&agent, &url).unwrap();
+        let text = fetch_manifest_body(&agent, &url, Duration::from_secs(30)).unwrap();
         assert_eq!(text.as_bytes(), body);
     }
 }

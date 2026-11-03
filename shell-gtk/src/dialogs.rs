@@ -192,6 +192,9 @@ pub fn run_dialog(
         .build();
 
     let mut rows: Vec<(&'static str, RowWidget)> = Vec::new();
+    // The first editable field takes the focus when the dialog
+    // opens (the Add URL dialog opens ready to type/paste).
+    let mut first_focus: Option<gtk::Widget> = None;
     for (i, f) in fields.iter().enumerate() {
         let row = i as i32;
         match &f.kind {
@@ -204,8 +207,10 @@ pub fn run_dialog(
             FieldKind::ReadOnly => {
                 let label = gtk::Label::new(Some(f.label));
                 label.set_halign(gtk::Align::Start);
+                label.set_valign(gtk::Align::Baseline);
                 let value = gtk::Label::new(Some(&f.initial));
                 value.set_halign(gtk::Align::Start);
+                value.set_valign(gtk::Align::Baseline);
                 value.set_selectable(true);
                 // Wrap long values (URLs, explanatory notes):
                 // unwrapped, one long line stretched the Refresh
@@ -219,11 +224,16 @@ pub fn run_dialog(
             FieldKind::Entry => {
                 let label = gtk::Label::new(Some(f.label));
                 label.set_halign(gtk::Align::Start);
+                label.set_valign(gtk::Align::Baseline);
                 let entry = gtk::Entry::new();
                 entry.set_text(&f.initial);
                 entry.set_hexpand(true);
+                entry.set_valign(gtk::Align::Baseline);
                 // Enter in any entry confirms the dialog.
                 entry.set_activates_default(true);
+                if first_focus.is_none() {
+                    first_focus = Some(entry.clone().upcast::<gtk::Widget>());
+                }
                 grid.attach(&label, 0, row, 1, 1);
                 grid.attach(&entry, 1, row, 1, 1);
                 rows.push((f.id, RowWidget::Entry(entry)));
@@ -249,7 +259,9 @@ pub fn run_dialog(
             FieldKind::Combo(choices) => {
                 let label = gtk::Label::new(Some(f.label));
                 label.set_halign(gtk::Align::Start);
+                label.set_valign(gtk::Align::Baseline);
                 let combo = gtk::ComboBoxText::new();
+                combo.set_valign(gtk::Align::Baseline);
                 for c in choices {
                     combo.append_text(c);
                 }
@@ -279,6 +291,9 @@ pub fn run_dialog(
     let content = dialog.content_area();
     content.add(&grid);
     dialog.show_all();
+    if let Some(w) = &first_focus {
+        w.grab_focus();
+    }
 
     MODAL_DEPTH.with(|d| d.set(d.get() + 1));
     let response = dialog.run();

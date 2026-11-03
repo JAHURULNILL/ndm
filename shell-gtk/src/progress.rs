@@ -663,28 +663,56 @@ fn label_row(grid: &gtk::Grid, row: i32, name: &str) -> gtk::Label {
     let v = gtk::Label::new(None);
     v.set_xalign(0.0);
     v.set_hexpand(true);
+    // Values wrap instead of clipping: the Status row carries
+    // the full error text, and a long one used to run off the
+    // dialog's edge unreadable (QA-220 m4).
+    v.set_line_wrap(true);
+    v.set_max_width_chars(72);
     grid.attach(&l, 0, row, 1, 1);
     grid.attach(&v, 1, row, 1, 1);
     v
 }
 
+thread_local! {
+    /// Entries whose progress dialog the user has closed.
+    /// A background reveal (a retry, a queue promotion, any
+    /// later start of the same entry) must not re-open or yank
+    /// the dialog forward after that — QA-220 m3: dialogs
+    /// re-surfaced on every transition and stacked in front,
+    /// seizing the work area. An explicit open (double-click,
+    /// "Show progress") clears the mark.
+    static USER_CLOSED: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
 /// Open the dialog for `view`'s entry, or raise the existing one.
 /// G7: with `minimized` set (the reveal payload's view), the
 /// dialog is created with its full live state but lowered —
-/// iconified instead of presented.
+/// iconified instead of presented. `explicit` marks a user's
+/// own open (double-click / "Show progress"): it always
+/// presents and clears the user-closed mark. A non-explicit
+/// reveal for a user-closed entry does nothing at all, and
+/// for an already-open dialog it only refreshes the contents
+/// — never yanks the window forward.
 pub fn open_or_raise(
     parent: &gtk::ApplicationWindow,
     ctx: Ctx,
     view: &ProgressView,
     info: OpenInfo,
     minimized: bool,
+    explicit: bool,
 ) {
+    if explicit {
+        USER_CLOSED.with(|s| s.borrow_mut().remove(&view.id));
+    } else if USER_CLOSED.with(|s| s.borrow().contains(&view.id)) {
+        return;
+    }
     let existing = REGISTRY.with(|r| r.borrow().get(&view.id).cloned());
     if let Some(dlg) = existing {
         dlg.apply(view);
         if minimized {
             lower(&dlg);
-        } else {
+        } else if explicit {
             dlg.window.set_transient_for(Some(parent));
             dlg.window.present();
         }
@@ -976,13 +1004,21 @@ fn build(
         let d = dlg.clone();
         window.connect_delete_event(move |_, _| {
             REGISTRY.with(|r| r.borrow_mut().remove(&d.id));
+            // however it closed — X, Cancel, the entry leaving —
+            // a background reveal must not resurrect it (m3)
+            USER_CLOSED.with(|s| s.borrow_mut().insert(d.id.clone()));
             gtk::glib::Propagation::Proceed
         });
     }
     {
         let d = dlg.clone();
         btn_resume.connect_clicked(move |_| {
-            let _ = sink::rt::block_on(sink::resume_download(d.ctx.clone(), d.id.clone()));
+            // a resume is a download start — it can probe, so it
+            // runs on a worker, never on the UI thread
+            let (ctx, id) = (d.ctx.clone(), d.id.clone());
+            std::thread::spawn(move || {
+                let _ = sink::rt::block_on(sink::resume_download(ctx, id));
+            });
         });
     }
     {

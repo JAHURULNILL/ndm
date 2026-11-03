@@ -775,6 +775,13 @@ fn rebuild_display() {
 /// path behind double-click, the context menu, core's
 /// ProgressDialogReveal and the start-transition auto-open.
 fn open_progress_dialog(parent: HWND, id: &str, minimized: bool, activate: bool) {
+    if activate {
+        progress_dialog::note_explicit_open(id);
+    } else if progress_dialog::user_closed(id) {
+        // the user closed this dialog; a background reveal
+        // (retry, queue promotion) must not resurrect it (m3)
+        return;
+    }
     if activate && progress_dialog::raise_existing(id) {
         return;
     }
@@ -1137,10 +1144,17 @@ fn refresh_command_states() {
     let can_stop = sel.iter().any(|v| {
         matches!(v.status.as_str(), "downloading" | "starting" | "merging" | "queued")
     });
+    // Stop All only while something is downloading; Delete
+    // Completed only while a finished row exists (IDM logic —
+    // the GTK shell applies the same two rules).
+    let any_downloading = cache.iter().any(|v| v.status == "downloading");
+    let any_finished = cache.iter().any(|v| v.status == "finished");
     let tb = toolbar();
     tb.set_enabled(TB_RESUME, can_resume);
     tb.set_enabled(TB_STOP, can_stop);
     tb.set_enabled(TB_DELETE, !sel.is_empty());
+    tb.set_enabled(TB_STOP_ALL, any_downloading);
+    tb.set_enabled(TB_DELETE_COMPLETED, any_finished);
 }
 
 // ----------------------------------------------------------------
@@ -1361,8 +1375,8 @@ fn show_add_dialog(hwnd: HWND, prefill_url: Option<&str>) {
         Some(winui::dialog::FieldValue::Text(t)) => t.trim().to_string(),
         _ => String::new(),
     };
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        set_status(1, "Add failed: the URL must start with http:// or https://");
+    if !(url.starts_with("http://") || url.starts_with("https://") || url.starts_with("ftp://")) {
+        set_status(1, "Add failed: the URL must start with http://, https:// or ftp://");
         return;
     }
     let dir = match outcome.values.get(1) {
@@ -1924,12 +1938,14 @@ fn show_batch_dialog(hwnd: HWND, mut text: String, mut dir: String, mut report: 
             .collect();
         let urls: Vec<String> = raw_lines
             .iter()
-            .filter(|x| x.starts_with("http"))
+            .filter(|x| {
+                x.starts_with("http://") || x.starts_with("https://") || x.starts_with("ftp://")
+            })
             .cloned()
             .collect();
         let invalid = raw_lines.len() - urls.len();
         if raw_lines.is_empty() {
-            set_status(1, "Paste the links first — one http(s) link per line.");
+            set_status(1, "Paste the links first — one link per line (http, https or ftp).");
             continue;
         }
         if urls.is_empty() {
@@ -2000,7 +2016,12 @@ fn show_batch_dialog(hwnd: HWND, mut text: String, mut dir: String, mut report: 
                 failed.iter().map(|(u, _)| u.as_str()).collect();
             let remaining = raw_lines
                 .iter()
-                .filter(|u| failed_urls.contains(u.as_str()) || !u.starts_with("http"))
+                .filter(|u| {
+                    failed_urls.contains(u.as_str())
+                        || !(u.starts_with("http://")
+                            || u.starts_with("https://")
+                            || u.starts_with("ftp://"))
+                })
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");

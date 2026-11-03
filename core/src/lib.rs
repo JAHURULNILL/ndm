@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+pub mod capture;
 pub mod video;
 
 /* ---------- Phase 1 seam (NATIVE-PHASE1-LOG.md section 3) ----------
@@ -4743,29 +4744,58 @@ pub fn start_entry(app: &Ctx, entry: Arc<Entry>) {
         // page through yt-dlp - name that wait on the entry
         set_detail(&entry, "Resolving\u{2026}");
         let _ = app.emit(AppEvent::Progress(payload_of(&entry)));
-        match video::VideoJob::start_with_recorded_final(
+        // A captured entry restarts from its stored streams, not
+        // from a resolve (crate::capture) — a group that expired
+        // meanwhile fails the start with the plain message, which
+        // the Err arm below lands on the entry as its error.
+        let total_hint = entry
+            .restored
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.total)
+            .unwrap_or(0);
+        let started = match capture::preresolved_for(
+            data_dir(&state).as_deref(),
             &entry.url,
-            &entry.out_path,
             &entry.selector,
-            entry.audio,
-            &entry.name,
-            state.cookies_path(&entry.cookies),
-            &entry.login,
-            &entry.password,
-            &state.components(),
-            // a restarted stub keeps the size it was added with as
-            // its finish-line expectation; the probed duration was
-            // never persisted, so that half of the check sits out
-            entry
-                .restored
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|r| r.total)
-                .unwrap_or(0),
-            0.0,
-            recorded_final,
+            capture::now_unix(),
         ) {
+            Err(e) => Err(e),
+            Ok(Some(pre)) => video::VideoJob::start_with_preresolved(
+                &entry.url,
+                &entry.out_path,
+                &entry.selector,
+                entry.audio,
+                &entry.name,
+                state.cookies_path(&entry.cookies),
+                &entry.login,
+                &entry.password,
+                &state.components(),
+                total_hint,
+                0.0,
+                recorded_final.clone(),
+                pre,
+            ),
+            Ok(None) => video::VideoJob::start_with_recorded_final(
+                &entry.url,
+                &entry.out_path,
+                &entry.selector,
+                entry.audio,
+                &entry.name,
+                state.cookies_path(&entry.cookies),
+                &entry.login,
+                &entry.password,
+                &state.components(),
+                // a restarted stub keeps the size it was added with as
+                // its finish-line expectation; the probed duration was
+                // never persisted, so that half of the check sits out
+                total_hint,
+                0.0,
+                recorded_final,
+            ),
+        };
+        match started {
             Ok(job) => {
             job.set_limit(*entry.speed_limit.lock().unwrap());
             // the entry may have been removed or replaced while the job
@@ -5222,6 +5252,38 @@ pub fn adopt_parked_entries(
         persist(state);
     }
     adopted
+}
+
+/// M3 (QA-220): hand a queue's PAUSED members back to it for
+/// an explicit "Start Queue Now". The claim paths only ever
+/// take entries carrying the queued flag, and a pause clears
+/// it — so a member the user had paused sat invisible to every
+/// queue start while the UI announced the queue had started.
+/// The button press IS the user's order to run the whole
+/// queue (IDM semantics), so its paused members rejoin here.
+/// Passive paths (schedule window edges, settings saves) must
+/// NOT call this: a user pause is never auto-started behind
+/// their back — only the explicit command adopts them.
+pub fn requeue_paused_members(app: &Ctx, state: &AppState, queue: &str) -> bool {
+    let order = state.order.lock().unwrap().clone();
+    let mut any = false;
+    for id in &order {
+        if let Some(e) = state.get(id) {
+            if entry_queue(&e) != queue
+                || e.queued.load(Ordering::Relaxed)
+                || payload_of(&e).status != "paused"
+            {
+                continue;
+            }
+            mark_requeued(&e);
+            let _ = app.emit(AppEvent::Progress(payload_of(&e)));
+            any = true;
+        }
+    }
+    if any {
+        persist(state);
+    }
+    any
 }
 
 /// Claim a queued entry for a pump/scheduler start. A successful
@@ -5764,6 +5826,10 @@ pub fn scheduler_start_now(
     // for an unscheduled queue this silently started nothing
     // while the UI announced success.
     adopt_parked_entries(&app, &state, &current_settings(&state), &q, true);
+    // M3: the queue's PAUSED members are part of the queue too —
+    // the explicit press adopts them alongside the parked ones,
+    // or they never start (the claim paths cannot see them)
+    requeue_paused_members(&app, &state, &q);
     // the QUEUE's effective cap decides, not the global value: a
     // queue with its own cap fills its slots through the pump
     // instead of flooding past its simultaneous limit
@@ -6270,13 +6336,54 @@ pub async fn resume_download(
                     Some(PathBuf::from(fp))
                 }
             };
-            let job = match video::VideoJob::start_with_recorded_final(
+            // A captured entry resumes from its stored streams
+            // (crate::capture); an expired group refuses with the
+            // plain message, surfaced as the resume error.
+            let total_hint = entry
+                .restored
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r.total)
+                .unwrap_or(0);
+            let job = match capture::preresolved_for(
+                data_dir(&state).as_deref(),
                 &entry.url,
-                &entry.out_path,
                 &entry.selector,
-                entry.audio,
-                &entry.name,
-                state.cookies_path(&entry.cookies),
+                capture::now_unix(),
+            ) {
+                Err(e) => {
+                    entry.starting.store(false, Ordering::SeqCst);
+                    return Err(e);
+                }
+                Ok(Some(pre)) => match video::VideoJob::start_with_preresolved(
+                    &entry.url,
+                    &entry.out_path,
+                    &entry.selector,
+                    entry.audio,
+                    &entry.name,
+                    state.cookies_path(&entry.cookies),
+                    &entry.login,
+                    &entry.password,
+                    &state.components(),
+                    total_hint,
+                    0.0,
+                    recorded_final.clone(),
+                    pre,
+                ) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        entry.starting.store(false, Ordering::SeqCst);
+                        return Err(e);
+                    }
+                },
+                Ok(None) => match video::VideoJob::start_with_recorded_final(
+                    &entry.url,
+                    &entry.out_path,
+                    &entry.selector,
+                    entry.audio,
+                    &entry.name,
+                    state.cookies_path(&entry.cookies),
                 &entry.login,
                 &entry.password,
                 &state.components(),
@@ -6295,6 +6402,7 @@ pub async fn resume_download(
                     entry.starting.store(false, Ordering::SeqCst);
                     return Err(e);
                 }
+            }
             };
             // 209 §8: the live entry built below must carry the
             // stub's detail across (see the construction) — this
@@ -6465,7 +6573,32 @@ pub fn remove_entry_inner(
                 && entry_file_path(e) == target
         });
         if !shared {
-            let _ = std::fs::remove_file(&target);
+            // M2 (QA-220): the removal result is CHECKED, never
+            // swallowed. The old `let _ =` let a failed delete
+            // report success while the partial stayed on disk —
+            // and with the settle await running on the caller's
+            // UI thread, a wedged download's seconds-long settle
+            // invited a force-quit mid-removal, which leaked the
+            // file the same silent way. A file that cannot be
+            // removed now fails the removal: the entry stays in
+            // the list and the user hears why.
+            match std::fs::remove_file(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "the file could not be deleted ({}): {}",
+                        target.display(),
+                        e
+                    ));
+                }
+            }
+            if target.exists() {
+                return Err(format!(
+                    "the file could not be deleted: {}",
+                    target.display()
+                ));
+            }
         }
     }
     // the emit loop is stopped and the entry is leaving: its
@@ -7769,14 +7902,44 @@ pub async fn probe_video(
     // the job a Download click creates carries the trimmed URL
     // (submitVideo trims), so probe and seed under that same string
     let url = url.trim().to_string();
-    let info = crate::rt::spawn_blocking({
+    let probed = crate::rt::spawn_blocking({
         let url = url.clone();
         let components = components.clone();
         let cookies = cookies.clone();
         move || video::probe(&url, &components, cookies.as_deref())
     })
     .await
-    .map_err(|e| format!("internal join error: {e}"))??;
+    .map_err(|e| format!("internal join error: {e}"))?;
+    // The browser-capture door (2.3.0): a set the extension
+    // captured for this same video joins the picker as a second
+    // source under the SAME entry (the design's locked dedupe —
+    // one video, one entry, two sources). Looked up by identity,
+    // so the watch page and its youtu.be/shorts shapes agree.
+    let capture_dir = data_dir(&state);
+    let capture_set = capture::get_set(
+        capture_dir.as_deref(),
+        &capture::video_identity(&url),
+    );
+    let mut info = match probed {
+        Ok(info) => info,
+        Err(e) => {
+            // yt-dlp could not read the page — but the browser
+            // played it and its streams were captured: the picker
+            // stands on the captured set alone. A set whose links
+            // ALL died answers with the plain refresh message,
+            // never the raw probe error.
+            if let Some(set) = &capture_set {
+                let now = capture::now_unix();
+                if !capture::live_groups(set, now).is_empty() {
+                    return Ok(capture::bare_info(set, now));
+                }
+                if !set.streams.is_empty() {
+                    return Err(capture::EXPIRED_MESSAGE.to_string());
+                }
+            }
+            return Err(e);
+        }
+    };
     // Change 5 (2.0.4): seed the resolution cache for the picker's
     // preselected (and best) rows in the background, keyed exactly
     // as the coming job will key it — same site login the job will
@@ -7799,6 +7962,16 @@ pub async fn probe_video(
                 &components,
             );
         });
+    }
+    // The captured source joins AFTER the seeding (which must
+    // only ever warm yt-dlp selectors — a capture selector fed to
+    // the resolve would be a wasted yt-dlp run). Foregrounded
+    // when yt-dlp has no JavaScript runtime on this machine:
+    // there its own list is the partial one (pre-Windows-10 TV
+    // formats), and the browser's capture is the full one.
+    if let Some(set) = &capture_set {
+        let foreground = ndm::video_probe::no_js_runtime_mode();
+        capture::merge_into_info(&mut info, set, foreground, capture::now_unix());
     }
     Ok(info)
 }
@@ -7970,6 +8143,20 @@ pub fn do_add_video(
     if state.update_required.load(Ordering::SeqCst) {
         return Err("please install the required update before starting new downloads".to_string());
     }
+    // The browser-capture door: a `ndmcap:` selector names a
+    // captured stream group, not a yt-dlp format. Resolve it to
+    // its streams NOW, while the refusal is still a picker
+    // message: a group that is gone or whose links expired fails
+    // here in plain language, never as a job error later.
+    let preresolved = match capture::preresolved_for(
+        data_dir(state).as_deref(),
+        &url,
+        &selector,
+        capture::now_unix(),
+    ) {
+        Ok(p) => p,
+        Err(e) => return Err(e),
+    };
     // category routing (IDM-style) happens BEFORE the duplicate
     // check, so a re-add compares against the folder the first add
     // was actually routed to. An explicit folder from the video
@@ -8010,8 +8197,9 @@ pub fn do_add_video(
     // cache key — a later/queued/cap-waited start (and every
     // Download-all row) then starts from a warm cache instead of
     // paying a second yt-dlp resolve inside "starting".
-    // Fire-and-forget, exactly like the picker seeding.
-    {
+    // Fire-and-forget, exactly like the picker seeding. A captured
+    // selector is never warmed: there is nothing to resolve.
+    if preresolved.is_none() {
         let warm_cookies = state.cookies_path(&cookies_token);
         let warm_components = state.components();
         let (warm_url, warm_selector) = (url.clone(), selector.clone());
@@ -8159,19 +8347,37 @@ pub fn do_add_video(
         Plan::Start(stub) => stub,
     };
     let id = stub.id.clone();
-    let job = match video::VideoJob::start(
-        &stub.url,
-        &stub.out_path,
-        &stub.selector,
-        stub.audio,
-        &stub.name,
-        state.cookies_path(&stub.cookies),
-        &stub.login,
-        &stub.password,
-        &state.components(),
-        total_hint,
-        duration_hint,
-    ) {
+    let job = match preresolved {
+        Some(pre) => video::VideoJob::start_with_preresolved(
+            &stub.url,
+            &stub.out_path,
+            &stub.selector,
+            stub.audio,
+            &stub.name,
+            state.cookies_path(&stub.cookies),
+            &stub.login,
+            &stub.password,
+            &state.components(),
+            total_hint,
+            duration_hint,
+            None,
+            pre,
+        ),
+        None => video::VideoJob::start(
+            &stub.url,
+            &stub.out_path,
+            &stub.selector,
+            stub.audio,
+            &stub.name,
+            state.cookies_path(&stub.cookies),
+            &stub.login,
+            &stub.password,
+            &state.components(),
+            total_hint,
+            duration_hint,
+        ),
+    };
+    let job = match job {
         Ok(job) => job,
         Err(e) => {
             // the claim goes back out: the add failed before it
@@ -10582,6 +10788,62 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
         write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
         return;
     }
+    if kind == "captured_streams" {
+        // The browser-capture door (2.3.0): the extension watched
+        // the browser play this video and — at the user's click —
+        // handed over the real stream URLs. Store the set under
+        // the video's identity, then open the picker on the page
+        // exactly like a "video" line: the picker merges the
+        // captured source into its yt-dlp results (or stands on
+        // it alone when yt-dlp cannot read the page).
+        let state = handle.state();
+        let streams: Vec<capture::CapturedStream> = v
+            .get("streams")
+            .and_then(|s| serde_json::from_value::<Vec<capture::CapturedStream>>(s.clone()).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s: &capture::CapturedStream| {
+                (s.url.starts_with("http://") || s.url.starts_with("https://"))
+                    && s.url.len() <= 8192
+            })
+            .take(32)
+            .collect();
+        if streams.is_empty() {
+            drop_cookies_token(&state, &token);
+            write_ack_and_result(
+                handle,
+                ack_id.as_deref(),
+                serde_json::json!({ "ok": false, "error": "no usable streams in the capture" }),
+            );
+            return;
+        }
+        let title: String = v["title"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(300)
+            .collect();
+        capture::store_set(
+            data_dir(&state).as_deref(),
+            capture::CapturedSet {
+                page_url: url.to_string(),
+                title: title.clone(),
+                streams,
+                received_unix: capture::now_unix(),
+            },
+        );
+        handle.raise();
+        let payload = serde_json::json!({
+            "url": url,
+            "title": title,
+            "cookies": token,
+            "captured": true,
+        });
+        state.pending_videos.lock().unwrap().push(payload.clone());
+        let _ = handle.emit(AppEvent::IncomingVideo(payload));
+        write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
+        return;
+    }
     if kind == "video" {
         handle.raise();
         let payload = serde_json::json!({
@@ -12297,6 +12559,57 @@ mod tests {
         assert!(!claim_queued(&e));
     }
 
+    #[test]
+    fn requeue_paused_members_takes_only_the_queues_paused() {
+        // M3 (QA-220): Start Queue Now must run the queue's paused
+        // members — they carry no queued flag, so no claim path
+        // could see them before this adoption existed
+        let dir = std::env::temp_dir().join(format!("ndm-m3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let put = |e: Entry| {
+            let id = e.id.clone();
+            state.entries.lock().unwrap().insert(id.clone(), Arc::new(e));
+            state.order.lock().unwrap().push(id);
+        };
+        // the queue's paused member, with bytes already down
+        let mut paused = parked_entry(500, "paused");
+        paused.id = "m3-paused".to_string();
+        *paused.queue.lock().unwrap() = "Main".to_string();
+        put(paused);
+        // another queue's paused member — not this queue's to start
+        let mut other = parked_entry(500, "paused");
+        other.id = "m3-other".to_string();
+        *other.queue.lock().unwrap() = "Night".to_string();
+        let other_id = other.id.clone();
+        put(other);
+        // a finished member of the queue — never requeued
+        let mut done = parked_entry(1000, "finished");
+        done.id = "m3-done".to_string();
+        *done.queue.lock().unwrap() = "Main".to_string();
+        let done_id = done.id.clone();
+        put(done);
+
+        assert!(requeue_paused_members(&ctx, &state, "Main"));
+        let entries: Vec<Arc<Entry>> =
+            state.entries.lock().unwrap().values().cloned().collect();
+        let main_paused = entries
+            .iter()
+            .find(|e| entry_queue(e) == "Main" && payload_of(e).status == "queued")
+            .expect("the paused member must be handed back to its queue");
+        assert!(main_paused.queued.load(Ordering::Relaxed));
+        let other = state.get(&other_id).unwrap();
+        assert!(!other.queued.load(Ordering::Relaxed));
+        assert_eq!(payload_of(&other).status, "paused");
+        let done = state.get(&done_id).unwrap();
+        assert!(!done.queued.load(Ordering::Relaxed));
+        // a second pass finds nothing left to adopt
+        assert!(!requeue_paused_members(&ctx, &state, "Main"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Release BLOCKER: video dedupe keys on the target path ──
 
     const DUPE_URL: &str = "https://www.youtube.com/watch?v=fixture";
@@ -13612,6 +13925,91 @@ mod tests {
     struct NullSink;
     impl EventSink for NullSink {
         fn emit(&self, _event: AppEvent) {}
+    }
+
+    /// The browser-capture door's host round-trip, app half: a
+    /// `captured_streams` queue line (the shape ndm-host writes)
+    /// stores its set under the video's identity, queues the
+    /// picker input with the captured marker, and acks — and the
+    /// stored set resolves back to a download's streams.
+    #[test]
+    fn captured_streams_line_stores_set_and_opens_picker() {
+        let dir = std::env::temp_dir().join(format!("ndm-capture-drain-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let page = "https://www.youtube.com/watch?v=DRAINtest99";
+        let line = serde_json::json!({
+            "id": "drain-ack-1",
+            "kind": "captured_streams",
+            "url": page,
+            "pageUrl": page,
+            "title": "Drain Test",
+            "streams": [
+                { "url": "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=136",
+                  "mimeType": "video/mp4", "qualityLabel": "720p",
+                  "hasAudio": false, "hasVideo": true },
+                { "url": "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=140",
+                  "mimeType": "audio/mp4", "qualityLabel": null,
+                  "hasAudio": true, "hasVideo": false }
+            ]
+        })
+        .to_string();
+        handle_incoming_line(&ctx, &line);
+        let set = capture::get_set(Some(&dir), &capture::video_identity(page))
+            .expect("the drain must store the captured set");
+        assert_eq!(set.title, "Drain Test");
+        assert_eq!(set.streams.len(), 2);
+        {
+            let pending = state.pending_videos.lock().unwrap();
+            assert_eq!(pending.len(), 1, "one picker input queued: {pending:?}");
+            assert_eq!(pending[0]["url"], serde_json::json!(page));
+            assert_eq!(pending[0]["captured"], serde_json::json!(true));
+        }
+        assert!(
+            dir.join("acks").join("drain-ack-1.ack").is_file(),
+            "the host's ack must be written"
+        );
+        // and the picker's 720p row resolves to the paired streams
+        let opts = capture::captured_options(&set, capture::now_unix());
+        assert_eq!(opts.len(), 1);
+        let pre = capture::preresolved_for(
+            Some(&dir),
+            page,
+            &opts[0].selector,
+            capture::now_unix(),
+        )
+        .unwrap()
+        .expect("the stored set resolves");
+        assert_eq!(pre.streams.len(), 2, "video + audio parts travel together");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A captured line with no usable stream stores nothing and
+    /// queues nothing — the ack still answers (with the refusal),
+    /// so the extension can tell the user instead of hanging.
+    #[test]
+    fn captured_streams_line_without_streams_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ndm-capture-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let line = serde_json::json!({
+            "id": "drain-ack-2",
+            "kind": "captured_streams",
+            "url": "https://example.com/watch/1",
+            "title": "Nothing",
+            "streams": []
+        })
+        .to_string();
+        handle_incoming_line(&ctx, &line);
+        assert!(state.pending_videos.lock().unwrap().is_empty());
+        let result = std::fs::read_to_string(dir.join("results").join("drain-ack-2.json"))
+            .expect("a result is written even for a refusal");
+        assert!(result.contains("\"ok\":false"), "refusal result: {result}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F1 end-to-end: a tiny local site (python http.server on

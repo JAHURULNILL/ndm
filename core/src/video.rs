@@ -1194,6 +1194,10 @@ pub struct VideoJob {
     /// candidate that fails the finalize guards is NOT an error —
     /// the job falls through to a normal download
     recorded_final: Option<PathBuf>,
+    /// the browser-capture door's pre-resolved streams, when this
+    /// job was started from a captured picker option (see
+    /// Preresolved); None for every yt-dlp-resolved job
+    preresolved: Option<Preresolved>,
     /// what the user was shown and chose at add time: the picked
     /// option's probed size in bytes and the page video's probed
     /// duration in seconds (0 = unknown). The finish line
@@ -1211,6 +1215,32 @@ struct DirectStream {
     has_audio: bool,
     cookie: Option<String>,
     referer: Option<String>,
+}
+
+/// One stream of a caller-supplied resolution (see Preresolved).
+#[derive(Clone, Debug)]
+pub struct PreresolvedStream {
+    pub url: String,
+    pub ext: String,
+    pub has_audio: bool,
+    pub cookie: Option<String>,
+    pub referer: Option<String>,
+}
+
+/// A resolution supplied by the caller instead of a yt-dlp run —
+/// the browser-capture door's streams (crate::capture): the
+/// browser already unlocked and played these, so there is nothing
+/// to resolve; the job downloads them through the same parallel
+/// engine + ffmpeg mux as a resolved selection, and NEVER falls
+/// back to yt-dlp (its selector names a capture group, not a
+/// yt-dlp format — feeding it to yt-dlp would only manufacture a
+/// raw format error where the user deserves the plain
+/// capture-expired message).
+#[derive(Clone, Debug)]
+pub struct Preresolved {
+    pub title: String,
+    pub streams: Vec<PreresolvedStream>,
+    pub expect_audio: bool,
 }
 
 /// A completed stream resolution: everything a job start needs to
@@ -1964,6 +1994,7 @@ impl VideoJob {
             expect_size,
             expect_duration,
             None,
+            None,
         )
     }
 
@@ -2002,6 +2033,45 @@ impl VideoJob {
             expect_size,
             expect_duration,
             recorded_final,
+            None,
+        )
+    }
+
+    /// Start a job whose streams are already known — the
+    /// browser-capture door (crate::capture): no yt-dlp resolve,
+    /// no yt-dlp fallback; the engine downloads the supplied
+    /// streams and muxes them exactly as it does a resolved
+    /// selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_preresolved(
+        url: &str,
+        dir: &Path,
+        selector: &str,
+        audio: bool,
+        title: &str,
+        cookies: Option<PathBuf>,
+        login: &str,
+        password: &str,
+        components_dir: &Path,
+        expect_size: u64,
+        expect_duration: f64,
+        recorded_final: Option<PathBuf>,
+        preresolved: Preresolved,
+    ) -> Result<Arc<VideoJob>, String> {
+        Self::start_impl(
+            url,
+            dir,
+            selector,
+            audio,
+            title,
+            cookies,
+            login,
+            password,
+            components_dir,
+            expect_size,
+            expect_duration,
+            recorded_final,
+            Some(preresolved),
         )
     }
 
@@ -2019,6 +2089,7 @@ impl VideoJob {
         expect_size: u64,
         expect_duration: f64,
         recorded_final: Option<PathBuf>,
+        preresolved: Option<Preresolved>,
     ) -> Result<Arc<VideoJob>, String> {
         // M-4: no recorded path handed in — a complete file
         // already sitting at this job's expected final path (its
@@ -2096,6 +2167,7 @@ impl VideoJob {
             format_size_exact: Mutex::new(false),
             downloaded_total: Mutex::new(0),
             recorded_final,
+            preresolved,
             expect_size,
             expect_duration,
         });
@@ -2184,13 +2256,55 @@ impl VideoJob {
         sel: &str,
         my_gen: u64,
     ) -> bool {
-        // A fresh cached resolution for this exact URL + selector +
-        // cookie set (left by an earlier start of the same selection
-        // or by the flyout's warm resolve) skips the yt-dlp run
-        // entirely — that run is the whole click-to-first-byte wait.
-        // A miss resolves live and leaves its result behind.
-        let res_key = self.resolution_key(sel);
-        let (resolved_title, streams) = match resolution_cache_get(&res_key, Instant::now()) {
+        // A caller-supplied resolution (the browser-capture door)
+        // skips both the cache and the yt-dlp resolve: the streams
+        // are already the real ones. Its learned state is exactly
+        // what the capture declared — nothing else is known about
+        // the selection, so every other learned field starts
+        // cleared (the m-7 rule: assign, never merge).
+        let (resolved_title, streams) = if let Some(pre) = &self.preresolved {
+            *self.expect_audio.lock().unwrap() = pre.expect_audio;
+            *self.expected_media.lock().unwrap() = None;
+            *self.pair_audio_url.lock().unwrap() = None;
+            *self.format_size.lock().unwrap() = None;
+            *self.format_size_exact.lock().unwrap() = false;
+            let mut streams: Vec<DirectStream> = pre
+                .streams
+                .iter()
+                .map(|s| DirectStream {
+                    url: s.url.clone(),
+                    ext: s.ext.clone(),
+                    has_audio: s.has_audio,
+                    cookie: s.cookie.clone(),
+                    referer: s.referer.clone(),
+                })
+                .collect();
+            // Streams the capture left cookieless inherit the
+            // job's captured session (the 2.2.0 cookie jar's
+            // source file): googlevideo-class hosts answer a
+            // bare request, but a session-gated CDN may not, and
+            // the browser's cookies are what it played with.
+            if let Some(path) = &self.cookies {
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    let now = crate::capture::now_unix();
+                    for st in &mut streams {
+                        if st.cookie.is_none() {
+                            st.cookie = crate::capture::cookie_header_from_netscape(
+                                &text, &st.url, now,
+                            );
+                        }
+                    }
+                }
+            }
+            (pre.title.clone(), streams)
+        } else {
+            // A fresh cached resolution for this exact URL + selector +
+            // cookie set (left by an earlier start of the same selection
+            // or by the flyout's warm resolve) skips the yt-dlp run
+            // entirely — that run is the whole click-to-first-byte wait.
+            // A miss resolves live and leaves its result behind.
+            let res_key = self.resolution_key(sel);
+            match resolution_cache_get(&res_key, Instant::now()) {
             Some(res) => {
                 // a cache hit defines this selection's learned
                 // state completely (m-7): assign, never merge with
@@ -2221,6 +2335,7 @@ impl VideoJob {
                     Instant::now(),
                 );
                 fresh
+            }
             }
         };
         // The resolved streams are the ground truth for what the
@@ -3119,8 +3234,18 @@ impl VideoJob {
     }
 
     fn spawn(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
-        let ytdlp = find_tool("yt-dlp", components_dir)
-            .ok_or("yt-dlp not found — the video component is not installed yet")?;
+        // A captured job never invokes yt-dlp (no resolve, no
+        // fallback), so a missing yt-dlp must not refuse it: an
+        // empty path stands in and is never executed.
+        let ytdlp = match find_tool("yt-dlp", components_dir) {
+            Some(p) => p,
+            None if self.preresolved.is_some() => PathBuf::new(),
+            None => {
+                return Err(
+                    "yt-dlp not found — the video component is not installed yet".to_string(),
+                )
+            }
+        };
         let ffmpeg = find_tool("ffmpeg", components_dir).ok_or(
             "ffmpeg is not available on this system — it joins the video and audio into one playable file. Install ffmpeg with your system package manager (Debian/Ubuntu: sudo apt install ffmpeg), or use an NDM build that bundles it, then try again".to_string(),
         )?;
@@ -3220,6 +3345,23 @@ impl VideoJob {
             if job.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
                 || job.stop_flag.lock().unwrap().is_some()
             {
+                return;
+            }
+            if job.preresolved.is_some() {
+                // A captured job has NO yt-dlp fallback: its
+                // selector names a capture group, and running
+                // yt-dlp with it would only manufacture a raw
+                // format error. The engine refused the streams —
+                // in practice their signed links have died — so
+                // the entry fails with the plain-language message
+                // the design promises for exactly this case. The
+                // part files stay on disk (the engine path kept
+                // them), so a fresh capture can still resume.
+                let mut p = job.progress.lock().unwrap();
+                p.status = "error".to_string();
+                p.error = Some(crate::capture::EXPIRED_MESSAGE.to_string());
+                p.speed_bps = 0.0;
+                p.conns = 0;
                 return;
             }
             // the fallback is a fresh attempt: whatever phase the
@@ -3925,6 +4067,7 @@ mod tests {
             size_text: String::new(),
             audio,
             height,
+            source: String::new(),
         }
     }
 
@@ -4920,6 +5063,7 @@ At least one output file must be specified";
             format_size_exact: Mutex::new(false),
             downloaded_total: Mutex::new(0),
             recorded_final: None,
+            preresolved: None,
             expect_size: 0,
             expect_duration: 0.0,
         }

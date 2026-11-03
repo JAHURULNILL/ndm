@@ -175,7 +175,18 @@ pub fn show(ui: &Rc<Ui>) {
     let dlg = dialog(&ui.window, "Scheduler", "Save", 620, 640);
     let content = dlg.content_area();
     let g = grid();
-    content.pack_start(&g, true, true, 0);
+    // The form's natural height is ~770 px — taller than a
+    // 720p screen (QA-220 m6). It rides in a scrolled window
+    // capped well under that: the dialog opens at most ~640 px
+    // tall and the lower rows scroll into reach.
+    let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(520)
+        .build();
+    scroll.add(&g);
+    content.pack_start(&scroll, true, true, 0);
     let mut y = 0;
     let queue_combo = gtk::ComboBoxText::new();
     y = row(&g, y, "Queue", &queue_combo);

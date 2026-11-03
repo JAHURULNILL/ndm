@@ -25,6 +25,12 @@ pub struct QualityOption {
     pub size_text: String,
     pub audio: bool,
     pub height: u64,
+    /// Which door produced this option: "" (or "ytdlp") for the
+    /// yt-dlp probe, "browser" for a stream captured from the
+    /// user's own browser tab (the browser-capture door, 2.3.0).
+    /// Older payloads have no field → the yt-dlp door.
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -878,6 +884,7 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
             size_text: st,
             audio: false,
             height: 0,
+            source: String::new(),
         });
     } else {
         for &h in heights.iter().rev() {
@@ -904,6 +911,7 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
                 size_text: st,
                 audio: false,
                 height: h,
+                source: String::new(),
             });
         }
     }
@@ -938,6 +946,7 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
         size_text: audio_st,
         audio: true,
         height: 0,
+        source: String::new(),
     });
 
     options

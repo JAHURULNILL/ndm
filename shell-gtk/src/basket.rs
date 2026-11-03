@@ -134,7 +134,7 @@ fn on_drop(ui: &Rc<Ui>, b: &Rc<Basket>, data: &gtk::SelectionData) {
         .find(|l| !l.is_empty() && !l.starts_with('#'))
         .unwrap_or("")
         .to_string();
-    if candidate.starts_with("http://") || candidate.starts_with("https://") {
+    if crate::is_download_url(&candidate) {
         match sink::basket_add(ui.ctx.clone(), candidate) {
             Ok(()) => show_note(b, "Sent to NDM ✓"),
             Err(_) => show_note(b, "Could not send the link"),
