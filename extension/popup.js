@@ -11,6 +11,8 @@ async function init() {
   const chkTabOff = document.getElementById('chkTabOff');
   const btnSite = document.getElementById('btnSite');
   const btn = document.getElementById('btnVideo');
+  const selForceKey = document.getElementById('selForceKey');
+  const selPreventKey = document.getElementById('selPreventKey');
 
   let bridgeOk = false;
   try {
@@ -35,12 +37,28 @@ async function init() {
   let stored = {};
   let tabOffStored = {};
   try {
-    stored = await chrome.storage.local.get(['ndmIntercept', 'ndmSiteExceptions']);
+    stored = await chrome.storage.local.get(['ndmIntercept', 'ndmSiteExceptions', 'ndmForceKey', 'ndmPreventKey']);
     tabOffStored = await tabStore.get({ ndmTabOff: {} });
   } catch (e) {}
   chk.checked = stored.ndmIntercept !== false;
   chk.addEventListener('change', () => {
     chrome.storage.local.set({ ndmIntercept: chk.checked });
+  });
+
+  // Hold-keys (IDM's Options → Keys): which modifier held during
+  // a link click forces NDM / prevents the takeover. Stored in
+  // local storage; content.js reads and live-updates from it.
+  selForceKey.value = ['alt', 'shift', 'ctrl', 'insert'].includes(stored.ndmForceKey)
+    ? stored.ndmForceKey
+    : 'alt';
+  selPreventKey.value = ['shift', 'alt', 'ctrl', 'altshift'].includes(stored.ndmPreventKey)
+    ? stored.ndmPreventKey
+    : 'shift';
+  selForceKey.addEventListener('change', () => {
+    chrome.storage.local.set({ ndmForceKey: selForceKey.value });
+  });
+  selPreventKey.addEventListener('change', () => {
+    chrome.storage.local.set({ ndmPreventKey: selPreventKey.value });
   });
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });

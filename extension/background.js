@@ -246,10 +246,14 @@ chrome.tabs.onRemoved.addListener(tabId => {
 });
 
 /* ------------------------------------------------------------------ */
-/* Alt+Shift "prevent" gestures (F-EXT-13)                             */
+/* Hold-key "prevent" gestures (F-EXT-13)                             */
 /* ------------------------------------------------------------------ */
 
-/* The click layer notes every Alt+Shift click (URL + time). A
+/* The keys themselves are configured in the popup and read by
+   the click layer (content.js: ndmForceKey / ndmPreventKey,
+   defaults force = Alt, prevent = Shift); this layer only
+   keeps the bypass set they feed. The click layer notes every
+   prevent-key click (URL + time). A
    browser download that starts for a noted URL is the browser
    keeping a file the user explicitly gave it — the downloads
    layer must not grab it after the fact.
@@ -286,7 +290,7 @@ function recentPreventFor(url) {
 }
 
 /* The downloads layer's check CONSUMES the witness: one
-   Alt+Shift click shields exactly one download of its URL. */
+   prevent click shields exactly one download of its URL. */
 function consumePreventFor(url) {
   if (!recentPreventFor(url)) return false;
   recentPrevents.delete(url);
@@ -993,7 +997,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === 'ndm-note-prevent') {
-    // An Alt+Shift click in some page: remember it so the
+    // A prevent-key click in some page: remember it so the
     // downloads layer stays out of the browser download it is
     // about to produce (F-EXT-13).
     notePrevent(message.url || '');
@@ -1539,7 +1543,7 @@ async function findReferrerTab(referrer) {
   }
 }
 
-/* Was this download produced by an Alt+Shift "prevent" click
+/* Was this download produced by a hold-key "prevent" click
    (F-EXT-13)? Two witnesses, either is enough: the click layer's
    timestamped note for this URL, or the source tab's content
    script reporting the gesture (held now / clicked seconds
@@ -1764,7 +1768,7 @@ async function handleInterceptedDownload(item, suggestedFilename) {
   await settingsReady;
   if (!shouldInterceptItem(item)) return;
 
-  // Alt+Shift "prevent" (F-EXT-13): the user explicitly gave
+  // Hold-key "prevent" (F-EXT-13): the user explicitly gave
   // this file to the browser — this layer stays out completely,
   // exactly like the click layer does.
   if (await preventGestureForItem(item)) return;
@@ -1894,7 +1898,7 @@ async function handleInterceptedDownload(item, suggestedFilename) {
 
 if (chrome.downloads.onDeterminingFilename) {
   chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-    // An Alt+Shift prevent click for this URL already decided
+    // A prevent-key click for this URL already decided
     // this file belongs to the browser (F-EXT-13) — don't even
     // steer its filename. (The async gate in
     // handleInterceptedDownload re-checks with the tab query,

@@ -4851,14 +4851,41 @@
       } catch (e) {}
     }
   }
-  // IDM's keys (Options → General → Keys): hold Alt+Shift while
-  // clicking to PREVENT taking over one link; hold Insert while
-  // clicking to FORCE the download. Per-site exception list and
-  // per-tab off remain the other escape hatches.
-  let ndmForceHeld = false;
+  // IDM's keys (Options → General → Keys), configurable in the
+  // popup: hold the FORCE key while clicking a link to send it
+  // to NDM even when its type is not in the takeover list; hold
+  // the PREVENT key while clicking to keep that one download in
+  // the browser. Defaults: force = Alt, prevent = Shift. The
+  // pre-config gestures stay selectable (Insert to force,
+  // Alt+Shift to prevent), and Alt+Shift still prevents under
+  // the defaults because Shift is the prevent key. Per-site
+  // exception list and per-tab off remain the other hatches.
+  // HONEST LIMIT (MV3): modifier state exists only on a real
+  // click event in this script. A download a page starts with
+  // no click carries no key state at all, so neither key can
+  // affect it directly — force cannot grab it, and prevent can
+  // shield only the download the prevent-click itself produced
+  // (via the URL-bound witness the downloads layer checks).
+  let ndmForceKey = 'alt';
+  let ndmPreventKey = 'shift';
+  const FORCE_KEY_VALUES = ['alt', 'shift', 'ctrl', 'insert'];
+  const PREVENT_KEY_VALUES = ['shift', 'alt', 'ctrl', 'altshift'];
+  function validHoldKey(v, fallback, values) {
+    return values.includes(v) ? v : fallback;
+  }
+  // Whether a key/click event shows `key` held. Insert has no
+  // flag on a click event — it is tracked in ndmForceHeld.
+  function keyHeldFromEvent(key, e) {
+    if (key === 'alt') return !!e.altKey;
+    if (key === 'shift') return !!e.shiftKey;
+    if (key === 'ctrl') return !!e.ctrlKey;
+    if (key === 'altshift') return !!(e.altKey && e.shiftKey);
+    return false;
+  }
+  let ndmForceHeld = false; // the Insert key, tracked by key events
   let ndmSiteExcepted = false;
   let ndmTabDisabled = false;
-  // Alt+Shift state is TRACKED from key events (like Insert) and
+  // Prevent state is TRACKED from key events (like Insert) and
   // also read off the click event itself — either source alone
   // proved unreliable in the wild (F-EXT-13). The tracked state
   // is also what the background's downloads layer asks about: a
@@ -4869,7 +4896,15 @@
   let lastPreventClickAt = 0;
   let lastPreventClickUrl = '';
   function syncPreventHeld(e) {
-    ndmPreventHeld = !!(e.altKey && e.shiftKey);
+    ndmPreventHeld = keyHeldFromEvent(ndmPreventKey, e);
+  }
+  function clickForceHit(e) {
+    return ndmForceKey === 'insert'
+      ? ndmForceHeld
+      : keyHeldFromEvent(ndmForceKey, e);
+  }
+  function clickPreventHit(e) {
+    return keyHeldFromEvent(ndmPreventKey, e) || ndmPreventHeld;
   }
   function notePreventClick(url) {
     lastPreventClickAt = Date.now();
@@ -4915,7 +4950,11 @@
       ndmHostStatus: '',
       ndmHostStatusAt: 0,
       ndmSiteExceptions: [],
+      ndmForceKey: 'alt',
+      ndmPreventKey: 'shift',
     }).then(v => {
+      ndmForceKey = validHoldKey(v.ndmForceKey, 'alt', FORCE_KEY_VALUES);
+      ndmPreventKey = validHoldKey(v.ndmPreventKey, 'shift', PREVENT_KEY_VALUES);
       ndmInterceptActive = v.ndmIntercept !== false;
       ndmHostStatusStr = v.ndmHostStatus || '';
       ndmHostStatusAt = Number(v.ndmHostStatusAt) || 0;
@@ -4930,6 +4969,13 @@
       // ndmTabOff lives in SESSION storage (EX-m6); everything else
       // is local. Session changes only ever carry that one key.
       if (area !== 'local' && area !== 'session') return;
+      if (changes.ndmForceKey) {
+        ndmForceKey = validHoldKey(changes.ndmForceKey.newValue, 'alt', FORCE_KEY_VALUES);
+      }
+      if (changes.ndmPreventKey) {
+        ndmPreventKey = validHoldKey(changes.ndmPreventKey.newValue, 'shift', PREVENT_KEY_VALUES);
+        ndmPreventHeld = false;
+      }
       if (changes.ndmIntercept) {
         ndmInterceptActive = changes.ndmIntercept.newValue !== false;
       }
@@ -4995,32 +5041,36 @@
       if (window.top !== window.self) return;
       if (!ndmInterceptActive) return;
       if (ndmHostKnownMissing) return;
-      if (e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey) return;
-      // IDM keys: Alt+Shift held PREVENTS the takeover of this
-      // one link. The gesture is RECORDED before bailing — the
-      // browser is about to start its own download, and the
-      // background's downloads layer must be able to learn that
-      // this click was a prevent (via the note above and its
-      // 'ndm-prevent-state' query), or it would simply grab the
-      // file itself and re-open this dialog (F-EXT-13). Any
-      // other Alt/Shift click keeps the browser's own semantics
-      // (new window/tab) as before.
-      if ((e.altKey && e.shiftKey) || ndmPreventHeld) {
+      if (e.defaultPrevented || e.button !== 0 || e.metaKey) return;
+      // Hold-keys: the configured PREVENT key held keeps this
+      // one link in the browser. The gesture is RECORDED before
+      // bailing — the browser is about to start its own
+      // download, and the background's downloads layer must be
+      // able to learn that this click was a prevent (via the
+      // note above and its 'ndm-prevent-state' query), or it
+      // would simply grab the file itself and re-open this
+      // dialog (F-EXT-13). When both keys are held — or the
+      // same key is chosen for both — prevent wins.
+      if (clickPreventHit(e)) {
         const a =
           e.target && e.target.closest ? e.target.closest('a[href]') : null;
         notePreventClick(a ? a.href : '');
         return;
       }
-      if (e.altKey || e.shiftKey) return;
-      // Insert held FORCES the download — the user's explicit
-      // override gesture, with ONE consistent meaning: it
-      // bypasses every per-page gate (per-tab pause, per-site
-      // exception, downloadable-type check alike). It used to
-      // skip only the last two, so Insert on a per-tab-paused
-      // tab silently did nothing. The extension-wide states
-      // above (global toggle, known-missing host) still win:
-      // they are not per-page gates.
-      const forced = ndmForceHeld;
+      // The configured FORCE key held FORCES the download — the
+      // user's explicit override gesture, with ONE consistent
+      // meaning: it bypasses every per-page gate (per-tab pause,
+      // per-site exception, downloadable-type check alike). It
+      // used to skip only the last two, so a force gesture on a
+      // per-tab-paused tab silently did nothing. The
+      // extension-wide states above (global toggle,
+      // known-missing host) still win: they are not per-page
+      // gates.
+      const forced = clickForceHit(e);
+      // A modifier that is NOT the configured force key keeps
+      // the browser's own semantics (Ctrl+click = new tab,
+      // Shift+click = new window, Alt+click = browser default).
+      if (!forced && (e.altKey || e.shiftKey || e.ctrlKey)) return;
       if (!forced && ndmTabDisabled) return;
       const target = e.target && e.target.closest ? e.target.closest('a[href]') : null;
       if (!target || !/^https?:\/\//i.test(target.href)) return;
@@ -5044,8 +5094,9 @@
     if (!msg) return;
     if (msg.action === 'ndm-prevent-state') {
       // The background's downloads layer asks before taking over
-      // a browser-started download (F-EXT-13): was Alt+Shift held
-      // for the click that produced it — held right now, or a
+      // a browser-started download (F-EXT-13): was the prevent
+      // key held for the click that produced it — held right
+      // now, or a
       // prevent click for THIS download's URL?
       // The witness is URL-scoped and single-use (#23): a match
       // must name the same URL the click was on, and answering a

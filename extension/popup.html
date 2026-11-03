@@ -37,6 +37,8 @@
   }
   button.link:disabled { color: #9aa7b1; cursor: default; }
   .sep { border-top: 1px solid #e3e9ee; margin: 10px 0 2px; }
+  label.key { justify-content: space-between; }
+  label.key select { font-size: 12.5px; padding: 2px; }
 </style>
 </head>
 <body>
@@ -51,6 +53,27 @@
     <input type="checkbox" id="chkIntercept">
     <span>Intercept browser downloads (send files to NDM)</span>
   </label>
+
+  <label class="opt key">
+    <span>Hold to force NDM download</span>
+    <select id="selForceKey">
+      <option value="alt">Alt</option>
+      <option value="shift">Shift</option>
+      <option value="ctrl">Ctrl</option>
+      <option value="insert">Insert</option>
+    </select>
+  </label>
+
+  <label class="opt key">
+    <span>Hold to let browser download</span>
+    <select id="selPreventKey">
+      <option value="shift">Shift</option>
+      <option value="alt">Alt</option>
+      <option value="ctrl">Ctrl</option>
+      <option value="altshift">Alt+Shift</option>
+    </select>
+  </label>
+  <div class="hint">Hold the key while clicking a link. Keys act on link clicks only.</div>
 
   <div class="sep"></div>
 

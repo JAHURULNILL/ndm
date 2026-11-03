@@ -68,6 +68,8 @@ write_manifest "$SCRIPT_DIR/com.ndm.host.chrome.json.tmpl" \
     "$HOME/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts"
 write_manifest "$SCRIPT_DIR/com.ndm.host.chrome.json.tmpl" \
     "$HOME/.config/microsoft-edge/NativeMessagingHosts"
+write_manifest "$SCRIPT_DIR/com.ndm.host.chrome.json.tmpl" \
+    "$HOME/.config/opera/NativeMessagingHosts"
 
 if [ "$WANT_FIREFOX" -eq 1 ]; then
     write_manifest "$SCRIPT_DIR/com.ndm.host.firefox.json.tmpl" \

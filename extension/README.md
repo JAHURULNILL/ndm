@@ -19,6 +19,49 @@ extension does:
 - **Popup** — shows whether the NDM bridge (native messaging host) is
   reachable, the interception toggle, and a one-click
   "Download current page video" button on video pages.
+- **Hold-keys** (like IDM's Options → Keys, set in the popup) — hold a
+  key while clicking a link to force or prevent one takeover; see
+  [Hold-keys](#hold-keys) below.
+
+## Hold-keys
+
+Two modifier keys, chosen in the popup (stored as `ndmForceKey` /
+`ndmPreventKey` in `chrome.storage.local`):
+
+| Setting | Default | Choices |
+|---|---|---|
+| Hold to force NDM download | **Alt** | Alt, Shift, Ctrl, Insert |
+| Hold to let browser download | **Shift** | Shift, Alt, Ctrl, Alt+Shift |
+
+- **Force** — clicking a link with the force key held sends that link
+  to NDM (the in-page file dialog opens) even when its file type is
+  not in the takeover list, and it overrides the per-tab pause and
+  per-site exceptions. It does not override the global interception
+  toggle or a missing NDM bridge.
+- **Prevent** — clicking with the prevent key held keeps that one
+  download in the browser. The click's URL is recorded in a
+  short-lived bypass set in the background worker; the browser
+  download that click produces is then skipped by both interception
+  layers (the click layer and the downloads-API layer). The witness
+  is bound to that one URL and consumed by its first matching
+  download; its window is 60 s because countdown/redirect portals
+  can take well over a few seconds between the click and the
+  download it produces, and URL-binding plus single use is what
+  makes a long window safe.
+- If both keys are held (or the same key is chosen for both),
+  **prevent wins**. A modifier that is not the configured force key
+  keeps the browser's own meaning (Ctrl+click = new tab, and so on).
+
+**Honest limits:** the keys act on *link clicks* — that is the only
+place a browser extension can truthfully see modifier state, because
+the click event itself carries it. A download a page starts on its
+own (a script, a redirect, a timer) carries no key state at all, so
+neither key can affect it: force cannot grab a click-less download,
+and prevent shields only the download that the prevent-click itself
+produced. (Before this setting existed the gestures were fixed —
+Insert to force, Alt+Shift to prevent; both remain selectable
+above, and Alt+Shift still prevents under the defaults because
+Shift is the prevent key.)
 
 ## How it talks to the app
 
@@ -56,6 +99,42 @@ must name this extension's ID (see below).
    build is needed for a permanent install.)
 3. The Firefox add-on ID is fixed: `ndm@nill.download`
    (from `browser_specific_settings.gecko.id` in the manifest).
+
+### Microsoft Edge / Opera
+
+**The same package works as-is — no separate Edge or Opera build.**
+The release `ndm-extension-<version>.zip` (or this folder) loads in
+both, verified by audit:
+
+- The code uses only the standard `chrome.*` MV3 namespaces
+  (`runtime`, `tabs`, `downloads`, `webRequest`, `storage`,
+  `contextMenus`, `notifications`, `cookies`, `scripting`, `alarms`,
+  `windows`) — Edge and Opera both implement them.
+- No Google-specific URLs, no `externally_connectable`, no
+  `update_url`, and no store-specific manifest fields. The
+  manifest's `key` field is a standard Chromium field that pins the
+  extension ID; Edge and Opera accept it, so the ID — and therefore
+  the native-host `allowed_origins` entry — is the same as in
+  Chrome. `browser_specific_settings.gecko` is Firefox-only and is
+  ignored by Chromium browsers.
+- Native messaging works the same way: `install-host.sh` already
+  writes the host manifest for Edge
+  (`~/.config/microsoft-edge/NativeMessagingHosts`) and Opera
+  (`~/.config/opera/NativeMessagingHosts`) on Linux; on Windows the
+  host is registered under the same `com.ndm.host` registry scheme
+  Edge and Opera read.
+
+Install (developer mode / load unpacked):
+
+- **Edge:** open `edge://extensions`, turn on **Developer mode**
+  (left sidebar), click **Load unpacked**, and select this
+  `extension/` folder (or a folder unzipped from the release zip).
+- **Opera:** open `opera://extensions`, turn on **Developer mode**
+  (top-right), click **Load unpacked**, and select the same folder.
+
+Publishing to the Edge Add-ons store or Opera Add-ons is a separate
+submission step done by the user with their own publisher account;
+it is not part of this package.
 
 ## Finding the extension ID (needed for the host manifest)
 
