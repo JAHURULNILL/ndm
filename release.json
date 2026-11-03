@@ -1,12 +1,12 @@
 {
-  "version": "2.1.0",
-  "min_supported": "2.1.0",
-  "notes": "Nill Download Manager 2.1.0 rebuilds the app's interface as true native windows — raw Win32 on Windows, GTK on Linux — over the same engine, download journal and browser-extension protocol, so nothing about downloading changes and everything in 2.0.10 is included. With no web engine in between, the app starts and responds faster. On Windows the installer no longer fetches and installs the WebView2 runtime, so setup is smaller and works fully offline, while the app-local runtime libraries it still needs are unchanged; on Linux the package drops the WebKit stack entirely. The per-download progress dialog is now a real native dialog on both systems, in the established shape — live percentage and filename in the title, Download status, Speed Limiter and Options on completion tabs, and the per-connection strip and table. The .ndm.lock cleanup also completes what 2.0.10 began: a finished download's lock file is now removed the moment the download finishes, rather than at the next launch. 2.1.0 is a required update for older versions.",
-  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.1.0/NDM_2.1.0_amd64.deb",
-  "deb_sha256": "8de8d24dfa4154dc13820f4f975675ef7ae22f695b79b7268741f1ec571b0b63",
-  "ext_sha256": "9a635708976947cfce57743198c9ef4915b656130cbb556fa499de0daa139204",
-  "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.1.0/NDM_2.1.0_Windows_Portable.zip",
-  "win_sha256": "7960139f1be3a6935e7d876aee0fe28c3c8a75362c40b6a54ceeae546eedb149",
-  "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.1.0/NDM_2.1.0_x64-setup.exe",
-  "win_setup_sha256": "4a5cbfbbd73d03202e0a339b18d1c1e5d51364f38ec11d2695a1809cd51f6cbb"
+  "version": "2.1.1",
+  "min_supported": "2.1.1",
+  "notes": "Nill Download Manager 2.1.1 is a correctness release for the native interface, fixing everything a full hands-on audit of 2.1.0 turned up. The download list can no longer scramble its rows when downloads are added, finished and deleted in sequence; a failed add — a dead link, a 404 — no longer leaves a phantom row behind; a direct link to a video file now keeps its video handling instead of being treated as a plain file; after an error, the progress dialog shows exactly what is really on disk — real downloaded amount, real percentage, honest resume capability — instead of stale figures; and an unreachable host now fails cleanly inside a clear bound instead of hanging in a probing state. Smaller fixes in the same pass: the progress dialog's connection table shows every row, paused downloads are labelled \"Paused\", and error messages are written in plain language. The retired WebView-era code — about 58,000 lines — has also been removed from the repository; app behaviour is otherwise unchanged from 2.1.0. The downloading engine itself was audited byte for byte and needed no changes.",
+  "deb_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.1.1/NDM_2.1.1_amd64.deb",
+  "deb_sha256": "871214baa6296384b58e6ba2bddbc4ffd266c35f1543f5ae6f4afa5d26a42844",
+  "ext_sha256": "1a17ac04e87a059d1ffe19836b6c30726d4d2f1ffbdbe99e716ee726e658a2c6",
+  "win_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.1.1/NDM_2.1.1_Windows_Portable.zip",
+  "win_sha256": "1b0f275d7809bb1a4e09ea77e522826919d21ea287022985a9bde2521917bd44",
+  "win_setup_url": "https://github.com/JAHURULNILL/ndm/releases/download/v2.1.1/NDM_2.1.1_x64-setup.exe",
+  "win_setup_sha256": "ff372519a4d0db47c8d382452663f7fb9f3feac6dac3e2c95321fe13be64f1d3"
 }
