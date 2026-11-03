@@ -160,108 +160,11 @@ jobs:
           $app = Start-Process (Resolve-Path "$dir/ndm-app.exe").Path -PassThru
           Start-Sleep -Seconds 10
           if ($app.HasExited) { Write-Warning "ndm-app.exe exited early, code $($app.ExitCode)" } else { Write-Host "ndm-app.exe alive after 10s"; Stop-Process -Id $app.Id -Force }
-      - name: Build installer (NSIS)
-        shell: pwsh
-        run: |
-          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
-          if (-not $makensis) {
-            choco install nsis -y --no-progress
-            $makensis = "C:\Program Files (x86)\NSIS\makensis.exe"
-          }
-          if (-not (Test-Path $makensis)) { throw "makensis not found" }
-          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
-          & $makensis "/DVERSION=$v" "/DSRCROOT=$PWD\NDM-Windows-Portable" "/DOUTFILE=$PWD\NDM_${v}_x64-setup.exe" "/DICON=$PWD\assets\icon.ico" scripts\installer.nsi
-          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path "NDM_${v}_x64-setup.exe")) { throw "installer exe was not produced" }
-          Write-Host "installer built: NDM_${v}_x64-setup.exe"
-      # NSIS setups detach: the launcher process exits while the
-      # real installer works in a child process, so -Wait alone can
-      # return before a single file is copied. Poll for the full
-      # layout instead — that is the actual completion signal.
-      - name: Silent-install test — layout + installed app launch
-        shell: pwsh
-        run: |
-          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $setup = (Resolve-Path "NDM_${v}_x64-setup.exe").Path
-          $installDir = "$env:LOCALAPPDATA\Programs\Nill Download Manager"
-          Start-Process $setup -ArgumentList "/S" -PassThru | Out-Null
-          $want = @(
-            "ndm-app.exe", "ndm-host.exe", "ucrtbase.dll", "installed.flag", "uninstall.exe",
-            "extension\manifest.json", "extension\background.js"
-          )
-          $deadline = (Get-Date).AddSeconds(180)
-          $missing = $want
-          while ((Get-Date) -lt $deadline) {
-            $missing = $want | Where-Object { -not (Test-Path (Join-Path $installDir $_)) }
-            if (-not $missing) { break }
-            Start-Sleep -Seconds 2
-          }
-          if ($missing) { throw "install layout incomplete, missing: $($missing -join ', ')" }
-          Write-Host "install layout complete in $installDir"
-          # the slim layout must NOT carry a bundled engine: if a
-          # components folder ever reappears in the installer, the
-          # package is bloated again — fail here, not in the field
-          if (Test-Path "$installDir\components") { throw "slim install must not contain a components folder" }
-          if ((Get-Content "$installDir\installed.flag" -Raw) -notmatch [regex]::Escape($v)) { throw "installed.flag does not carry version $v" }
-          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Nill Download Manager\Nill Download Manager.lnk")) { throw "Start Menu shortcut missing" }
-          if (-not (Test-Path "$env:USERPROFILE\Desktop\Nill Download Manager.lnk")) { throw "desktop shortcut missing" }
-          $arp = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Nill Download Manager" -ErrorAction Stop
-          if ($arp.DisplayVersion -ne $v) { throw "Add/Remove Programs DisplayVersion is '$($arp.DisplayVersion)', expected '$v'" }
-          Write-Host "shortcuts + uninstall entry (v$v) verified"
-          $app = Start-Process "$installDir\ndm-app.exe" -PassThru
-          Start-Sleep -Seconds 10
-          if ($app.HasExited) { throw "installed ndm-app.exe exited early, code $($app.ExitCode)" }
-          Write-Host "installed ndm-app.exe alive after 10s"
-          Stop-Process -Id $app.Id -Force
-          Start-Sleep -Seconds 2
-      # The installed launch above must have made the app register
-      # its native-messaging host (its own first-run mechanism):
-      # HKCU keys for Chrome + Firefox pointing at manifest files
-      # under %APPDATA%\com.ndm.downloadmanager\.
-      - name: Extension registration check
-        shell: pwsh
-        run: |
-          $manifestDir = "$env:APPDATA\com.ndm.downloadmanager"
-          foreach ($f in @("com.ndm.host.chrome.json", "com.ndm.host.firefox.json")) {
-            if (-not (Test-Path (Join-Path $manifestDir $f))) { throw "host manifest missing: $f" }
-          }
-          foreach ($kv in @(
-            @{ Key = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.ndm.host"; Manifest = "com.ndm.host.chrome.json" },
-            @{ Key = "HKCU:\Software\Mozilla\NativeMessagingHosts\com.ndm.host"; Manifest = "com.ndm.host.firefox.json" }
-          )) {
-            if (-not (Test-Path $kv.Key)) { throw "registry key missing: $($kv.Key)" }
-            $target = (Get-Item $kv.Key).GetValue("")
-            $expected = Join-Path $manifestDir $kv.Manifest
-            if ($target -ne $expected) { throw "$($kv.Key) points at '$target', expected '$expected'" }
-            Write-Host "registered: $($kv.Key) -> $target"
-          }
-          Write-Host "extension registration verified (Chrome + Firefox)"
-      # No CDP GUI smoke any more: that driver spoke to the old
-      # WebView UI. The native shell has no debugging port — its
-      # Windows GUI proof is the install + launch-alive gates
-      # above and the real-machine run, stated honestly rather
-      # than faked here.
-      - name: Uninstall (report-only)
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $installDir = "$env:LOCALAPPDATA\Programs\Nill Download Manager"
-          Get-Process ndm-app -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          if (Test-Path "$installDir\uninstall.exe") {
-            Start-Process "$installDir\uninstall.exe" -ArgumentList "/S" -PassThru | Out-Null
-            $deadline = (Get-Date).AddSeconds(60)
-            while ((Get-Date) -lt $deadline -and (Test-Path "$installDir\ndm-app.exe")) { Start-Sleep -Seconds 2 }
-            if (Test-Path "$installDir\ndm-app.exe") { Write-Warning "uninstall did not remove the app exe within 60s" }
-            else { Write-Host "uninstall removed the installed copy" }
-          } else {
-            Write-Warning "uninstall.exe not present — nothing to uninstall"
-          }
       - uses: actions/upload-artifact@v4
         with:
           name: ndm-windows
           path: |
             NDM_*_Windows_Portable.zip
-            NDM_*_x64-setup.exe
       - name: Attach Windows assets to their GitHub release (dispatch runs only)
         if: github.event_name == 'workflow_dispatch'
         shell: pwsh
@@ -270,8 +173,7 @@ jobs:
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
           $zip = (Get-ChildItem "NDM_${v}_Windows_Portable.zip").Name
-          $setup = (Get-ChildItem "NDM_${v}_x64-setup.exe").Name
-          gh release upload "v$v" $zip $setup --clobber --repo $env:GITHUB_REPOSITORY
+          gh release upload "v$v" $zip --clobber --repo $env:GITHUB_REPOSITORY
   windows-i686:
     runs-on: windows-latest
     permissions:
@@ -357,6 +259,50 @@ jobs:
           $app = Start-Process (Resolve-Path "$dir/ndm-app.exe").Path -PassThru
           Start-Sleep -Seconds 10
           if ($app.HasExited) { Write-Warning "ndm-app.exe exited early, code $($app.ExitCode)" } else { Write-Host "ndm-app.exe alive after 10s"; Stop-Process -Id $app.Id -Force }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ndm-windows-x86
+          path: |
+            NDM_*_Windows_Portable_x86.zip
+      - name: Attach Windows x86 assets to their GitHub release (dispatch runs only)
+        if: github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $zip = (Get-ChildItem "NDM_${v}_Windows_Portable_x86.zip").Name
+          gh release upload "v$v" $zip --clobber --repo $env:GITHUB_REPOSITORY
+  windows-setup:
+    needs: [windows, windows-i686]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: ndm-windows
+          path: artifacts/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: ndm-windows-x86
+          path: artifacts/x86
+      # One installer for every Windows (the IDM shape): both
+      # portable trees go in as x64\ and x86\ payload folders and
+      # scripts/installer.nsi (UNIVERSAL mode) installs the one
+      # that matches the machine. The portable ZIPs stay separate
+      # release assets for anyone who wants them.
+      - name: Assemble universal tree
+        shell: pwsh
+        run: |
+          $zip64 = (Get-ChildItem artifacts/x64/NDM_*_Windows_Portable.zip).FullName
+          $zip86 = (Get-ChildItem artifacts/x86/NDM_*_Windows_Portable_x86.zip).FullName
+          Expand-Archive $zip64 -DestinationPath stage64
+          Expand-Archive $zip86 -DestinationPath stage86
+          New-Item -ItemType Directory -Force NDM-Universal/x64, NDM-Universal/x86 | Out-Null
+          Copy-Item stage64/NDM-Windows-Portable/* NDM-Universal/x64/ -Recurse
+          Copy-Item stage86/NDM-Windows-Portable-x86/* NDM-Universal/x86/ -Recurse
       - name: Build installer (NSIS)
         shell: pwsh
         run: |
@@ -367,10 +313,10 @@ jobs:
           }
           if (-not (Test-Path $makensis)) { throw "makensis not found" }
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
-          & $makensis "/DVERSION=$v" "/DSRCROOT=$PWD\NDM-Windows-Portable-x86" "/DOUTFILE=$PWD\NDM_${v}_x86-setup.exe" "/DICON=$PWD\assets\icon.ico" scripts\installer.nsi
+          & $makensis "/DVERSION=$v" "/DSRCROOT=$PWD\NDM-Universal" "/DUNIVERSAL=1" "/DOUTFILE=$PWD\NDM_${v}_setup.exe" "/DICON=$PWD\assets\icon.ico" scripts\installer.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path "NDM_${v}_x86-setup.exe")) { throw "installer exe was not produced" }
-          Write-Host "installer built: NDM_${v}_x86-setup.exe"
+          if (-not (Test-Path "NDM_${v}_setup.exe")) { throw "installer exe was not produced" }
+          Write-Host "universal installer built: NDM_${v}_setup.exe"
       # NSIS setups detach: the launcher process exits while the
       # real installer works in a child process, so -Wait alone can
       # return before a single file is copied. Poll for the full
@@ -379,7 +325,7 @@ jobs:
         shell: pwsh
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $setup = (Resolve-Path "NDM_${v}_x86-setup.exe").Path
+          $setup = (Resolve-Path "NDM_${v}_setup.exe").Path
           $installDir = "$env:LOCALAPPDATA\Programs\Nill Download Manager"
           Start-Process $setup -ArgumentList "/S" -PassThru | Out-Null
           $want = @(
@@ -455,17 +401,15 @@ jobs:
           }
       - uses: actions/upload-artifact@v4
         with:
-          name: ndm-windows-x86
+          name: ndm-windows-setup
           path: |
-            NDM_*_Windows_Portable_x86.zip
-            NDM_*_x86-setup.exe
-      - name: Attach Windows x86 assets to their GitHub release (dispatch runs only)
+            NDM_*_setup.exe
+      - name: Attach the universal installer to its GitHub release (dispatch runs only)
         if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $zip = (Get-ChildItem "NDM_${v}_Windows_Portable_x86.zip").Name
-          $setup = (Get-ChildItem "NDM_${v}_x86-setup.exe").Name
-          gh release upload "v$v" $zip $setup --clobber --repo $env:GITHUB_REPOSITORY
+          $setup = (Get-ChildItem "NDM_${v}_setup.exe").Name
+          gh release upload "v$v" $setup --clobber --repo $env:GITHUB_REPOSITORY
