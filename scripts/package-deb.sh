@@ -47,7 +47,7 @@ install -m 755 scripts/ndm-setup-browser.sh "$STAGE/usr/bin/ndm-setup-browser"
 for spec in "32x32 32x32.png" "64x64 64x64.png" "128x128 128x128.png" "256x256 128x128@2x.png" "512x512 icon.png"; do
   set -- $spec
   mkdir -p "$STAGE/usr/share/icons/hicolor/$1/apps"
-  install -m 644 "src-tauri/icons/$2" "$STAGE/usr/share/icons/hicolor/$1/apps/ndm-app.png"
+  install -m 644 "assets/$2" "$STAGE/usr/share/icons/hicolor/$1/apps/ndm-app.png"
 done
 
 cat > "$STAGE/usr/share/applications/NDM.desktop" << 'EOF'

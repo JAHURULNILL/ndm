@@ -7,7 +7,7 @@
 [![Latest release](https://img.shields.io/github/v/release/JAHURULNILL/ndm)](https://github.com/JAHURULNILL/ndm/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
-![Built with Rust](https://img.shields.io/badge/built%20with-Rust%20%2B%20Tauri%202-orange)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange)
 
 [Download](#download) · [Features](#features) · [Browser extension](#browser-extension) · [Building from source](#building-from-source) · [Website](https://ndm.zahurul.tech)
 
@@ -15,14 +15,15 @@
 
 ---
 
-NDM is a desktop download manager written in Rust on top of Tauri 2. It splits
+NDM is a desktop download manager written in Rust with a fully native
+UI — GTK 3 on Linux, raw Win32 controls on Windows, no WebView. It splits
 files into segments and downloads them over multiple connections, resumes
 interrupted downloads exactly where they stopped, takes over downloads from
 your browser, grabs videos and whole sites, and stays out of your way while
-doing it — the app is a single ~5 MB installer with no bundled runtime.
+doing it — the app is a single ~3 MB installer with no bundled runtime.
 
-The current release is **1.9.0**. See the
-[release notes](https://github.com/JAHURULNILL/ndm/releases/tag/v1.9.0) for
+The current release is **2.1.1**. See the
+[release notes](https://github.com/JAHURULNILL/ndm/releases/tag/v2.1.1) for
 what changed.
 
 ## Features
@@ -90,11 +91,11 @@ what changed.
 ### Linux (.deb — Debian, Ubuntu and derivatives)
 
 ```bash
-wget https://github.com/JAHURULNILL/ndm/releases/download/v1.9.0/NDM_1.9.0_amd64.deb
-sudo apt install ./NDM_1.9.0_amd64.deb
+wget https://github.com/JAHURULNILL/ndm/releases/download/v2.1.1/NDM_2.1.1_amd64.deb
+sudo apt install ./NDM_2.1.1_amd64.deb
 ```
 
-The package depends on `libwebkit2gtk-4.1-0`, `libgtk-3-0` and `ffmpeg`,
+The package depends on `libgtk-3-0` and `ffmpeg`,
 which apt resolves automatically. On first launch the app quietly downloads
 its video components (yt-dlp and deno, ~83 MB, verified against pinned
 SHA-256 hashes before use) — nothing else to set up.
@@ -104,11 +105,11 @@ A portable tarball for other distributions can be built from source with
 
 ### Windows
 
-A portable Windows build (app + host + extension in one ZIP) is defined in
-the [GitHub Actions workflow](.github/workflows/build.yml), which runs on
-release tags. It targets Windows 10/11 with the WebView2 runtime
-(preinstalled on Windows 11 and on updated Windows 10); a signed .msi
-installer is a later step.
+Every release ships a per-user NSIS installer
+(`NDM_<version>_x64-setup.exe`) and a portable ZIP (app + host +
+extension), built by the [GitHub Actions workflow](.github/workflows/build.yml).
+The Windows shell is raw Win32 — it runs on Windows 7, 8, 8.1, 10 and 11
+with no WebView2 runtime and nothing to install first.
 
 ### Browser extension
 
@@ -134,8 +135,9 @@ Full details: [extension/README.md](extension/README.md).
 | `src/components.rs` | First-run component manager (yt-dlp / deno, SHA-256-verified) |
 | `src/updater.rs` | Update checker driven by [`release.json`](release.json) in this repo |
 | `src/main.rs` | Command-line frontend for the engine |
-| `src-tauri/` | The Tauri application: state, scheduler, settings, IPC commands |
-| `ui/` | The app window (plain HTML/CSS/JS, no framework) |
+| `core/` | App logic shared by both shells: state, scheduler, settings, download orchestration |
+| `shell-gtk/` | The Linux app (GTK 3) |
+| `shell-win/` | The Windows app (raw Win32) |
 | `extension/` | The MV3 browser extension |
 
 The extension never talks to the app over the network. It sends one JSON
@@ -149,17 +151,20 @@ manager.
 
 ## Building from source
 
-Requirements: a stable Rust toolchain, and on Linux the WebKitGTK 4.1 /
-GTK 3 development packages plus ffmpeg:
+Requirements: a stable Rust toolchain, and on Linux the GTK 3
+development package plus ffmpeg:
 
 ```bash
-sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev \
-  libayatana-appindicator3-dev librsvg2-dev ffmpeg
+sudo apt install libgtk-3-dev ffmpeg
 
 cargo build --release                                     # engine, CLI, host
-cargo build --release --manifest-path src-tauri/Cargo.toml  # desktop app
+cargo build --release --manifest-path core/Cargo.toml     # shared app logic
+cargo build --release --manifest-path shell-gtk/Cargo.toml  # Linux app
 bash scripts/package-deb.sh                               # -> NDM_<version>_amd64.deb
 ```
+
+The Windows app (`shell-win/`) builds for `x86_64-pc-windows-msvc`;
+CI builds it and packages the installer from `scripts/installer.nsi`.
 
 ## License
 

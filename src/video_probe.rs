@@ -546,6 +546,29 @@ fn format_is_audio_only(f: &serde_json::Value) -> bool {
     }
 }
 
+/// The format list a probe result builds its options from.
+/// yt-dlp's generic extractor describes a DIRECT media file (a
+/// bare .mp4/.mp3 link) with the media fields on the result
+/// object itself and NO `formats` array at all — reading only
+/// the array yielded an empty list, so a direct .mp4 offered
+/// nothing but an audio option and the "video" came down as an
+/// audio-only .m4a (M3). A result that carries its own media URL
+/// and is not a playlist IS its own single format — the same
+/// fallback core's resolver applies to `requested_formats`.
+fn probe_formats(v: &serde_json::Value) -> Vec<serde_json::Value> {
+    let formats = v["formats"].as_array().cloned().unwrap_or_default();
+    if !formats.is_empty() {
+        return formats;
+    }
+    let direct_media = v["url"].as_str().map(|u| !u.is_empty()).unwrap_or(false)
+        && v["entries"].is_null()
+        && v["_type"].as_str() != Some("playlist");
+    if direct_media {
+        return vec![v.clone()];
+    }
+    formats
+}
+
 /// Build the quality options from yt-dlp's format list. Pure
 /// (no I/O) so the classification rules — above all "no video
 /// streams means no video options" — are unit-testable.
@@ -973,7 +996,7 @@ pub fn probe(
     let raw_thumb = pick_thumbnail_url(&v);
     let thumbnail = fetch_thumbnail_data_uri(&raw_thumb).unwrap_or(raw_thumb);
 
-    let formats = v["formats"].as_array().cloned().unwrap_or_default();
+    let formats = probe_formats(&v);
 
     let options = build_options(&formats, duration_f64);
 
@@ -994,6 +1017,69 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ndm-test-cookies-{name}-{}.txt", std::process::id()));
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn direct_media_result_without_formats_offers_its_video() {
+        // M3: yt-dlp's generic extractor on a bare .mp4 link —
+        // the media fields sit on the result object itself and
+        // there is NO formats array.
+        let v: serde_json::Value = serde_json::json!({
+            "id": "clip",
+            "title": "clip",
+            "url": "http://127.0.0.1:8077/clip.mp4",
+            "ext": "mp4",
+            "duration": 12,
+        });
+        let formats = probe_formats(&v);
+        assert_eq!(formats.len(), 1);
+        let options = build_options(&formats, 12.0);
+        assert!(
+            options.iter().any(|o| !o.audio),
+            "a direct .mp4 must offer a video option, got: {:?}",
+            options.iter().map(|o| &o.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_audio_result_without_formats_offers_no_video() {
+        // the same shape for a bare .mp3: audio only, honestly
+        let v: serde_json::Value = serde_json::json!({
+            "id": "song",
+            "title": "song",
+            "url": "http://127.0.0.1:8077/song.mp3",
+            "ext": "mp3",
+            "duration": 200,
+        });
+        let formats = probe_formats(&v);
+        assert_eq!(formats.len(), 1);
+        let options = build_options(&formats, 200.0);
+        assert!(options.iter().all(|o| o.audio));
+        assert!(!options.is_empty());
+    }
+
+    #[test]
+    fn formats_array_and_playlists_pass_through_unchanged() {
+        let v: serde_json::Value = serde_json::json!({
+            "id": "x",
+            "title": "x",
+            "url": "http://h/watch",
+            "formats": [
+                { "format_id": "18", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a" }
+            ],
+        });
+        let formats = probe_formats(&v);
+        assert_eq!(formats.len(), 1);
+        assert_eq!(formats[0]["format_id"], "18");
+
+        // a playlist result is not its own format, even with a url
+        let p: serde_json::Value = serde_json::json!({
+            "id": "pl",
+            "_type": "playlist",
+            "url": "http://h/list",
+            "entries": [{ "id": "a" }],
+        });
+        assert!(probe_formats(&p).is_empty());
     }
 
     #[test]

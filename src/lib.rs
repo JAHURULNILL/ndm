@@ -1184,11 +1184,16 @@ pub fn probe_with_auth(url: &str, auth: &Auth) -> Result<Probe, String> {
 }
 
 /// Probing must not hang a download start for minutes: a dedicated agent
-/// with a short timeout, separate from the transfer agent.
+/// with a short timeout, separate from the transfer agent. The
+/// connect phase gets its own cap — ureq otherwise lets an
+/// unroutable host sit in the connect phase until the overall
+/// deadline, and DNS stalls are not covered by the read/write
+/// timeouts at all (M5).
 fn probe_agent_for(url: &str) -> ureq::Agent {
     apply_proxy_for(ureq::AgentBuilder::new()
         .redirect_auth_headers(ureq::RedirectAuthHeaders::Never), url)
         .timeout(Duration::from_secs(15))
+        .timeout_connect(Duration::from_secs(10))
         .user_agent(BROWSER_UA)
         .build()
 }
@@ -1346,6 +1351,7 @@ enum ProbeFail {
 const PROBE_ATTEMPTS: usize = 3;
 
 fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, String> {
+    let started = Instant::now();
     let mut attempt = 0usize;
     loop {
         match probe_once(agent, url, auth) {
@@ -1353,7 +1359,17 @@ fn probe_with(agent: &ureq::Agent, url: &str, auth: &Auth) -> Result<Probe, Stri
             Err(ProbeFail::Definitive(m)) => return Err(m),
             Err(ProbeFail::Transient(m)) => {
                 attempt += 1;
-                if attempt >= PROBE_ATTEMPTS {
+                // a hard total budget across attempts (M5): one
+                // attempt can chain several requests (HEAD, range
+                // check, range GET), each individually timed out,
+                // and an unroutable host used to stretch three
+                // attempts past three minutes of "Probing
+                // connection…". Past the budget the failure is the
+                // answer — the caller lands the entry in its error
+                // state instead of waiting on a dead host.
+                if attempt >= PROBE_ATTEMPTS
+                    || started.elapsed() > Duration::from_secs(30)
+                {
                     return Err(m);
                 }
                 std::thread::sleep(Duration::from_millis(if attempt == 1 { 300 } else { 900 }));

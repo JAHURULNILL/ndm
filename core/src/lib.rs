@@ -2733,6 +2733,42 @@ pub fn plain_server_error(err: &str) -> String {
     }
 }
 
+/// The error text as the user should read it in the list and
+/// the progress dialog (m5). A definitive server answer is
+/// translated by plain_server_error; the engine's raw transport
+/// wording ("Connection Failed: Connect error: Connection
+/// refused (os error 111)") names no action and leaks OS
+/// internals, so the common transport failures map to plain
+/// sentences. Anything else passes through unchanged. Display
+/// only: the stored record keeps the raw text every substring
+/// check (error_is_permanent & co) depends on.
+pub fn display_error(err: &str) -> String {
+    let plain = plain_server_error(err);
+    if plain != err {
+        return plain;
+    }
+    let lower = err.to_lowercase();
+    if lower.contains("connection refused") {
+        "The server refused the connection — it may be down or too busy.".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "The connection timed out — the server did not answer in time.".to_string()
+    } else if lower.contains("dns")
+        || lower.contains("failed to look up")
+        || lower.contains("name or service not known")
+    {
+        "That address could not be found — check the address and your connection."
+            .to_string()
+    } else if lower.contains("connection failed")
+        || lower.contains("connect error")
+        || lower.contains("os error")
+    {
+        "Could not connect to the server — check your connection and try again."
+            .to_string()
+    } else {
+        err.to_string()
+    }
+}
+
 /// IDM's Scheduler default: a failed file is retried at most this
 /// many times, then it stays failed with its error visible.
 pub const RETRY_MAX: u32 = 10;
@@ -3459,10 +3495,26 @@ pub fn benign_start_rejection(e: &str) -> bool {
     e == ALREADY_STARTING || e == REMOVED_BEFORE_START || e == LATCH_BLOCKED
 }
 
+/// The honest counters for a failure record: the engine's state
+/// file is the resume truth (the same peek demote_terminal_live
+/// snapshots from); without one, the entry's previous record
+/// stands. A failed (re)start must not zero a download's known
+/// size, progress and resume capability in the list, the
+/// progress dialog and the journal (M4).
+pub fn error_snapshot(entry: &Entry) -> (u64, u64, Vec<u8>, bool) {
+    if let Some(pk) = ndm::peek_state(&entry.url, &entry.out_path) {
+        return (pk.total, pk.done_bytes, pk.blocks, true);
+    }
+    match &*entry.restored.lock_ok() {
+        Some(r) => (r.total, r.done_bytes, r.blocks.clone(), r.resumable),
+        None => (0, 0, Vec::new(), false),
+    }
+}
+
 /// Record a stub start's failure on the entry: the visible error
-/// record (counters zeroed — the entry is a stub again and its
-/// engine state file, not this record, carries the resume truth),
-/// an automatic retry, and a persist. Returns false WITHOUT
+/// record (its counters come from error_snapshot — the engine
+/// state file, not this record, carries the resume truth), an
+/// automatic retry, and a persist. Returns false WITHOUT
 /// touching anything when the "failure" is a benign rejection
 /// (see benign_start_rejection): a redundant start command
 /// changes nothing.
@@ -3470,11 +3522,12 @@ pub fn record_start_failure(state: &AppState, entry: &Entry, e: &str) -> bool {
     if benign_start_rejection(e) {
         return false;
     }
+    let (total, done_bytes, blocks, resumable) = error_snapshot(entry);
     *entry.restored.lock().unwrap() = Some(Restored {
-        total: 0,
-        done_bytes: 0,
-        blocks: Vec::new(),
-        resumable: false,
+        total,
+        done_bytes,
+        blocks,
+        resumable,
         status: "error".to_string(),
         error: e.to_string(),
     });
@@ -4428,12 +4481,14 @@ pub fn start_entry(app: &Ctx, entry: Arc<Entry>) {
                 entry.starting.store(false, Ordering::SeqCst);
                 // mirror the HTTP path: a failed start must surface as a
                 // visible error, not sit silently on a stale status —
-                // with the reason attached, so the user can act on it
+                // with the reason attached, so the user can act on it.
+                // The counters keep the entry's known truth (M4).
+                let (total, done_bytes, blocks, resumable) = error_snapshot(&entry);
                 *entry.restored.lock().unwrap() = Some(Restored {
-                    total: 0,
-                    done_bytes: 0,
-                    blocks: Vec::new(),
-                    resumable: false,
+                    total,
+                    done_bytes,
+                    blocks,
+                    resumable,
                     status: "error".to_string(),
                     error: e,
                 });
@@ -4471,22 +4526,27 @@ pub fn start_entry(app: &Ctx, entry: Arc<Entry>) {
                         // still probing: the pause wins over the
                         // start failure — the entry records "paused",
                         // not an error, and no automatic retry is
-                        // queued behind the user's back
+                        // queued behind the user's back. The
+                        // counters keep the entry's known truth (M4).
+                        let (total, done_bytes, blocks, resumable) =
+                            error_snapshot(&e);
                         *e.restored.lock().unwrap() = Some(Restored {
-                            total: 0,
-                            done_bytes: 0,
-                            blocks: Vec::new(),
-                            resumable: false,
+                            total,
+                            done_bytes,
+                            blocks,
+                            resumable,
                             status: "paused".to_string(),
                             error: String::new(),
                         });
                         let _ = app.emit(AppEvent::Progress(payload_of(&e)));
                     } else {
+                        let (total, done_bytes, blocks, resumable) =
+                            error_snapshot(&e);
                         *e.restored.lock().unwrap() = Some(Restored {
-                            total: 0,
-                            done_bytes: 0,
-                            blocks: Vec::new(),
-                            resumable: false,
+                            total,
+                            done_bytes,
+                            blocks,
+                            resumable,
                             status: "error".to_string(),
                             error: start_err,
                         });
@@ -5655,6 +5715,20 @@ pub async fn add_download(
                 .get(&id)
                 .map(|cur| Arc::ptr_eq(&cur, &stub))
                 .unwrap_or(false);
+            if ours && !error_is_permanent(&e) {
+                // M5: a transport failure (unroutable host, refused
+                // or timed-out connection) is not a verdict on the
+                // address: the entry stays — journaled, in a clean
+                // error state with an automatic retry, exactly like
+                // an entry that fails mid-download — instead of
+                // wedging on "Probing connection…" in the list and
+                // vanishing from the journal. A definitive server
+                // answer (404/410/…) still removes the stub below
+                // and is reported to the caller as what it is.
+                record_start_failure(&state, &stub, &e);
+                let _ = app.emit(AppEvent::Progress(payload_of(&stub)));
+                return Ok(id);
+            }
             if ours {
                 state.entries.lock().unwrap().remove(&id);
                 state.order.lock().unwrap().retain(|x| x != &id);
@@ -5667,6 +5741,14 @@ pub async fn add_download(
                 // number back, so a failed add leaves neither a
                 // placeholder entry nor a gap in the numbering
                 release_entry_id(&state, &id);
+                // start_engine already emitted this stub's first
+                // Progress payload, so the shells are showing a
+                // "Probing" row for it: rows leave only through
+                // EntryRemoved, and a rejected add (404 & co) must
+                // not leave a phantom row behind (M2)
+                let _ = app.emit(AppEvent::EntryRemoved(
+                    serde_json::json!({ "id": id }),
+                ));
             }
             persist(&state);
             // a definitive server answer (404/410/…) is reported
@@ -7712,6 +7794,12 @@ pub fn do_add_video(
                 let _ = std::fs::remove_file(path);
             }
             release_entry_id(state, &id);
+            // same rule as the HTTP add rollback: if a row was
+            // ever shown for this stub, EntryRemoved is the only
+            // way it leaves (M2)
+            let _ = app.emit(AppEvent::EntryRemoved(
+                serde_json::json!({ "id": id }),
+            ));
             return Err(e);
         }
     };

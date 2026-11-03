@@ -1,51 +1,12 @@
-; Nill Download Manager — per-user NSIS installer (NATIVE variant).
+; Nill Download Manager — per-user NSIS installer.
 ;
-; NATIVE: This file is the Phase-4 release-swap replacement for
-; scripts\installer.nsi (NDM Native UI Programme, NATIVE-PLAN.md
-; §4 Phase 4). It is NOT used by any build tonight: the live
-; 2.0.9 release path keeps building scripts\installer.nsi
-; byte-untouched. At the Phase-4 swap (first native Windows
-; release, 2.1.0) this file replaces installer.nsi, and
-; scripts\webview2-setup.ps1 is deleted in the same change.
-;
-; NATIVE: Full list of deltas vs installer.nsi — nothing else
-; differs; every other line is byte-identical to installer.nsi:
-;   D1. This header block (native identity + swap instructions
-;       + this delta list).
-;   D2. The header paragraph "WebView2 on older Windows: ..."
-;       is replaced by the "Native shell:" paragraph below —
-;       the native shell needs no WebView2 runtime at all.
-;   D3. Install section: the WebView2Loader.dll comment + File
-;       line are removed — the native shell exe does not link
-;       the WebView2 loader, so no loader DLL ships beside it.
-;   D4. Install section: the whole WebView2 runtime block is
-;       removed (InitPluginsDir / SetOutPath "$PLUGINSDIR" /
-;       File "webview2-setup.ps1" / the nsExec::ExecToLog
-;       powershell invocation / Pop $0 / SetOutPath restore) —
-;       no runtime is downloaded or installed at install time.
-;   D5. Uninstall section: Delete "$INSTDIR\WebView2Loader.dll"
-;       is removed — a native install never places that file.
-;   D6. "; NATIVE:" marker comments at the app-exe sites
-;       (finish-page Run target, silent-mode relaunch, the
-;       rename-aside + File pair, shortcuts, DisplayIcon,
-;       uninstall deletes) recording that the installed file
-;       NAME stays ndm-app.exe while its CONTENT becomes the
-;       native shell binary (see the layout note below). No
-;       functional change in D6.
-;
-; NATIVE: App-exe name decision: the native Windows shell
-; (shell-win crate, binary ndm-shell-win) ships AS the app exe
-; under the existing installed name ndm-app.exe — the CI
-; Assemble step copies/renames it into SRCROOT as ndm-app.exe,
-; exactly as it places the Tauri binary there today. Keeping
-; the name preserves every contract that keys off it: the
+; App-exe name decision: the native Windows shell (shell-win
+; crate, binary ndm-shell-win) ships AS the app exe under the
+; installed name ndm-app.exe — the CI Assemble step
+; copies/renames it into SRCROOT as ndm-app.exe. Keeping the
+; name preserves every contract that keys off it: the
 ; self-update relaunch, shortcuts, the Add/Remove Programs
-; DisplayIcon, and the uninstall file list. What changes is
-; only the footprint: no WebView2Loader.dll and no embedded
-; WebView UI assets; the setup stays in the ≈4.4 MB class
-; (the WebView2 runtime was downloaded at install time, never
-; inside the setup) and the app exe itself shrinks from
-; 14.06 MB to an estimated 6–9 MB (NATIVE-PLAN.md §4).
+; DisplayIcon, and the uninstall file list.
 ;
 ; Packages the assembled portable tree (the exact folder the
 ; portable ZIP wraps) so the installed layout is identical to the
@@ -90,7 +51,7 @@
 ; the app supports (7/8/8.1/10/11).
 
 !ifndef VERSION
-  !define VERSION "2.1.0"
+  !define VERSION "2.1.1"
 !endif
 !ifndef SRCROOT
   !define SRCROOT "NDM-Windows-Portable"
@@ -99,7 +60,7 @@
   !define OUTFILE "NDM_${VERSION}_x64-setup.exe"
 !endif
 !ifndef ICON
-  !define ICON "..\src-tauri\icons\icon.ico"
+  !define ICON "..\assets\icon.ico"
 !endif
 !define APPNAME "Nill Download Manager"
 !define REGKEY "Software\Nill Download Manager"
@@ -128,7 +89,7 @@ VIAddVersionKey "LegalCopyright" ""
 
 !define MUI_ICON "${ICON}"
 !define MUI_UNICON "${ICON}"
-; NATIVE: finish-page Run target — file name unchanged (ndm-app.exe); its content is now the native shell binary.
+; finish-page Run target — file name unchanged (ndm-app.exe); its content is now the native shell binary.
 !define MUI_FINISHPAGE_RUN "$INSTDIR\ndm-app.exe"
 !define MUI_FINISHPAGE_RUN_TEXT "Run ${APPNAME}"
 !insertmacro MUI_PAGE_WELCOME
@@ -149,7 +110,7 @@ VIAddVersionKey "LegalCopyright" ""
 Function .onInstSuccess
   ${If} ${Silent}
     Sleep 2000
-    ; NATIVE: silent-mode relaunch target — same file name, native shell binary.
+    ; silent-mode relaunch target — same file name, native shell binary.
     Exec '"$INSTDIR\ndm-app.exe"'
   ${EndIf}
 FunctionEnd
@@ -162,7 +123,7 @@ Section "Install"
   ; shutting down (self-update hands over exactly like that)
   ; cannot lock the new copy out. The .old files are best-effort
   ; deleted below and by the app on its next start.
-  ; NATIVE: rename-aside + install of the app exe — same file
+  ; rename-aside + install of the app exe — same file
   ; name and same SRCROOT slot; SRCROOT\ndm-app.exe now holds
   ; the native shell binary (renamed by CI's Assemble step).
   ${If} ${FileExists} "$INSTDIR\ndm-app.exe"
@@ -175,7 +136,7 @@ Section "Install"
     Rename "$INSTDIR\ndm-host.exe" "$INSTDIR\ndm-host.exe.old"
   ${EndIf}
   File "${SRCROOT}\ndm-host.exe"
-  ; NATIVE: no WebView2Loader.dll File line here — delta D3:
+  ; no WebView2Loader.dll File line here: the native shell
   ; the native shell does not link the WebView2 loader, so the
   ; loader DLL is not in SRCROOT and is not installed.
   ; App-local Universal CRT: Windows 7/8 carry no in-box UCRT,
@@ -202,11 +163,9 @@ Section "Install"
   Delete "$INSTDIR\ndm-app.exe.old"
   Delete "$INSTDIR\ndm-host.exe.old"
 
-  ; NATIVE: no WebView2 runtime block here — delta D4: the
-  ; InitPluginsDir / webview2-setup.ps1 extraction / nsExec
-  ; powershell invocation from installer.nsi are gone. The
-  ; native shell needs no runtime provisioning of any kind,
-  ; so installation proceeds straight to the uninstaller,
+  ; no WebView2 runtime block here: the native shell needs
+  ; no runtime provisioning of any kind, so installation
+  ; proceeds straight to the uninstaller,
   ; shortcuts and registry below, in silent and interactive
   ; modes alike (the silent-install layout behaviour is
   ; otherwise unchanged).
@@ -214,7 +173,7 @@ Section "Install"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   ; Shortcuts: Start Menu folder + desktop.
-  ; NATIVE: shortcut targets — same file name, native shell binary.
+  ; shortcut targets — same file name, native shell binary.
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\ndm-app.exe"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\Uninstall ${APPNAME}.lnk" "$INSTDIR\uninstall.exe"
@@ -227,7 +186,7 @@ Section "Install"
   WriteRegStr HKCU "${UNREGKEY}" "DisplayVersion" "${VERSION}"
   WriteRegStr HKCU "${UNREGKEY}" "Publisher" "Nill"
   WriteRegStr HKCU "${UNREGKEY}" "InstallLocation" "$INSTDIR"
-  ; NATIVE: DisplayIcon — same file name, native shell binary (its icon resource is the app icon).
+  ; DisplayIcon — same file name, native shell binary (its icon resource is the app icon).
   WriteRegStr HKCU "${UNREGKEY}" "DisplayIcon" "$INSTDIR\ndm-app.exe"
   WriteRegStr HKCU "${UNREGKEY}" "UninstallString" '"$INSTDIR\uninstall.exe"'
   WriteRegStr HKCU "${UNREGKEY}" "QuietUninstallString" '"$INSTDIR\uninstall.exe" /S'
@@ -249,14 +208,14 @@ Section "Uninstall"
   ; manifests) and the browser NativeMessagingHosts keys are
   ; deliberately left behind, so a reinstall picks everything
   ; back up — the standard per-user app behaviour.
-  ; NATIVE: uninstall file list — same names, native shell
-  ; binary; no WebView2Loader.dll delete (delta D5, below).
+  ; uninstall file list — same names, native shell
+  ; binary; no WebView2Loader.dll delete.
   Delete "$INSTDIR\ndm-app.exe"
   Delete "$INSTDIR\ndm-app.exe.old"
   Delete "$INSTDIR\ndm-host.exe"
   Delete "$INSTDIR\ndm-host.exe.old"
-  ; NATIVE: no Delete "$INSTDIR\WebView2Loader.dll" here —
-  ; delta D5: a native install never places that file. (An
+  ; no Delete "$INSTDIR\WebView2Loader.dll" here —
+  ; a native install never places that file. (An
   ; upgrade-in-place over a Tauri install is handled by the
   ; install section's layout plus the /REBOOTOK sweep below;
   ; the stale loader file, if any, is inert beside the native
