@@ -138,6 +138,13 @@ fn dialog_status_text(d: &ProgressView) -> String {
                 d.detail.clone()
             }
         }
+        "resuming" => {
+            if d.detail.trim().is_empty() {
+                "Resuming…".to_string()
+            } else {
+                d.detail.clone()
+            }
+        }
         "downloading" => "Receiving data…".to_string(),
         "merging" => "Merging…".to_string(),
         "paused" => "Paused".to_string(),
@@ -199,7 +206,13 @@ fn enablement(status: &str) -> (bool, bool, bool) {
     match status {
         "downloading" => (false, true, true),
         "merging" => (false, false, false),
-        "starting" => (false, false, true),
+        // Pause stays live while the job is still resolving
+        // ("starting") or recovering from a stall ("resuming"):
+        // core's pause parks the job in both phases (the stop
+        // flag discards the in-flight resolve), and a greyed
+        // Pause here read as "pause is broken" in the field
+        // (2.3.1 bug 4).
+        "starting" | "resuming" => (false, true, true),
         "queued" | "paused" => (true, false, true),
         "error" | "cancelled" => (true, false, false),
         _ => (false, false, false), // finished and anything else

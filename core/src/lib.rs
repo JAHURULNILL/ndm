@@ -2106,6 +2106,7 @@ pub fn detail_of(entry: &Entry, status: &str) -> String {
     }
     match status {
         "starting" => "Probing connection\u{2026}".to_string(),
+        "resuming" => "Resuming\u{2026}".to_string(),
         "merging" => "Merging\u{2026}".to_string(),
         "downloading" => "Receiving data\u{2026}".to_string(),
         _ => String::new(),
@@ -3030,7 +3031,7 @@ pub enum DueRetry {
 
 pub fn due_retry_action(count: u32, status: &str) -> DueRetry {
     match status {
-        "downloading" | "starting" | "merging" | "queued" => DueRetry::Keep,
+        "downloading" | "starting" | "resuming" | "merging" | "queued" => DueRetry::Keep,
         "error" => {
             if count >= RETRY_MAX {
                 DueRetry::Drop
@@ -4524,7 +4525,7 @@ pub fn count_active(state: &AppState) -> usize {
             e.starting.load(Ordering::Relaxed)
                 || matches!(
                     payload_of(e).status.as_str(),
-                    "downloading" | "starting" | "merging"
+                    "downloading" | "starting" | "resuming" | "merging"
                 )
         })
         .count()
@@ -5006,7 +5007,7 @@ pub fn count_active_for(state: &AppState, queue: &str) -> usize {
                     || e.slot_preclaimed.load(Ordering::Relaxed)
                     || matches!(
                         payload_of(e).status.as_str(),
-                        "downloading" | "starting" | "merging"
+                        "downloading" | "starting" | "resuming" | "merging"
                     ))
         })
         .count()
@@ -5331,7 +5332,7 @@ pub fn mark_requeued(e: &Entry) {
     }
 }
 
-/// G7: after an app-side start, when the user's progress-dialog
+/// G7: after a start, when the user's progress-dialog
 /// setting creates the dialog ("show" or "minimized"), tell the
 /// UI to open the per-download progress dialog on this entry,
 /// carrying the view so the shell presents it right. IDM's
@@ -5340,9 +5341,12 @@ pub fn mark_requeued(e: &Entry) {
 /// only "never" creates nothing. Core owns the setting and the
 /// start-scoping, so core emits for both create cases and the
 /// shell decides presentation (the single-window Tauri shell
-/// treats "minimized" as a no-op). Browser-takeover starts (the
-/// host paths) never call this — the browser already has the
-/// user's attention (spec §1.3).
+/// treats "minimized" as a no-op). Silent background catches
+/// never call this; an EXPLICIT Download press in the browser
+/// (the *_direct incoming kinds) does — the user's standing
+/// rule is that a progress card appears after Download is
+/// pressed, and only silent captures are exempt (2.3.1 bug 9:
+/// an extension "Download Now" used to land in dead air).
 pub fn maybe_reveal_progress_dialog(app: &Ctx, state: &AppState, entry: &Entry) {
     let view = current_settings(state).progress_dialog_view;
     if view == "show" || view == "minimized" {
@@ -5485,7 +5489,7 @@ pub fn pause_all(app: &Ctx, requeue: bool, queue: Option<&str>) {
             // as live, and without the requeue no scheduler path
             // ever claims it again
             let st = payload_of(&e).status;
-            let was_active = matches!(st.as_str(), "downloading" | "starting" | "merging");
+            let was_active = matches!(st.as_str(), "downloading" | "starting" | "resuming" | "merging");
             if let Some(dl) = &e.download {
                 dl.control.pause();
             }
@@ -5897,7 +5901,7 @@ pub fn start_all(app: Ctx) -> usize {
         // into its own files — they skip exactly like "downloading"
         if matches!(
             status.as_str(),
-            "finished" | "downloading" | "starting" | "merging" | "cancelled"
+            "finished" | "downloading" | "starting" | "resuming" | "merging" | "cancelled"
         ) {
             continue;
         }
@@ -6276,7 +6280,7 @@ pub async fn resume_download(
     // is already running needs no slot and is left alone.
     if !matches!(
         payload_of(&entry).status.as_str(),
-        "downloading" | "starting" | "merging"
+        "downloading" | "starting" | "resuming" | "merging"
     ) {
         let queue = entry_queue(&entry);
         let must_wait = {
@@ -6519,6 +6523,67 @@ pub fn remove_entry_inner(
     // (the browser dialog's path) already settled this way;
     // the app's own removal now gets the same treatment.
     settle_entry_engines(&entry)?;
+    // 2.3.1 (item 11): the file deletion runs BEFORE any list
+    // mutation. The old order marked the entry removed, swept
+    // its temps and noted its quota first, and only then tried
+    // remove_file — so when that failed (M2's checked error) the
+    // entry was half-mutated, and a shell offering "remove from
+    // the list anyway" would have re-run the whole removal over
+    // the debris. Now a file failure returns with the entry
+    // untouched apart from the settle (its job is stopped,
+    // which deleting implies anyway), and the retry is clean.
+    if delete_file {
+        let target = entry_file_path(&entry);
+        // A target that is a DIRECTORY is "no file yet", never
+        // an error: a video job that never got past probing
+        // carries only its save folder (no name was ever
+        // resolved), and remove_file on it failed EISDIR —
+        // with M2's keep-the-entry rule that made the entry
+        // permanently undeletable (the user's trap). The job's
+        // partial/temp artifacts are swept below either way.
+        if target.is_file() {
+            // snapshot first, file paths computed unlocked (the
+            // same discipline as the duplicate finders)
+            let others: Vec<Arc<Entry>> = state
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
+            let shared = others.iter().any(|e| {
+                e.id != entry.id
+                    && !e.removed.load(Ordering::Relaxed)
+                    && entry_file_path(e) == target
+            });
+            // W193-5: if ANOTHER live entry points at the same
+            // file, the file stays — it is that entry's data too.
+            if !shared {
+                // M2 (QA-220): the removal result is CHECKED,
+                // never swallowed. A file that cannot be removed
+                // fails the removal: the entry stays in the list
+                // and the user hears why (and can still choose
+                // list-only removal — see the shells' flow).
+                match std::fs::remove_file(&target) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "the file could not be deleted ({}): {}",
+                            target.display(),
+                            e
+                        ));
+                    }
+                }
+                if target.exists() {
+                    return Err(format!(
+                        "the file could not be deleted: {}",
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
     state.retries.lock_ok().remove(id);
     delete_progress_file(app, id);
     // its downloaded bytes stay on the quota meter even though
@@ -6546,61 +6611,9 @@ pub fn remove_entry_inner(
         let _ = std::fs::remove_file(path);
     }
     // IDM's delete confirmation offers "also delete the file":
-    // only then does the downloaded data itself go (the plain
-    // list removal above always keeps it). W193-2: the choice
-    // applies to the entry's file WHATEVER its status — the
-    // old rule silently kept the file of any entry that was
-    // not finished, so deleting an ACTIVE download with the
-    // box ticked stopped it, dropped the row, and left the
-    // partial on disk anyway. The engines have settled by
-    // now, so removing the file cannot race a writer. One
-    // guard (W193-5): if ANOTHER live entry points at the
-    // same file, the file stays — it is that entry's data too.
-    if delete_file {
-        let target = entry_file_path(&entry);
-        // snapshot first, file paths computed unlocked (the
-        // same discipline as the duplicate finders)
-        let others: Vec<Arc<Entry>> = state
-            .entries
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
-        let shared = others.iter().any(|e| {
-            e.id != entry.id
-                && !e.removed.load(Ordering::Relaxed)
-                && entry_file_path(e) == target
-        });
-        if !shared {
-            // M2 (QA-220): the removal result is CHECKED, never
-            // swallowed. The old `let _ =` let a failed delete
-            // report success while the partial stayed on disk —
-            // and with the settle await running on the caller's
-            // UI thread, a wedged download's seconds-long settle
-            // invited a force-quit mid-removal, which leaked the
-            // file the same silent way. A file that cannot be
-            // removed now fails the removal: the entry stays in
-            // the list and the user hears why.
-            match std::fs::remove_file(&target) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    return Err(format!(
-                        "the file could not be deleted ({}): {}",
-                        target.display(),
-                        e
-                    ));
-                }
-            }
-            if target.exists() {
-                return Err(format!(
-                    "the file could not be deleted: {}",
-                    target.display()
-                ));
-            }
-        }
-    }
+    // the file itself was already removed above, BEFORE the
+    // list mutation (2.3.1 item 11 — see there). W193-2: the
+    // choice applies to the entry's file WHATEVER its status.
     // the emit loop is stopped and the entry is leaving: its
     // progress mirror must not survive it (the delete at the
     // top of this command ran before the settle, when a last
@@ -7035,7 +7048,17 @@ pub fn run_component_setup(app: Ctx) {
                 }
             }
             match pass {
-                Ok(()) => break Ok(()),
+                Ok(()) => {
+                    // Mirror the UCRT set next to the fetched
+                    // binaries: ffmpeg.exe imports the api-ms-win-crt
+                    // contracts a stock Windows 7/8 cannot resolve
+                    // from the components folder (app-local covers
+                    // only the exe's own folder). Best-effort —
+                    // Windows 10+ never uses the copies, and a copy
+                    // failure must not fail the whole setup.
+                    let _ = ndm::components::ensure_ucrt_companions(&dir);
+                    break Ok(());
+                }
                 Err(e) => {
                     attempt += 1;
                     if attempt >= 20 {
@@ -10577,6 +10600,34 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or("bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b")
             .to_string();
+        // 2.3.1 (item 14, browser-primary): when the picker
+        // send names a page-data group AND the stored capture
+        // set for this page holds that exact group live, the
+        // entry takes the capture selector — its start then
+        // resolves NOTHING through yt-dlp (start_entry's
+        // preresolved_for serves the page's own streams to the
+        // engine). Any mismatch — no set stored, the group
+        // expired — keeps the yt-dlp selector below: page data
+        // is the primary route, yt-dlp the fallback, exactly
+        // the order the user approved.
+        let selector = match v["capSelector"]
+            .as_str()
+            .filter(|s| capture::is_captured_selector(s))
+        {
+            Some(cap)
+                if capture::preresolved_for(
+                    data_dir(&state).as_deref(),
+                    url,
+                    cap,
+                    capture::now_unix(),
+                )
+                .map(|o| o.is_some())
+                .unwrap_or(false) =>
+            {
+                cap.to_string()
+            }
+            _ => selector,
+        };
         let audio = v["audio"].as_bool().unwrap_or(false);
         let later = v["later"].as_bool().unwrap_or(false);
         let total_hint = v["total"].as_u64().unwrap_or(0);
@@ -10602,7 +10653,13 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
             force,
             main_queue_name(),
             false,
-            true,
+            // from_browser=false: a video_direct line exists only
+            // because the user pressed Download on a chosen
+            // quality in the extension's picker — an explicit
+            // start, so the G7 progress-dialog reveal applies
+            // (2.3.1 bug 9). The silent "video" kind (which opens
+            // the in-app picker and starts nothing) is unaffected.
+            false,
         ) {
             Ok(entry_id) => write_ack_and_result(
                 handle,
@@ -10750,7 +10807,18 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
                     let _ = handle.emit(AppEvent::Progress(payload_of(&stub)));
                     persist(&state);
                 } else {
+                    let stub_for_reveal = stub.clone();
                     start_entry(handle, stub);
+                    // 2.3.1 bug 9: an explicit "Download Now" in
+                    // the extension's file dialog is a Download
+                    // press — the app's progress dialog appears
+                    // for the job (per the progress_dialog_view
+                    // setting), never dead air after the dialog
+                    // closes. Download Later stays unrevealed:
+                    // nothing has started.
+                    if !later {
+                        maybe_reveal_progress_dialog(handle, &state, &stub_for_reveal);
+                    }
                 }
                 write_ack_and_result(
                     handle,
@@ -10832,6 +10900,15 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
                 received_unix: capture::now_unix(),
             },
         );
+        // 2.3.1 (item 14): a store-only send is the browser
+        // picker's page-data handoff — the set lands so the
+        // video_direct line that follows can name its group;
+        // raising the app and opening ITS picker over the
+        // browser flow the user is standing in would be wrong.
+        if v["storeOnly"].as_bool().unwrap_or(false) {
+            write_ack_and_result(handle, ack_id.as_deref(), serde_json::json!({ "ok": true }));
+            return;
+        }
         handle.raise();
         let payload = serde_json::json!({
             "url": url,
@@ -12610,6 +12687,123 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ── 2.3.1 item 11: the delete trap ──────────────────────
+
+    fn put_entry(state: &AppState, e: Entry) -> String {
+        let id = e.id.clone();
+        state.entries.lock().unwrap().insert(id.clone(), Arc::new(e));
+        state.order.lock().unwrap().push(id.clone());
+        id
+    }
+
+    #[test]
+    fn delete_trap_folder_only_video_job_removes_cleanly() {
+        // The user's field case: a paused YouTube job that never
+        // got past probing carries the BARE SAVE FOLDER as its
+        // path. Delete-with-file used to remove_file() that
+        // directory → EISDIR → M2 kept the entry — forever.
+        let dir = std::env::temp_dir().join(format!("ndm-del11-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let mut e = restored_entry("Some Song - Lyrics Video", "video", 32_180_000, dir.clone());
+        e.id = "del11-trap".to_string();
+        e.restored.lock().unwrap().as_mut().unwrap().status = "paused".to_string();
+        e.restored.lock().unwrap().as_mut().unwrap().done_bytes = 0;
+        // a yt-dlp part from the aborted attempt + a stranger's
+        // file that must survive untouched
+        let part = dir.join("Some Song - Lyrics Video.f137.mp4.part");
+        std::fs::write(&part, b"partial").unwrap();
+        let stranger = dir.join("keep-me.txt");
+        std::fs::write(&stranger, b"mine").unwrap();
+        let id = put_entry(&state, e);
+
+        let r = remove_entry_inner(&ctx, &state, &id, true);
+        assert!(r.is_ok(), "delete must succeed, got {r:?}");
+        assert!(state.get(&id).is_none(), "entry must leave the list");
+        assert!(dir.is_dir(), "the save folder itself must survive");
+        assert!(!part.exists(), "the job's own part must be swept");
+        assert!(stranger.exists(), "unrelated files must survive");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_with_file_removes_a_real_partial() {
+        let dir = std::env::temp_dir().join(format!("ndm-del11b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let file = dir.join("linux.iso");
+        std::fs::write(&file, vec![7u8; 4096]).unwrap();
+        let mut e = restored_entry("linux.iso", "http", 10_000_000, file.clone());
+        e.id = "del11-partial".to_string();
+        e.restored.lock().unwrap().as_mut().unwrap().status = "paused".to_string();
+        e.restored.lock().unwrap().as_mut().unwrap().done_bytes = 4096;
+        let id = put_entry(&state, e);
+
+        assert!(remove_entry_inner(&ctx, &state, &id, true).is_ok());
+        assert!(!file.exists(), "the partial must be deleted");
+        assert!(state.get(&id).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_with_undeletable_file_keeps_entry_but_list_removal_still_works() {
+        // The file cannot go (its folder is read-only): the
+        // removal must FAIL with the entry still listed and
+        // unmutated, so the shell can offer "Remove from list
+        // anyway" — which must then succeed.
+        let dir = std::env::temp_dir().join(format!("ndm-del11c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let file = dir.join("locked.bin");
+        std::fs::write(&file, b"data").unwrap();
+        let mut e = restored_entry("locked.bin", "http", 4, file.clone());
+        e.id = "del11-locked".to_string();
+        e.restored.lock().unwrap().as_mut().unwrap().status = "paused".to_string();
+        let id = put_entry(&state, e);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let r = remove_entry_inner(&ctx, &state, &id, true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            // root ignores the read-only bit, so the failure
+            // half of this test only means anything for a
+            // non-root euid (CI runners, real installs).
+            let euid_root = std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("Uid:"))
+                        .and_then(|l| l.split_whitespace().nth(1).map(|u| u == "0"))
+                })
+                .unwrap_or(false);
+            if !euid_root {
+                assert!(r.is_err(), "an undeletable file must fail the removal: {r:?}");
+                assert!(state.get(&id).is_some(), "the entry must stay listed");
+                assert!(file.exists());
+                // "Remove from list anyway": list-only removal works
+                assert!(remove_entry_inner(&ctx, &state, &id, false).is_ok());
+                assert!(state.get(&id).is_none());
+                assert!(file.exists(), "list-only removal keeps the file");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── Release BLOCKER: video dedupe keys on the target path ──
 
     const DUPE_URL: &str = "https://www.youtube.com/watch?v=fixture";
@@ -13983,6 +14177,120 @@ mod tests {
         .unwrap()
         .expect("the stored set resolves");
         assert_eq!(pre.streams.len(), 2, "video + audio parts travel together");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.3.1 (item 14): the JS mirror of capture::group_key
+    /// (extension/content.js captureGroupKey) must produce the
+    /// identical selector for the identical stream set — the
+    /// whole browser-primary handoff keys on the two agreeing.
+    /// The expected value below was produced by the JS
+    /// implementation itself (node, BigInt FNV-1a).
+    #[test]
+    fn capture_group_key_matches_the_extension_mirror() {
+        let group = capture::CapturedGroup {
+            streams: vec![
+                capture::CapturedStream {
+                    url: "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=136"
+                        .to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    quality_label: Some("720p".to_string()),
+                    has_audio: false,
+                    has_video: true,
+                },
+                capture::CapturedStream {
+                    url: "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=140"
+                        .to_string(),
+                    mime_type: "audio/mp4".to_string(),
+                    quality_label: None,
+                    has_audio: true,
+                    has_video: false,
+                },
+            ],
+            audio_only: false,
+            label: "720p".to_string(),
+            height: 720,
+            ext: "MP4".to_string(),
+        };
+        assert_eq!(
+            capture::selector_for(&group),
+            "ndmcap:79fb980354323b2e",
+            "the Rust and JS group keys must agree bit for bit"
+        );
+    }
+
+    /// 2.3.1 (item 14): a store-only captured line lands the set
+    /// WITHOUT opening the app picker (the browser picker owns
+    /// the flow), and a video_direct naming the stored group
+    /// takes the capture selector — while a video_direct naming
+    /// a group that does not exist keeps its yt-dlp selector.
+    #[test]
+    fn store_only_set_then_video_direct_cap_selector() {
+        let dir = std::env::temp_dir().join(format!("ndm-cap14-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let page = "https://www.youtube.com/watch?v=CAP14test9";
+        let store_line = serde_json::json!({
+            "id": "cap14-store",
+            "kind": "captured_streams",
+            "url": page,
+            "pageUrl": page,
+            "title": "Page Data Test",
+            "storeOnly": true,
+            "streams": [
+                { "url": "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=136",
+                  "mimeType": "video/mp4", "qualityLabel": "720p",
+                  "hasAudio": false, "hasVideo": true },
+                { "url": "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=140",
+                  "mimeType": "audio/mp4", "qualityLabel": null,
+                  "hasAudio": true, "hasVideo": false }
+            ]
+        })
+        .to_string();
+        handle_incoming_line(&ctx, &store_line);
+        let set = capture::get_set(Some(&dir), &capture::video_identity(page))
+            .expect("the store-only line must store the set");
+        assert!(
+            state.pending_videos.lock().unwrap().is_empty(),
+            "store-only must NOT queue the app picker"
+        );
+        let cap_sel = capture::captured_options(&set, capture::now_unix())[0]
+            .selector
+            .clone();
+
+        let send = |ack: &str, cap: Option<&str>| {
+            let mut line = serde_json::json!({
+                "id": ack,
+                "kind": "video_direct",
+                "url": page,
+                "pageUrl": page,
+                "title": "Page Data Test",
+                "selector": "bv*[height<=720]+ba[ext=m4a]",
+                "dir": dir.to_string_lossy(),
+                "later": true,
+                "total": 1234,
+            });
+            if let Some(c) = cap {
+                line["capSelector"] = serde_json::json!(c);
+            }
+            handle_incoming_line(&ctx, &line.to_string());
+        };
+        send("cap14-a", Some(&cap_sel));
+        send("cap14-b", Some("ndmcap:0000000000000000"));
+        let entries: Vec<Arc<Entry>> =
+            state.entries.lock().unwrap().values().cloned().collect();
+        assert_eq!(entries.len(), 2);
+        let by_sel: Vec<&str> = entries.iter().map(|e| e.selector.as_str()).collect();
+        assert!(
+            by_sel.contains(&cap_sel.as_str()),
+            "the matching send must take the capture selector: {by_sel:?}"
+        );
+        assert!(
+            by_sel.contains(&"bv*[height<=720]+ba[ext=m4a]"),
+            "the bogus-key send must keep its yt-dlp selector: {by_sel:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

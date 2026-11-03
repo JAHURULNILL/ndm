@@ -66,6 +66,20 @@ fn plain_write_error(e: &io::Error) -> String {
     }
 }
 
+/// How a parallel worker's write failure is classified
+/// (QA-220 m2, 2.3.1): disk-full is Permanent — the download
+/// fails at once with the plain sentence — because as a
+/// retryable block error it looped silently for minutes (the
+/// pool re-fetched the same bytes into the same full disk).
+/// Every other write error keeps the historical Retry shape.
+fn write_block_error(e: &io::Error) -> BlockError {
+    if disk_full_sentence(e).is_some() {
+        BlockError::Permanent(plain_write_error(e))
+    } else {
+        BlockError::Retry(plain_write_error(e))
+    }
+}
+
 pub mod components;
 pub mod ftp;
 pub mod updater;
@@ -147,7 +161,7 @@ pub fn video_pair_connections(max_conn: usize) -> (usize, usize) {
     if max_conn >= 5 {
         (max_conn - 2, 2)
     } else {
-        ((max_conn + 1) / 2, (max_conn / 2).max(1))
+        (max_conn.div_ceil(2), (max_conn / 2).max(1))
     }
 }
 
@@ -1060,47 +1074,97 @@ pub struct Probe {
     pub range_unverified: bool,
 }
 
+/// The filename inside one Content-Disposition value
+/// (`filename*=UTF-8''...` preferred, else `filename="..."`),
+/// sanitized; None when the value carries no usable name.
+fn name_from_disposition(cd: &str) -> Option<String> {
+    // 1. RFC 5987 filename*=UTF-8''...
+    for part in cd.split(';').map(|s| s.trim()) {
+        if let Some(rest) = part
+            .strip_prefix("filename*=")
+            .or_else(|| part.strip_prefix("FILENAME*="))
+        {
+            let val = rest.trim().trim_matches('"');
+            let encoded = val
+                .split_once("''")
+                .map(|(_, r)| r)
+                .unwrap_or(val);
+            let decoded = percent_decode(encoded);
+            let cleaned = sanitize_suggested_name(&decoded);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+    }
+    // 2. Standard filename="..."
+    for part in cd.split(';').map(|s| s.trim()) {
+        if let Some(rest) = part
+            .strip_prefix("filename=")
+            .or_else(|| part.strip_prefix("FILENAME="))
+        {
+            let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+            let decoded = percent_decode(val);
+            let cleaned = sanitize_suggested_name(&decoded);
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+    }
+    None
+}
+
+/// A URL-derived name is plausible as a file name when it is not
+/// the bare-handler fallback and carries an extension. A signed
+/// CDN URL's path tail — a bare asset UUID with no extension —
+/// is NOT plausible: the name the user was offered lives on the
+/// original (feed) URL, never on the redirect target (2.3.1:
+/// update assets added through the browser arrived named
+/// "4c62eef7-…" — the release-asset UUID — instead of the
+/// .deb/.zip names from the URLs that were clicked).
+fn plausible_file_name(name: &str) -> bool {
+    name != "index" && name.contains('.')
+}
+
 /// Extract a clean filename from a `Content-Disposition` header value
 /// (`filename*=UTF-8''...` or `filename="..."`) or, failing that, from
 /// the final post-redirect URL when it differs from `original_url`.
 fn extract_suggested_name(resp: &ureq::Response, original_url: &str) -> Option<String> {
     if let Some(cd) = resp.header("Content-Disposition") {
-        // 1. RFC 5987 filename*=UTF-8''...
-        for part in cd.split(';').map(|s| s.trim()) {
-            if let Some(rest) = part
-                .strip_prefix("filename*=")
-                .or_else(|| part.strip_prefix("FILENAME*="))
-            {
-                let val = rest.trim().trim_matches('"');
-                let encoded = val
-                    .split_once("''")
-                    .map(|(_, r)| r)
-                    .unwrap_or(val);
-                let decoded = percent_decode(encoded);
-                let cleaned = sanitize_suggested_name(&decoded);
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
-                }
-            }
-        }
-        // 2. Standard filename="..."
-        for part in cd.split(';').map(|s| s.trim()) {
-            if let Some(rest) = part
-                .strip_prefix("filename=")
-                .or_else(|| part.strip_prefix("FILENAME="))
-            {
-                let val = rest.trim().trim_matches(|c| c == '"' || c == '\'');
-                let decoded = percent_decode(val);
-                let cleaned = sanitize_suggested_name(&decoded);
-                if !cleaned.is_empty() {
-                    return Some(cleaned);
-                }
-            }
+        if let Some(name) = name_from_disposition(cd) {
+            return Some(name);
         }
     }
     let final_url = resp.get_url();
     if !final_url.is_empty() && final_url != original_url {
+        // Signed CDN URLs (GitHub release assets, S3) carry the
+        // real name in the response-content-disposition QUERY
+        // parameter — the name the origin promised the browser —
+        // while their path tail is an opaque asset id.
+        if let Some(query) = final_url.split('?').nth(1) {
+            for pair in query.split('&') {
+                let Some((k, v)) = pair.split_once('=') else {
+                    continue;
+                };
+                if k == "response-content-disposition" {
+                    let cd = percent_decode(v);
+                    if let Some(name) = name_from_disposition(&cd) {
+                        return Some(name);
+                    }
+                }
+            }
+        }
+        // The original URL's own plausible name beats an
+        // implausible redirect tail (the asset-UUID case above);
+        // a plausible redirect tail still wins for short-link
+        // flows whose original URL names nothing.
+        let from_original = file_name_of(original_url);
         let from_final = file_name_of(final_url);
+        if plausible_file_name(&from_final) {
+            return Some(from_final);
+        }
+        if plausible_file_name(&from_original) {
+            return Some(from_original);
+        }
         if from_final != "index" {
             return Some(from_final);
         }
@@ -1262,11 +1326,10 @@ fn parse_set_cookie(raw: &str) -> Option<(String, String, Option<String>, String
                 if v.starts_with('/') {
                     path = v.to_string();
                 }
-            } else if k.trim().eq_ignore_ascii_case("max-age") {
-                if v.parse::<i64>().map(|n| n <= 0).unwrap_or(false) {
+            } else if k.trim().eq_ignore_ascii_case("max-age")
+                && v.parse::<i64>().map(|n| n <= 0).unwrap_or(false) {
                     expired = true;
                 }
-            }
         }
     }
     Some((name.to_string(), value.to_string(), domain, path, expired))
@@ -2376,7 +2439,10 @@ fn download_block_run(
         if shared.control.paused.load(Ordering::Relaxed) {
             return Err(BlockError::Paused);
         }
-        write_at(file, &buf[..n], *pos).map_err(|e| BlockError::Retry(plain_write_error(&e)))?;
+        // the classification is write_block_error's: disk-full
+        // fails the download at once (QA-220 m2), anything else
+        // retries the block
+        write_at(file, &buf[..n], *pos).map_err(|e| write_block_error(&e))?;
         *pos += n as u64;
         shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
         {
@@ -3527,7 +3593,7 @@ impl InFlightGuard {
         {
             Ok(f) => f,
             Err(_) => {
-                return Ok(File::open("/dev/null").map_err(|e| e.to_string())?);
+                return File::open("/dev/null").map_err(|e| e.to_string());
             }
         };
         if os_file_lock::try_acquire(&f) {
@@ -3673,7 +3739,7 @@ fn start_impl(
     let jar = pre_probed
         .as_ref()
         .map(|p| p.cookies.clone())
-        .unwrap_or_else(CookieJar::new);
+        .unwrap_or_default();
     let probed = match pre_probed {
         Some(p) => p,
         // F5: a start that was not already probed by the caller
@@ -5704,6 +5770,91 @@ mod tests {
         set_global_proxy("");
     }
 
+    /// A GitHub-release-shaped redirect pair on a loopback
+    /// port: the friendly release path 302s to a signed asset
+    /// URL whose path tail is a bare UUID — the shape that used
+    /// to land in the download list AS the file name (2.3.1
+    /// bug 6b, the updater's own downloads included).
+    fn signed_asset_site() -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let path = line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    const UUID: &str = "4c62eef7-1111-4222-8333-444444444444";
+                    if path.starts_with("/releases/download/") {
+                        let loc = format!(
+                            "http://127.0.0.1:{port}/asset/{UUID}?response-content-disposition=attachment%3B%20filename%3DNDM_2.3.0_amd64.deb"
+                        );
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+                        );
+                    } else if path.starts_with("/plain/") {
+                        let loc = format!("http://127.0.0.1:{port}/asset/{UUID}");
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+                        );
+                    } else if path.starts_with("/asset/") {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = s.write_all(b"data");
+                    } else {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn suggested_name_survives_signed_asset_redirects() {
+        let port = signed_asset_site();
+        // with the disposition echoed in the signed URL's query
+        let p = probe(&format!(
+            "http://127.0.0.1:{port}/releases/download/v2.3.0/NDM_2.3.0_amd64.deb"
+        ))
+        .expect("probe must succeed");
+        assert_eq!(
+            p.suggested_name.as_deref(),
+            Some("NDM_2.3.0_amd64.deb"),
+            "the list must show the real asset name, not the signed URL's UUID tail"
+        );
+        // without it: the ORIGINAL URL's tail is the only
+        // plausible name — the UUID tail must not win
+        let p = probe(&format!("http://127.0.0.1:{port}/plain/realname.zip"))
+            .expect("probe must succeed");
+        assert_eq!(p.suggested_name.as_deref(), Some("realname.zip"));
+    }
+
     /// A tiny canned web site on a loopback port: two "hosts"
     /// (127.0.0.1 and localhost) sharing one server, pages at two
     /// depths, files of known sizes.
@@ -6467,6 +6618,209 @@ mod tests {
             }
         });
         port
+    }
+
+    /// A range server that caps EACH connection at ~512 KB/s
+    /// (32 KiB every 62 ms): the per-connection-throttle shape
+    /// of bug 10's audit. Returns (port, live connection count).
+    fn per_conn_cap_server(
+        body: Vec<u8>,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = count.clone();
+        let body = std::sync::Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let count = count2.clone();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range:") {
+                                    let spec = v.trim().trim_start_matches("bytes=");
+                                    let mut it = spec.splitn(2, '-');
+                                    let a: u64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+                                    let b: u64 = it
+                                        .next()
+                                        .and_then(|x| x.trim().parse().ok())
+                                        .unwrap_or(body.len() as u64 - 1);
+                                    range = Some((a, b));
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    let (a, b) = range.unwrap_or((0, total - 1));
+                    let b = b.min(total - 1);
+                    let slice = &body[a as usize..=b as usize];
+                    if line.starts_with("HEAD") {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n").as_bytes(),
+                        );
+                        return;
+                    }
+                    let hdr = if range.is_some() {
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", slice.len())
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", slice.len())
+                    };
+                    if s.write_all(hdr.as_bytes()).is_err() {
+                        return;
+                    }
+                    for piece in slice.chunks(32 * 1024) {
+                        if s.write_all(piece).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(62));
+                    }
+                });
+            }
+        });
+        (port, count)
+    }
+
+    #[test]
+    fn disk_full_write_errors_are_permanent_not_retried() {
+        // QA-220 m2 (2.3.1): the classification itself — an
+        // ENOSPC-class write error must come out Permanent (the
+        // download fails at once) with the plain sentence; any
+        // other write error stays a retryable block error.
+        let enospc = io::Error::from_raw_os_error(28);
+        match write_block_error(&enospc) {
+            BlockError::Permanent(msg) => {
+                assert!(msg.contains("The disk is full"), "{msg}")
+            }
+            BlockError::Retry(msg) => {
+                panic!("ENOSPC must be Permanent, got Retry: {msg}")
+            }
+            _ => panic!("ENOSPC must be Permanent"),
+        }
+        let eio = io::Error::from_raw_os_error(5);
+        assert!(
+            matches!(write_block_error(&eio), BlockError::Retry(_)),
+            "ordinary write errors stay retryable"
+        );
+    }
+
+    #[test]
+    fn disk_full_mid_download_fails_fast() {
+        // The m2 shape end to end: a 3 MiB tmpfs and an 8 MiB
+        // download — preallocation (sparse set_len) succeeds,
+        // the writes start failing ENOSPC mid-download. The old
+        // code looped on those blocks for minutes; the download
+        // must now error within seconds, naming the disk.
+        // Needs mount privileges (root); skips where it cannot
+        // mount rather than failing for the wrong reason.
+        let dir = std::env::temp_dir().join(format!("ndm-full-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mounted = std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=3M", "tmpfs"])
+            .arg(&dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !mounted {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let body = pattern_body(8 * 1024 * 1024);
+        let port = het_range_server(body, 0);
+        let url = format!("http://127.0.0.1:{port}/big.bin");
+        let out = dir.join("big.bin");
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(30));
+        let elapsed = t0.elapsed();
+        let err = dl.progress().error.unwrap_or_default();
+        let _ = std::process::Command::new("umount").arg(&dir).status();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(st, Some(Status::Error), "status: {:?}", dl.status());
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "disk-full must surface in seconds, not minutes (took {elapsed:?})"
+        );
+        assert!(
+            err.contains("The disk is full"),
+            "the error must name the disk: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_connection_aggregates_per_connection_caps() {
+        // 2.3.1 (bug 10 audit): against a server that caps every
+        // single connection, the engine must (a) open its
+        // connection set promptly at start — not trickle them
+        // in — and (b) aggregate the caps: N connections finish
+        // in a small fraction of the one-connection time, bytes
+        // exact.
+        let body = pattern_body(3 * 1024 * 1024);
+        let (port, conns) = per_conn_cap_server(body.clone());
+        let url = format!("http://127.0.0.1:{port}/iso.bin");
+        let dir = std::env::temp_dir();
+
+        // one connection: ~3 MiB at ~512 KB/s ≈ 6 s
+        let out1 = dir.join(format!("ndm-cap1-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out1);
+        let _ = std::fs::remove_file(state_path_for(&out1));
+        let t0 = Instant::now();
+        let dl = start(&url, &out1, 1, 256 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        let single = t0.elapsed();
+        assert_eq!(st, Some(Status::Finished));
+        assert_eq!(std::fs::read(&out1).unwrap(), body);
+
+        // eight connections: the set opens promptly and the
+        // aggregate rate is a multiple of the single cap
+        let before = conns.load(std::sync::atomic::Ordering::SeqCst);
+        let out8 = dir.join(format!("ndm-cap8-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out8);
+        let _ = std::fs::remove_file(state_path_for(&out8));
+        let t0 = Instant::now();
+        let dl = start(&url, &out8, 8, 256 * 1024).unwrap();
+        let mut prompt_at: Option<Duration> = None;
+        while t0.elapsed() < Duration::from_secs(3) {
+            if conns.load(std::sync::atomic::Ordering::SeqCst) >= before + 6 {
+                prompt_at = Some(t0.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        let multi = t0.elapsed();
+        assert_eq!(st, Some(Status::Finished));
+        assert_eq!(std::fs::read(&out8).unwrap(), body);
+        assert!(
+            prompt_at.is_some_and(|d| d < Duration::from_millis(1500)),
+            "the connection set must open promptly (saw {prompt_at:?})"
+        );
+        assert!(
+            multi * 2 < single,
+            "8 connections ({multi:?}) must at least halve the 1-connection time ({single:?})"
+        );
+        let _ = std::fs::remove_file(&out1);
+        let _ = std::fs::remove_file(&out8);
     }
 
     #[test]

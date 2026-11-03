@@ -110,6 +110,11 @@
     // consumers mark those with a "~" instead of claiming exact.
     let bestAudioApprox = false;
     let bestM4aApprox = false;
+    // The best M4A format OBJECT: the audio stream every video
+    // option pairs with (2.3.1 item 14 — the options carry the
+    // page's own stream URLs, so the app's download can start
+    // from this data without any resolver run).
+    let bestM4aFormat = null;
 
     for (const f of allFormats) {
       const mime = (f.mimeType || '').toLowerCase();
@@ -127,6 +132,7 @@
         bestM4aBytes = est;
         bestM4aKbps = kbps;
         bestM4aApprox = cl <= 0;
+        bestM4aFormat = f;
       }
     }
     if (bestAudioBytes === 0 && duration > 0) {
@@ -164,6 +170,7 @@
           hasBundledAudio,
           fps,
           score,
+          format: f,
         });
       }
     }
@@ -190,7 +197,7 @@
       const noteParts = ['MP4'];
       if (sizeText) noteParts.push(sizeText);
 
-      options.push({
+      const opt = {
         selector: `bv*[height<=${h}][ext=mp4]+ba[ext=m4a]/b[height<=${h}][ext=mp4]/bv*[height<=${h}]+ba/b[height<=${h}]/b`,
         label,
         ext: 'mp4',
@@ -202,7 +209,42 @@
           (item.vApprox || (!item.hasBundledAudio && bestM4aApprox)),
         audio: false,
         height: h,
-      });
+      };
+      // 2.3.1 (item 14, browser-primary): carry the page's OWN
+      // stream URLs for this quality — the same formats the
+      // sizes above were computed from. A format whose response
+      // entry has no direct URL (signatureCipher only) cannot
+      // be handed over; the option then simply has no streams
+      // and the app's yt-dlp fallback serves it, as before.
+      const vf = item.format;
+      if (vf && typeof vf.url === 'string' && /^https:\/\//.test(vf.url)) {
+        const vStream = {
+          url: vf.url,
+          mimeType: (vf.mimeType || '').split(';')[0].trim(),
+          qualityLabel: `${h}p`,
+          hasAudio: item.hasBundledAudio,
+          hasVideo: true,
+        };
+        if (item.hasBundledAudio) {
+          opt.streams = [vStream];
+        } else if (
+          bestM4aFormat &&
+          typeof bestM4aFormat.url === 'string' &&
+          /^https:\/\//.test(bestM4aFormat.url)
+        ) {
+          opt.streams = [
+            vStream,
+            {
+              url: bestM4aFormat.url,
+              mimeType: (bestM4aFormat.mimeType || '').split(';')[0].trim(),
+              qualityLabel: '',
+              hasAudio: true,
+              hasVideo: false,
+            },
+          ];
+        }
+      }
+      options.push(opt);
     }
 
     // Both audio rows are m4a-first selectors (ba[ext=m4a]/…), so

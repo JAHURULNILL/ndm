@@ -1250,9 +1250,13 @@ pub struct Preresolved {
 /// page URL, the effective selector, the audio flag, the site login,
 /// a hash of its password (m-6: the login NAME alone used to key it,
 /// so a corrected password kept being served the resolution the wrong
-/// one produced), the proxy, and a hash of the cookie file's BYTES
-/// (a re-login or a refreshed session changes the bytes, so it can
-/// never be served a resolution made under the old cookies). A cached
+/// one produced), the proxy, and the canonical signature of the
+/// cookie file's cookie SET (a re-login or a refreshed session
+/// changes values, so it can never be served a resolution made
+/// under the old cookies — but a mere reordering of the same set
+/// between two captures of one session must NOT change the key:
+/// the picker's warm capture and the click's capture are two
+/// reads of one jar, see cookie_text_signature). A cached
 /// resolution can therefore only be wrong if the STREAM URL itself
 /// died inside the TTL window — and that case is already handled: the
 /// engine's start or stream error path falls back to the yt-dlp
@@ -1306,6 +1310,39 @@ fn password_signature(password: &str) -> u64 {
 /// flyout-open warm resolve (see warm_resolution).
 const RESOLUTION_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 const RESOLUTION_CACHE_CAP: usize = 64;
+/// 2.3.1 stall recovery (bugs 2+3): an engine attempt whose
+/// combined downloaded bytes have not advanced for this long is
+/// wedged — throttled connections dribble too slowly to trip
+/// the engine's own 30 s pool policy (any byte refreshes it),
+/// so the video job runs its own tighter clock and recovers in
+/// place instead of abandoning the transfer.
+const VIDEO_STALL_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
+/// The least combined progress over one stall window that
+/// still counts as a living transfer (~2.7 KB/s): a throttled
+/// stream's dribble stays under it, a slow-but-real one clears
+/// it.
+const VIDEO_STALL_MIN_ADVANCE: u64 = 32 * 1024;
+/// Recovery attempts per engine run: fresh connections, fresh
+/// connections again, then one re-resolve of the stream URLs.
+/// Consecutive BARREN recovery attempts tolerated before the
+/// job falls back to yt-dlp (attempts that gain real bytes do
+/// not spend this budget — see the attempt loop).
+const MAX_VIDEO_RECOVERIES: u32 = 3;
+
+/// How one engine attempt ended (see poll_engine_attempt).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EngineAttempt {
+    /// Every stream finished; the merge may begin.
+    Finished,
+    /// Advance stayed under the floor for a whole
+    /// VIDEO_STALL_WINDOW mid-transfer (throttle dribble).
+    Stalled,
+    /// A stream reported a terminal engine error.
+    Errored,
+    /// The job was stopped (pause/cancel/newer generation):
+    /// the caller must not touch progress further.
+    Stopped,
+}
 /// Wall-clock bound for one resolve: the picker probe already
 /// budgets 45 s for yt-dlp to read a page, and a challenged resolve
 /// must not hold a job in "starting" past that same budget.
@@ -1315,19 +1352,19 @@ static RESOLUTION_CACHE: Mutex<Vec<(ResolutionKey, Instant, Resolution)>> =
     Mutex::new(Vec::new());
 
 /// Content signature of the cookie file a resolution was made with:
-/// FNV-1a over its bytes. No file and an unreadable file get distinct
-/// sentinels so neither can alias a real (or empty) file's hash.
+/// the CANONICAL signature of its text (see
+/// ndm::video_probe::cookie_text_signature) — the warm resolve and
+/// the Download click capture the same browser session into
+/// different files whose byte order can differ, and the cache key
+/// must see them as the same session. No file and an unreadable
+/// file get distinct sentinels so neither can alias a real (or
+/// empty) file's hash.
 fn cookies_signature(cookies: Option<&Path>) -> u64 {
     let Some(p) = cookies else { return 0 };
     let Ok(bytes) = std::fs::read(p) else {
         return u64::MAX;
     };
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    ndm::video_probe::cookie_text_signature(&String::from_utf8_lossy(&bytes))
 }
 
 fn resolution_cache_get(key: &ResolutionKey, now: Instant) -> Option<Resolution> {
@@ -1346,6 +1383,16 @@ fn resolution_cache_store(key: ResolutionKey, res: Resolution, now: Instant) {
     while cache.len() > RESOLUTION_CACHE_CAP {
         cache.remove(0);
     }
+}
+
+/// Drop one cached resolution: stall recovery's last resort
+/// re-resolves the stream URLs, and the cache would otherwise
+/// hand back the very URLs that just wedged (2.3.1 bugs 2+3).
+fn resolution_cache_evict(key: &ResolutionKey) {
+    RESOLUTION_CACHE
+        .lock()
+        .unwrap()
+        .retain(|(k, _, _)| k != key);
 }
 
 /// Keys with a resolve run currently in flight, plus the condvar
@@ -2376,174 +2423,177 @@ impl VideoJob {
         // reports an acodec); a pair where both streams carry audio
         // (a combined stream plus a separate track) treats the first
         // as primary. A single stream keeps the full count, and
-        // 3+-stream sets (exotic) keep the old even split.
-        let primary = streams.iter().position(|s| !s.has_audio).unwrap_or(0);
-        let stream_conn = |i: usize| -> usize {
-            if streams.len() == 2 {
-                let (video_conn, audio_conn) = ndm::video_pair_connections(max_conn);
-                if i == primary {
-                    video_conn
-                } else {
-                    audio_conn
-                }
-            } else if streams.len() > 1 {
-                (max_conn / streams.len()).max(1)
-            } else {
-                max_conn
-            }
-        };
+        // 3+-stream sets (exotic) keep the old even split. The split
+        // itself is computed inside the attempt loop below, because a
+        // stall recovery's re-resolve can change the stream set.
 
+        // 2.3.1 stall recovery (bugs 2+3): a throttled CDN stream
+        // (googlevideo-class) decays to ~0 B/s and then sits there
+        // — every connection alive, no error, no bytes. The old
+        // shape waited for the engine's own 30 s no-progress
+        // verdict, then abandoned the engine for the yt-dlp
+        // fallback, whose single stream throttled the same way;
+        // the entry cycled "Probing connection…" for hours at
+        // 12% (the user's recording). The attempt loop instead
+        // recovers IN PLACE: cancel the wedged streams (parts and
+        // their resume state stay on disk), restart them from the
+        // downloaded offset on fresh connections, and — when
+        // fresh connections alone do not revive the transfer —
+        // re-resolve the stream URLs once and continue from the
+        // same offset. The cap counts BARREN attempts only (ones
+        // that gained almost nothing): a recovery that moves
+        // real bytes is the medicine working, not a failure to
+        // ration — a per-connection throttle can need several.
+        // Only a job that stops gaining falls back to yt-dlp,
+        // as before.
         let mut part_paths: Vec<PathBuf> = Vec::new();
-        let mut dls: Vec<Arc<ndm::Download>> = Vec::new();
-        for (i, st) in streams.iter().enumerate() {
-            let part = self
-                .dir
-                .join(format!(".{stem}.ndm_stream{i}.{}.part", st.ext));
-            let auth = ndm::Auth {
-                cookie: st.cookie.clone(),
-                referer: st.referer.clone(),
-                authorization: None,
+        let mut streams = streams;
+        let mut barren = 0u32;
+        'attempts: loop {
+            // the connection split is recomputed per attempt: a
+            // re-resolve can change the stream set under us
+            let primary = streams.iter().position(|s| !s.has_audio).unwrap_or(0);
+            let stream_conn = |i: usize| -> usize {
+                if streams.len() == 2 {
+                    let (video_conn, audio_conn) = ndm::video_pair_connections(max_conn);
+                    if i == primary {
+                        video_conn
+                    } else {
+                        audio_conn
+                    }
+                } else if streams.len() > 1 {
+                    (max_conn / streams.len()).max(1)
+                } else {
+                    max_conn
+                }
             };
-            match ndm::start_with_auth(&st.url, &part, stream_conn(i), ndm::DEFAULT_BLOCK, auth) {
-                Ok(dl) => {
-                    let lim = self.limit();
-                    if lim > 0 {
-                        dl.set_limit(lim);
+            let mut dls: Vec<Arc<ndm::Download>> = Vec::new();
+            part_paths.clear();
+            for (i, st) in streams.iter().enumerate() {
+                let part = self
+                    .dir
+                    .join(format!(".{stem}.ndm_stream{i}.{}.part", st.ext));
+                let auth = ndm::Auth {
+                    cookie: st.cookie.clone(),
+                    referer: st.referer.clone(),
+                    authorization: None,
+                };
+                match ndm::start_with_auth(&st.url, &part, stream_conn(i), ndm::DEFAULT_BLOCK, auth) {
+                    Ok(dl) => {
+                        let lim = self.limit();
+                        if lim > 0 {
+                            dl.set_limit(lim);
+                        }
+                        part_paths.push(part);
+                        dls.push(dl);
                     }
-                    part_paths.push(part);
-                    dls.push(dl);
+                    Err(_) => {
+                        for d in &dls {
+                            d.control.cancel();
+                        }
+                        // KEEP the part files and their resume state: a
+                        // stream that failed to START must not destroy the
+                        // bytes the other stream already fetched — a retry
+                        // resumes them instead of restarting from byte 0
+                        // (only a user cancel deletes partials).
+                        self.active_downloads.lock().unwrap().clear();
+                        return false;
+                    }
                 }
-                Err(_) => {
+            }
+
+            *self.active_downloads.lock().unwrap() = dls.clone();
+            let attempt_start_done = self.progress.lock().unwrap().done;
+            let outcome = self.poll_engine_attempt(&dls, my_gen, attempt_start_done);
+            match outcome {
+                EngineAttempt::Finished => break 'attempts,
+                EngineAttempt::Stopped => return true,
+                EngineAttempt::Errored | EngineAttempt::Stalled => {
+                    let done_now = self.progress.lock().unwrap().done;
+                    // An error before ANY byte moved is a start
+                    // failure, not a stall: the yt-dlp fallback
+                    // stays the fast answer, exactly as before.
+                    if outcome == EngineAttempt::Errored && done_now == 0 {
+                        self.active_downloads.lock().unwrap().clear();
+                        return false;
+                    }
+                    // barren accounting: an attempt that gained
+                    // real bytes resets the count; only nearly
+                    // motionless attempts spend it
+                    if done_now.saturating_sub(attempt_start_done) >= VIDEO_STALL_MIN_ADVANCE * 4 {
+                        barren = 0;
+                    } else {
+                        barren += 1;
+                    }
+                    if barren > MAX_VIDEO_RECOVERIES {
+                        self.active_downloads.lock().unwrap().clear();
+                        return false; // Fall back to yt-dlp
+                    }
+                    // Errored streams point at dead URLs more
+                    // than throttled ones: re-resolve on the
+                    // error path and once stalls turn barren;
+                    // plain stalls first retry the same URLs on
+                    // fresh connections (a new connection is what
+                    // a per-connection throttle resets on).
+                    let reresolve = outcome == EngineAttempt::Errored || barren >= 2;
                     for d in &dls {
                         d.control.cancel();
                     }
-                    // KEEP the part files and their resume state: a
-                    // stream that failed to START must not destroy the
-                    // bytes the other stream already fetched — a retry
-                    // resumes them instead of restarting from byte 0
-                    // (only a user cancel deletes partials).
-                    return false;
-                }
-            }
-        }
-
-        *self.active_downloads.lock().unwrap() = dls.clone();
-
-        // Poll parallel multi-connection progress until all streams finish
-        loop {
-            if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
-                for d in &dls {
-                    d.control.cancel();
-                }
-                return true;
-            }
-            if let Some(flag) = self.stop_flag.lock().unwrap().clone() {
-                if flag == "cancelled" {
-                    for d in &dls {
-                        d.control.cancel();
+                    self.active_downloads.lock().unwrap().clear();
+                    // The cancelled streams must fully SETTLE
+                    // before the restart reopens the same part
+                    // files: the engine's one-writer guard is
+                    // released by the supervisor only after the
+                    // final state save, and a worker wedged on a
+                    // silent socket can take the engine's own
+                    // watchdog horizon (~30 s) to die. Restarting
+                    // earlier does not fail soft — the new start
+                    // is REFUSED ("another download is already
+                    // writing") and the whole engine path dies
+                    // into the fallback. So wait the horizon
+                    // out; "resuming" (set just above the wait)
+                    // is the honest status meanwhile — a job that
+                    // already HAS bytes is resuming, never
+                    // "probing" again (bug 3). A job whose streams
+                    // still have not settled by then gives up to
+                    // the fallback instead of starting into the
+                    // guard.
+                    {
+                        let mut p = self.progress.lock().unwrap();
+                        if p.status != "paused" {
+                            p.status = "resuming".to_string();
+                            p.speed_bps = 0.0;
+                            p.conns = 0;
+                        }
                     }
-                    // the part files and their resume state are
-                    // KEPT: plain list removal preserves partials
-                    // on BOTH engines (parity with the yt-dlp path),
-                    // and deleting them is exclusive to the discard
-                    // flow in main.rs, which sweeps .ndm_stream*
-                    // when the user explicitly discards
-                    let mut p = self.progress.lock().unwrap();
-                    p.status = "cancelled".to_string();
-                    p.speed_bps = 0.0;
-                    p.conns = 0;
-                    return true;
-                }
-            }
-
-            let mut total_sum = 0u64;
-            let mut done_sum = 0u64;
-            let mut speed_sum = 0.0f64;
-            let mut conns_sum = 0usize;
-            let mut all_finished = true;
-            let mut any_error = false;
-            let mut any_paused = false;
-            // A1: the total may lock only when EVERY part has
-            // reported a probed total — a part that has not probed
-            // yet reports 0 and vetoes the lock
-            let mut all_totals_known = !dls.is_empty();
-
-            for d in &dls {
-                let pr = d.progress();
-                if pr.total == 0 {
-                    all_totals_known = false;
-                }
-                total_sum = total_sum.saturating_add(pr.total);
-                done_sum = done_sum.saturating_add(pr.done_bytes);
-                if pr.status == ndm::Status::Downloading {
-                    speed_sum += pr.speed_bps;
-                    conns_sum = conns_sum.saturating_add(pr.conns);
-                }
-                match pr.status {
-                    ndm::Status::Finished => {}
-                    ndm::Status::Paused => {
-                        all_finished = false;
-                        any_paused = true;
+                    let settle_deadline = Instant::now() + std::time::Duration::from_secs(35);
+                    while !dls.iter().all(|d| d.is_settled()) {
+                        if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+                            || self.stop_flag.lock().unwrap().is_some()
+                        {
+                            return true;
+                        }
+                        if Instant::now() >= settle_deadline {
+                            self.active_downloads.lock().unwrap().clear();
+                            return false; // Fall back to yt-dlp
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                    ndm::Status::Error | ndm::Status::Cancelled => {
-                        all_finished = false;
-                        any_error = true;
+                    if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+                        || self.stop_flag.lock().unwrap().is_some()
+                    {
+                        return true;
                     }
-                    ndm::Status::Downloading => {
-                        all_finished = false;
+                    if reresolve && self.preresolved.is_none() {
+                        resolution_cache_evict(&self.resolution_key(sel));
+                        match self.resolve_direct_streams(ytdlp, components_dir, sel) {
+                            Some((_, fresh)) => streams = fresh,
+                            None => return false, // Fall back to yt-dlp
+                        }
                     }
+                    // loop: restart every stream from its offset
                 }
             }
-
-            {
-                let mut p = self.progress.lock().unwrap();
-                // A1: once every part has probed, the total is the
-                // parts' sum — set ONCE and locked. Before the lock
-                // the total keeps its hint value instead of jumping
-                // with each part that happens to report early; after
-                // it, per-part sum drift can never move it again.
-                if !p.total_locked && all_totals_known && total_sum > 0 {
-                    p.total = total_sum;
-                    p.total_locked = true;
-                }
-                if done_sum != p.done {
-                    p.last_progress_at = Instant::now();
-                }
-                p.done = done_sum;
-                p.speed_bps = if any_paused { 0.0 } else { speed_sum };
-                p.conns = if any_paused || all_finished {
-                    0
-                } else {
-                    conns_sum.max(1)
-                };
-                p.status = if any_paused {
-                    "paused".to_string()
-                } else if done_sum > 0 || p.total_locked {
-                    // bytes are moving — or every stream has
-                    // reported in (probed), which ends "starting"
-                    // even before the first byte lands
-                    "downloading".to_string()
-                } else {
-                    "starting".to_string()
-                };
-            }
-
-            if any_error {
-                for d in &dls {
-                    d.control.cancel();
-                }
-                // KEEP part files + resume state (see above): the
-                // yt-dlp fallback uses different file names, so the
-                // engine partials cost nothing to keep and a later
-                // retry resumes instead of re-downloading gigabytes.
-                self.active_downloads.lock().unwrap().clear();
-                return false; // Fall back to yt-dlp
-            }
-
-            if all_finished {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(120));
         }
 
         self.active_downloads.lock().unwrap().clear();
@@ -2846,6 +2896,167 @@ impl VideoJob {
             }
         } else {
             false
+        }
+    }
+
+    /// Poll one engine attempt's streams until they all finish,
+    /// a stream errors, the job is stopped — or the transfer
+    /// stalls (2.3.1 bugs 2+3): the combined advance over a
+    /// VIDEO_STALL_WINDOW stays under VIDEO_STALL_MIN_ADVANCE.
+    /// A pure zero-advance test is not enough: a throttled
+    /// googlevideo connection DRIBBLES (the field recording sat
+    /// at ~0.8 KB/s), and any dribble would reset a zero-test
+    /// forever while the ETA reads hours. The floor (~2.7 KB/s)
+    /// sits far below any healthy stream and far above the
+    /// throttle's drip. The aggregate progress bookkeeping is
+    /// the pre-2.3.1 poll loop's, unchanged; only the exits are
+    /// named now, so the caller (run_parallel_engine's attempt
+    /// loop) can recover a stalled attempt in place instead of
+    /// dropping to the yt-dlp fallback at the first wedge.
+    fn poll_engine_attempt(
+        &self,
+        dls: &[Arc<ndm::Download>],
+        my_gen: u64,
+        resume_from: u64,
+    ) -> EngineAttempt {
+        let mut mark_done = 0u64;
+        let mut mark_at = Instant::now();
+        loop {
+            if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                for d in dls {
+                    d.control.cancel();
+                }
+                return EngineAttempt::Stopped;
+            }
+            if let Some(flag) = self.stop_flag.lock().unwrap().clone() {
+                if flag == "cancelled" {
+                    for d in dls {
+                        d.control.cancel();
+                    }
+                    // the part files and their resume state are
+                    // KEPT: plain list removal preserves partials
+                    // on BOTH engines (parity with the yt-dlp path),
+                    // and deleting them is exclusive to the discard
+                    // flow in main.rs, which sweeps .ndm_stream*
+                    // when the user explicitly discards
+                    let mut p = self.progress.lock().unwrap();
+                    p.status = "cancelled".to_string();
+                    p.speed_bps = 0.0;
+                    p.conns = 0;
+                    return EngineAttempt::Stopped;
+                }
+            }
+
+            let mut total_sum = 0u64;
+            let mut done_sum = 0u64;
+            let mut speed_sum = 0.0f64;
+            let mut conns_sum = 0usize;
+            let mut all_finished = true;
+            let mut any_error = false;
+            let mut any_paused = false;
+            // A1: the total may lock only when EVERY part has
+            // reported a probed total — a part that has not probed
+            // yet reports 0 and vetoes the lock
+            let mut all_totals_known = !dls.is_empty();
+
+            for d in dls {
+                let pr = d.progress();
+                if pr.total == 0 {
+                    all_totals_known = false;
+                }
+                total_sum = total_sum.saturating_add(pr.total);
+                done_sum = done_sum.saturating_add(pr.done_bytes);
+                if pr.status == ndm::Status::Downloading {
+                    speed_sum += pr.speed_bps;
+                    conns_sum = conns_sum.saturating_add(pr.conns);
+                }
+                match pr.status {
+                    ndm::Status::Finished => {}
+                    ndm::Status::Paused => {
+                        all_finished = false;
+                        any_paused = true;
+                    }
+                    ndm::Status::Error | ndm::Status::Cancelled => {
+                        all_finished = false;
+                        any_error = true;
+                    }
+                    ndm::Status::Downloading => {
+                        all_finished = false;
+                    }
+                }
+            }
+
+            // (the stall window is judged at the bottom of the
+            // loop from this mark — see there)
+
+            {
+                let mut p = self.progress.lock().unwrap();
+                // A1: once every part has probed, the total is the
+                // parts' sum — set ONCE and locked. Before the lock
+                // the total keeps its hint value instead of jumping
+                // with each part that happens to report early; after
+                // it, per-part sum drift can never move it again.
+                if !p.total_locked && all_totals_known && total_sum > 0 {
+                    p.total = total_sum;
+                    p.total_locked = true;
+                }
+                if done_sum != p.done {
+                    p.last_progress_at = Instant::now();
+                }
+                p.done = done_sum;
+                p.speed_bps = if any_paused { 0.0 } else { speed_sum };
+                p.conns = if any_paused || all_finished {
+                    0
+                } else {
+                    conns_sum.max(1)
+                };
+                p.status = if any_paused {
+                    "paused".to_string()
+                } else if resume_from > 0 && done_sum <= resume_from && p.status == "resuming" {
+                    // a recovery attempt stays "resuming" until
+                    // NEW bytes land past the offset it resumed
+                    // from — flipping to "downloading" on the
+                    // resumed total alone would lie about data
+                    // moving again (bug 3's honest status)
+                    "resuming".to_string()
+                } else if done_sum > 0 || p.total_locked {
+                    // bytes are moving — or every stream has
+                    // reported in (probed), which ends "starting"
+                    // even before the first byte lands
+                    "downloading".to_string()
+                } else {
+                    "starting".to_string()
+                };
+            }
+
+            if any_error {
+                for d in dls {
+                    d.control.cancel();
+                }
+                // KEEP part files + resume state (see above): the
+                // yt-dlp fallback uses different file names, so the
+                // engine partials cost nothing to keep and a later
+                // retry resumes instead of re-downloading gigabytes.
+                return EngineAttempt::Errored;
+            }
+
+            if all_finished {
+                return EngineAttempt::Finished;
+            }
+
+            // The stall verdict comes last: a paused job is
+            // waiting on the user, not the network, and a
+            // finished one has already returned above. The mark
+            // rolls forward one window at a time; a window whose
+            // advance stayed under the floor is a stall.
+            if mark_at.elapsed() >= VIDEO_STALL_WINDOW {
+                if !any_paused && done_sum.saturating_sub(mark_done) < VIDEO_STALL_MIN_ADVANCE {
+                    return EngineAttempt::Stalled;
+                }
+                mark_done = done_sum;
+                mark_at = Instant::now();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(120));
         }
     }
 
@@ -3844,10 +4055,13 @@ impl VideoJob {
         // "starting" included (A2): a pause that lands while the
         // job is still resolving has no downloads and no child to
         // observe the stop — without the flip here the entry would
-        // sit in "starting" after its thread has gone. ("merging"
-        // is deliberately absent: the merge finalize sees the stop
-        // flag itself and publishes the pause with its kept merge.)
-        if p.status == "downloading" || p.status == "starting" {
+        // sit in "starting" after its thread has gone. "resuming"
+        // (2.3.1 stall recovery) is the same shape: the pause can
+        // land in the gap between attempts, when no stream is
+        // active either. ("merging" is deliberately absent: the
+        // merge finalize sees the stop flag itself and publishes
+        // the pause with its kept merge.)
+        if p.status == "downloading" || p.status == "starting" || p.status == "resuming" {
             p.status = "paused".to_string();
             p.speed_bps = 0.0;
             p.conns = 0;
@@ -4324,6 +4538,311 @@ mod tests {
             cookies_signature(Some(&a))
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cookies_signature_ignores_export_order() {
+        // 2.3.1 (bug 1): the picker's warm and the job's resolve
+        // snapshot the browser's cookies in two separate exports
+        // whose line order is not guaranteed. The signature must
+        // be over the cookie SET, or the warmed resolution is
+        // invisible to the job and Download re-probes from zero.
+        let dir = std::env::temp_dir().join(format!("ndm-cksig2-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let l1 = ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\talpha";
+        let l2 = ".youtube.com\tTRUE\t/\tTRUE\t1893456000\tHSID\tbeta";
+        let l3 = "#HttpOnly_.google.com\tTRUE\t/\tTRUE\t1893456000\tNID\tgamma";
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        let c = dir.join("c.txt");
+        std::fs::write(&a, format!("# Netscape HTTP Cookie File\n{l1}\n{l2}\n{l3}\n")).unwrap();
+        std::fs::write(&b, format!("{l3}\n{l1}\n{l2}\n")).unwrap();
+        // same set, one value changed → a different login state
+        std::fs::write(&c, format!("{l1}\n{l2}\n")).unwrap();
+        assert_eq!(
+            cookies_signature(Some(&a)),
+            cookies_signature(Some(&b)),
+            "same cookie set in another order must sign the same"
+        );
+        assert_ne!(cookies_signature(Some(&a)), cookies_signature(Some(&c)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warmed_resolution_is_visible_to_the_job_key() {
+        // 2.3.1 (bug 1), the picker→job bridge end to end at the
+        // cache layer: a resolution stored under the key the
+        // WARM path computes must be found by the key the JOB
+        // path computes when both sides sign the same cookie set
+        // exported in different orders.
+        let dir = std::env::temp_dir().join(format!("ndm-warmkey-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let a = dir.join("warm.txt");
+        let b = dir.join("job.txt");
+        std::fs::write(&a, ".x.com\tTRUE\t/\tTRUE\t1893456000\tA\t1\n.x.com\tTRUE\t/\tTRUE\t1893456000\tB\t2\n").unwrap();
+        std::fs::write(&b, ".x.com\tTRUE\t/\tTRUE\t1893456000\tB\t2\n.x.com\tTRUE\t/\tTRUE\t1893456000\tA\t1\n").unwrap();
+        let url = format!("https://example.com/watch?v=warm{}", std::process::id());
+        let key_with = |cookies: &Path| ResolutionKey {
+            url: url.clone(),
+            sel: "bv*+ba".to_string(),
+            audio: false,
+            login: String::new(),
+            password_sig: password_signature(""),
+            cookies_sig: cookies_signature(Some(cookies)),
+            proxy: ndm::global_proxy(),
+        };
+        let warm_key = key_with(&a);
+        let job_key = key_with(&b);
+        assert!(warm_key == job_key, "both paths must compute the same key");
+        resolution_cache_store(warm_key, test_resolution(), Instant::now());
+        assert!(
+            resolution_cache_get(&job_key, Instant::now()).is_some(),
+            "the job must find the warmed resolution — no second probe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One throttle-mimic connection. While the throttle
+    /// window is open it serves a small fast budget and then
+    /// goes SILENT holding the socket open — the googlevideo
+    /// shape from the field recording (connections neither
+    /// deliver nor die). After the window, connections serve
+    /// at full speed, as a revived route does after the job
+    /// re-connects / re-resolves.
+    fn throttle_conn(
+        mut sock: std::net::TcpStream,
+        payload: Arc<Vec<u8>>,
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+        throttle_until: Instant,
+    ) {
+        use std::io::{Read, Write};
+        conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            match sock.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let total = payload.len() as u64;
+        let (start, end, partial) = if let Some(line) =
+            head.lines().find(|l| l.to_ascii_lowercase().starts_with("range:"))
+        {
+            let spec = line.split('=').nth(1).unwrap_or("").trim();
+            let mut it = spec.splitn(2, '-');
+            let a: u64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let b: u64 = it
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(total - 1);
+            (a, b.min(total - 1), true)
+        } else {
+            (0, total - 1, false)
+        };
+        let is_head = head.starts_with("HEAD");
+        let len = end - start + 1;
+        let headers = if partial {
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            )
+        };
+        if sock.write_all(headers.as_bytes()).is_err() || is_head {
+            return;
+        }
+        const BUDGET: u64 = 64 * 1024;
+        let body = &payload[start as usize..=end as usize];
+        if Instant::now() >= throttle_until {
+            let _ = sock.write_all(body);
+            return;
+        }
+        let fast = (len.min(BUDGET)) as usize;
+        if sock.write_all(&body[..fast]).is_err() {
+            return;
+        }
+        // the throttle's silence: hold the socket, send nothing
+        // more, until the client gives up and closes (which is
+        // the recovery working) — the read detects the close
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(120)));
+        let mut sink = [0u8; 1024];
+        loop {
+            match sock.read(&mut sink) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn stall_recovery_resumes_and_completes() {
+        // 2.3.1 (bugs 2+3): a preresolved job whose streams all
+        // decay into the throttle dribble must recover in place
+        // — fresh connections from the downloaded offset, status
+        // "resuming", no yt-dlp fallback, no full re-probe — and
+        // land byte-exact. Before the fix this shape froze at
+        // ~12% and cycled "Probing connection..." for hours.
+        // The fixture must be a REAL mp4: the job's finish line
+        // remuxes the downloaded stream with ffmpeg (audio is
+        // normalized to AAC), so random bytes would fail the
+        // merge, not the download. Generated with the ffmpeg the
+        // product itself requires; skipped when it is absent.
+        let gen_dir = std::env::temp_dir().join(format!("ndm-stallgen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gen_dir);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        let src = gen_dir.join("src.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "7", "-vf", "noise=alls=70:allf=t",
+                "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "6M",
+                "-c:a", "aac", "-shortest",
+            ])
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("ffmpeg unavailable — stall fixture skipped");
+            let _ = std::fs::remove_dir_all(&gen_dir);
+            return;
+        }
+        let payload = Arc::new(std::fs::read(&src).unwrap());
+        assert!(payload.len() > 4 * 1024 * 1024, "fixture too small: {}", payload.len());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // the throttle window: long enough for the job's first
+        // attempt to wedge and its stall verdict to fire (one
+        // full window to drain the budgets, one to judge the
+        // silence), short enough to keep the test quick
+        let throttle_until = Instant::now() + std::time::Duration::from_secs(20);
+        {
+            let payload = payload.clone();
+            let conns = conns.clone();
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    match sock {
+                        Ok(s) => {
+                            let p = payload.clone();
+                            let c = conns.clone();
+                            std::thread::spawn(move || throttle_conn(s, p, c, throttle_until));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        let url = format!("http://127.0.0.1:{port}/videoplayback");
+        let dir = std::env::temp_dir().join(format!("ndm-stall-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let comp = dir.join("comp");
+        std::fs::create_dir_all(&comp).unwrap();
+
+        let job = VideoJob::start_with_preresolved(
+            &url,
+            &dir,
+            "bv",
+            false,
+            "stall fixture",
+            None,
+            "",
+            "",
+            &comp,
+            payload.len() as u64,
+            0.0,
+            None,
+            Preresolved {
+                title: "stall fixture".to_string(),
+                streams: vec![PreresolvedStream {
+                    url: url.clone(),
+                    ext: "mp4".to_string(),
+                    has_audio: true,
+                    cookie: None,
+                    referer: None,
+                }],
+                expect_audio: true,
+            },
+        )
+        .expect("job must start");
+
+        let mut saw_resuming = false;
+        let mut last_dbg = String::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(240);
+        let final_status = loop {
+            let (status, done) = {
+                let p = job.progress.lock().unwrap();
+                (p.status.clone(), p.done)
+            };
+            let dbg = format!("{status}@{done}");
+            if dbg != last_dbg {
+                last_dbg = dbg;
+            }
+            if status == "resuming" {
+                saw_resuming = true;
+            }
+            if status == "finished" || status == "error" || status == "cancelled" {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "job wedged in {status} at {done} bytes — the stall loop is back"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let err_text = job.progress.lock().unwrap().error.clone();
+        assert_eq!(final_status, "finished", "job error: {err_text:?}");
+        assert!(saw_resuming, "a recovery must surface as 'resuming'");
+        let final_path = job
+            .progress
+            .lock()
+            .unwrap()
+            .final_path
+            .clone()
+            .expect("finished job records its file");
+        // The finish line remuxes (audio normalized to AAC), so
+        // the final container legitimately differs from the
+        // served bytes: what must hold is that every downloaded
+        // byte arrived (progress done == served total, asserted
+        // by the finish itself) and the output is a real,
+        // playable mp4 of the same magnitude.
+        let out_len = std::fs::metadata(&final_path).unwrap().len();
+        assert!(
+            out_len > payload.len() as u64 / 2 && out_len < payload.len() as u64 * 2,
+            "remuxed size {out_len} vs served {}",
+            payload.len()
+        );
+        let probe = std::process::Command::new("ffmpeg")
+            .args(["-i"])
+            .arg(&final_path)
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&probe.stderr);
+        assert!(info.contains("Video:"), "final file has no video stream: {info}");
+        assert!(info.contains("Audio:"), "final file has no audio stream: {info}");
+        assert!(
+            conns.load(std::sync::atomic::Ordering::SeqCst) >= 4,
+            "recovery must open fresh connections"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&gen_dir);
     }
 
     #[test]
@@ -5067,6 +5586,30 @@ At least one output file must be specified";
             expect_size: 0,
             expect_duration: 0.0,
         }
+    }
+
+    #[test]
+    fn pause_during_probing_and_recovery_parks_the_job() {
+        // 2.3.1 (bug 4): Pause must work while the job is still
+        // resolving ("starting" — the field recording's Probing
+        // state, where the dialog's Pause button was disabled)
+        // and in the stall-recovery gap ("resuming", no streams
+        // active): the stop flag is set for the resolve/runner
+        // to discard its result, and the status flips at once.
+        let job = bare_job();
+        job.progress.lock().unwrap().status = "starting".to_string();
+        job.pause();
+        assert_eq!(job.progress.lock().unwrap().status, "paused");
+        assert_eq!(
+            job.stop_flag.lock().unwrap().as_deref(),
+            Some("paused"),
+            "the in-flight resolve must be told to discard"
+        );
+        let job = bare_job();
+        job.progress.lock().unwrap().status = "resuming".to_string();
+        job.pause();
+        assert_eq!(job.progress.lock().unwrap().status, "paused");
+        assert_eq!(job.stop_flag.lock().unwrap().as_deref(), Some("paused"));
     }
 
     #[test]

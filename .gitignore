@@ -11,3 +11,7 @@ ndm-*-linux-x86_64
 *.part
 /downloads/
 .pkg-tmp/
+core/target/
+shell-gtk/target/
+shell-win/target/
+.tmp/

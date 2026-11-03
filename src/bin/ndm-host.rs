@@ -804,6 +804,11 @@ fn captured_queue_object(message: &Value) -> Result<Value, String> {
         "pageUrl": page_url,
         "title": title,
         "streams": streams,
+        // 2.3.1 (item 14): the browser picker's page-data send
+        // stores the set WITHOUT opening the app's picker on
+        // top of the browser flow — the download send that
+        // follows names the chosen group itself.
+        "storeOnly": message.get("storeOnly").and_then(Value::as_bool).unwrap_or(false),
     }))
 }
 
@@ -892,6 +897,20 @@ fn handle_download(message: &Value) -> Value {
         let later = message.get("later").and_then(Value::as_bool).unwrap_or(false);
         let total = message.get("total").and_then(Value::as_u64).unwrap_or(0);
         let force = message.get("force").and_then(Value::as_bool).unwrap_or(false);
+        // 2.3.1 (item 14, browser-primary): a picker send may
+        // name the page-data group it chose (`ndmcap:<16 hex>`,
+        // the capture door's selector shape). Forwarded as-is;
+        // the app re-derives the group from its stored set and
+        // only honours a key that matches a live group — a
+        // stale or forged key simply keeps the yt-dlp selector.
+        if kind == "video_direct" {
+            if let Some(cap) = message.get("capSelector").and_then(Value::as_str) {
+                let hex = cap.strip_prefix("ndmcap:").unwrap_or("");
+                if hex.len() == 16 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                    obj["capSelector"] = json!(cap);
+                }
+            }
+        }
         obj["selector"] = json!(selector);
         obj["dir"] = json!(dir);
         obj["audio"] = json!(audio);

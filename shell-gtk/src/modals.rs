@@ -97,6 +97,13 @@ fn note_label(text: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.set_xalign(0.0);
     l.set_line_wrap(true);
+    // A wrapping label still reports its UNWRAPPED line as its
+    // natural width, and the window grows to fit it — one signed
+    // CDN address (thousands of chars) blew this dialog wider
+    // than the screen (2.3.1 field bug). Capping the width in
+    // characters bounds the natural width, so the wrap actually
+    // happens inside the dialog's own width.
+    l.set_max_width_chars(64);
     l
 }
 
@@ -202,6 +209,8 @@ fn show_complete_one(parent: &gtk::ApplicationWindow, ctx: Ctx, p: &serde_json::
         gtk::glib::markup_escape_text(name)
     ));
     title.set_xalign(0.0);
+    title.set_line_wrap(true);
+    title.set_max_width_chars(64);
     body.pack_start(&title, false, false, 0);
     let url = p.get("url").and_then(|x| x.as_str()).unwrap_or("");
     if !url.is_empty() {
@@ -246,6 +255,8 @@ fn show_complete_summary(parent: &gtk::ApplicationWindow, ctx: Ctx, batch: &[ser
     let title = gtk::Label::new(None);
     title.set_markup(&format!("<b>{} downloads completed</b>", batch.len()));
     title.set_xalign(0.0);
+    title.set_line_wrap(true);
+    title.set_max_width_chars(64);
     body.pack_start(&title, false, false, 0);
     let mut names: Vec<String> = batch
         .iter()

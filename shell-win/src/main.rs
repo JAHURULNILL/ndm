@@ -68,7 +68,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     GetCursorPos, GetMessageW, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
     SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage, ASFW_ANY,
-    MB_OK, MINMAXINFO, MSG, SW_RESTORE, SW_SHOW,
+    IDYES, MB_ICONQUESTION, MB_OK, MB_YESNO, MINMAXINFO, MSG, SW_RESTORE, SW_SHOW,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY,
     WM_DROPFILES, WM_GETMINMAXINFO, WM_NOTIFY, WM_SIZE,
 };
@@ -1704,7 +1704,7 @@ fn cmd_delete(hwnd: HWND, ids: Vec<String>) {
     let Some(delete_file) = show_delete_confirm(hwnd, &ids) else {
         return;
     };
-    let results = ndm_core::remove_downloads(c, ids, Some(delete_file));
+    let results = ndm_core::remove_downloads(c.clone(), ids, Some(delete_file));
     let failed: Vec<String> = results
         .iter()
         .filter(|r| r.get("ok").and_then(|x| x.as_bool()) != Some(true))
@@ -1718,6 +1718,37 @@ fn cmd_delete(hwnd: HWND, ids: Vec<String>) {
         set_status(1, "Deleted");
     } else {
         set_status(1, &format!("Some entries could not be deleted: {}", failed.join("; ")));
+        // 2.3.1 (item 11, mirrored from the GTK flow): no traps —
+        // a file that could not be deleted must not make its
+        // entry undeletable. Offer list-only removal in the
+        // dialog flow; the file stays on disk, said plainly.
+        if delete_file {
+            let failed_ids: Vec<String> = results
+                .iter()
+                .filter(|r| r.get("ok").and_then(|x| x.as_bool()) != Some(true))
+                .filter_map(|r| r.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()))
+                .collect();
+            if !failed_ids.is_empty() {
+                let text = format!(
+                    "{}\n\nRemove from the list anyway? The file stays on disk.",
+                    failed.join("; ")
+                );
+                let text_buf = winui::wide(&text);
+                let title_buf = winui::wide("File could not be deleted");
+                let yes = unsafe {
+                    MessageBoxW(
+                        Some(hwnd),
+                        winui::pcw(&text_buf),
+                        winui::pcw(&title_buf),
+                        MB_YESNO | MB_ICONQUESTION,
+                    )
+                } == IDYES;
+                if yes {
+                    let _ = ndm_core::remove_downloads(c, failed_ids, Some(false));
+                    set_status(1, "Deleted");
+                }
+            }
+        }
     }
     refresh_list();
 }

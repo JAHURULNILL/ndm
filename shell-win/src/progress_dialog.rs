@@ -708,7 +708,10 @@ fn title_for(view: &ProgressView) -> String {
 fn button_states(status: &str) -> (bool, bool, bool) {
     match status {
         "downloading" => (false, true, true),
-        "starting" => (false, false, true),
+        // Pause stays live during the resolve ("starting") and
+        // stall-recovery ("resuming") phases, mirroring the GTK
+        // matrix — core parks the job in both (2.3.1 bug 4).
+        "starting" | "resuming" => (false, true, true),
         "queued" | "paused" => (true, false, true),
         "error" | "cancelled" => (true, false, false),
         _ => (false, false, false), // merging, finished, anything else

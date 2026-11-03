@@ -1233,6 +1233,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return false;
   }
 
+  if (message.action === 'ndm-capture-store') {
+    // 2.3.1 (item 14, browser-primary): the picker extracted
+    // the page's OWN stream data (YouTube's player response)
+    // and is about to send its download naming one group of
+    // it. Store the set in the app FIRST (storeOnly: no app
+    // picker opens — the browser flow owns the screen), so
+    // the download's start finds its streams waiting and
+    // never resolves through yt-dlp.
+    const pageUrl = message.pageUrl || (sender.tab && sender.tab.url) || '';
+    const streams = Array.isArray(message.streams) ? message.streams.slice(0, 32) : [];
+    if (!/^https?:\/\//.test(pageUrl) || !streams.length) {
+      sendResponse({ ok: false, error: 'Nothing to store.' });
+      return false;
+    }
+    (async () => {
+      const cookies = await captureCookies(pageUrl, pageUrl);
+      const res = await sendCapturedNative({
+        type: 'captured_streams',
+        pageUrl,
+        title: message.title || '',
+        streams,
+        cookies,
+        storeOnly: true,
+        ext_version: chrome.runtime.getManifest().version,
+      });
+      sendResponse(res);
+    })();
+    return true;
+  }
+
   if (message.action === 'ndm-send-captured') {
     // The popup's capture click: hand this tab's captured set to
     // the app (which stores it and opens the picker). This is
@@ -1559,6 +1589,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         payload.selector = message.selector || '';
         payload.audio = !!message.audio;
         payload.force = !!message.force;
+      }
+      // 2.3.1 (item 14): the page-data group the picker chose,
+      // when its options came from the page itself. The host
+      // validates the shape; the app honours it only against
+      // its stored set.
+      if (kind === 'video_direct' && typeof message.capSelector === 'string') {
+        payload.capSelector = message.capSelector;
       }
       // 'file' is the in-page "Download Later" kind (E1): its
       // dir/later/total are the user's actual choices, so they

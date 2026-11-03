@@ -347,11 +347,106 @@
     return `${pre}${r} sec`;
   }
 
+  /* A bare site name is NOT a title (2.3.1 item 13): on a
+     Facebook feed, document.title is literally "Facebook", and
+     the picker's name field defaulted to that — the file would
+     have been saved as "Facebook.mp4" while the post's own
+     caption sat right there on the page. */
+  const BARE_SITE_NAMES = new Set([
+    'facebook', 'youtube', 'instagram', 'tiktok', 'vimeo',
+    'dailymotion', 'x', 'twitter', 'twitch', 'reddit', 'bilibili',
+  ]);
+
   function cleanPageTitle() {
-    return (document.title || 'video')
+    const t = (document.title || '')
       .replace(/^\(\d+\)\s*/, '')
       .replace(/\s*[-|•]\s*(YouTube|Facebook|Instagram|TikTok|Vimeo|Dailymotion|X|Twitch).*$/i, '')
-      .trim() || 'video';
+      .trim();
+    if (!t || BARE_SITE_NAMES.has(t.toLowerCase())) return '';
+    return t;
+  }
+
+  /* The post caption for the video the user clicked — the
+     text the author wrote above it. Facebook puts it in a
+     message block inside the same article container as the
+     player; the selectors are tried most-specific first, with
+     a tolerant dir="auto" text scan as the fallback. Returns
+     '' when nothing readable is found. */
+  function postCaptionText(videoEl) {
+    try {
+      if (!videoEl || !videoEl.closest) return '';
+      const container = videoEl.closest(
+        '[data-testid*="post" i], [role="article"], article'
+      );
+      if (!container) return '';
+      const clean = s =>
+        String(s || '').replace(/\s+/g, ' ').trim();
+      for (const sel of [
+        '[data-testid="post_message"]',
+        '[data-ad-preview="message"]',
+        '[data-ad-comet-preview="message"]',
+      ]) {
+        const el = container.querySelector(sel);
+        const t = clean(el && el.textContent);
+        if (t.length >= 4) return t;
+      }
+      // the caption is the first substantial text block in the
+      // post (before the player in reading order); comments and
+      // reaction counts come later and are shorter or numeric
+      for (const el of container.querySelectorAll('div[dir="auto"]')) {
+        if (el.contains(videoEl)) continue;
+        const t = clean(el.textContent);
+        if (t.length >= 10 && /[A-Za-z\u0980-\u09FF]/.test(t)) return t;
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  /* The picker's default file name, best source first
+     (2.3.1 item 13): post caption → og:title → page title →
+     "<Site> video <id>". A bare site name or bare domain can
+     never be the answer at any step. */
+  function pageVideoTitle(videoEl, targetUrl) {
+    const tidy = s => {
+      let t = String(s || '').replace(/\s+/g, ' ').trim();
+      if (t.length > 140) {
+        const cut = t.slice(0, 140);
+        const sp = cut.lastIndexOf(' ');
+        t = (sp > 40 ? cut.slice(0, sp) : cut).trim();
+      }
+      return t;
+    };
+    const notBare = t =>
+      t && !BARE_SITE_NAMES.has(t.toLowerCase()) ? t : '';
+    const caption = tidy(postCaptionText(videoEl));
+    if (caption) return caption;
+    try {
+      const og = document.querySelector(
+        'meta[property="og:title"], meta[name="twitter:title"]'
+      );
+      const ogT = notBare(tidy(og && og.getAttribute('content')));
+      if (ogT) return ogT;
+    } catch (e) {}
+    const pageT = notBare(tidy(cleanPageTitle()));
+    if (pageT) return pageT;
+    // last resort: name the SITE and the video id — honest
+    // about what it is, and unique per video
+    let site = 'Video';
+    let id = '';
+    try {
+      const u = new URL(targetUrl || location.href);
+      const h = u.hostname.replace(/^www\./, '');
+      if (h.includes('facebook')) site = 'Facebook video';
+      else if (h.includes('instagram')) site = 'Instagram video';
+      else if (h.includes('tiktok')) site = 'TikTok video';
+      else if (h.includes('youtube') || h === 'youtu.be') site = 'YouTube video';
+      const m =
+        u.pathname.match(/\/(?:videos|reel|shorts)\/(\d+|[A-Za-z0-9_-]+)/) ||
+        u.searchParams.get('v');
+      if (Array.isArray(m)) id = m[1] || '';
+      else if (typeof m === 'string') id = m;
+    } catch (e) {}
+    return id ? `${site} ${id}` : site;
   }
 
   /* Ensure panelHost is attached inside fullscreenElement when the player enters
@@ -544,6 +639,21 @@
         const id = u.pathname.slice(1).split(/[/?#]/)[0];
         if (id) return `https://www.youtube.com/watch?v=${id}`;
       }
+      if (/(^|\.)facebook\.com$/.test(u.hostname) || u.hostname === 'fb.watch') {
+        // 2.3.1 (item 12): ONE canonical shape per Facebook
+        // video, whatever the feed/share URL looked like — a
+        // page permalink (/SomePage/videos/<id>/), a watch URL
+        // (?v=<id>) and a reel all name the same video, and the
+        // resolver gets its best-supported form instead of a
+        // tracking-laden feed URL. Reels keep their own shape:
+        // they are a separate extractor path.
+        const vm = u.pathname.match(/\/videos\/(\d+)/);
+        const vParam = u.searchParams.get('v');
+        const vid = (vm && vm[1]) || (vParam && /^\d+$/.test(vParam) ? vParam : '');
+        if (vid) return `https://www.facebook.com/videos/${vid}`;
+        const rm = u.pathname.match(/\/reel\/(\d+)/);
+        if (rm) return `https://www.facebook.com/reel/${rm[1]}`;
+      }
       return u.href;
     } catch (e) {
       return urlStr || location.href;
@@ -566,6 +676,51 @@
     return '';
   }
 
+  /* 2.3.1 (item 14): the capture door's group key, mirrored —
+     FNV-1a over the group's stream URLs in order (core
+     capture::group_key). The app re-derives it from the stored
+     set; both sides hashing the same streams the same way is
+     what lets a picker send name its group without any index
+     ever being exchanged. BigInt keeps the 64-bit math exact. */
+  function captureGroupKey(streams) {
+    let h = 0xcbf29ce484222325n;
+    const prime = 0x100000001b3n;
+    const mask = 0xffffffffffffffffn;
+    const enc = new TextEncoder();
+    for (const s of streams) {
+      for (const b of enc.encode(String((s && s.url) || ''))) {
+        h ^= BigInt(b);
+        h = (h * prime) & mask;
+      }
+      h ^= 0xffn;
+      h = (h * prime) & mask;
+    }
+    return 'ndmcap:' + h.toString(16).padStart(16, '0');
+  }
+
+  /* The page-data streams riding on one picker option,
+     sanitized for the wire (shape the host also enforces):
+     1–2 streams, https URLs, bounded strings, real flags. */
+  function sanitizeOptionStreams(raw) {
+    if (!Array.isArray(raw) || !raw.length || raw.length > 2) return null;
+    const out = [];
+    for (const s of raw) {
+      if (!s || typeof s !== 'object') return null;
+      if (typeof s.url !== 'string' || !/^https:\/\//.test(s.url) || s.url.length > 8192) {
+        return null;
+      }
+      out.push({
+        url: s.url,
+        mimeType: typeof s.mimeType === 'string' ? s.mimeType.slice(0, 128) : '',
+        qualityLabel: typeof s.qualityLabel === 'string' ? s.qualityLabel.slice(0, 64) : '',
+        hasAudio: !!s.hasAudio,
+        hasVideo: !!s.hasVideo,
+      });
+    }
+    if (!out.some(s => s.hasAudio || s.hasVideo)) return null;
+    return out;
+  }
+
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || e.data.source !== 'ndm-page-hook') return;
     if (e.data.type === 'ndm-player-info' && e.data.info) {
@@ -585,6 +740,17 @@
         if (!opt || typeof opt !== 'object') continue;
         if (typeof opt.selector !== 'string' || !SAFE_SELECTOR_RE.test(opt.selector)) continue;
         if (typeof opt.ext !== 'string' || !/^[a-zA-Z0-9]{2,5}$/.test(opt.ext)) continue;
+        // Page-data streams (item 14): keep them only if they
+        // sanitize, and name their group. An option without
+        // streams stays on the yt-dlp fallback untouched.
+        const streams = sanitizeOptionStreams(opt.streams);
+        if (streams) {
+          opt.streams = streams;
+          opt.capSelector = captureGroupKey(streams);
+        } else {
+          delete opt.streams;
+          delete opt.capSelector;
+        }
         validOptions.push(opt);
       }
       if (!validOptions.length) return;
@@ -602,6 +768,41 @@
   function requestMainWorldPlayerInfo() {
     try {
       window.postMessage({ source: 'ndm-content', type: 'ndm-request-player-info' }, '*');
+    } catch (e) {}
+  }
+
+  /* 2.3.1 (item 14, browser-primary): before a picker send
+     that names a page-data group, hand the page's whole stream
+     set to the app (store-only). The set lives in the probe
+     cache — the page-hook info that populated this picker.
+     Best-effort and memoised per set: if the store fails, the
+     send still goes out and the app simply falls back to its
+     yt-dlp selector, exactly the approved fallback order. */
+  let pageStreamsStoredKey = '';
+  async function ensurePageStreamsStored(targetUrl, title) {
+    try {
+      const info = probeCacheGet(canonicalVideoKey(targetUrl), true);
+      const opts = (info && (info.options || info.qualities)) || [];
+      const seen = new Set();
+      const streams = [];
+      for (const o of opts) {
+        for (const s of (o && o.streams) || []) {
+          if (!seen.has(s.url)) {
+            seen.add(s.url);
+            streams.push(s);
+          }
+        }
+      }
+      if (!streams.length) return;
+      const key = `${targetUrl}|${streams.length}|${streams[0].url}`;
+      if (pageStreamsStoredKey === key) return;
+      pageStreamsStoredKey = key;
+      await chrome.runtime.sendMessage({
+        action: 'ndm-capture-store',
+        pageUrl: targetUrl,
+        title: title || (info && info.title) || '',
+        streams,
+      });
     } catch (e) {}
   }
 
@@ -642,7 +843,22 @@
         throw err;
       });
     inFlightProbes.set(flightKey, p);
-    return p;
+    if (warm) return p;
+    // 2.3.1 (item 12): the picker gets a HARD deadline. The
+    // native probe is itself capped (host 45 s, background
+    // 50 s), but a reply can still be lost on the way (an MV3
+    // service-worker restart mid-probe settles nothing), and
+    // the field recording showed the picker spinning for a
+    // whole 77 s video with no way out. At 20 s the picker
+    // fails honestly instead; the probe itself keeps running
+    // underneath and its late result still lands in the cache
+    // above, so a second click is usually instant.
+    return Promise.race([
+      p,
+      new Promise(resolve =>
+        setTimeout(() => resolve({ ok: false, error: 'ndm-picker-timeout' }), 20000)
+      ),
+    ]);
   }
 
   async function backgroundPreProbe() {
@@ -751,6 +967,25 @@
     return '';
   }
 
+  /* The picker's probe-failure status line, shared by the
+     modal and the flyout: plain language, what happened, and
+     what the user can do next. The 20 s deadline's marker gets
+     the site-aware remedy — for Facebook the capture route
+     needs the video to have played, which is the one action
+     that actually unblocks it. */
+  function probeFailMessage(errText) {
+    if (String(errText || '') === 'ndm-picker-timeout') {
+      if (/(^|\.)facebook\.com$/.test(location.hostname)) {
+        return 'Facebook took too long to answer. Press Play on the video, then try again — or pick the automatic quality below.';
+      }
+      return 'Reading this video took too long. Try again in a moment — or pick the automatic quality below.';
+    }
+    const plain = plainErrorText(errText);
+    return plain
+      ? `${plain} — automatic quality is still available below.`
+      : 'Could not read exact formats — automatic quality is still available below.';
+  }
+
   // Used only when probing produced no format list at all (the
   // same two automatic choices the old dialog fell back to).
   const DEFAULT_QUALITIES = [
@@ -830,7 +1065,7 @@
     const currentAnchor = explicitUrl ? null : (srcAnchor || anchor || pickAnchor());
     const rawTargetUrl = explicitUrl || (await resolveVideoUrl(currentAnchor));
     const targetUrl = canonicalVideoKey(rawTargetUrl);
-    const fallbackTitle = cleanPageTitle();
+    const fallbackTitle = pageVideoTitle(currentAnchor, targetUrl);
     const fallbackThumb = guessFallbackThumbnail(targetUrl, currentAnchor);
 
     let savedDir = '~/Downloads';
@@ -847,7 +1082,7 @@
     const isAudio = !!(currentAnchor && currentAnchor.tagName === 'AUDIO');
 
     const backdrop = document.createElement('div');
-    backdrop.className = 'ndm-modal-backdrop ndm-vp-backdrop';
+    backdrop.className = 'ndm-modal-backdrop ndm-glass-backdrop';
     for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'dblclick']) {
       backdrop.addEventListener(evt, e => e.stopPropagation());
     }
@@ -857,7 +1092,7 @@
     });
 
     const dialog = document.createElement('div');
-    dialog.className = 'ndm-modal ndm-vp';
+    dialog.className = 'ndm-modal ndm-glass';
     dialog.innerHTML = `
       <div class="ndm-m-head">
         <div class="ndm-m-brand">
@@ -1113,8 +1348,12 @@
         dupeEntryId = null;
         btnStart.textContent = 'Download';
         btnCancel.textContent = 'Cancel';
-        setStatus('Select a quality, then Download', false);
       }
+      // The hint must follow the selection (2.3.1 bug 7a): the
+      // standing "Select a quality, then Download" text stayed
+      // on screen even after a row was picked, reading as if
+      // nothing had been chosen.
+      setStatus(`${q.label || 'Quality'} selected — press Download`, false);
     }
 
     let warmSentFor = ''; // target URL the warm resolve was fired for
@@ -1131,8 +1370,8 @@
     function warmResolve(list) {
       if (warmSentFor === targetUrl) return;
       const items = (list || [])
-        .filter(o => o && typeof o.selector === 'string' && o.selector)
-        .slice(0, 4)
+        .filter(o => o && typeof o.selector === 'string' && o.selector && !o.capSelector)
+        .slice(0, 6)
         .map(o => ({
           selector: o.selector, // the same string the Download send passes
           audio: !!o.audio,     // the same flag its send carries
@@ -1201,13 +1440,7 @@
       // The automatic choices stay available; the failure is a
       // PLAIN-language status only (R3-EXT-05) — raw probe text
       // is tool stderr and never reaches the user.
-      const plain = plainErrorText(errText);
-      setStatus(
-        plain
-          ? `${plain} — automatic quality is still available below.`
-          : 'Could not read exact formats — automatic quality is still available below.',
-        false
-      );
+      setStatus(probeFailMessage(errText), false);
     }
 
     /* One entry-progress poll, the same channel the flyout's
@@ -1309,6 +1542,14 @@
       } catch (e) {}
       let res;
       try {
+        // Item 14: a page-data quality starts from the page's
+        // own streams — store the set, then name its group.
+        if (q.capSelector) {
+          await ensurePageStreamsStored(
+            targetUrl,
+            titleIn.value.trim() || probedTitle || fallbackTitle
+          );
+        }
         const resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
           kind: 'video_direct',
@@ -1316,6 +1557,7 @@
           pageUrl: location.href,
           title: titleIn.value.trim() || probedTitle || fallbackTitle,
           selector: q.selector,
+          capSelector: q.capSelector || undefined,
           audio: !!q.audio,
           dir: chosenDir,
           later: false,
@@ -1465,7 +1707,7 @@
     const rawTargetUrl =
       handoff && handoff.url ? handoff.url : await resolveVideoUrl(currentAnchor);
     const targetUrl = canonicalVideoKey(rawTargetUrl);
-    const fallbackTitle = cleanPageTitle();
+    const fallbackTitle = pageVideoTitle(currentAnchor, targetUrl);
 
     let savedDir = '~/Downloads';
     try {
@@ -1831,6 +2073,10 @@
        on open, on probe completion, or on selection changes. */
     async function startQuality(q, force) {
       try {
+        // Item 14: same page-data handoff as the modal's send.
+        if (q.capSelector) {
+          await ensurePageStreamsStored(targetUrl, probedTitle || fallbackTitle);
+        }
         const resp = await chrome.runtime.sendMessage({
           action: 'ndm-download',
           kind: 'video_direct',
@@ -1838,6 +2084,7 @@
           pageUrl: location.href,
           title: probedTitle || fallbackTitle,
           selector: q.selector,
+          capSelector: q.capSelector || undefined,
           audio: !!q.audio,
           dir: savedDir,
           later: false,
@@ -3262,8 +3509,8 @@
     function warmResolve() {
       if (warmSentFor === targetUrl) return;
       const items = qualities
-        .filter(o => o && typeof o.selector === 'string' && o.selector)
-        .slice(0, 4)
+        .filter(o => o && typeof o.selector === 'string' && o.selector && !o.capSelector)
+        .slice(0, 6)
         .map(o => ({
           selector: o.selector, // the same string the row's click passes
           audio: !!o.audio,     // the same flag its click sends
@@ -3333,12 +3580,7 @@
       // verbatim.
       renderList();
       settleProbe();
-      const plain = plainErrorText(errText);
-      showNote(
-        plain
-          ? `${plain} — automatic quality is still available below.`
-          : 'Could not read exact formats — automatic quality is still available below.'
-      );
+      showNote(probeFailMessage(errText));
       footEl.style.display = 'flex';
     }
 
@@ -3471,7 +3713,8 @@
   }
 
   /* ---------------------------------------------------------------- */
-  /* In-Browser IDM Download File Info Modal (.iso, .zip, .exe, etc.) */
+  /* In-Browser file card (.iso, .zip, .exe, etc.) — the glass
+     card shared with the video picker (2.3.1, bug 8). */
   /* ---------------------------------------------------------------- */
 
   /* E2: hand an already-started FILE entry to the flyout's
@@ -3577,46 +3820,54 @@
     }
 
     const backdrop = document.createElement('div');
-    backdrop.className = 'ndm-modal-backdrop';
+    backdrop.className = 'ndm-modal-backdrop ndm-glass-backdrop';
     for (const evt of ['mousedown', 'pointerdown', 'mouseup', 'click', 'dblclick', 'keydown', 'keyup']) {
       backdrop.addEventListener(evt, e => e.stopPropagation());
     }
 
+    /* 2.3.1 (bug 8): the file card IS the picker's card — same
+       glass finish (.ndm-glass), same structure (preview block
+       with the editable name, folder row, status line) and at
+       most three actions. The old flat "Download File Info"
+       form and its fourth "Open in NDM App" button are gone:
+       the user's standing rule is ONE card design everywhere. */
     const dialog = document.createElement('div');
-    dialog.className = 'ndm-modal';
+    dialog.className = 'ndm-modal ndm-glass';
+    let hostLabel = '';
+    try { hostLabel = new URL(targetUrl).hostname; } catch (e) {}
     dialog.innerHTML = `
       <div class="ndm-m-head">
         <div class="ndm-m-brand">
           <span class="ndm-m-logo">⬇</span>
-          <span>Download File Info — NDM</span>
+          <span>Download with NDM</span>
         </div>
         <button class="ndm-m-x" type="button" title="Close">×</button>
       </div>
       <div class="ndm-m-body">
-        <div class="ndm-m-folder-row">
-          <label class="ndm-m-lbl">URL</label>
-          <input class="ndm-m-input ndm-f-url" type="text" readonly />
-        </div>
-        <div class="ndm-m-folder-row">
-          <label class="ndm-m-lbl">Category</label>
-          <div><span class="ndm-q-badge video ndm-f-cat">${escapeHtml(currentCat)}</span></div>
-        </div>
-        <div class="ndm-m-folder-row">
-          <label class="ndm-m-lbl">Save to folder</label>
-          <input class="ndm-m-input ndm-f-dir" type="text" placeholder="~/Downloads" />
-        </div>
-        <div class="ndm-m-folder-row">
-          <label class="ndm-m-lbl">File name</label>
-          <input class="ndm-m-input ndm-f-name" type="text" spellcheck="false" />
+        <div class="ndm-m-preview">
+          <div class="ndm-m-thumb-wrap">
+            <div class="ndm-m-thumb-ph">📄</div>
+          </div>
+          <div class="ndm-m-meta">
+            <label class="ndm-m-lbl">File Name</label>
+            <input class="ndm-m-input ndm-f-name" type="text" spellcheck="false" />
+            <div class="ndm-m-sub">
+              <span class="ndm-f-host">${escapeHtml(hostLabel)}</span>
+              <span class="ndm-q-badge video ndm-f-cat">${escapeHtml(currentCat)}</span>
+            </div>
+          </div>
         </div>
         <div class="ndm-f-summary">
           <span class="ndm-f-size">${currentBytes > 0 ? escapeHtml(fmtBytes(currentBytes)) : 'Checking size…'}</span>
           <span class="ndm-f-resume">Checking…</span>
         </div>
+        <div class="ndm-m-folder-row">
+          <label class="ndm-m-lbl">Save to folder</label>
+          <input class="ndm-m-input ndm-f-dir" type="text" placeholder="~/Downloads" />
+        </div>
         <div class="ndm-m-status" style="display:none"></div>
       </div>
       <div class="ndm-m-foot">
-        <button class="ndm-btn ndm-btn-ghost ndm-btn-app" type="button" title="Open this download in the NDM desktop app window">Open in NDM App</button>
         <div class="ndm-m-foot-right">
           <button class="ndm-btn ndm-btn-secondary ndm-btn-cancel" type="button">Cancel</button>
           <button class="ndm-btn ndm-btn-secondary ndm-btn-later" type="button">Download Later</button>
@@ -3643,7 +3894,6 @@
     backdrop.tabIndex = -1;
     backdrop.focus();
 
-    const urlIn = dialog.querySelector('.ndm-f-url');
     const catEl = dialog.querySelector('.ndm-f-cat');
     const sizeEl = dialog.querySelector('.ndm-f-size');
     const resumeEl = dialog.querySelector('.ndm-f-resume');
@@ -3652,11 +3902,9 @@
     const statusEl = dialog.querySelector('.ndm-m-status');
     const btnClose = dialog.querySelector('.ndm-m-x');
     const btnCancel = dialog.querySelector('.ndm-btn-cancel');
-    const btnApp = dialog.querySelector('.ndm-btn-app');
     const btnLater = dialog.querySelector('.ndm-btn-later');
     const btnStart = dialog.querySelector('.ndm-btn-start');
 
-    urlIn.value = targetUrl;
     nameIn.value = initialName;
     dirIn.value = savedDir;
 
@@ -3688,32 +3936,6 @@
     activeModalDismiss = dismissDialog;
     backdrop.addEventListener('click', e => {
       if (e.target === backdrop) dismissDialog();
-    });
-
-    btnApp.addEventListener('click', async () => {
-      if (sending || closed) return;
-      btnApp.disabled = true;
-      btnApp.textContent = 'Opening NDM…';
-      try {
-        const resp = await chrome.runtime.sendMessage({
-          action: 'ndm-download',
-          kind: 'file',
-          url: targetUrl,
-          pageUrl: pageReferrer,
-          title: nameIn.value.trim() || initialName,
-        });
-        if (resp && resp.ok) {
-          confirmTakeover();
-          closed = true;
-          closeBrowserModal();
-        } else {
-          btnApp.disabled = false;
-          btnApp.textContent = 'Open in NDM App';
-        }
-      } catch (e) {
-        btnApp.disabled = false;
-        btnApp.textContent = 'Open in NDM App';
-      }
     });
 
     async function triggerFileDownload(later) {
@@ -4151,19 +4373,21 @@
         background: rgba(255,255,255,.65);
       }
 
-      /* ── Video picker modal: Glass Match finish ────────────
-         Every override is scoped under .ndm-vp: the file modal
-         shares the .ndm-m-* shell classes and keeps its own
-         finish untouched. Same language as the app's Glass
-         Light and the flyout concept: frosted white glass, the
-         #1f6fd0 blue story, soft ambient shadow, glass header
-         strip, primary action solid blue. */
-      .ndm-vp-backdrop {
+      /* ── Glass Match finish (video picker AND file card) ───
+         Every override is scoped under .ndm-glass, carried by
+         BOTH in-page cards: the user's standing rule (1 Nov) is
+         ONE card design everywhere — the old flat "Download
+         File Info" finish was abolished (2.3.1, bug 8). Same
+         language as the app's Glass Light and the flyout:
+         frosted white glass, the #1f6fd0 blue story, soft
+         ambient shadow, glass header strip, primary action
+         solid blue. */
+      .ndm-glass-backdrop {
         background: rgba(8, 15, 28, .55);
         -webkit-backdrop-filter: blur(5px);
         backdrop-filter: blur(5px);
       }
-      .ndm-modal.ndm-vp {
+      .ndm-modal.ndm-glass {
         background: linear-gradient(165deg, rgba(255,255,255,.94), rgba(238,246,253,.90));
         -webkit-backdrop-filter: blur(18px) saturate(1.5);
         backdrop-filter: blur(18px) saturate(1.5);
@@ -4175,103 +4399,103 @@
           0 0 44px rgba(64,145,220,.20);
         color: #16283c;
       }
-      .ndm-vp .ndm-m-head {
+      .ndm-glass .ndm-m-head {
         background: linear-gradient(to bottom, rgba(255,255,255,.65), rgba(255,255,255,.12));
         border-bottom: 1px solid rgba(31,111,208,.14);
         color: #14335c;
       }
-      .ndm-vp .ndm-m-logo {
+      .ndm-glass .ndm-m-logo {
         background: linear-gradient(180deg, #3c8be0, #1f6fd0);
         border-radius: 7px;
       }
-      .ndm-vp .ndm-m-x {
+      .ndm-glass .ndm-m-x {
         color: #5b7186; border-radius: 7px;
       }
-      .ndm-vp .ndm-m-x:hover {
+      .ndm-glass .ndm-m-x:hover {
         background: rgba(31,111,208,.12); color: #14335c;
       }
-      .ndm-vp .ndm-m-preview {
+      .ndm-glass .ndm-m-preview {
         background: rgba(255,255,255,.55);
         border: 1px solid rgba(31,111,208,.16);
         border-radius: 12px;
       }
-      .ndm-vp .ndm-m-thumb-wrap {
+      .ndm-glass .ndm-m-thumb-wrap {
         border-radius: 10px;
         border: 1px solid rgba(255,255,255,.7);
         box-shadow: 0 4px 12px rgba(18,44,77,.22);
       }
-      .ndm-vp .ndm-m-lbl { color: #5b7186; }
-      .ndm-vp .ndm-m-input {
+      .ndm-glass .ndm-m-lbl { color: #5b7186; }
+      .ndm-glass .ndm-m-input {
         border: 1px solid rgba(31,111,208,.30); border-radius: 9px;
         background: rgba(255,255,255,.85); color: #16283c;
       }
-      .ndm-vp .ndm-m-input:focus {
+      .ndm-glass .ndm-m-input:focus {
         border-color: #1f6fd0;
         box-shadow: 0 0 0 3px rgba(31,111,208,.25);
       }
-      .ndm-vp .ndm-m-sub { color: #5b7186; }
-      .ndm-vp .ndm-m-qhead { color: #33506e; }
-      .ndm-vp .ndm-m-qlist {
+      .ndm-glass .ndm-m-sub { color: #5b7186; }
+      .ndm-glass .ndm-m-qhead { color: #33506e; }
+      .ndm-glass .ndm-m-qlist {
         background: rgba(255,255,255,.55);
         border: 1px solid rgba(31,111,208,.16);
         border-radius: 12px;
       }
-      .ndm-vp .ndm-q-row {
+      .ndm-glass .ndm-q-row {
         border-bottom: 1px solid rgba(31,111,208,.09);
       }
-      .ndm-vp .ndm-q-row:hover { background: rgba(31,111,208,.07); }
-      .ndm-vp .ndm-q-row.sel {
+      .ndm-glass .ndm-q-row:hover { background: rgba(31,111,208,.07); }
+      .ndm-glass .ndm-q-row.sel {
         background: linear-gradient(180deg, rgba(31,111,208,.16), rgba(31,111,208,.10));
         color: #0f2c52;
       }
-      .ndm-vp .ndm-q-radio { border-color: #8494a7; }
-      .ndm-vp .ndm-q-row.sel .ndm-q-radio { border-color: #1f6fd0; }
-      .ndm-vp .ndm-q-row.sel .ndm-q-radio::after { background: #1f6fd0; }
-      .ndm-vp .ndm-q-badge { border-radius: 6px; }
-      .ndm-vp .ndm-q-badge.video {
+      .ndm-glass .ndm-q-radio { border-color: #8494a7; }
+      .ndm-glass .ndm-q-row.sel .ndm-q-radio { border-color: #1f6fd0; }
+      .ndm-glass .ndm-q-row.sel .ndm-q-radio::after { background: #1f6fd0; }
+      .ndm-glass .ndm-q-badge { border-radius: 6px; }
+      .ndm-glass .ndm-q-badge.video {
         background: rgba(31,111,208,.12); color: #0f4c8c;
         border: 1px solid rgba(31,111,208,.30);
       }
-      .ndm-vp .ndm-q-badge.audio {
+      .ndm-glass .ndm-q-badge.audio {
         background: rgba(245,197,66,.18); color: #8a5a12;
         border: 1px solid rgba(214,164,32,.35);
       }
-      .ndm-vp .ndm-q-label { color: #16283c; }
-      .ndm-vp .ndm-q-note { color: #5b7186; }
-      .ndm-vp .ndm-q-size {
+      .ndm-glass .ndm-q-label { color: #16283c; }
+      .ndm-glass .ndm-q-note { color: #5b7186; }
+      .ndm-glass .ndm-q-size {
         background: rgba(255,255,255,.6); color: #33506e;
         border: 1px solid rgba(31,111,208,.18);
       }
-      .ndm-vp .ndm-q-size.exact {
+      .ndm-glass .ndm-q-size.exact {
         background: rgba(31,111,208,.12); color: #0f4c8c;
         border-color: rgba(31,111,208,.28);
       }
-      .ndm-vp .ndm-q-row.sel .ndm-q-size {
+      .ndm-glass .ndm-q-row.sel .ndm-q-size {
         background: linear-gradient(to bottom, #3c8be0, #1f6fd0);
         color: #fff; border-color: #1e4e96;
       }
-      .ndm-vp .ndm-m-status {
+      .ndm-glass .ndm-m-status {
         background: rgba(31,111,208,.08);
         border: 1px solid rgba(31,111,208,.16);
         color: #33506e; border-radius: 9px;
       }
-      .ndm-vp .ndm-m-status.err {
+      .ndm-glass .ndm-m-status.err {
         background: #fff1f2; border-color: #fecdd3; color: #9f1239;
       }
-      .ndm-vp .ndm-m-foot {
+      .ndm-glass .ndm-m-foot {
         background: linear-gradient(to bottom, rgba(255,255,255,.35), rgba(255,255,255,.10));
         border-top: 1px solid rgba(31,111,208,.14);
         justify-content: flex-end;
       }
-      .ndm-vp .ndm-btn {
+      .ndm-glass .ndm-btn {
         border-radius: 9px; height: 32px; padding: 0 16px;
       }
-      .ndm-vp .ndm-btn-primary {
+      .ndm-glass .ndm-btn-primary {
         background: linear-gradient(to bottom, #3c8be0, #1f6fd0);
         border: 1px solid #1e4e96;
         box-shadow: 0 1px 4px rgba(18,44,77,.18), inset 0 1px 0 rgba(255,255,255,.25);
       }
-      .ndm-vp .ndm-btn-secondary {
+      .ndm-glass .ndm-btn-secondary {
         background: linear-gradient(to bottom, #ffffff, #e9f0f7);
         border: 1px solid rgba(31,111,208,.28); color: #16283c;
         box-shadow: 0 1px 3px rgba(18,44,77,.10);

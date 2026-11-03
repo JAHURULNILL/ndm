@@ -174,11 +174,45 @@ pub fn run_dialog(
     fields: &[FieldSpec],
     ok_label: &str,
 ) -> Option<HashMap<String, FieldValue>> {
+    run_dialog_impl(parent, title, fields, ok_label, true)
+}
+
+/// A read-only information dialog (About, Keyboard Shortcuts):
+/// one dismiss button only. The shared builder's Cancel twin
+/// made no sense there — Cancel and OK did the same thing,
+/// which reads as an unfinished dialog (2.3.1 consistency fix).
+pub fn run_info_dialog(
+    parent: &impl IsA<gtk::Window>,
+    title: &str,
+    fields: &[FieldSpec],
+    ok_label: &str,
+) -> Option<HashMap<String, FieldValue>> {
+    run_dialog_impl(parent, title, fields, ok_label, false)
+}
+
+fn run_dialog_impl(
+    parent: &impl IsA<gtk::Window>,
+    title: &str,
+    fields: &[FieldSpec],
+    ok_label: &str,
+    with_cancel: bool,
+) -> Option<HashMap<String, FieldValue>> {
+    let buttons: Vec<(&str, gtk::ResponseType)> = if with_cancel {
+        vec![
+            (ok_label, gtk::ResponseType::Ok),
+            ("Cancel", gtk::ResponseType::Cancel),
+        ]
+    } else {
+        vec![(ok_label, gtk::ResponseType::Ok)]
+    };
     let dialog = gtk::Dialog::with_buttons(
         Some(title),
         Some(parent),
         gtk::DialogFlags::MODAL | gtk::DialogFlags::DESTROY_WITH_PARENT,
-        &[(ok_label, gtk::ResponseType::Ok), ("Cancel", gtk::ResponseType::Cancel)],
+        &buttons
+            .iter()
+            .map(|(l, r)| (*l, *r))
+            .collect::<Vec<_>>()[..],
     );
     dialog.set_default_response(gtk::ResponseType::Ok);
 
@@ -363,7 +397,7 @@ pub fn about_field_table() -> Vec<FieldSpec> {
 
 /// Show the About dialog (the worked example for `run_dialog`).
 pub fn show_about(parent: &impl IsA<gtk::Window>) {
-    let _ = run_dialog(parent, "About NDM", &about_field_table(), "OK");
+    let _ = run_info_dialog(parent, "About NDM", &about_field_table(), "OK");
 }
 
 /// The generic confirmation (app.js showConfirm / #cfmodal):

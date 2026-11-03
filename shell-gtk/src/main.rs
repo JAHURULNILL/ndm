@@ -26,6 +26,7 @@ mod blockmap;
 mod dialogs;
 mod form;
 mod gtksink;
+mod icons;
 mod modals;
 mod basket;
 mod grabber;
@@ -76,7 +77,8 @@ const COL_TOTAL: u32 = 14; // u64 — raw total bytes
 const COL_SPEED: u32 = 15; // f64 — raw speed B/s
 const COL_ADDED_RAW: u32 = 16; // String — ISO added stamp (hidden sort key)
 const COL_STATUS_RAW: u32 = 17; // String — raw status word (hidden sort key)
-const NCOLS: usize = 18;
+const COL_ICON: u32 = 18; // Pixbuf — per-type row glyph (item 17)
+const NCOLS: usize = 19;
 
 // Category-tree model columns: the row label plus the filter
 // key the selection applies (app.js visibleItems semantics:
@@ -191,6 +193,13 @@ fn status_text(d: &ProgressView) -> String {
                 d.detail.clone()
             }
         }
+        "resuming" => {
+            if d.detail.trim().is_empty() {
+                "Resuming…".to_string()
+            } else {
+                d.detail.clone()
+            }
+        }
         "merging" => "Merging…".to_string(),
         _ if d.total > 0 => format!("{:.2}%", pct_of(d.total, d.done_bytes)),
         s => {
@@ -245,6 +254,10 @@ struct Ui {
     /// The View menu's Drop Basket check item — the basket
     /// window's own close button keeps it in step (basket.rs).
     basket_check: RefCell<Option<gtk::CheckMenuItem>>,
+    /// The category sidebar's scrolled container — the View
+    /// menu's Categories Sidebar toggle shows/hides it (2.3.1:
+    /// the toggle used to be scaffold with no handler at all).
+    cat_pane: RefCell<Option<gtk::ScrolledWindow>>,
 }
 
 /// ETA text for a payload, "~"-marked until credible — the same
@@ -368,6 +381,14 @@ fn apply_progress(ui: &Ui, d: &ProgressView) {
             (COL_SPEED, &d.speed_bps as &dyn gtk::glib::ToValue),
             (COL_ADDED_RAW, &d.added as &dyn gtk::glib::ToValue),
             (COL_STATUS_RAW, &d.status as &dyn gtk::glib::ToValue),
+            (
+                COL_ICON,
+                &icons::pixbuf(
+                    icons::row_icon_name(&d.category, &d.name),
+                    16,
+                    ui.window.scale_factor(),
+                ) as &dyn gtk::glib::ToValue,
+            ),
         ],
     );
     refresh_status_counts(ui);
@@ -1449,20 +1470,22 @@ fn run_delete(ui: &Rc<Ui>, ids: Vec<String>, delete_file: bool) {
     });
     let ui2 = ui.clone();
     rx.attach(None, move |results| {
-        settle_delete(&ui2, &results);
+        settle_delete(&ui2, &results, delete_file);
         gtk::glib::ControlFlow::Break
     });
 }
 
-fn settle_delete(ui: &Rc<Ui>, results: &[serde_json::Value]) {
+fn settle_delete(ui: &Rc<Ui>, results: &[serde_json::Value], delete_file: bool) {
     let mut removed = 0usize;
     let mut failures: Vec<String> = Vec::new();
+    let mut failed_ids: Vec<String> = Vec::new();
     for r in results {
         let id = r.get("id").and_then(|x| x.as_str()).unwrap_or("");
         if r.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
             removed += 1;
             remove_entry_local(ui, id);
         } else {
+            failed_ids.push(id.to_string());
             let name = ui
                 .entries
                 .borrow()
@@ -1499,6 +1522,31 @@ fn settle_delete(ui: &Rc<Ui>, results: &[serde_json::Value]) {
                 if removed == 1 { "" } else { "s" }
             ),
         );
+    }
+    // 2.3.1 (item 11): no traps, ever. When the file deletion
+    // failed, the entry stayed in the list — offer the IDM way
+    // out IN the dialog flow: report the file problem and let
+    // the user remove the entry from the list anyway (the file
+    // itself then stays on disk, which the dialog says plainly).
+    if delete_file && !failed_ids.is_empty() {
+        let text = if failed_ids.len() == 1 {
+            format!(
+                "{}\n\nRemove it from the list anyway? The file stays on disk.",
+                failures[0]
+            )
+        } else {
+            format!(
+                "{} downloads could not delete their files.\n\n{}Remove them from the list anyway? The files stay on disk.",
+                failed_ids.len(),
+                failures[0]
+            )
+        };
+        let fields = [dialogs::FieldSpec::readonly("why", "", &text)];
+        if dialogs::run_dialog(&ui.window, "File could not be deleted", &fields, "Remove anyway")
+            .is_some()
+        {
+            run_delete(ui, failed_ids, false);
+        }
     }
 }
 
@@ -1856,8 +1904,34 @@ fn open_progress_dialog_reveal(ui: &Rc<Ui>, id: &str) {
 }
 
 fn open_progress_dialog_view(ui: &Rc<Ui>, id: &str, minimized: bool, explicit: bool) {
+    open_progress_dialog_view_try(ui, id, minimized, explicit, true);
+}
+
+fn open_progress_dialog_view_try(
+    ui: &Rc<Ui>,
+    id: &str,
+    minimized: bool,
+    explicit: bool,
+    may_retry: bool,
+) {
     let view = ui.entries.borrow().get(id).cloned();
     let Some(view) = view else {
+        if may_retry && !explicit {
+            // Core's start-reveal can beat the shell mirror's
+            // first payload for a just-created entry by one emit
+            // cycle: the entry exists, the mirror just has not
+            // ingested it yet. One short retry instead of a false
+            // "no longer in the list" notice and a lost dialog
+            // (the bug-9 dead-air failure in race form).
+            let (u, id) = (ui.clone(), id.to_string());
+            gtk::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(350),
+                move || {
+                    open_progress_dialog_view_try(&u, &id, minimized, false, false);
+                },
+            );
+            return;
+        }
         set_notice(ui, "That download is no longer in the list");
         return;
     };
@@ -2036,16 +2110,40 @@ fn build_menubar(ui: &Rc<Ui>) -> gtk::MenuBar {
         real_item(menu, "Options", Box::new(move || options::show(&u)));
     });
 
-    // View — the checkable toggles keep their scaffold form
-    // (state display only); Refresh List is real.
+    // View — Dark Theme and Categories Sidebar are REAL
+    // toggles (2.3.1: they shipped as scaffold check items
+    // with no handlers — dead controls that lied to the user).
+    // Both persist in ui-prefs and are applied at startup.
     {
         let root = menu_item("View");
         let menu = gtk::Menu::new();
-        for label in ["Dark Theme", "Categories Sidebar"] {
-            let item = gtk::CheckMenuItem::with_label(label);
-            if label != "Dark Theme" {
-                item.set_active(true);
-            }
+        {
+            let item = gtk::CheckMenuItem::with_label("Dark Theme");
+            item.set_active(prefs::get("ndm-dark-theme")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false));
+            item.connect_toggled(move |it| {
+                let on = it.is_active();
+                if let Some(settings) = gtk::Settings::default() {
+                    settings.set_property("gtk-application-prefer-dark-theme", on);
+                }
+                prefs::set("ndm-dark-theme", serde_json::json!(on));
+            });
+            menu.add(&item);
+        }
+        {
+            let item = gtk::CheckMenuItem::with_label("Categories Sidebar");
+            item.set_active(prefs::get("ndm-sidebar")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true));
+            let u = ui.clone();
+            item.connect_toggled(move |it| {
+                let on = it.is_active();
+                if let Some(pane) = u.cat_pane.borrow().as_ref() {
+                    pane.set_visible(on);
+                }
+                prefs::set("ndm-sidebar", serde_json::json!(on));
+            });
             menu.add(&item);
         }
         {
@@ -2134,19 +2232,30 @@ fn build_toolbar(ui: &Rc<Ui>) -> gtk::Toolbar {
             .borrow_mut()
             .insert(id.to_string(), btn.clone());
     };
-    let add_real = |id: &str, label: &str, f: Box<dyn Fn()>| {
+    let scale = ui.window.scale_factor();
+    let add_real = |id: &str, label: &str, icon: &str, f: Box<dyn Fn()>| {
         let btn = gtk::ToolButton::builder().label(label).build();
+        if let Some(img) = icons::image(icon, 22, scale) {
+            // apply_toolbar marks every button no_show_all (so the
+            // state-restore show_all cannot resurrect a hidden
+            // one) — which also means the window's show_all never
+            // reaches this child. Show it explicitly, or the button
+            // renders label-only (and, in icon-only size, nothing).
+            img.show();
+            btn.set_icon_widget(Some(&img));
+        }
         register(ui, id, &btn);
         btn.connect_clicked(move |_| f());
         bar.add(&btn);
     };
 
     let u = ui.clone();
-    add_real("btnAdd", "Add URL", Box::new(move || open_add_dialog(&u)));
+    add_real("btnAdd", "Add URL", "add", Box::new(move || open_add_dialog(&u)));
     let u = ui.clone();
     add_real(
         "btnResume",
         "Resume",
+        "resume",
         Box::new(move || {
             let ids = selected_ids(&u);
             resume_ids(&u, &ids);
@@ -2156,37 +2265,40 @@ fn build_toolbar(ui: &Rc<Ui>) -> gtk::Toolbar {
     add_real(
         "btnStop",
         "Stop",
+        "stop",
         Box::new(move || {
             let ids = selected_ids(&u);
             pause_ids(&u, &ids);
         }),
     );
     let u = ui.clone();
-    add_real("btnStopAll", "Stop All", Box::new(move || pause_all_downloading(&u)));
+    add_real("btnStopAll", "Stop All", "stop_all", Box::new(move || pause_all_downloading(&u)));
     bar.add(&gtk::SeparatorToolItem::new());
     let u = ui.clone();
     add_real(
         "btnDelete",
         "Delete",
+        "delete",
         Box::new(move || {
             let ids = selected_ids(&u);
             delete_ids(&u, ids);
         }),
     );
     let u = ui.clone();
-    add_real("btnDelDone", "Delete Completed", Box::new(move || delete_completed(&u)));
+    add_real("btnDelDone", "Delete Completed", "delete_completed", Box::new(move || delete_completed(&u)));
     let u = ui.clone();
-    add_real("btnOptions", "Options", Box::new(move || options::show(&u)));
+    add_real("btnOptions", "Options", "options", Box::new(move || options::show(&u)));
     let u = ui.clone();
-    add_real("btnScheduler", "Scheduler", Box::new(move || scheduler::show(&u)));
+    add_real("btnScheduler", "Scheduler", "scheduler", Box::new(move || scheduler::show(&u)));
     let u = ui.clone();
-    add_real("btnStartQueue", "Start Queue", Box::new(move || start_queue_now(&u)));
+    add_real("btnStartQueue", "Start Queue", "queue_start", Box::new(move || start_queue_now(&u)));
     let u = ui.clone();
-    add_real("btnStopQueue", "Stop Queue", Box::new(move || stop_queue_now(&u)));
+    add_real("btnStopQueue", "Stop Queue", "queue_stop", Box::new(move || stop_queue_now(&u)));
     let u = ui.clone();
     add_real(
         "btnGrabber",
         "Grabber",
+        "grabber",
         Box::new(move || grabber::show(u.clone(), None, false)),
     );
     *ui.toolbar.borrow_mut() = Some(bar.clone());
@@ -2419,6 +2531,20 @@ pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
         if c.width > 0 {
             col.set_fixed_width(c.width);
             col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+        }
+        if model_col == COL_NAME {
+            // Per-type row glyph (item 17), packed ahead of the
+            // name text inside the same column — no model or
+            // column-order change.
+            let pix = gtk::CellRendererPixbuf::new();
+            gtk::prelude::CellLayoutExt::pack_start(&col, &pix, false);
+            gtk::prelude::CellLayoutExt::add_attribute(
+                &col,
+                &pix,
+                "pixbuf",
+                COL_ICON as i32,
+            );
+            pix.set_padding(2, 0);
         }
         let cell = gtk::CellRendererText::new();
         if model_col == COL_NAME {
@@ -2909,7 +3035,39 @@ pub(crate) fn app_data_dir() -> PathBuf {
     base.join("com.ndm.downloadmanager")
 }
 
+/// The finish layer (item 17): one accent, calm hover/pressed
+/// states on the toolbar, and a focus ring a keyboard user can
+/// actually see. Deliberately shallow — layout, structure and the
+/// distro theme's own styling are untouched; this only evens out
+/// states the stock theme leaves flat.
+fn install_finish_css() {
+    const CSS: &str = "
+toolbar { padding: 4px 6px; }
+toolbar button { border-radius: 8px; padding: 6px 10px 4px 10px; }
+toolbar button:hover { background-color: alpha(#2f7fd0, 0.10); }
+toolbar button:active { background-color: alpha(#2f7fd0, 0.18); }
+toolbar button:disabled { opacity: 0.45; }
+button:focus, entry:focus, treeview:focus, check:focus, radio:focus {
+  outline-color: alpha(#2f7fd0, 0.55);
+  outline-style: solid;
+  outline-width: 2px;
+  outline-offset: -2px;
+}
+";
+    let provider = gtk::CssProvider::new();
+    if provider.load_from_data(CSS.as_bytes()).is_ok() {
+        if let Some(screen) = gtk::gdk::Screen::default() {
+            gtk::StyleContext::add_provider_for_screen(
+                &screen,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    }
+}
+
 fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot) {
+    install_finish_css();
     let store = gtk::ListStore::new(&[
         gtk::glib::types::Type::STRING, // COL_ID
         gtk::glib::types::Type::STRING, // COL_NAME
@@ -2929,6 +3087,7 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
         gtk::glib::types::Type::F64,    // COL_SPEED
         gtk::glib::types::Type::STRING, // COL_ADDED_RAW
         gtk::glib::types::Type::STRING, // COL_STATUS_RAW
+        gtk::gdk_pixbuf::Pixbuf::static_type(), // COL_ICON
     ]);
     debug_assert_eq!(store.n_columns() as usize, NCOLS);
 
@@ -2972,6 +3131,7 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
         toolbar_buttons: RefCell::new(HashMap::new()),
         col_cfg: RefCell::new(col_cfg),
         basket_check: RefCell::new(None),
+        cat_pane: RefCell::new(None),
     });
     ui.status[0].set_text("No downloads");
     ui.status[2].set_text("Ready");
@@ -3242,6 +3402,22 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
         .build();
     cat_scroll.add(&cat_view);
     cat_scroll.set_size_request(200, -1);
+    *ui.cat_pane.borrow_mut() = Some(cat_scroll.clone());
+    // The persisted sidebar choice is applied at the END of
+    // build_ui, after on_state_restored's show_all: hiding it
+    // here via no_show_all would make show_all skip the whole
+    // subtree and the tree inside would never be shown at all
+    // (the pane would sit allocated but blank).
+    // …and the persisted dark-theme choice (the Settings object
+    // is process-wide, so this also covers later dialogs).
+    if prefs::get("ndm-dark-theme")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        if let Some(settings) = gtk::Settings::default() {
+            settings.set_property("gtk-application-prefer-dark-theme", true);
+        }
+    }
     let list_scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -3290,6 +3466,16 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
     // the window may show now.
     let background = std::env::args().any(|a| a == "--background");
     on_state_restored(&window, background);
+    // The persisted Categories Sidebar choice, applied after
+    // show_all has shown the whole tree (see cat_pane above).
+    if !prefs::get("ndm-sidebar")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
+        if let Some(pane) = ui.cat_pane.borrow().as_ref() {
+            pane.set_visible(false);
+        }
+    }
 }
 
 fn main() {

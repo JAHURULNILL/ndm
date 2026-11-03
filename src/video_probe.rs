@@ -938,8 +938,8 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
     };
     options.push(QualityOption {
         selector: "ba[ext=m4a]/ba/b".into(),
-        label: a_label.into(),
-        ext: a_ext.into(),
+        label: a_label,
+        ext: a_ext,
         note: audio_note,
         size_bytes: audio_bytes,
         size_approx: audio_approx,
@@ -1046,7 +1046,59 @@ fn probe_cookies_signature(cookies: Option<&Path>) -> u64 {
     let Ok(bytes) = std::fs::read(p) else {
         return u64::MAX;
     };
-    fnv1a(&bytes)
+    cookie_text_signature(&String::from_utf8_lossy(&bytes))
+}
+
+/// Canonical signature of a Netscape cookie file's TEXT: the
+/// (domain, path, name, value) tuples, sorted, then hashed.
+///
+/// The raw bytes are NOT a stable identity for "the same browser
+/// session": the extension captures the cookie jar twice for one
+/// download — once for the picker's warm resolve, once for the
+/// Download click — and `chrome.cookies.getAll` does not promise
+/// a stable ordering between the two captures (a cookie the page
+/// re-set in between comes back in a different position). The
+/// byte hash therefore differed between the warm's cache key and
+/// the job's, the warmed resolution was invisible to the job,
+/// and every picker click paid a second full yt-dlp resolve
+/// (2.3.1 start-latency bug: ~17 s of "Probing connection…"
+/// after the picker had JUST probed the same page). Sorting the
+/// tuples makes the signature a function of the cookie SET:
+/// same session, any capture order — same signature; a changed
+/// value (re-login, refreshed session) still changes it.
+pub fn cookie_text_signature(text: &str) -> u64 {
+    let mut tuples: Vec<(&str, &str, &str, &str)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        // "#HttpOnly_" lines ARE cookies (yt-dlp's own parser
+        // strips the prefix); other '#' lines are comments.
+        let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() >= 7 {
+            tuples.push((f[0], f[2], f[5], f[6]));
+        } else {
+            // not a Netscape line: keep the raw content in the
+            // set so ANY content difference still changes the
+            // signature (ordering is normalized by the sort)
+            tuples.push((line, "", "", ""));
+        }
+    }
+    tuples.sort_unstable();
+    let mut buf = String::new();
+    for (d, p, n, v) in tuples {
+        buf.push_str(d);
+        buf.push('\u{1}');
+        buf.push_str(p);
+        buf.push('\u{1}');
+        buf.push_str(n);
+        buf.push('\u{1}');
+        buf.push_str(v);
+        buf.push('\n');
+    }
+    fnv1a(buf.as_bytes())
 }
 
 fn probe_key(url: &str, components_dir: &Path, cookies: Option<&Path>) -> ProbeKey {
@@ -1241,6 +1293,68 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ndm-test-cookies-{name}-{}.txt", std::process::id()));
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn picker_sizes_are_true_totals_of_what_each_row_downloads() {
+        // 2.3.1 (bug 7b audit): the field recording showed 360p
+        // at 10.0 MB ABOVE 480p at 7.4 MB. Two shapes must both
+        // display the TRUE total of the streams the row's own
+        // selector will fetch:
+        let audio = serde_json::json!({
+            "format_id": "140", "ext": "m4a", "vcodec": "none",
+            "acodec": "mp4a.40.2", "filesize": 2_000_000, "protocol": "https"
+        });
+        let size_of = |opts: &[QualityOption], h: u64| {
+            opts.iter()
+                .find(|o| o.height == h)
+                .map(|o| o.size_bytes)
+                .unwrap_or(0)
+        };
+        // Shape A — the field's: 360p exists ONLY as a muxed
+        // format (10 MB complete), 480p only as a video-only
+        // stream (5.4 MB) that pairs with the 2 MB audio. Then
+        // 10.0 > 7.4 on screen is CORRECT: each number is the
+        // full size of the file that row produces.
+        let formats_a = vec![
+            serde_json::json!({
+                "format_id": "18", "ext": "mp4", "height": 360,
+                "vcodec": "avc1.42001E", "acodec": "mp4a.40.2",
+                "filesize": 10_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "format_id": "135", "ext": "mp4", "height": 480,
+                "vcodec": "avc1.4d401e", "acodec": "none",
+                "filesize": 5_400_000, "protocol": "https"
+            }),
+            audio.clone(),
+        ];
+        let opts = build_options(&formats_a, 100.0);
+        assert_eq!(size_of(&opts, 360), 10_000_000, "muxed row = its own full size");
+        assert_eq!(size_of(&opts, 480), 7_400_000, "pair row = video + audio");
+        // Shape B: BOTH a muxed (10 MB) and a video-only (6 MB)
+        // 360p exist. The selector's first branches take the
+        // video-only PAIR, so the row must show 6 + 2 = 8 MB —
+        // never the muxed file's 10 MB.
+        let formats_b = vec![
+            serde_json::json!({
+                "format_id": "18", "ext": "mp4", "height": 360,
+                "vcodec": "avc1.42001E", "acodec": "mp4a.40.2",
+                "filesize": 10_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "format_id": "134", "ext": "mp4", "height": 360,
+                "vcodec": "avc1.4d401e", "acodec": "none",
+                "filesize": 6_000_000, "protocol": "https"
+            }),
+            audio.clone(),
+        ];
+        let opts = build_options(&formats_b, 100.0);
+        assert_eq!(
+            size_of(&opts, 360),
+            8_000_000,
+            "the row must price the pair its selector fetches, not the muxed alternative"
+        );
     }
 
     #[test]

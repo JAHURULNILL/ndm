@@ -484,7 +484,7 @@ fn probe_ftp_once(url: &str, auth: &Auth) -> Result<Probe, FtpErr> {
         // distinguish "no SIZE support" from "no such file" with
         // the cheapest available witness: REST works on a real
         // file even when SIZE does not
-        let (code, _) = conn.cmd(&format!("REST 0"))?;
+        let (code, _) = conn.cmd(&"REST 0".to_string())?;
         if code == 550 {
             return Err(FtpErr::Permanent(format!(
                 "the FTP server at {} says the file is not available (550)",

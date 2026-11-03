@@ -303,7 +303,7 @@ pub fn show_shortcuts(ui: &Rc<Ui>) {
         FieldSpec::readonly("k5", "Ctrl+Q", "Exit NDM"),
         FieldSpec::readonly("k6", "Ctrl+A", "Select All Downloads"),
     ];
-    crate::dialogs::run_dialog(&ui.window, "Keyboard Shortcuts", &fields, "OK");
+    crate::dialogs::run_info_dialog(&ui.window, "Keyboard Shortcuts", &fields, "OK");
 }
 
 // ---- Customize Toolbar (app.js openToolbarCfg) -------------------
