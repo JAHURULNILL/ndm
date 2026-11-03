@@ -9,7 +9,6 @@
 //! app.js showNextComplete / closeComplete / showUpdate /
 //! onUpdateProgress) one for one.
 
-use gtk::gdk::prelude::*;
 use gtk::prelude::*;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

@@ -62,8 +62,6 @@ pub struct FieldSpec {
 pub enum FieldKind {
     /// Single-line text entry.
     Entry,
-    /// Password entry (input hidden).
-    EntrySecret,
     /// Drop-down with the given choices.
     Combo(Vec<String>),
     /// Checkbutton; the label sits on the button itself.
@@ -81,16 +79,6 @@ impl FieldSpec {
             label,
             kind: FieldKind::Entry,
             initial: initial.to_string(),
-            initial_bool: false,
-        }
-    }
-
-    pub fn secret(id: &'static str, label: &'static str) -> Self {
-        FieldSpec {
-            id,
-            label,
-            kind: FieldKind::EntrySecret,
-            initial: String::new(),
             initial_bool: false,
         }
     }
@@ -228,16 +216,12 @@ pub fn run_dialog(
                 grid.attach(&value, 1, row, 1, 1);
                 rows.push((f.id, RowWidget::ReadOnly));
             }
-            FieldKind::Entry | FieldKind::EntrySecret => {
+            FieldKind::Entry => {
                 let label = gtk::Label::new(Some(f.label));
                 label.set_halign(gtk::Align::Start);
                 let entry = gtk::Entry::new();
                 entry.set_text(&f.initial);
                 entry.set_hexpand(true);
-                if matches!(f.kind, FieldKind::EntrySecret) {
-                    entry.set_visibility(false);
-                    entry.set_input_purpose(gtk::InputPurpose::Password);
-                }
                 // Enter in any entry confirms the dialog.
                 entry.set_activates_default(true);
                 grid.attach(&label, 0, row, 1, 1);

@@ -146,7 +146,7 @@ fn dialog_status_text(d: &ProgressView) -> String {
             if d.error.is_empty() {
                 "Error".to_string()
             } else {
-                d.error.clone()
+                sink::display_error(&d.error)
             }
         }
         "cancelled" => "Cancelled".to_string(),
@@ -467,8 +467,14 @@ impl ProgDlg {
                     [
                         format!("{}", i + 1),
                         fmt_size(*b),
+                        // row Info follows the ENTRY's state, not
+                        // the connection's last live code: finished
+                        // rows read "Done" (N1) and a paused entry's
+                        // rows must not claim "Receiving data…" (m3)
                         if d.status == "finished" {
                             "Done".to_string()
+                        } else if d.status == "paused" {
+                            "Paused".to_string()
                         } else {
                             info_text(d.conns_state.get(i).copied().unwrap_or(0)).to_string()
                         },
@@ -488,6 +494,13 @@ impl ProgDlg {
                         ],
                     );
                 }
+                // m1: the viewport grows with the row count (up
+                // to ten rows) instead of pinning every table at
+                // three visible rows — the rest used to hide
+                // behind a scrollbar nobody thinks to scroll, so
+                // the rows never summed to the dialog's total
+                let h = (30 + rows.len() as i32 * 26).clamp(104, 290);
+                self.table_scroll.set_size_request(-1, h);
                 c.rows = rows;
             }
         }

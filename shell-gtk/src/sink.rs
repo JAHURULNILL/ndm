@@ -24,7 +24,7 @@ pub use ndm_core::{AppEvent, AppState, Ctx, EventSink, ProgressPayload};
 /// shapes.
 pub use ndm_core::{
     add_download, add_video, basket_add, category_names_in_use, check_ext_notice, check_update,
-    components_status, current_settings, delete_category, discard_cookies, ensure_components,
+    components_status, current_settings, delete_category, discard_cookies, display_error, ensure_components,
     export_downloads, get_pending_update, get_settings, grab_explore, handle_dropped_path,
     install_update, list_downloads, move_in_queue, open_path, pause_download, probe_file,
     probe_video, refresh_url, remove_downloads, rename_category, resume_download, rt,
@@ -32,7 +32,7 @@ pub use ndm_core::{
     run_scheduler_loop, run_snapshot_loop, run_startup_sweeps, run_update_recheck_loop,
     scheduler_start_now, scheduler_stop_now, set_completion_actions, set_entry_description,
     set_entry_limit, set_entry_queue, set_settings, set_show_complete_override, start_all,
-    startup_resume, take_pending_grabs, take_pending_videos, take_startup_notice, Settings,
+    startup_resume, take_startup_notice, Settings,
 };
 
 /// Build core's grab arguments from their JSON (serde) shape —
@@ -48,8 +48,8 @@ pub fn to_json<T: serde::Serialize>(v: &T) -> serde_json::Value {
 }
 
 /// Field-readable view of a core `ProgressPayload`, decoded from
-/// its serialized wire shape. Field names, order and types match
-/// core's struct exactly (the old mirror's list); missing keys
+/// its serialized wire shape. Field names and types match core's
+/// struct (the subset this shell reads); missing keys
 /// decode to the type's zero value, matching how the web UI
 /// treated absent fields.
 #[derive(Clone, Debug, Default)]
@@ -68,7 +68,6 @@ pub struct ProgressView {
     pub added: String,
     pub last_try: String,
     pub resume_capability: String,
-    pub completion: String,
     pub error: String,
     pub queue: String,
     pub conns_detail: Vec<u64>,
@@ -83,7 +82,6 @@ pub struct ProgressView {
     /// G2 completion action set + show-complete override
     pub completion_actions: Vec<String>,
     pub show_complete_override: Option<bool>,
-    pub final_path: String,
     /// truthful sub-status ("Probing connection…"); "" = none
     pub detail: String,
 }
@@ -139,7 +137,6 @@ impl From<&ProgressPayload> for ProgressView {
             added: s(&v, "added"),
             last_try: s(&v, "last_try"),
             resume_capability: s(&v, "resume_capability"),
-            completion: s(&v, "completion"),
             error: s(&v, "error"),
             queue: s(&v, "queue"),
             conns_detail: vu(&v, "conns_detail"),
@@ -157,7 +154,6 @@ impl From<&ProgressPayload> for ProgressView {
             show_complete_override: v
                 .get("show_complete_override")
                 .and_then(|x| x.as_bool()),
-            final_path: s(&v, "final_path"),
             detail: s(&v, "detail"),
         }
     }

@@ -271,7 +271,17 @@ fn eta_text(ui: &Ui, d: &ProgressView) -> String {
     }
 }
 
-fn find_iter(store: &gtk::ListStore, id: &str) -> Option<gtk::TreeIter> {
+/// Locate an entry's row by its stable id, as a TreePath.
+///
+/// The path — never the iter — crosses this function's boundary:
+/// a GtkTreeIter that was advanced by `iter_next` and then
+/// returned by value can silently point at row 0 again (the
+/// mutation goes through a shared reference, and the returned
+/// copy is free to be materialized from the pre-advance value;
+/// proven with a minimal repro during the 2.1.0 audit fixes —
+/// M1). Callers re-acquire the iter from the path at the point
+/// of use, which is always exact.
+fn find_path(store: &gtk::ListStore, id: &str) -> Option<gtk::TreePath> {
     let mut iter = store.iter_first()?;
     loop {
         let row_id: String = store
@@ -279,7 +289,7 @@ fn find_iter(store: &gtk::ListStore, id: &str) -> Option<gtk::TreeIter> {
             .get()
             .unwrap_or_default();
         if row_id == id {
-            return Some(iter);
+            return store.path(&iter);
         }
         if !store.iter_next(&mut iter) {
             return None;
@@ -287,12 +297,18 @@ fn find_iter(store: &gtk::ListStore, id: &str) -> Option<gtk::TreeIter> {
     }
 }
 
+/// The iter for an entry's row, freshly acquired from its path
+/// (see find_path for why the iter itself is never carried).
+fn iter_for(store: &gtk::ListStore, id: &str) -> Option<gtk::TreeIter> {
+    find_path(store, id).and_then(|p| store.iter(&p))
+}
+
 /// Write one payload into its list row, creating the row on first
 /// sight. This is the native replacement for the web UI's
 /// progress-event row update (render/updateRowCells).
 fn apply_progress(ui: &Ui, d: &ProgressView) {
     let left = eta_text(ui, d);
-    let iter = match find_iter(&ui.store, &d.id) {
+    let iter = match iter_for(&ui.store, &d.id) {
         Some(it) => it,
         None => ui.store.append(),
     };
@@ -457,7 +473,7 @@ fn upsert_entry(ui: &Ui, d: &ProgressView) {
     }
     if entry_visible(&ui.filter.borrow(), d) {
         apply_progress(ui, d);
-    } else if let Some(mut iter) = find_iter(&ui.store, &d.id) {
+    } else if let Some(mut iter) = iter_for(&ui.store, &d.id) {
         ui.store.remove(&mut iter);
         ui.eta_samples.borrow_mut().remove(&d.id);
         refresh_status_counts(ui);
@@ -468,7 +484,7 @@ fn remove_entry_local(ui: &Ui, id: &str) {
     ui.entries.borrow_mut().remove(id);
     ui.order.borrow_mut().retain(|x| x != id);
     ui.eta_samples.borrow_mut().remove(id);
-    if let Some(mut iter) = find_iter(&ui.store, id) {
+    if let Some(mut iter) = iter_for(&ui.store, id) {
         ui.store.remove(&mut iter);
     }
     refresh_status_counts(ui);
@@ -490,13 +506,11 @@ fn selected_ids(ui: &Ui) -> Vec<String> {
 }
 
 fn select_id(ui: &Ui, id: &str) {
-    if let Some(iter) = find_iter(&ui.store, id) {
+    if let Some(path) = find_path(&ui.store, id) {
         let sel = ui.list_view.selection();
         sel.unselect_all();
-        sel.select_iter(&iter);
-        if let Some(path) = ui.store.path(&iter) {
-            ui.list_view.scroll_to_cell(Some(&path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
-        }
+        sel.select_path(&path);
+        ui.list_view.scroll_to_cell(Some(&path), None::<&gtk::TreeViewColumn>, false, 0.0, 0.0);
     }
 }
 
@@ -690,7 +704,10 @@ fn open_file_dialog(ui: &Rc<Ui>, offer: Option<&serde_json::Value>) {
                 "General".to_string(),
                 String::new(),
                 String::new(),
-                format!("Could not check this address: {}", e),
+                format!(
+                    "Could not check this address: {}",
+                    sink::display_error(&e)
+                ),
             ),
         };
 
@@ -1665,13 +1682,6 @@ fn build_toolbar(ui: &Rc<Ui>) -> gtk::Toolbar {
         btn.connect_clicked(move |_| f());
         bar.add(&btn);
     };
-    let add_stub = |id: &str, label: &str| {
-        let btn = gtk::ToolButton::builder().label(label).build();
-        register(ui, id, &btn);
-        let f = stub_action(ui, label);
-        btn.connect_clicked(move |_| f());
-        bar.add(&btn);
-    };
 
     let u = ui.clone();
     add_real("btnAdd", "Add URL", Box::new(move || open_add_dialog(&u)));
@@ -2160,7 +2170,7 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                     .map(|d| entry_visible(&ui.filter.borrow(), d))
                     .unwrap_or(false);
                 if still_visible {
-                    if let Some(iter) = find_iter(&ui.store, id) {
+                    if let Some(iter) = iter_for(&ui.store, id) {
                         ui.store.set(
                             &iter,
                             &[
@@ -2173,7 +2183,7 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                         );
                         refresh_status_counts(ui);
                     }
-                } else if let Some(mut iter) = find_iter(&ui.store, id) {
+                } else if let Some(mut iter) = iter_for(&ui.store, id) {
                     ui.store.remove(&mut iter);
                     refresh_status_counts(ui);
                 }
