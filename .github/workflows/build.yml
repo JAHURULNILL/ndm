@@ -1,16 +1,16 @@
 # NDM release builds.
 #
-# Linux:   the .deb (Debian/Ubuntu family) and the portable tarball
-#          (any distro) — the same packaging scripts used locally.
-#          Since 2.1.0 the app is the native GTK shell
-#          (shell-gtk crate); there is no WebKit dependency.
+# Linux: the .deb (Debian/Ubuntu family) and the portable tarball
+# (any distro) — the same packaging scripts used locally.
+# Since 2.1.0 the app is the native GTK shell
+# (shell-gtk crate); there is no WebKit dependency.
 # Windows: a portable ZIP (ndm-app.exe + ndm-host.exe + extension)
-#          AND a per-user NSIS installer
-#          (NDM_<ver>_x64-setup.exe, built from scripts/installer.nsi
-#          over the same assembled tree, silent-install tested in
-#          the job). Since 2.1.0 ndm-app.exe is the native Win32
-#          shell (shell-win crate) — no WebView2 runtime is needed
-#          on any supported Windows (7/8/8.1/10/11).
+# AND a per-user NSIS installer
+# (NDM_<ver>_x64-setup.exe, built from scripts/installer.nsi
+# over the same assembled tree, silent-install tested in
+# the job). Since 2.1.0 ndm-app.exe is the native Win32
+# shell (shell-win crate) — no WebView2 runtime is needed
+# on any supported Windows (7/8/8.1/10/11).
 #
 # Runs on version tags (v*) and on manual dispatch.
 name: build
@@ -38,6 +38,11 @@ jobs:
           builds segfault on merges, this one is merge-verified)
         run: |
           curl -sL -o /tmp/ff.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz
+          # Pinned by hash (BtbN 'latest' is a rolling build): a
+          # changed upstream tarball fails this step loudly instead
+          # of shipping an unverified ffmpeg. Refresh the pin
+          # deliberately when adopting a newer build.
+          echo "41935986e233c418caef02fe35c5d5a8a4c5c59e8cdd65701dde742d8ec1fbea /tmp/ff.tar.xz" | sha256sum -c -
           tar -xJf /tmp/ff.tar.xz -C /tmp
           cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg tools/ffmpeg
           chmod +x tools/ffmpeg
@@ -70,7 +75,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          v=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          v=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*\"\(.*\)\".*/\1/')
           gh release upload "v$v" NDM_*_amd64.deb NDM_*_Linux_Portable.tar.xz ndm-extension-*.zip --clobber --repo "$GITHUB_REPOSITORY"
 
   windows:
@@ -114,10 +119,11 @@ jobs:
           # 7/8 resolve ndm-app.exe's remaining api-ms-win-crt-*
           # forwarders app-locally. The installer packages this
           # same folder (SRCROOT), so one copy covers both.
-          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
+          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist\" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
           if (-not $ucrtBase) { throw "UCRT redist set (x64) not found on this runner" }
           Copy-Item (Join-Path $ucrtBase.DirectoryName "*.dll") $dir/
           Copy-Item extension $dir/extension -Recurse
+          Remove-Item $dir/extension/gen_icons.py, $dir/extension/manifest.firefox.json -ErrorAction SilentlyContinue
           Compress-Archive $dir "NDM_${v}_Windows_Portable.zip"
       # Win7/8 API discipline as a hard gate (NATIVE-PLAN.md
       # risk #4): the shipped exe must not import any function
@@ -213,10 +219,11 @@ jobs:
           # 7/8 resolve ndm-app.exe's remaining api-ms-win-crt-*
           # forwarders app-locally. The installer packages this
           # same folder (SRCROOT), so one copy covers both.
-          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'x86' } | Select-Object -First 1
+          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist\" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'x86' } | Select-Object -First 1
           if (-not $ucrtBase) { throw "UCRT redist set (x86) not found on this runner" }
           Copy-Item (Join-Path $ucrtBase.DirectoryName "*.dll") $dir/
           Copy-Item extension $dir/extension -Recurse
+          Remove-Item $dir/extension/gen_icons.py, $dir/extension/manifest.firefox.json -ErrorAction SilentlyContinue
           Compress-Archive $dir "NDM_${v}_Windows_Portable_x86.zip"
       # Win7/8 API discipline as a hard gate (NATIVE-PLAN.md
       # risk #4): the shipped exe must not import any function
@@ -310,7 +317,7 @@ jobs:
           if (-not (Test-Path $makensis)) { throw "makensis not found" }
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
           & $makensis "/DVERSION=$v" "/DSRCROOT=$PWD\NDM-Universal" "/DUNIVERSAL=1" "/DOUTFILE=$PWD\NDM_${v}_setup.exe" "/DICON=$PWD\assets\icon.ico" scripts\installer.nsi
-          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exitcode $LASTEXITCODE" }
           if (-not (Test-Path "NDM_${v}_setup.exe")) { throw "installer exe was not produced" }
           Write-Host "universal installer built: NDM_${v}_setup.exe"
       # NSIS setups detach: the launcher process exits while the
@@ -409,3 +416,71 @@ jobs:
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
           $setup = (Get-ChildItem "NDM_${v}_setup.exe").Name
           gh release upload "v$v" $setup --clobber --repo $env:GITHUB_REPOSITORY
+  feed:
+    needs: [linux, windows, windows-i686, windows-setup]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Generate, attach and verify release.json (the update feed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          v=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*\"\(.*\)\".*/\1/')
+          echo "feed for version $v"
+          deb=$(find artifacts -name "NDM_${v}_amd64.deb" | head -1)
+          ext=$(find artifacts -name "ndm-extension-${v}.zip" | head -1)
+          win=$(find artifacts -name "NDM_${v}_Windows_Portable.zip" | head -1)
+          winx=$(find artifacts -name "NDM_${v}_Windows_Portable_x86.zip" | head -1)
+          setup=$(find artifacts -name "NDM_${v}_setup.exe" | head -1)
+          for f in "$deb" "$ext" "$win" "$winx" "$setup"; do
+            if [ -z "$f" ] || [ ! -f "$f" ]; then echo "MISSING payload for $v"; exit 1; fi
+          done
+          notes=$(gh release view "v$v" --json body --jq .body --repo "$GITHUB_REPOSITORY")
+          if [ -z "$notes" ]; then echo "release v$v has no body for the feed notes"; exit 1; fi
+          python3 - "$v" "$deb" "$ext" "$win" "$winx" "$setup" "$notes" <<'PYEOF'
+          import hashlib, json, sys
+          v, deb, ext, win, winx, setup, notes = sys.argv[1:8]
+          def sha(p):
+              h = hashlib.sha256()
+              with open(p, 'rb') as f:
+                  for chunk in iter(lambda: f.read(1 << 20), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+          base = f"https://github.com/JAHURULNILL/ndm/releases/download/v{v}"
+          feed = {
+              "deb_sha256": sha(deb),
+              "deb_url": f"{base}/NDM_{v}_amd64.deb",
+              "ext_sha256": sha(ext),
+              "min_supported": v,
+              "notes": notes,
+              "version": v,
+              "win_setup_sha256": sha(setup),
+              "win_setup_url": f"{base}/NDM_{v}_setup.exe",
+              "win_sha256": sha(win),
+              "win_url": f"{base}/NDM_{v}_Windows_Portable.zip",
+              "win_x86_setup_sha256": sha(setup),
+              "win_x86_setup_url": f"{base}/NDM_{v}_setup.exe",
+              "win_x86_sha256": sha(winx),
+              "win_x86_url": f"{base}/NDM_{v}_Windows_Portable_x86.zip",
+          }
+          with open("release.json", "w") as f:
+              json.dump(feed, f, separators=(",", ":"), sort_keys=True)
+          print("release.json generated for", v)
+          PYEOF
+          gh release upload "v$v" release.json --clobber --repo "$GITHUB_REPOSITORY"
+          # The updater's primary route is latest/download: prove the
+          # bytes served there are exactly the bytes generated here.
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            if curl -fsSL "https://github.com/$GITHUB_REPOSITORY/releases/latest/download/release.json" -o /tmp/served.json && cmp -s release.json /tmp/served.json; then ok=1; break; fi
+            sleep 10
+          done
+          if [ "$ok" != "1" ]; then echo "latest/download does not serve the generated feed"; exit 1; fi
+          echo "feed verified on the latest/download route"
