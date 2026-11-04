@@ -5973,22 +5973,52 @@ mod tests {
             &comp, payload_len as u64, 0.0,
         )
         .expect("job must start");
-        // 170 s covers ~11 stall windows and three fast windows:
-        // a job that only spent budget would have fallen back at
-        // the fourth barren attempt (< ~90 s) and errored on the
-        // fileless stub; a resetting job is still cycling with
-        // >= 8 MiB banked (two windows' worth).
+        // A job that only spent budget would have fallen back
+        // at the fourth barren attempt (< ~90 s) and errored on
+        // the fileless stub; a resetting job keeps cycling while
+        // it banks bytes. The wait is PROGRESS-bounded, not
+        // wall-clock-bounded: 2 MiB is 16x the 128 KiB reset
+        // line, so reaching it proves several productive
+        // window-straddling attempts — but how long that takes
+        // is a property of the machine, not of the code. The
+        // fixed 170 s budget passed on the dev VM and on CI #74
+        // yet failed CI #77 at 1.75 MiB still-downloading: a
+        // slower runner, not a barren job. So: succeed at
+        // 2 MiB banked while cycling; fail only if the job
+        // leaves the cycling states or banks NOTHING for 60 s
+        // (a genuinely stuck job), with a 600 s outer cap.
         let job_start = Instant::now();
-        let ok = audit_wait_for(170, "productive windows banked, still cycling", || {
-            let p = job.progress.lock().unwrap();
-            // 2 MiB is 16x the 128 KiB reset line: reaching it
-            // takes several window-straddling attempts at this
-            // rig's measured rates (attempt/window alignment,
-            // settle time and suite-parallel load eat most of
-            // each window)
-            p.done >= 2 * 1024 * 1024
-                && matches!(p.status.as_str(), "starting" | "downloading" | "resuming")
-        });
+        let ok = {
+            let mut last_done = 0u64;
+            let mut last_progress = Instant::now();
+            let outer = Instant::now();
+            loop {
+                let (done, cycling) = {
+                    let p = job.progress.lock().unwrap();
+                    (
+                        p.done,
+                        matches!(p.status.as_str(), "starting" | "downloading" | "resuming"),
+                    )
+                };
+                if done >= 2 * 1024 * 1024 && cycling {
+                    break true;
+                }
+                if !cycling {
+                    break false;
+                }
+                if done > last_done {
+                    last_done = done;
+                    last_progress = Instant::now();
+                }
+                if last_progress.elapsed() > std::time::Duration::from_secs(60)
+                    || outer.elapsed() > std::time::Duration::from_secs(600)
+                {
+                    eprintln!("timed out waiting for productive windows banked, still cycling");
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        };
         let (status, done) = {
             let p = job.progress.lock().unwrap();
             (p.status.clone(), p.done)
