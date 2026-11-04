@@ -15491,6 +15491,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // Unix-only fixture: the completion program here is a shell
+    // script, which Windows cannot execute (a Windows user points
+    // the setting at an .exe). The exactly-once dispatch logic it
+    // proves is platform-independent.
+    #[cfg(unix)]
     #[test]
     fn b6_two_finishes_in_one_tick_fire_completion_exactly_once_each() {
         // Two entries reach Finished together; each emit loop runs
