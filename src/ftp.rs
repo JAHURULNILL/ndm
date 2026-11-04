@@ -1442,6 +1442,15 @@ mod tests {
     static SERIAL: Mutex<()> = Mutex::new(());
     const PORT: u16 = 8921;
 
+    /// Lock SERIAL, recovering from poison: the guard carries no
+    /// data (it only serializes the port), so one test's panic
+    /// must not cascade-fail its siblings (CI #79: a fixture
+    /// startup panic failed all six FTP tests, five of them
+    /// with PoisonError before they even ran).
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn pattern_body(len: usize) -> Vec<u8> {
         (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
     }
@@ -1463,7 +1472,7 @@ mod tests {
             let log = dir.join("server.log");
             let ready = dir.join("ready");
             let script = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ftp_server.py");
-            let child = Command::new("python3")
+            let mut child = Command::new("python3")
                 .args([
                     script,
                     "--root",
@@ -1479,9 +1488,22 @@ mod tests {
                 .stderr(std::process::Stdio::null())
                 .spawn()
                 .expect("python3 fixture server");
+            // 60 s, not 10: a cold Windows runner (process
+            // creation + AV scan of a fresh python) ate the
+            // whole 10 s once (CI #79) and the panic cascaded
+            // through the SERIAL lock to all six FTP tests.
+            // Fail fast — with the real cause — if the child
+            // dies first, and never leak it holding the port.
             let t0 = Instant::now();
             while !ready.exists() {
-                assert!(t0.elapsed() < Duration::from_secs(10), "fixture server never came up");
+                if let Ok(Some(status)) = child.try_wait() {
+                    panic!("fixture server exited early: {status}");
+                }
+                if t0.elapsed() >= Duration::from_secs(60) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fixture server never came up");
+                }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Server { child, dir, log }
@@ -1551,7 +1573,7 @@ mod tests {
     fn reply_lines_are_length_capped() {
         // W3-13: a server streaming one endless line must fail as
         // a protocol Retry, not grow the line buffer unbounded
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         for (payload, expect_ok) in [
             (b"220 ready\r\n".to_vec(), true),
             (vec![b'x'; 9000], false),
@@ -1603,7 +1625,7 @@ mod tests {
 
     #[test]
     fn ftp_anonymous_download_byte_identical() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let body = pattern_body(3 * 1024 * 1024);
         let _srv = Server::start("anon", &[("big.bin", body.clone())], &[]);
         let url = format!("ftp://127.0.0.1:{PORT}/big.bin");
@@ -1622,7 +1644,7 @@ mod tests {
 
     #[test]
     fn ftp_user_pass_download_byte_identical() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let body = pattern_body(2 * 1024 * 1024);
         let _srv = Server::start(
             "auth",
@@ -1644,7 +1666,7 @@ mod tests {
 
     #[test]
     fn ftp_resume_uses_rest_offsets_no_full_refetch() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let body = pattern_body(4 * 1024 * 1024);
         // throttled to 512 KiB/s per connection so the cancel
         // lands mid-file deterministically
@@ -1698,7 +1720,7 @@ mod tests {
 
     #[test]
     fn ftp_parallel_uses_multiple_control_connections() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let body = pattern_body(6 * 1024 * 1024);
         let srv = Server::start("parallel", &[("big.bin", body.clone())], &[]);
         let url = format!("ftp://127.0.0.1:{PORT}/big.bin");
@@ -1720,7 +1742,7 @@ mod tests {
 
     #[test]
     fn ftp_rest_refused_falls_back_to_single_stream() {
-        let _serial = SERIAL.lock().unwrap();
+        let _serial = serial();
         let body = pattern_body(2 * 1024 * 1024);
         let srv = Server::start("norest", &[("file.bin", body.clone())], &["--no-rest"]);
         let url = format!("ftp://127.0.0.1:{PORT}/file.bin");
