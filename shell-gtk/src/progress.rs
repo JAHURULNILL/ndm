@@ -215,7 +215,11 @@ fn enablement(status: &str) -> (bool, bool, bool) {
         "starting" | "resuming" => (false, true, true),
         "queued" | "paused" => (true, false, true),
         "error" | "cancelled" => (true, false, false),
-        _ => (false, false, false), // finished and anything else
+        // Finished: nothing left to pause or resume, but Cancel
+        // must still dismiss the dialog — greying it left the
+        // window X as the only way out (2.3.1 gate finding).
+        "finished" => (false, false, true),
+        _ => (false, false, false),
     }
 }
 
@@ -1042,9 +1046,13 @@ fn build(
     }
     {
         // G3: Cancel = core pause + close; entry + partial remain.
+        // A finished entry has nothing to pause — there Cancel is
+        // a pure close (its enablement is finished-only, above).
         let d = dlg.clone();
         btn_cancel.connect_clicked(move |_| {
-            let _ = sink::pause_download(d.ctx.clone(), d.id.clone());
+            if d.last.borrow().status != "finished" {
+                let _ = sink::pause_download(d.ctx.clone(), d.id.clone());
+            }
             close(&d.id);
         });
     }

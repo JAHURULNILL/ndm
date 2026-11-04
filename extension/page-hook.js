@@ -318,4 +318,159 @@
   }, true);
 
   setTimeout(broadcastPlayerInfo, 50);
+
+  /* ---------------------------------------------------------------- */
+  /* Facebook (2.3.2, WS-B): the same page-data door as YouTube, on   */
+  /* the page's OWN objects. Comet serialises its video data into    */
+  /* the page (preload / data-sjs script JSON): each video object    */
+  /* carries a dash_manifest and/or the progressive playable_url*    */
+  /* fields. fb-classify.js (loaded before this hook in the MAIN     */
+  /* world on facebook.com) classifies one object into picker        */
+  /* options (audit ladder rungs 1–2); this hook only finds the      */
+  /* objects, keys them by THEIR video id and bridges them to        */
+  /* content.js — per video, never per page: a feed holds many        */
+  /* videos, and one video's data must never be cached or offered     */
+  /* under another's id. Objects with no derivable id on a page      */
+  /* whose URL names no video are skipped, not guessed at.           */
+  /* Field shapes are MODELLED (audit-232 §3) — live verification    */
+  /* belongs on the user's machine; the VM cannot reach Facebook.    */
+  /* ---------------------------------------------------------------- */
+  const isFacebookPage = /(^|\.)facebook\.com$/.test(location.hostname);
+  if (isFacebookPage && typeof NdmFbClassify !== 'undefined') {
+    const FBC = NdmFbClassify;
+    // A page-data quality whose stored group is somehow not live
+    // app-side falls back to yt-dlp with the picker's own generic
+    // best-MP4 selector (the DEFAULT_QUALITIES 'best' shape), so
+    // the approved fallback order is unchanged.
+    const FB_FALLBACK_SELECTOR =
+      'bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b';
+    const fbSent = new Map(); // videoId -> option signature already broadcast
+
+    /* Classifier options -> the picker's option shape (the same
+       fields the YouTube extractor above produces). Sizes are
+       honestly absent: FB page data exposes no contentLength, so
+       no size is claimed. The streams ride along (item 14's door):
+       content.js sanitizes them and names their capture group. */
+    function fbPickerOptions(classifierOptions) {
+      const out = [];
+      for (const o of classifierOptions || []) {
+        const streams = [];
+        for (const s of o.streams || []) {
+          const st = {
+            url: s.url,
+            mimeType: s.mimeType || 'video/mp4',
+            qualityLabel: '',
+            hasAudio: false,
+            hasVideo: false,
+          };
+          if (s.role === 'audio') {
+            st.hasAudio = true;
+          } else if (s.role === 'video') {
+            st.hasVideo = true;
+            st.qualityLabel = o.height ? `${o.height}p` : '';
+          } else {
+            // 'av' — one progressive file carrying both
+            st.hasAudio = true;
+            st.hasVideo = true;
+            st.qualityLabel = o.height ? `${o.height}p` : '';
+          }
+          streams.push(st);
+        }
+        if (!streams.length) continue;
+        out.push({
+          selector: FB_FALLBACK_SELECTOR,
+          label: o.label,
+          ext: 'mp4',
+          note: 'MP4',
+          size_bytes: 0,
+          size_text: '',
+          size_approx: false,
+          audio: false,
+          height: o.height || 0,
+          streams,
+        });
+      }
+      return out;
+    }
+
+    /* Scan the page's serialised video objects, keyed by video
+       id. Bounded: at most 24 candidate blobs, 1.5 MB each —
+       a feed page carries many scripts and the scan runs on
+       picker requests, so it must stay cheap. */
+    function collectFbVideos() {
+      const byId = new Map();
+      const pageId = FBC.facebookVideoId(location.href);
+      const addObject = obj => {
+        const diag = [];
+        const opts = FBC.optionsFromVideoObject(obj, diag);
+        if (!opts.length) return;
+        let id = '';
+        if (typeof obj.id === 'string' && /^\d{5,}$/.test(obj.id)) id = obj.id;
+        else if (typeof obj.id === 'number' && Number.isFinite(obj.id)) id = String(obj.id);
+        if (!id) id = pageId; // a permalink page names its one video
+        if (!id) return; // unkeyable on a feed: skipped, never guessed
+        if (!byId.has(id)) byId.set(id, opts);
+      };
+      let scanned = 0;
+      for (const s of document.querySelectorAll('script')) {
+        if (scanned >= 24) break;
+        const t = s.textContent || '';
+        if (t.length < 40 || t.length > 1500000) continue;
+        if (!t.includes('dash_manifest') && !t.includes('playable_url')) continue;
+        scanned++;
+        let parsed = null;
+        try {
+          parsed = JSON.parse(t);
+        } catch (e) {}
+        if (!parsed) continue;
+        const objs = [];
+        FBC.findVideoObjects(parsed, objs, new Set());
+        for (const o of objs) addObject(o);
+      }
+      return byId;
+    }
+
+    function broadcastFbInfo(onlyId) {
+      let byId;
+      try {
+        byId = collectFbVideos();
+      } catch (e) {
+        return;
+      }
+      for (const [id, classifierOptions] of byId) {
+        if (onlyId && id !== onlyId) continue;
+        const options = fbPickerOptions(classifierOptions);
+        if (!options.length) continue;
+        const sig = options
+          .map(o => o.streams.map(s => s.url).join('|'))
+          .join(';;');
+        // Unprompted broadcasts dedupe by signature; an explicit
+        // per-id request ALWAYS answers — the requester may have
+        // loaded after the first broadcast and missed it.
+        if (!onlyId && fbSent.get(id) === sig) continue;
+        fbSent.set(id, sig);
+        window.postMessage(
+          {
+            source: 'ndm-page-hook',
+            type: 'ndm-fb-info',
+            pageUrl: location.href,
+            info: { videoId: id, options },
+          },
+          '*'
+        );
+      }
+    }
+
+    window.addEventListener('message', e => {
+      if (e.source !== window || !e.data || e.data.source !== 'ndm-content') return;
+      if (e.data.type === 'ndm-request-fb-info') {
+        // Per click, per video: the picker names the id it is
+        // opening for; rescan (feed posts load lazily) and answer
+        // for that id — and refresh the others while here.
+        broadcastFbInfo(String(e.data.videoId || ''));
+      }
+    });
+
+    setTimeout(() => broadcastFbInfo(''), 300);
+  }
 })();

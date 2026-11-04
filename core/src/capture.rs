@@ -62,6 +62,12 @@ pub struct CapturedStream {
     pub has_audio: bool,
     #[serde(default)]
     pub has_video: bool,
+    /// the capturing browser's own User-Agent, stamped by the
+    /// host from the capture message (audit-232 S3): capture sets
+    /// stored before this field existed parse with None and keep
+    /// the engine's fallback UA.
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 /// Everything captured for one page, stamped when the app
@@ -76,6 +82,15 @@ pub struct CapturedSet {
     pub streams: Vec<CapturedStream>,
     #[serde(default)]
     pub received_unix: u64,
+    /// 2.3.2 (WS-B): the recorder's per-video grouping key
+    /// ("fb:<id>") when this set names ONE Facebook video whose
+    /// page URL does not (a feed). The store identity derives
+    /// from it (see set_identity), so two videos captured on the
+    /// same feed page are two sets and can never merge. Empty
+    /// for every unkeyed set (the page-data door, YouTube, and
+    /// all pre-2.3.2 captures).
+    #[serde(default)]
+    pub video_key: String,
 }
 
 /* ------------------------------------------------------------------ */
@@ -93,6 +108,59 @@ pub fn video_identity(page_url: &str) -> String {
         return format!("yt:{id}");
     }
     format!("url:{}", normalize_url(page_url))
+}
+
+/// The numeric video id a Facebook URL names — /videos/<id>,
+/// /reel/<id> (also /<page>/videos/<id>), watch?v=<digits> — or
+/// None when the URL names no specific video (feed, profile,
+/// shortlink). The mirror of the extension's
+/// fb-classify::facebookVideoId; the two must agree, because the
+/// extension keys a capture by this id and the app looks the set
+/// up by it.
+pub fn facebook_video_id(url: &str) -> Option<String> {
+    let (_, host, _, path, query) = split_url(url)?;
+    if !(host == "facebook.com" || host.ends_with(".facebook.com") || host == "fb.watch") {
+        return None;
+    }
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    for pair in segs.windows(2) {
+        if (pair[0] == "videos" || pair[0] == "reel")
+            && !pair[1].is_empty()
+            && pair[1].chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(pair[1].to_string());
+        }
+    }
+    let v = query_param(&query, "v")?;
+    (!v.is_empty() && v.chars().all(|c| c.is_ascii_digit())).then(|| v.to_string())
+}
+
+/// The store identity of ONE captured set (2.3.2 WS-B): a page
+/// URL that names its video (a Facebook permalink) keys the set
+/// by that video, whatever door it arrived through; a set
+/// carrying a recorder video key keys by page identity + key, so
+/// it coexists with — and never merges into — other videos'
+/// sets from the same page; anything else keeps the standing
+/// page identity.
+pub fn set_identity(set: &CapturedSet) -> String {
+    if let Some(id) = facebook_video_id(&set.page_url) {
+        return format!("fb:{id}");
+    }
+    if !set.video_key.is_empty() {
+        return format!("{}#vg:{}", video_identity(&set.page_url), set.video_key);
+    }
+    video_identity(&set.page_url)
+}
+
+/// The identity a URL-only lookup (the probe merge, a
+/// preresolved start) must use — the same derivation
+/// set_identity applies when the page URL names its video, so a
+/// Facebook permalink finds the set its recorder capture stored.
+pub fn identity_for_url(url: &str) -> String {
+    if let Some(id) = facebook_video_id(url) {
+        return format!("fb:{id}");
+    }
+    video_identity(url)
 }
 
 /// Split a URL into (scheme, host, port, path, query) without a
@@ -467,7 +535,7 @@ fn persist_sets(dir: &Path, sets: &[(String, CapturedSet)]) {
 /// the durable copy in step. `dir` is the app-data dir; None is
 /// memory-only (tests, pre-init callers).
 pub fn store_set(dir: Option<&Path>, set: CapturedSet) {
-    let identity = video_identity(&set.page_url);
+    let identity = set_identity(&set);
     let mut sets = SETS.lock().unwrap();
     if sets.is_empty() {
         if let Some(d) = dir {
@@ -591,7 +659,7 @@ pub fn preresolved_for(
     let Some(key) = selector.strip_prefix(SELECTOR_PREFIX) else {
         return Ok(None);
     };
-    let identity = video_identity(page_url);
+    let identity = identity_for_url(page_url);
     let set = get_set(dir, &identity).ok_or_else(|| MISSING_MESSAGE.to_string())?;
     let group = group_streams(&set.streams)
         .into_iter()
@@ -609,6 +677,12 @@ pub fn preresolved_for(
             has_audio: s.has_audio,
             cookie: None,
             referer: Some(set.page_url.clone()),
+            // an empty UA is no UA: never let a blank string
+            // replace the engine's fallback on the wire
+            user_agent: s
+                .user_agent
+                .clone()
+                .filter(|u| !u.trim().is_empty()),
         })
         .collect();
     Ok(Some(Preresolved {
@@ -693,6 +767,7 @@ mod tests {
             },
             has_audio,
             has_video,
+            user_agent: None,
         }
     }
 
@@ -715,6 +790,7 @@ mod tests {
                 ),
             ],
             received_unix: 1_000,
+            video_key: String::new(),
         }
     }
 
@@ -744,6 +820,82 @@ mod tests {
         assert_eq!(
             video_identity("https://example.com:443/watch/42?id=7"),
             b
+        );
+    }
+
+    #[test]
+    fn facebook_video_id_names_one_video_or_none() {
+        // the same shapes the extension's facebookVideoId accepts
+        assert_eq!(
+            facebook_video_id("https://www.facebook.com/SomePage/videos/1234567890123456/").as_deref(),
+            Some("1234567890123456")
+        );
+        assert_eq!(
+            facebook_video_id("https://www.facebook.com/reel/9876543210987654").as_deref(),
+            Some("9876543210987654")
+        );
+        assert_eq!(
+            facebook_video_id("https://www.facebook.com/watch/?v=1234567890123456").as_deref(),
+            Some("1234567890123456")
+        );
+        // a feed, a profile and a shortlink name NO video
+        assert_eq!(facebook_video_id("https://www.facebook.com/"), None);
+        assert_eq!(facebook_video_id("https://www.facebook.com/SomePage"), None);
+        assert_eq!(facebook_video_id("https://fb.watch/abcDEF/"), None);
+        assert_eq!(facebook_video_id("https://www.youtube.com/watch?v=abcDEF123_-"), None);
+    }
+
+    #[test]
+    fn fb_permalink_set_identity_matches_the_url_lookup() {
+        // a set captured on a permalink page and a probe of that
+        // page URL must land on the SAME identity, keyed by the
+        // video — not by the tracking-laden URL it arrived as
+        let page = "https://www.facebook.com/SomePage/videos/1234567890123456/?utm_source=x";
+        assert_eq!(identity_for_url(page), "fb:1234567890123456");
+        let set = CapturedSet {
+            page_url: page.to_string(),
+            title: "Permalink video".to_string(),
+            streams: vec![stream(
+                "https://video.example.fbcdn.net/v.mp4",
+                "video/mp4",
+                "720p",
+                true,
+                true,
+            )],
+            received_unix: now_unix(),
+            video_key: "fb:1234567890123456".to_string(),
+        };
+        assert_eq!(set_identity(&set), identity_for_url(page));
+    }
+
+    #[test]
+    fn fb_feed_sets_with_different_video_keys_never_merge() {
+        // two videos recorded on ONE feed page (the recorder's
+        // per-video grouping key is the only thing told apart):
+        // each set is stored under its own identity, and the bare
+        // feed identity holds NO merged set at all
+        let feed = format!("https://www.facebook.com/wsb-feed-{}", std::process::id());
+        let mk = |key: &str, url: &str| CapturedSet {
+            page_url: feed.clone(),
+            title: "Feed video".to_string(),
+            streams: vec![stream(url, "video/mp4", "720p", true, true)],
+            received_unix: now_unix(),
+            video_key: key.to_string(),
+        };
+        let a = mk("fb:111111111111111", "https://video.example.fbcdn.net/a-only.mp4");
+        let b = mk("fb:222222222222222", "https://video.example.fbcdn.net/b-only.mp4");
+        assert_ne!(set_identity(&a), set_identity(&b));
+        store_set(None, a.clone());
+        store_set(None, b.clone());
+        let got_a = get_set(None, &set_identity(&a)).expect("set A stored");
+        let got_b = get_set(None, &set_identity(&b)).expect("set B stored");
+        assert_eq!(got_a.streams.len(), 1);
+        assert_eq!(got_a.streams[0].url, a.streams[0].url);
+        assert_eq!(got_b.streams.len(), 1);
+        assert_eq!(got_b.streams[0].url, b.streams[0].url);
+        assert!(
+            get_set(None, &video_identity(&feed)).is_none(),
+            "no feed-wide merged set may exist"
         );
     }
 
@@ -834,6 +986,30 @@ mod tests {
         assert_eq!(merge_into_info(&mut info2, &set, true, 1_000), 2);
         assert_eq!(info2.options[0].source, "browser");
         assert_eq!(info2.options[2].source, "");
+    }
+
+    #[test]
+    fn capture_user_agent_field_is_backwards_compatible() {
+        // a set stored by a build from before the userAgent field
+        // existed (audit-232 S3) has no such key anywhere and must
+        // still parse, with the UA absent; a set carrying one
+        // round-trips it verbatim
+        let old: CapturedSet = serde_json::from_str(
+            r#"{"pageUrl":"https://www.youtube.com/watch?v=OLDtest999","title":"t",
+                "streams":[{"url":"https://rr1.googlevideo.com/videoplayback?itag=136",
+                             "mimeType":"video/mp4","qualityLabel":"720p",
+                             "hasAudio":false,"hasVideo":true}],
+                "receivedUnix":1000}"#,
+        )
+        .expect("an old-format set must parse");
+        assert_eq!(old.streams[0].user_agent, None);
+
+        let mut set = dash_set("https://www.youtube.com/watch?v=ZZZtest999", 9_999_999_999);
+        set.streams[0].user_agent = Some("Brave/131 (test)".to_string());
+        let raw = serde_json::to_string(&set).unwrap();
+        let back: CapturedSet = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.streams[0].user_agent.as_deref(), Some("Brave/131 (test)"));
+        assert_eq!(back.streams[1].user_agent, None);
     }
 
     #[test]

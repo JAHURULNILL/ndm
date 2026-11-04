@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nill Download Manager",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "description": "Send downloads and online videos from your browser to Nill Download Manager, a fast desktop download manager.",
   "icons": {
     "16": "icon16.png",
@@ -49,9 +49,22 @@
     },
     {
       "matches": [
+        "*://*.facebook.com/*"
+      ],
+      "js": [
+        "fb-classify.js",
+        "page-hook.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN",
+      "all_frames": false
+    },
+    {
+      "matches": [
         "<all_urls>"
       ],
       "js": [
+        "fb-classify.js",
         "content.js"
       ],
       "run_at": "document_idle",

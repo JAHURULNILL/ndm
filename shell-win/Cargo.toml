@@ -1,6 +1,6 @@
 [package]
 name = "ndm-shell-win"
-version = "2.3.1"
+version = "2.3.2"
 edition = "2021"
 description = "NDM — native Windows shell (raw Win32 via the windows crate, winui helpers)"
 license = "MIT OR Apache-2.0"

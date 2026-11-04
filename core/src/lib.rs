@@ -226,6 +226,7 @@ impl AppState {
             pending_grabs: Mutex::new(Vec::new()),
             components_busy: AtomicBool::new(false),
             retries: Mutex::new(HashMap::new()),
+            heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             pending_update: Mutex::new(None),
             update_required: AtomicBool::new(false),
@@ -1791,6 +1792,11 @@ pub struct AppState {
     /// IDM-queue-style automatic retries of failed downloads:
     /// entry id → (attempts so far, when the next attempt is due)
     retries: Mutex<HashMap<String, (u32, Instant)>>,
+    /// WS-A: expiry-heal attempts already spent per entry this
+    /// session (see MAX_HEAL_ATTEMPTS). Session-only: a restart
+    /// of the app is a new episode, like the retry budget's
+    /// due-times.
+    heals: Mutex<HashMap<String, u32>>,
     /// downloads have actually run in this session (gates the
     /// exit-when-done action so an idle launch never self-closes)
     had_active: AtomicBool,
@@ -2993,6 +2999,127 @@ pub fn display_error(err: &str) -> String {
 /// many times, then it stays failed with its error visible.
 pub const RETRY_MAX: u32 = 10;
 
+/// WS-A (audit-232 S5): expiry-heal attempts per entry — a
+/// download whose signed address died mid-transfer re-probes its
+/// ORIGINAL URL and resumes on the fresh effective address, at
+/// most this many times, before it fails honestly with its error
+/// visible. Deliberately separate from RETRY_MAX: a heal is a
+/// targeted re-resolution of a KNOWN-dead address, not a blind
+/// retry, and its budget must not be refillable by the retry
+/// machinery cycling underneath it.
+pub const MAX_HEAL_ATTEMPTS: u32 = 3;
+
+/// WS-A: the heal gate as a pure decision — the address must
+/// have died (the engine's typed auth_dead signal), bytes must
+/// have flowed (a download refused from byte 0 has nothing to
+/// resume and its error is the honest one), the budget must have
+/// room, and a user-stopped job (paused / removed) never heals.
+pub fn heal_decision(auth_dead: bool, done_bytes: u64, attempts: u32, user_stopped: bool) -> bool {
+    auth_dead && done_bytes > 0 && attempts < MAX_HEAL_ATTEMPTS && !user_stopped
+}
+
+/// WS-A: heal backoff per attempt (2 s, 4 s, 8 s) — long enough
+/// for a pause pressed during the heal to land and be honoured,
+/// short against the 30 s generic-retry cadence it replaces.
+pub fn heal_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(2u64 << attempt.min(2))
+}
+
+/// WS-A (audit-232 S5): the expiry heal for one errored file
+/// entry, run from its emit loop's error arm. Returns true when
+/// the heal has taken over the failure (the caller must not
+/// register the generic retry or settle the error as final).
+///
+/// The restart goes through the ordinary start path, whose start
+/// probe re-resolves the ORIGINAL URL — following redirects
+/// under the job's own auth (its cookie header travels in the
+/// probe's Auth, and the probe's cookie jar collects the chain's
+/// Set-Cookies) — to a fresh effective address. The engine's
+/// resume verification then applies the established Refresh
+/// Address rule (see refresh_url): size + validators matching
+/// the journal resume from the sealed offsets; a different file
+/// restarts from zero, with the discarded bytes accounted in
+/// start_engine. There is deliberately no second implementation
+/// of that rule here.
+///
+/// Returns false when this failure is not a healable auth death
+/// (see heal_decision) and ordinary error handling stands.
+fn maybe_heal_expiry(app: &Ctx, entry: &Arc<Entry>) -> bool {
+    let Some(dl) = &entry.download else {
+        return false;
+    };
+    let p = dl.progress();
+    let state = app.state();
+    let attempts = state
+        .heals
+        .lock_ok()
+        .get(&entry.id)
+        .copied()
+        .unwrap_or(0);
+    let user_stopped = entry.removed.load(Ordering::SeqCst)
+        || entry.pause_requested.load(Ordering::SeqCst);
+    if !heal_decision(p.auth_dead, p.done_bytes, attempts, user_stopped) {
+        return false;
+    }
+    // The engine is terminal but may not be SETTLED: for the
+    // error outcome the supervisor publishes the status first
+    // and syncs the (possibly large) file afterwards, and the
+    // one-writer guard drops only after that final save. A heal
+    // that starts into that window is refused "another download
+    // is already writing" — the 100 MiB rig's shape, invisible
+    // at fixture scale where the sync is instant. Wait the
+    // settle out (same ~35 s bound as every settle wait); a
+    // download that still has not settled is not healed this
+    // tick and keeps its ordinary error handling.
+    wait_engine_settled(dl);
+    if !dl.is_settled() {
+        return false;
+    }
+    // spend the attempt up front: a heal whose re-probe still
+    // finds a dead address has spent its shot either way
+    state.heals.lock_ok().insert(entry.id.clone(), attempts + 1);
+    // Demote BEFORE the backoff: with the dead handle replaced
+    // by a stub, a pause pressed during the heal lands on the
+    // stub's pause latch — the form pause_download records for
+    // handle-less entries — where the wait below honours it.
+    // The same stop-gate discipline as video's B3-A gate: check
+    // before AND during, never start behind a stop.
+    let Some(stub) = demote_terminal_live(&state, entry) else {
+        return false;
+    };
+    set_detail(&stub, "Refreshing address\u{2026}");
+    let _ = app.emit(AppEvent::Progress(payload_of(&stub)));
+    persist(&state);
+    let stopped = |stub: &Arc<Entry>| {
+        stub.removed.load(Ordering::SeqCst)
+            || stub.pause_requested.load(Ordering::SeqCst)
+            || !state
+                .get(&stub.id)
+                .map(|e| Arc::ptr_eq(&e, stub))
+                .unwrap_or(false)
+    };
+    let backoff = heal_backoff(attempts);
+    let t0 = Instant::now();
+    while t0.elapsed() < backoff {
+        if stopped(&stub) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if stopped(&stub) {
+        // the user's stop wins: the entry stays parked exactly
+        // as the demote recorded it (paused, journal intact, a
+        // manual Resume still possible), the heal's detail
+        // clears, and nothing is registered behind their back
+        set_detail(&stub, "");
+        let _ = app.emit(AppEvent::Progress(payload_of(&stub)));
+        persist(&state);
+        return true;
+    }
+    start_entry(app, stub);
+    true
+}
+
 /// Register a failed entry for an automatic retry — IDM's queue
 /// semantics: a failed file is retried (its Scheduler default is 10
 /// attempts) instead of sitting dead until the user notices.
@@ -3669,6 +3796,9 @@ pub fn spawn_emit_loop(app: Ctx, entry: Arc<Entry>) {
                     let actions = completion_actions_of(&entry);
                     let terminal_fired = run_completion_actions(&app, &state, &entry);
                     state.retries.lock_ok().remove(&entry.id);
+                    // WS-A: a finished download's heal budget is
+                    // spent history — the episode is over
+                    state.heals.lock_ok().remove(&entry.id);
                     if current_settings(&state).sound_events {
                         play_event_sound(true);
                     }
@@ -3704,6 +3834,17 @@ pub fn spawn_emit_loop(app: Ctx, entry: Arc<Entry>) {
                     break;
                 }
                 "error" | "cancelled" => {
+                    // WS-A: an auth-dead file download heals
+                    // BEFORE any generic retry is registered —
+                    // the heal is this failure's retry, aimed at
+                    // the dead address itself (see
+                    // maybe_heal_expiry)
+                    if status == "error"
+                        && entry.kind == "http"
+                        && maybe_heal_expiry(&app, &entry)
+                    {
+                        break;
+                    }
                     let state = app.state();
                     if status == "error" {
                         if current_settings(&state).sound_events {
@@ -3957,6 +4098,7 @@ pub async fn start_engine(app: Ctx, stub: &Arc<Entry>) -> Result<Arc<Entry>, Str
             cookie,
             referer,
             authorization,
+            user_agent: None,
         }
     };
     // the probe inside ndm::start can take seconds; the entry must count
@@ -4147,6 +4289,20 @@ pub fn cap_suffixed_name(stem: &str, suffix: &str, ext: &str) -> String {
     let fixed = suffix.len() + ext.len();
     if stem.len() + fixed <= 255 {
         return format!("{stem}{suffix}{ext}");
+    }
+    if fixed > 255 {
+        // the extension alone (with the suffix) exceeds the limit
+        // — a capped name whose "extension" is ~254 bytes meeting
+        // a collision: the stem budget saturates at 0 and the old
+        // code returned suffix+ext whole, over the limit again.
+        // The suffix (uniqueness) survives; the extension
+        // truncates on a char boundary (WS-BUGS B5a).
+        let ext_budget = 255usize.saturating_sub(suffix.len());
+        let mut end = ext_budget.min(ext.len());
+        while end > 0 && !ext.is_char_boundary(end) {
+            end -= 1;
+        }
+        return format!("{suffix}{}", &ext[..end]);
     }
     let budget = 255usize.saturating_sub(fixed);
     let mut end = budget.min(stem.len());
@@ -7870,6 +8026,7 @@ pub async fn probe_file(
         cookie,
         referer,
         authorization,
+        user_agent: None,
     };
     // Change 4 (2.0.4): remember this probe for the Start that
     // follows (probe-once handoff) — signature taken over the auth
@@ -7941,7 +8098,7 @@ pub async fn probe_video(
     let capture_dir = data_dir(&state);
     let capture_set = capture::get_set(
         capture_dir.as_deref(),
-        &capture::video_identity(&url),
+        &capture::identity_for_url(&url),
     );
     let mut info = match probed {
         Ok(info) => info,
@@ -10898,6 +11055,15 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
                 title: title.clone(),
                 streams,
                 received_unix: capture::now_unix(),
+                // 2.3.2 (WS-B): the recorder's per-video grouping
+                // key when this set names one Facebook video —
+                // store_set derives the per-video identity from it
+                video_key: v["videoKey"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(80)
+                    .collect(),
             },
         );
         // 2.3.1 (item 14): a store-only send is the browser
@@ -11324,6 +11490,7 @@ pub fn sync_sweep(ctx: &Ctx, queue: &str) {
                 Some(e.referer.clone())
             },
             authorization: basic_auth_header(&login, &password),
+            user_agent: None,
         };
         let probe = match ndm::probe_with_auth(&e.url, &auth) {
             Ok(p) => p,
@@ -11684,8 +11851,14 @@ pub fn run_snapshot_loop(ctx: Ctx) {
 }
 
 /// Incoming queue from the browser extension (via ndm-host):
-/// drain immediately on startup and poll every 200ms so browser
-/// clicks feel instantaneous.
+/// drain immediately on startup and poll every 50ms so browser
+/// clicks feel instantaneous. (Audit-232 §2: the poll was 200 ms
+/// and a filesystem watch was considered, but the tree carries
+/// no watch dependency and the batch rule is existing deps
+/// first — 50 ms removes most of the click latency for one
+/// stat of an usually-absent file per tick. The drain itself is
+/// idempotent and claim-atomic, so nothing depends on the
+/// interval; drain_pickup_latency_stays_snappy locks the gain.)
 pub fn run_incoming_loop(ctx: Ctx, queue_dir: PathBuf) {
     std::thread::spawn(move || {
         // panic-isolated per tick: this thread is the ONLY
@@ -11697,12 +11870,12 @@ pub fn run_incoming_loop(ctx: Ctx, queue_dir: PathBuf) {
         }));
         let mut ticks = 0u64;
         loop {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(50));
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 drain_incoming(&ctx, &queue_dir);
             }));
             ticks += 1;
-            if ticks % 300 == 0 {
+            if ticks % 1200 == 0 {
                 prune_acks(&queue_dir, &live_progress_files(&ctx));
             }
         }
@@ -11837,6 +12010,7 @@ mod tests {
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
+            heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
             startup_notice: Mutex::new(None),
@@ -12045,6 +12219,7 @@ mod tests {
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
+            heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
             startup_notice: Mutex::new(None),
@@ -12126,6 +12301,7 @@ mod tests {
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
+            heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
             startup_notice: Mutex::new(None),
@@ -12439,6 +12615,7 @@ mod tests {
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
+            heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
             startup_notice: Mutex::new(None),
@@ -12494,6 +12671,7 @@ mod tests {
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
             retries: Mutex::new(HashMap::new()),
+            heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
             startup_notice: Mutex::new(None),
@@ -12956,6 +13134,7 @@ mod tests {
             cookie: Some("sid=1".into()),
             referer: None,
             authorization: None,
+            user_agent: None,
         };
         let probe = ndm::Probe {
             total: 1234,
@@ -14180,6 +14359,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// WS-C (2.3.2) click-latency regression lock, MEASURED through
+    /// the real chain a Download click pays: an append to
+    /// incoming.jsonl (what the host does) -> the incoming loop's
+    /// pickup -> the line processed -> the ack file the host waits
+    /// on. Audit-232 §2 modelled the old 200 ms poll at ~100 ms
+    /// mean / ~200 ms worst for this hop, paid TWICE per click;
+    /// the trimmed poll must keep the measured mean far under the
+    /// old mean. Margins are CI-generous on purpose: this locks
+    /// the order of magnitude, not the exact constant.
+    #[test]
+    fn drain_pickup_latency_stays_snappy() {
+        let dir = std::env::temp_dir().join(format!("ndm-drain-timing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let queue_dir = dir.join("incoming");
+        std::fs::create_dir_all(&queue_dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        run_incoming_loop(ctx, queue_dir.clone());
+        // let the startup drain and a few idle ticks pass: what is
+        // measured below is steady-state pickup, not app start
+        std::thread::sleep(Duration::from_millis(700));
+        let page = "https://www.youtube.com/watch?v=TIMINGtest9";
+        let mut samples: Vec<f64> = Vec::new();
+        for i in 0..6 {
+            let id = format!("wsc-timing-{i}");
+            let line = serde_json::json!({
+                "id": id,
+                "kind": "captured_streams",
+                "url": page,
+                "pageUrl": page,
+                "title": "Timing Test",
+                "storeOnly": true,
+                "streams": [
+                    { "url": "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=136",
+                      "mimeType": "video/mp4", "qualityLabel": "720p",
+                      "hasAudio": false, "hasVideo": true }
+                ]
+            })
+            .to_string();
+            // the host's append, replicated as one append write
+            let queue_file = queue_dir.join("incoming.jsonl");
+            {
+                use std::io::Write as _;
+                let mut f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&queue_file)
+                    .unwrap();
+                writeln!(f, "{line}").unwrap();
+            }
+            let t0 = Instant::now();
+            let ack = dir.join("acks").join(format!("{id}.ack"));
+            while !ack.is_file() {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(10),
+                    "sample {i}: the drain never acked"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+            // let the loop fall back into its poll sleep so the
+            // next sample does not start phase-locked to a tick
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let worst = samples.iter().cloned().fold(0.0f64, f64::max);
+        eprintln!(
+            "WS-C drain pickup: mean {mean:.1} ms, worst {worst:.1} ms, samples {samples:?}"
+        );
+        assert!(
+            mean < 75.0,
+            "drain pickup mean {mean:.1} ms — the poll trim regressed"
+        );
+        assert!(worst < 300.0, "drain pickup worst {worst:.1} ms");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 2.3.1 (item 14): the JS mirror of capture::group_key
     /// (extension/content.js captureGroupKey) must produce the
     /// identical selector for the identical stream set — the
@@ -14197,6 +14454,7 @@ mod tests {
                     quality_label: Some("720p".to_string()),
                     has_audio: false,
                     has_video: true,
+                    user_agent: None,
                 },
                 capture::CapturedStream {
                     url: "https://rr1.googlevideo.com/videoplayback?expire=9999999999&itag=140"
@@ -14205,6 +14463,7 @@ mod tests {
                     quality_label: None,
                     has_audio: true,
                     has_video: false,
+                    user_agent: None,
                 },
             ],
             audio_only: false,
@@ -14290,6 +14549,61 @@ mod tests {
         assert!(
             by_sel.contains(&"bv*[height<=720]+ba[ext=m4a]"),
             "the bogus-key send must keep its yt-dlp selector: {by_sel:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2.3.2 (WS-B): a captured_streams line carrying a recorder
+    /// videoKey stores its set under that video's own identity —
+    /// a second video's line on the SAME feed page neither
+    /// replaces nor merges with it, and the bare feed identity
+    /// holds nothing.
+    #[test]
+    fn captured_streams_line_with_video_key_stores_per_video() {
+        let dir = std::env::temp_dir().join(format!("ndm-capfb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let feed = "https://www.facebook.com/wsb-drain-feed";
+        let line = |id: &str, key: &str, url: &str| {
+            serde_json::json!({
+                "id": id,
+                "kind": "captured_streams",
+                "url": feed,
+                "pageUrl": feed,
+                "title": "Feed video",
+                "storeOnly": true,
+                "videoKey": key,
+                "streams": [
+                    { "url": url, "mimeType": "video/mp4", "qualityLabel": "720p",
+                      "hasAudio": true, "hasVideo": true }
+                ]
+            })
+            .to_string()
+        };
+        handle_incoming_line(&ctx, &line("fb-a", "fb:111111111111111", "https://video.example.fbcdn.net/a-only.mp4"));
+        handle_incoming_line(&ctx, &line("fb-b", "fb:222222222222222", "https://video.example.fbcdn.net/b-only.mp4"));
+        let identity_of = |key: &str| {
+            capture::set_identity(&capture::CapturedSet {
+                page_url: feed.to_string(),
+                title: String::new(),
+                streams: Vec::new(),
+                received_unix: 0,
+                video_key: key.to_string(),
+            })
+        };
+        let set_a = capture::get_set(Some(&dir), &identity_of("fb:111111111111111"))
+            .expect("keyed set A must be stored");
+        assert_eq!(set_a.streams.len(), 1);
+        assert_eq!(set_a.streams[0].url, "https://video.example.fbcdn.net/a-only.mp4");
+        assert_eq!(set_a.video_key, "fb:111111111111111");
+        let set_b = capture::get_set(Some(&dir), &identity_of("fb:222222222222222"))
+            .expect("keyed set B must be stored");
+        assert_eq!(set_b.streams[0].url, "https://video.example.fbcdn.net/b-only.mp4");
+        assert!(
+            capture::get_set(Some(&dir), &capture::video_identity(feed)).is_none(),
+            "the bare feed identity must hold no merged set"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14467,6 +14781,924 @@ mod tests {
         let _ = std::fs::remove_dir_all(&site_dir);
         let _ = std::fs::remove_dir_all(&dl_dir);
         result.unwrap();
+    }
+
+    // ---------- WS-BUGS B4/B6: reveal gating, scheduler/pause, ----------
+    // ---------- completion exactly-once, remove-vs-drain race ----------
+
+    /// An EventSink that records the events these audits assert on.
+    struct RecSink {
+        reveals: Mutex<Vec<serde_json::Value>>,
+        completes: Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl RecSink {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                reveals: Mutex::new(Vec::new()),
+                completes: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl EventSink for RecSink {
+        fn emit(&self, event: AppEvent) {
+            match event {
+                AppEvent::ProgressDialogReveal(v) => {
+                    self.reveals.lock().unwrap().push(v)
+                }
+                AppEvent::DownloadComplete(v) => {
+                    self.completes.lock().unwrap().push(v)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A minimal loopback range server for core-level start paths.
+    fn core_range_server(body: Vec<u8>) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    if let Some((rs, re)) = range {
+                        let end = re.min(total - 1);
+                        let slice = &body[rs as usize..=end as usize];
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = s.write_all(slice);
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(&body);
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn core_pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
+    }
+
+    /// WS-A rig (audit-232 S5 at reduced scale): a redirector
+    /// whose signed token dies mid-download. `/file` always 302s
+    /// to the CURRENT token URL `/f?tok=N`; once `die_after`
+    /// bytes have been served under token 1, the token rotates —
+    /// old-token requests get `dead_status` (403/410), and a fresh
+    /// probe of `/file` lands on token 2. With `changed`, token 2
+    /// serves a DIFFERENT body (same length, different ETag) —
+    /// the Refresh Address "different file" arm. Returns the
+    /// port and a counter of `/file` requests (probes).
+    fn expiry_redirect_server(
+        body: Vec<u8>,
+        changed_body: Option<Vec<u8>>,
+        dead_status: u16,
+        die_after: u64,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gen = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let body = Arc::new(body);
+        let changed_body = Arc::new(changed_body);
+        let probes_ret = probes.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let (body, changed_body, gen, served, probes) = (
+                    body.clone(),
+                    changed_body.clone(),
+                    gen.clone(),
+                    served.clone(),
+                    probes.clone(),
+                );
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if path == "/file" {
+                        probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let g = gen.load(std::sync::atomic::Ordering::Relaxed);
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 302 Found\r\nLocation: /f?tok={g}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let tok: usize = path
+                        .strip_prefix("/f?tok=")
+                        .and_then(|t| t.parse().ok())
+                        .unwrap_or(0);
+                    let g = gen.load(std::sync::atomic::Ordering::Relaxed);
+                    if tok != g {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 {dead_status} Gone\r\nContent-Length: 7\r\nConnection: close\r\n\r\nexpired")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let active: &[u8] = if g >= 2 {
+                        match changed_body.as_ref() {
+                            Some(b2) => b2,
+                            None => &body,
+                        }
+                    } else {
+                        &body
+                    };
+                    let total = active.len() as u64;
+                    let etag = if changed_body.is_some() {
+                        format!("\"gen{g}\"")
+                    } else {
+                        "\"wsa\"".to_string()
+                    };
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = match range {
+                        Some(r) => r,
+                        None => (0, total - 1),
+                    };
+                    let end = re.min(total - 1);
+                    let slice = &active[rs as usize..=end as usize];
+                    if range.is_some() {
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            )
+                            .as_bytes(),
+                        );
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                    }
+                    let _ = s.write_all(slice);
+                    let now = served
+                        .fetch_add(slice.len() as u64, std::sync::atomic::Ordering::Relaxed)
+                        + slice.len() as u64;
+                    if now > die_after && g == 1 {
+                        gen.store(2, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        (port, probes_ret)
+    }
+
+    fn wait_status(state: &AppState, id: &str, want: &str, secs: u64) -> bool {
+        let t0 = Instant::now();
+        loop {
+            if let Some(e) = state.get(id) {
+                if payload_of(&e).status == want {
+                    return true;
+                }
+            }
+            if t0.elapsed() > Duration::from_secs(secs) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// WS-A (audit-232 S5): a file download whose signed token
+    /// dies mid-download (403 shape AND 410 shape) must heal
+    /// itself — re-probe the original redirector URL, resume from
+    /// the journal on the fresh token — and land byte-identical.
+    /// Before the fix both shapes sat in "error" forever in this
+    /// harness (410 was Permanent-classified at the engine and
+    /// permanent-listed for retry; nothing re-probed on an error
+    /// path). The audit's rig shapes at 100 MiB died at 63% (403)
+    /// and 43.8% (410); this is the same shape at 6 MiB.
+    #[test]
+    fn expiry_heal_completes_both_shapes_byte_identical() {
+        for dead_status in [410u16, 403] {
+            let dir = std::env::temp_dir()
+                .join(format!("ndm-wsa-heal-{dead_status}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let body = core_pattern(6 * 1024 * 1024);
+            let (port, _probes) =
+                expiry_redirect_server(body.clone(), None, dead_status, 1024 * 1024);
+            let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+            let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+            let url = format!("http://127.0.0.1:{port}/file");
+            let stub = register_http_stub(
+                &state,
+                &url,
+                dir.to_string_lossy().as_ref(),
+                None,
+                Some("heal.bin"),
+                "",
+                "",
+                &main_queue_name(),
+                "",
+                "",
+                true,
+            )
+            .unwrap();
+            start_entry(&ctx, stub.clone());
+            assert!(
+                wait_status(&state, &stub.id, "finished", 120),
+                "status {dead_status}: the auth-dead download must heal and finish; last payload: {:?}",
+                state.get(&stub.id).map(|e| { let p = payload_of(&e); format!("{} err={} {}/{}", p.status, p.error, p.done_bytes, p.total) })
+            );
+            assert_eq!(
+                std::fs::read(dir.join("heal.bin")).unwrap(),
+                body,
+                "status {dead_status}: healed download must be byte-identical"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// WS-A: the heal's other arm — the re-probe finds a
+    /// DIFFERENT file behind the original address (new ETag,
+    /// same length): Refresh Address semantics restart the entry
+    /// from zero, and the finished file is the NEW body, never a
+    /// splice of old and new.
+    #[test]
+    fn expiry_heal_with_changed_file_restarts_from_zero() {
+        let dir = std::env::temp_dir().join(format!("ndm-wsa-changed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = core_pattern(6 * 1024 * 1024);
+        let body2: Vec<u8> = body.iter().map(|b| b ^ 0x5a).collect();
+        let (port, _probes) =
+            expiry_redirect_server(body.clone(), Some(body2.clone()), 410, 1024 * 1024);
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let url = format!("http://127.0.0.1:{port}/file");
+        let stub = register_http_stub(
+            &state,
+            &url,
+            dir.to_string_lossy().as_ref(),
+            None,
+            Some("changed.bin"),
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        start_entry(&ctx, stub.clone());
+        assert!(
+            wait_status(&state, &stub.id, "finished", 120),
+            "the changed-file heal must finish; last payload: {:?}",
+            state.get(&stub.id).map(|e| { let p = payload_of(&e); format!("{} err={} {}/{}", p.status, p.error, p.done_bytes, p.total) })
+        );
+        assert_eq!(
+            std::fs::read(dir.join("changed.bin")).unwrap(),
+            body2,
+            "a different file behind the address restarts from zero: the NEW body, whole"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS-A negative: a pause pressed DURING the heal (the entry
+    /// sits in "Refreshing address…") parks the job — the heal
+    /// must not start the download behind the user's back.
+    #[test]
+    fn expiry_heal_paused_mid_heal_does_not_start() {
+        let dir = std::env::temp_dir().join(format!("ndm-wsa-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = core_pattern(6 * 1024 * 1024);
+        let (port, _probes) = expiry_redirect_server(body.clone(), None, 410, 1024 * 1024);
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let url = format!("http://127.0.0.1:{port}/file");
+        let stub = register_http_stub(
+            &state,
+            &url,
+            dir.to_string_lossy().as_ref(),
+            None,
+            Some("paused.bin"),
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        let id = stub.id.clone();
+        start_entry(&ctx, stub);
+        // wait for the heal window: the detail text is the signal
+        let t0 = Instant::now();
+        let healing = loop {
+            if let Some(e) = state.get(&id) {
+                if payload_of(&e).detail == "Refreshing address\u{2026}" {
+                    break true;
+                }
+            }
+            if t0.elapsed() > Duration::from_secs(90) {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(healing, "the job never entered the heal window");
+        pause_download(ctx.clone(), id.clone()).unwrap();
+        // well past the heal backoff + a full restart's runtime:
+        // a heal that ignored the pause would have finished by now
+        std::thread::sleep(Duration::from_secs(10));
+        let e = state.get(&id).expect("entry still listed");
+        let p = payload_of(&e);
+        assert_eq!(p.status, "paused", "a mid-heal pause must park the job: {} {}/{}", p.error, p.done_bytes, p.total);
+        assert!(p.done_bytes < p.total, "bytes moved after the pause: {}/{}", p.done_bytes, p.total);
+        assert!(e.download.is_none(), "no engine may be live after the parked heal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS-A negative: with the heal budget already spent, an
+    /// auth-dead download fails honestly — no extra probe of the
+    /// original address, no loop, the error stays on the entry.
+    #[test]
+    fn expiry_heal_budget_exhausted_fails_honestly() {
+        let dir = std::env::temp_dir().join(format!("ndm-wsa-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = core_pattern(6 * 1024 * 1024);
+        let (port, probes) = expiry_redirect_server(body.clone(), None, 410, 1024 * 1024);
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        // the budget for this entry is already spent (as if three
+        // heals already ran and the address kept dying)
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let url = format!("http://127.0.0.1:{port}/file");
+        let stub = register_http_stub(
+            &state,
+            &url,
+            dir.to_string_lossy().as_ref(),
+            None,
+            Some("budget.bin"),
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        state
+            .heals
+            .lock()
+            .unwrap()
+            .insert(stub.id.clone(), MAX_HEAL_ATTEMPTS);
+        let id = stub.id.clone();
+        start_entry(&ctx, stub);
+        assert!(
+            wait_status(&state, &id, "error", 120),
+            "the download must reach its honest error; last payload: {:?}",
+            state.get(&id).map(|e| { let p = payload_of(&e); format!("{} err={} {}/{}", p.status, p.error, p.done_bytes, p.total) })
+        );
+        let probes_at_error = probes.load(std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(8));
+        let e = state.get(&id).expect("entry still listed");
+        assert_eq!(payload_of(&e).status, "error", "the failure must stay put");
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::Relaxed),
+            probes_at_error,
+            "an exhausted heal budget must not re-probe the address"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// WS-A: the heal gate's decision table — auth-death only,
+    /// bytes must have flowed, budget bounds it, a user stop
+    /// vetoes it outright.
+    #[test]
+    fn heal_decision_table() {
+        assert!(heal_decision(true, 100, 0, false));
+        assert!(heal_decision(true, 100, MAX_HEAL_ATTEMPTS - 1, false));
+        assert!(!heal_decision(true, 100, MAX_HEAL_ATTEMPTS, false), "budget spent");
+        assert!(!heal_decision(false, 100, 0, false), "not an auth death");
+        assert!(!heal_decision(true, 0, 0, false), "no bytes flowed — nothing to resume");
+        assert!(!heal_decision(true, 100, 0, true), "user-stopped jobs never heal");
+        assert_eq!(heal_backoff(0), Duration::from_secs(2));
+        assert_eq!(heal_backoff(1), Duration::from_secs(4));
+        assert_eq!(heal_backoff(2), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn b4_file_direct_reveals_but_download_later_does_not() {
+        // 2.3.1 item 9's design, proven at the drain: an explicit
+        // file_direct (Download Now in the extension's file dialog)
+        // reveals the progress dialog; the SAME payload with
+        // later=true starts nothing and reveals nothing.
+        let dir = std::env::temp_dir().join(format!("ndm-b4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dl_dir = dir.join("downloads");
+        std::fs::create_dir_all(&dl_dir).unwrap();
+        let body = core_pattern(200_000);
+        let port = core_range_server(body.clone());
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let sink = RecSink::new();
+        let ctx = Ctx::new(state.clone(), sink.clone());
+
+        let url1 = format!("http://127.0.0.1:{port}/now.bin");
+        let line = serde_json::json!({
+            "id": "b4-now", "kind": "file_direct", "url": url1,
+            "dir": dl_dir.to_string_lossy(), "later": false,
+            "title": "now.bin", "pageUrl": ""
+        })
+        .to_string();
+        handle_incoming_line(&ctx, &line);
+        assert_eq!(
+            sink.reveals.lock().unwrap().len(),
+            1,
+            "an explicit file_direct must reveal exactly once: {:?}",
+            sink.reveals.lock().unwrap()
+        );
+        let id1 = sink.reveals.lock().unwrap()[0]["id"]
+            .as_str()
+            .expect("the reveal names the entry")
+            .to_string();
+        assert!(
+            wait_status(&state, &id1, "finished", 30),
+            "the revealed download must actually run"
+        );
+        assert_eq!(
+            std::fs::read(dl_dir.join("now.bin")).unwrap(),
+            body,
+            "the revealed download lands byte-exact"
+        );
+
+        let url2 = format!("http://127.0.0.1:{port}/later.bin");
+        let line = serde_json::json!({
+            "id": "b4-later", "kind": "file_direct", "url": url2,
+            "dir": dl_dir.to_string_lossy(), "later": true,
+            "title": "later.bin", "pageUrl": ""
+        })
+        .to_string();
+        handle_incoming_line(&ctx, &line);
+        assert_eq!(
+            sink.reveals.lock().unwrap().len(),
+            1,
+            "Download Later must not reveal: {:?}",
+            sink.reveals.lock().unwrap()
+        );
+        let later_entry = state
+            .entries
+            .lock()
+            .unwrap()
+            .values()
+            .find(|e| e.url == url2)
+            .cloned()
+            .expect("the later entry exists");
+        assert_eq!(payload_of(&later_entry).status, "paused");
+        assert!(later_entry.download.is_none(), "later starts no engine");
+
+        let _ = remove_download(ctx.clone(), id1, Some(true));
+        let _ = remove_download(ctx.clone(), later_entry.id.clone(), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b4_reveal_follows_the_progress_dialog_view_setting() {
+        let dir = std::env::temp_dir().join(format!("ndm-b4view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let sink = RecSink::new();
+        let ctx = Ctx::new(state.clone(), sink.clone());
+        let stub = register_http_stub(
+            &state,
+            "http://127.0.0.1:9/x.bin",
+            dir.to_string_lossy().as_ref(),
+            None,
+            None,
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        for (view, want) in [("never", 0), ("minimized", 1), ("show", 2)] {
+            state.settings.lock().unwrap().progress_dialog_view = view.to_string();
+            maybe_reveal_progress_dialog(&ctx, &state, &stub);
+            assert_eq!(
+                sink.reveals.lock().unwrap().len(),
+                want,
+                "view={view} must produce {want} cumulative reveals"
+            );
+        }
+        assert_eq!(
+            sink.reveals.lock().unwrap()[0]["view"],
+            serde_json::json!("minimized")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b4_pump_claimed_start_also_reveals() {
+        // The queue pump reveals for EVERY entry it claims —
+        // including claims nobody explicitly pressed for in the
+        // moment (scheduler promoter, automatic retry, startup
+        // resume all ride this pump). This pins the behaviour the
+        // B4 audit reports: pump claims are NOT silent starts.
+        let dir = std::env::temp_dir().join(format!("ndm-b4pump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = core_pattern(80_000);
+        let port = core_range_server(body);
+        let url = format!("http://127.0.0.1:{port}/pumped.bin");
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let sink = RecSink::new();
+        let ctx = Ctx::new(state.clone(), sink.clone());
+        let stub = register_http_stub(
+            &state,
+            &url,
+            dir.to_string_lossy().as_ref(),
+            None,
+            None,
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        stub.queued.store(true, Ordering::Relaxed);
+        pump_queue(&ctx);
+        assert!(
+            wait_status(&state, &stub.id, "finished", 30),
+            "the pump must claim and run the queued entry"
+        );
+        assert_eq!(
+            sink.reveals.lock().unwrap().len(),
+            1,
+            "a pump-claimed start reveals like any other start: {:?}",
+            sink.reveals.lock().unwrap()
+        );
+        let _ = remove_download(ctx.clone(), stub.id.clone(), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b6_scheduler_never_starts_a_user_paused_entry() {
+        // The scheduler's own machinery (periodic pump, window-open
+        // adoption, start-all-queued) must leave a user-paused entry
+        // alone; only the EXPLICIT Start Queue Now press adopts
+        // paused members (requeue_paused_members' documented job).
+        let dir = std::env::temp_dir().join(format!("ndm-b6pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = core_pattern(120_000);
+        let port = core_range_server(body);
+        let url = format!("http://127.0.0.1:{port}/paused.bin");
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let stub = register_http_stub(
+            &state,
+            &url,
+            dir.to_string_lossy().as_ref(),
+            None,
+            None,
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        let id = stub.id.clone();
+        let queue = entry_queue(&stub);
+        // the entry sits queued (as Download Later / a schedule
+        // member would), then the user pauses it
+        stub.queued.store(true, Ordering::Relaxed);
+        pause_download(ctx.clone(), id.clone()).unwrap();
+        let entry = state.get(&id).unwrap();
+        assert!(!entry.queued.load(Ordering::Relaxed), "pause leaves the queue");
+        assert!(entry.pause_requested.load(Ordering::SeqCst), "pause latches");
+
+        // everything the scheduler loop does on its own:
+        pump_queue(&ctx);
+        let s = current_settings(&state);
+        adopt_parked_entries(&ctx, &state, &s, &queue, false);
+        start_all_queued(&ctx, Some(&queue));
+        pump_queue(&ctx);
+        std::thread::sleep(Duration::from_millis(500));
+        let entry = state.get(&id).unwrap();
+        assert!(
+            entry.download.is_none(),
+            "scheduler machinery started a user-paused entry"
+        );
+        assert_eq!(payload_of(&entry).status, "paused");
+
+        // the explicit press is the documented exception: it adopts
+        // the paused member and the download runs
+        scheduler_start_now(ctx.clone(), Some(queue)).unwrap();
+        assert!(
+            wait_status(&state, &id, "finished", 30),
+            "Start Queue Now must run the adopted entry"
+        );
+        let _ = remove_download(ctx.clone(), id, Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b6_two_finishes_in_one_tick_fire_completion_exactly_once_each() {
+        // Two entries reach Finished together; each emit loop runs
+        // its finish arm once (the `emitting` guard also swallows
+        // the duplicate spawn), so the global completion program
+        // sees each file exactly once — and the journal both loops
+        // persist through stays valid, with both entries finished.
+        let dir = std::env::temp_dir().join(format!("ndm-b6fin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("completions.log");
+        let script = dir.join("hook.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$1\" >> {}\n", log.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let data_file = dir.join("downloads.json");
+        let state = Arc::new(state_with_data_file(data_file.clone()));
+        state.settings.lock().unwrap().completion_program =
+            script.to_string_lossy().into_owned();
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+
+        let mut entries = Vec::new();
+        for (id, name, size) in [("dl-1", "one.bin", 5u64), ("dl-2", "two.bin", 7u64)] {
+            let out = dir.join(name);
+            std::fs::write(&out, vec![b'x'; size as usize]).unwrap();
+            let mut e = restored_entry(name, "http", size, out);
+            e.id = id.to_string();
+            e.url = format!("http://127.0.0.1:9/{name}");
+            let e = Arc::new(e);
+            state.entries.lock().unwrap().insert(id.to_string(), e.clone());
+            state.order.lock().unwrap().push(id.to_string());
+            entries.push(e);
+        }
+        for e in &entries {
+            spawn_emit_loop(ctx.clone(), e.clone());
+            // a second spawn request for the same entry must be a
+            // no-op while the first loop lives (exactly-once guard)
+            spawn_emit_loop(ctx.clone(), e.clone());
+        }
+        // both finish arms run the program once per entry
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(20) {
+            if let Ok(text) = std::fs::read_to_string(&log) {
+                if text.lines().count() >= 2 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // settle: no third invocation may trail in
+        std::thread::sleep(Duration::from_millis(800));
+        let text = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+        assert_eq!(lines.len(), 2, "completion program invocations: {lines:?}");
+        assert!(lines.iter().any(|l| l.ends_with("one.bin")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.ends_with("two.bin")), "{lines:?}");
+        // the interleaved persists leave one valid journal holding
+        // both entries as finished
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&data_file).unwrap())
+                .expect("downloads.json stays valid JSON");
+        let arr = journal.as_array().expect("journal is a list");
+        assert_eq!(arr.len(), 2, "journal: {journal}");
+        assert!(
+            arr.iter().all(|e| e["status"] == serde_json::json!("finished")),
+            "journal: {journal}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn b6_remove_races_incoming_add_for_the_same_url() {
+        // Delete of an entry while the drain is mid-add of a
+        // capture for the same URL, in every interleaving the loop
+        // can produce: no panic, never two live entries for the
+        // URL, and the journal stays valid JSON throughout.
+        let body = core_pattern(60_000);
+        let port = core_range_server(body);
+        let url = format!("http://127.0.0.1:{port}/race.bin");
+        for iter in 0..25 {
+            let dir = std::env::temp_dir()
+                .join(format!("ndm-b6race-{}-{iter}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let data_file = dir.join("downloads.json");
+            let state = Arc::new(state_with_data_file(data_file.clone()));
+            let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+            let pre = register_http_stub(
+                &state,
+                &url,
+                dir.to_string_lossy().as_ref(),
+                None,
+                None,
+                "",
+                "",
+                &main_queue_name(),
+                "",
+                "",
+                true,
+            )
+            .unwrap();
+            let line = serde_json::json!({
+                "id": format!("b6-race-{iter}"), "kind": "file_direct",
+                "url": url, "dir": dir.to_string_lossy(),
+                "later": false, "title": "race.bin", "pageUrl": ""
+            })
+            .to_string();
+            let ctx_a = ctx.clone();
+            let drain = std::thread::spawn(move || handle_incoming_line(&ctx_a, &line));
+            let ctx_b = ctx.clone();
+            let pre_id = pre.id.clone();
+            let remover =
+                std::thread::spawn(move || remove_download(ctx_b, pre_id, Some(false)));
+            drain.join().expect("the drain must not panic");
+            let _ = remover.join().expect("the removal must not panic");
+            let same_url = state
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|e| e.url == url)
+                .count();
+            assert!(
+                same_url <= 1,
+                "iteration {iter}: {same_url} live entries for one URL"
+            );
+            persist(&state);
+            let journal: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&data_file).unwrap())
+                    .expect("journal stays valid JSON");
+            assert!(journal.is_array());
+            // stop any engine the winning add started
+            let ids: Vec<String> = state.order.lock().unwrap().clone();
+            for id in ids {
+                let _ = remove_download(ctx.clone(), id, Some(true));
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn b5_core_allocation_keeps_hostile_name_hints_inside_the_folder() {
+        // The core half of B5(a): a browser/user-supplied name hint
+        // is sanitised and capped at registration, so the entry's
+        // output path is always ONE file directly inside the
+        // target folder — whatever the hint tried to be.
+        let dir = std::env::temp_dir().join(format!("ndm-b5alloc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let cases: [(&str, &str); 4] = [
+            ("../../evil.bin", "evil.bin"),
+            ("..\\..\\win.dll", "win.dll"),
+            ("a/b/c.zip", "c.zip"),
+            ("plain.dat", "plain.dat"),
+        ];
+        for (i, (hint, want)) in cases.iter().enumerate() {
+            let stub = register_http_stub(
+                &state,
+                &format!("http://127.0.0.1:9/f{i}"),
+                dir.to_string_lossy().as_ref(),
+                None,
+                Some(hint),
+                "",
+                "",
+                &main_queue_name(),
+                "",
+                "",
+                true,
+            )
+            .unwrap();
+            assert_eq!(stub.name, *want, "hint {hint}");
+            assert_eq!(stub.out_path.parent(), Some(dir.as_path()), "hint {hint}");
+        }
+        // the suffixed-candidate cap holds even when the
+        // "extension" alone nearly fills the limit (a capped
+        // hostile name meeting a collision sibling)
+        let fat_ext = format!(".{}", "x".repeat(253));
+        let cand = cap_suffixed_name("a", " (1)", &fat_ext);
+        assert!(cand.len() <= 255, "suffixed cap: {} bytes", cand.len());
+        assert!(cand.contains(" (1)"), "the uniqueness suffix survives: {cand}");
+        // a 400-char hint is capped to a creatable name, in-folder
+        let long_hint = format!("{}.bin", "n".repeat(400));
+        let stub = register_http_stub(
+            &state,
+            "http://127.0.0.1:9/long",
+            dir.to_string_lossy().as_ref(),
+            None,
+            Some(&long_hint),
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        assert!(stub.name.len() <= 255, "hint capped: {} bytes", stub.name.len());
+        assert_eq!(stub.out_path.parent(), Some(dir.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

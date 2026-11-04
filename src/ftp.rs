@@ -933,6 +933,14 @@ pub(crate) fn ftp_worker(
                         }
                         break;
                     }
+                    Err(BlockError::YieldedByte(_)) => {
+                        // FTP runs never arm a tail byte-split
+                        // (that is the HTTP helper path's alone);
+                        // if one ever surfaced here, re-running
+                        // the same sub-run from its cursor is the
+                        // safe response
+                        continue;
+                    }
                     Err(BlockError::Recycle) => {
                         continue;
                     }
@@ -1161,23 +1169,31 @@ pub(crate) fn start_ftp_single_stream(
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(1),
+        conn_cap: AtomicUsize::new(1),
+        worker_count: 1,
+        pair_survivor: AtomicBool::new(false),
         active_workers: AtomicUsize::new(1),
         throttle_times: Mutex::new(Vec::new()),
         range_200_count: AtomicUsize::new(0),
         single_fallback: AtomicBool::new(false),
         fallback_used: AtomicBool::new(false),
         failed: AtomicBool::new(false),
+        auth_dead: AtomicBool::new(false),
         error: Mutex::new(None),
         control: control.clone(),
         block_state: vec![AtomicU8::new(0)],
         status: Mutex::new(Status::Downloading),
         partial: vec![AtomicU64::new(0)],
         conn_bytes: vec![AtomicU64::new(0)],
+        conn_rate_bps: vec![AtomicU64::new(0)],
+        peak_conn_rate_bps: AtomicU64::new(0),
         rate_hist: Mutex::new(std::collections::VecDeque::new()),
         own_limit: AtomicU64::new(0),
         own_limit_state: Mutex::new(None),
         last_progress: Mutex::new(Instant::now()),
         requeue: Mutex::new(Vec::new()),
+        byte_requeue: Mutex::new(Vec::new()),
+        tail_splits: Mutex::new(vec![None]),
         waiting_workers: AtomicUsize::new(0),
         last_split: Mutex::new(None),
         last_journal_error: Mutex::new(None),

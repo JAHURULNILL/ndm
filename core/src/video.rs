@@ -71,6 +71,67 @@ pub fn probe_streams(path: &Path, components_dir: &Path) -> Option<(bool, bool)>
     Some(streams_in_ffmpeg_info(&stderr))
 }
 
+/// The codec name of the first audio stream in `ffmpeg -i`
+/// output (e.g. "aac", "opus", "mp3"), lower-cased. Pure parse,
+/// unit-tested. None when the file reports no audio stream.
+pub fn audio_codec_in_ffmpeg_info(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let t = line.trim_start();
+        if t.starts_with("Stream #") {
+            if let Some(rest) = t.split(": Audio: ").nth(1) {
+                let codec: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !codec.is_empty() {
+                    return Some(codec.to_lowercase());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The first audio stream's codec in a media file, via the same
+/// `ffmpeg -i` inspection probe_streams uses. None when the
+/// file cannot be probed or carries no audio.
+pub fn probe_audio_codec(path: &Path, components_dir: &Path) -> Option<String> {
+    let ffmpeg = find_tool("ffmpeg", components_dir)?;
+    let out = tool_cmd(ffmpeg)
+        .args(["-hide_banner", "-i"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+    audio_codec_in_ffmpeg_info(&String::from_utf8_lossy(&out.stderr))
+}
+
+/// The merge's audio arguments for an input whose audio may
+/// already be AAC (WS-D D3). The pair/single merges have always
+/// normalized audio to AAC 192k so an MP4 never carries a codec
+/// players refuse (Opus-in-MP4) — but when the source audio IS
+/// AAC already, the re-encode is pure cost: on the audit's pair
+/// fixture it owned ~9.0 s of the ~10 s last-byte-to-finished
+/// tail (a 128 s audio track re-encoded at ~14x realtime),
+/// while copying the same track through the same merge took
+/// 0.16 s. Copying also avoids a lossy-to-lossy generation.
+/// Non-AAC (or unprobeable) audio keeps the re-encode exactly
+/// as before.
+fn merge_audio_args(audio_source: &Path, components_dir: &Path) -> Vec<String> {
+    if probe_audio_codec(audio_source, components_dir).as_deref() == Some("aac") {
+        vec!["-c:a".into(), "copy".into()]
+    } else {
+        vec![
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            "192k".into(),
+        ]
+    }
+}
+
 /// Completion size reconciliation for MERGE/REMUX jobs (F-EXT-04,
 /// R3-EXT-01). The question at the finish line is whether the merged
 /// output holds the media this job selected — so the baseline is
@@ -1215,6 +1276,7 @@ struct DirectStream {
     has_audio: bool,
     cookie: Option<String>,
     referer: Option<String>,
+    user_agent: Option<String>,
 }
 
 /// One stream of a caller-supplied resolution (see Preresolved).
@@ -1225,17 +1287,23 @@ pub struct PreresolvedStream {
     pub has_audio: bool,
     pub cookie: Option<String>,
     pub referer: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 /// A resolution supplied by the caller instead of a yt-dlp run —
 /// the browser-capture door's streams (crate::capture): the
 /// browser already unlocked and played these, so there is nothing
 /// to resolve; the job downloads them through the same parallel
-/// engine + ffmpeg mux as a resolved selection, and NEVER falls
-/// back to yt-dlp (its selector names a capture group, not a
-/// yt-dlp format — feeding it to yt-dlp would only manufacture a
-/// raw format error where the user deserves the plain
-/// capture-expired message).
+/// engine + ffmpeg mux as a resolved selection, and never falls
+/// back to the yt-dlp DOWNLOADER (its selector names a capture
+/// group, not a yt-dlp format — feeding it to yt-dlp would only
+/// manufacture a raw format error where the user deserves the
+/// plain capture-expired message). One WS-A exception: when the
+/// captured streams AUTH-DIE (403/410) mid-download, the job
+/// re-resolves the PAGE URL through yt-dlp — with the standard
+/// best selector, not the capture key — and continues on the
+/// fresh streams through the engine (see
+/// heal_reresolve_preresolved).
 #[derive(Clone, Debug)]
 pub struct Preresolved {
     pub title: String,
@@ -1328,6 +1396,15 @@ const VIDEO_STALL_MIN_ADVANCE: u64 = 32 * 1024;
 /// job falls back to yt-dlp (attempts that gain real bytes do
 /// not spend this budget — see the attempt loop).
 const MAX_VIDEO_RECOVERIES: u32 = 3;
+
+/// How a cancelled-stream settle wait ended (see
+/// VideoJob::settle_streams).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StreamSettle {
+    Done,
+    Stopped,
+    TimedOut,
+}
 
 /// How one engine attempt ended (see poll_engine_attempt).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1847,6 +1924,7 @@ fn resolution_from_json(
             has_audio,
             cookie,
             referer,
+            user_agent: None,
         });
     }
     if !audio && saw_vcodec && !any_video {
@@ -2295,6 +2373,53 @@ impl VideoJob {
         probe.resolved
     }
 
+    /// WS-A (audit-232 S5): re-resolve this job's PAGE URL
+    /// through yt-dlp after a preresolved (browser-captured)
+    /// job's streams auth-died. The job's own selector names a
+    /// capture group — it is not a yt-dlp format expression — so
+    /// the heal resolves with the standard best selector for the
+    /// job's kind, and returns it alongside the fresh streams:
+    /// later stall re-resolves keep using that selector, never
+    /// the capture key. The cache entry for the heal selector is
+    /// evicted first — a heal must resolve LIVE, not inherit a
+    /// warm resolution whose URLs may be the ones that just died.
+    fn heal_reresolve_preresolved(
+        &self,
+        ytdlp: &Path,
+        components_dir: &Path,
+    ) -> Option<(Vec<DirectStream>, String)> {
+        let heal_sel = if self.audio {
+            "ba[ext=m4a]/ba/b".to_string()
+        } else {
+            ndm::video_probe::best_selector()
+        };
+        resolution_cache_evict(&self.resolution_key(&heal_sel));
+        let (_, fresh) = self.resolve_direct_streams(ytdlp, components_dir, &heal_sel)?;
+        Some((fresh, heal_sel))
+    }
+
+    /// Wait for cancelled streams to fully settle before their
+    /// part files are reopened (the engine's one-writer guard is
+    /// released only after the final state save; restarting
+    /// earlier is refused and kills the engine path). Bounded by
+    /// the engine's own watchdog horizon; a stop landing during
+    /// the wait is reported, never waited out.
+    fn settle_streams(&self, dls: &[Arc<ndm::Download>], my_gen: u64) -> StreamSettle {
+        let deadline = Instant::now() + std::time::Duration::from_secs(35);
+        while !dls.iter().all(|d| d.is_settled()) {
+            if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+                || self.stop_flag.lock().unwrap().is_some()
+            {
+                return StreamSettle::Stopped;
+            }
+            if Instant::now() >= deadline {
+                return StreamSettle::TimedOut;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        StreamSettle::Done
+    }
+
     fn run_parallel_engine(
         self: &Arc<Self>,
         ytdlp: &Path,
@@ -2324,6 +2449,7 @@ impl VideoJob {
                     has_audio: s.has_audio,
                     cookie: s.cookie.clone(),
                     referer: s.referer.clone(),
+                    user_agent: s.user_agent.clone(),
                 })
                 .collect();
             // Streams the capture left cookieless inherit the
@@ -2449,7 +2575,27 @@ impl VideoJob {
         let mut part_paths: Vec<PathBuf> = Vec::new();
         let mut streams = streams;
         let mut barren = 0u32;
+        // WS-A: once a preresolved job has healed, it runs on
+        // yt-dlp-resolved streams under this selector — later
+        // stall re-resolves use it instead of the capture key
+        let mut reresolve_sel: Option<String> = None;
         'attempts: loop {
+            // A stop that landed while the previous attempt was
+            // being recovered from — above all during the
+            // re-resolve below, whose yt-dlp child is not the
+            // job's tracked child and so cannot be killed by
+            // pause()/cancel() — must not restart any stream:
+            // the resolve's result is discarded here, exactly as
+            // the pre-loop resolve's is (the gate above the loop).
+            // Without this gate the loop restarted the streams
+            // and the poll, which only honours "cancelled" and
+            // the generation, ran the transfer on against an
+            // explicit pause (audit-232 B3a).
+            if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+                || self.stop_flag.lock().unwrap().is_some()
+            {
+                return true;
+            }
             // the connection split is recomputed per attempt: a
             // re-resolve can change the stream set under us
             let primary = streams.iter().position(|s| !s.has_audio).unwrap_or(0);
@@ -2468,6 +2614,7 @@ impl VideoJob {
                 }
             };
             let mut dls: Vec<Arc<ndm::Download>> = Vec::new();
+            let mut start_auth_dead = false;
             part_paths.clear();
             for (i, st) in streams.iter().enumerate() {
                 let part = self
@@ -2476,9 +2623,30 @@ impl VideoJob {
                 let auth = ndm::Auth {
                     cookie: st.cookie.clone(),
                     referer: st.referer.clone(),
+                    user_agent: st.user_agent.clone(),
                     authorization: None,
                 };
-                match ndm::start_with_auth(&st.url, &part, stream_conn(i), ndm::DEFAULT_BLOCK, auth) {
+                // WS-D D2 (audit-232 S4): a pair starts each side
+                // with the FULL pool spawned but only its pair
+                // share active — when one side finishes, the poll
+                // raises the survivor to the whole pool live (see
+                // poll_engine_attempt), instead of the larger
+                // stream finishing on its share while the finished
+                // side's connections idle. Non-pair sets keep the
+                // plain start (spawn == active, as before).
+                let started = if streams.len() == 2 {
+                    ndm::start_with_auth_limited(
+                        &st.url,
+                        &part,
+                        max_conn,
+                        stream_conn(i),
+                        ndm::DEFAULT_BLOCK,
+                        auth,
+                    )
+                } else {
+                    ndm::start_with_auth(&st.url, &part, stream_conn(i), ndm::DEFAULT_BLOCK, auth)
+                };
+                match started {
                     Ok(dl) => {
                         let lim = self.limit();
                         if lim > 0 {
@@ -2487,24 +2655,93 @@ impl VideoJob {
                         part_paths.push(part);
                         dls.push(dl);
                     }
-                    Err(_) => {
+                    Err(e) => {
                         for d in &dls {
                             d.control.cancel();
+                        }
+                        self.active_downloads.lock().unwrap().clear();
+                        // WS-A: a preresolved stream refused at
+                        // START with an auth-death error — the
+                        // capture died before this attempt got
+                        // going. Heal it below like the
+                        // mid-transfer death, instead of failing
+                        // the job on the spot.
+                        if self.preresolved.is_some() && ndm::error_is_auth_dead(&e) {
+                            start_auth_dead = true;
+                            break;
                         }
                         // KEEP the part files and their resume state: a
                         // stream that failed to START must not destroy the
                         // bytes the other stream already fetched — a retry
                         // resumes them instead of restarting from byte 0
                         // (only a user cancel deletes partials).
-                        self.active_downloads.lock().unwrap().clear();
                         return false;
                     }
                 }
             }
 
+            if start_auth_dead {
+                // WS-A heal for a capture that was already dead
+                // at start: settle the cancelled partial starts,
+                // spend one recovery unit, re-resolve the page
+                // URL, and retry the attempt on fresh streams —
+                // bounded by the same budget as every recovery
+                {
+                    let mut p = self.progress.lock().unwrap();
+                    if p.status != "paused" {
+                        p.status = "resuming".to_string();
+                        p.speed_bps = 0.0;
+                        p.conns = 0;
+                    }
+                }
+                match self.settle_streams(&dls, my_gen) {
+                    StreamSettle::Stopped => return true,
+                    StreamSettle::TimedOut => {
+                        self.active_downloads.lock().unwrap().clear();
+                        return false;
+                    }
+                    StreamSettle::Done => {}
+                }
+                if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
+                    || self.stop_flag.lock().unwrap().is_some()
+                {
+                    return true;
+                }
+                barren += 1;
+                if barren > MAX_VIDEO_RECOVERIES {
+                    self.active_downloads.lock().unwrap().clear();
+                    return false;
+                }
+                match self.heal_reresolve_preresolved(ytdlp, components_dir) {
+                    Some((fresh, heal_sel)) => {
+                        streams = fresh;
+                        reresolve_sel = Some(heal_sel);
+                        continue 'attempts;
+                    }
+                    None => return false,
+                }
+            }
+
             *self.active_downloads.lock().unwrap() = dls.clone();
+            // A pause that landed in the start window above (the
+            // active set was still empty, so pause() could only
+            // set the stop flag) applies to the fresh streams
+            // now: pausing them lets the poll park the job, the
+            // same end state as a pause mid-transfer. A cancel in
+            // the same window needs no help — the poll's first
+            // check already honours it.
+            if self.stop_flag.lock().unwrap().as_deref() == Some("paused") {
+                for d in &dls {
+                    d.control.pause();
+                }
+            }
             let attempt_start_done = self.progress.lock().unwrap().done;
             let outcome = self.poll_engine_attempt(&dls, my_gen, attempt_start_done);
+            // WS-A: did any stream's engine see its address die
+            // (403/410) during this attempt? Read before the
+            // outcome arm cancels anything — the flag lives on
+            // the engine handle, not the poll verdict
+            let attempt_auth_dead = dls.iter().any(|d| d.progress().auth_dead);
             match outcome {
                 EngineAttempt::Finished => break 'attempts,
                 EngineAttempt::Stopped => return true,
@@ -2517,10 +2754,25 @@ impl VideoJob {
                         self.active_downloads.lock().unwrap().clear();
                         return false;
                     }
+                    // WS-A accounting: a preresolved auth-death
+                    // spends one recovery unit for the attempt
+                    // even when the attempt gained real bytes
+                    // before dying — the page re-resolve it buys
+                    // is the expensive recovery, and letting
+                    // gains reset the budget would cycle forever
+                    // (heal, gain, die, heal…). The heal counts
+                    // against the SAME MAX_VIDEO_RECOVERIES
+                    // budget as every other recovery; no second
+                    // budget exists.
+                    let auth_heal_case = self.preresolved.is_some()
+                        && attempt_auth_dead
+                        && outcome == EngineAttempt::Errored;
                     // barren accounting: an attempt that gained
                     // real bytes resets the count; only nearly
                     // motionless attempts spend it
-                    if done_now.saturating_sub(attempt_start_done) >= VIDEO_STALL_MIN_ADVANCE * 4 {
+                    if auth_heal_case {
+                        barren += 1;
+                    } else if done_now.saturating_sub(attempt_start_done) >= VIDEO_STALL_MIN_ADVANCE * 4 {
                         barren = 0;
                     } else {
                         barren += 1;
@@ -2566,27 +2818,43 @@ impl VideoJob {
                             p.conns = 0;
                         }
                     }
-                    let settle_deadline = Instant::now() + std::time::Duration::from_secs(35);
-                    while !dls.iter().all(|d| d.is_settled()) {
-                        if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
-                            || self.stop_flag.lock().unwrap().is_some()
-                        {
-                            return true;
-                        }
-                        if Instant::now() >= settle_deadline {
+                    match self.settle_streams(&dls, my_gen) {
+                        StreamSettle::Stopped => return true,
+                        StreamSettle::TimedOut => {
                             self.active_downloads.lock().unwrap().clear();
                             return false; // Fall back to yt-dlp
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        StreamSettle::Done => {}
                     }
                     if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen
                         || self.stop_flag.lock().unwrap().is_some()
                     {
                         return true;
                     }
-                    if reresolve && self.preresolved.is_none() {
-                        resolution_cache_evict(&self.resolution_key(sel));
-                        match self.resolve_direct_streams(ytdlp, components_dir, sel) {
+                    if auth_heal_case {
+                        // WS-A (audit-232 S5): the capture's
+                        // streams auth-died — retrying them can
+                        // only burn the budget on dead URLs.
+                        // Re-resolve the PAGE URL instead and
+                        // continue from the same part offsets.
+                        // Non-auth failures never reach this
+                        // branch: they keep the behaviour below
+                        // (fresh connections, then the capture's
+                        // plain expired-message failure) exactly.
+                        match self.heal_reresolve_preresolved(ytdlp, components_dir) {
+                            Some((fresh, heal_sel)) => {
+                                streams = fresh;
+                                reresolve_sel = Some(heal_sel);
+                            }
+                            None => return false, // spawn reports the capture as expired
+                        }
+                    } else if reresolve && (self.preresolved.is_none() || reresolve_sel.is_some()) {
+                        // a healed job runs on yt-dlp streams:
+                        // later stall re-resolves use the heal's
+                        // selector, never the capture key
+                        let sel_now = reresolve_sel.as_deref().unwrap_or(sel);
+                        resolution_cache_evict(&self.resolution_key(sel_now));
+                        match self.resolve_direct_streams(ytdlp, components_dir, sel_now) {
                             Some((_, fresh)) => streams = fresh,
                             None => return false, // Fall back to yt-dlp
                         }
@@ -2672,27 +2940,19 @@ impl VideoJob {
                 "1:a:0".into(),
                 "-c:v".into(),
                 "copy".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                "192k".into(),
-                "-movflags".into(),
-                "+faststart".into(),
             ]);
+            // copy when the audio is already AAC, re-encode
+            // otherwise (see merge_audio_args, WS-D D3)
+            ff_args.extend(merge_audio_args(&part_paths[1], components_dir));
+            ff_args.extend(["-movflags".into(), "+faststart".into()]);
         } else if final_ext == "mp4" || final_ext == "m4a" || final_ext == "mov" {
             // Normalize the audio to AAC like the two-stream branch:
             // a verbatim copy can leave Opus-in-MP4 that many players
-            // refuse to play.
-            ff_args.extend([
-                "-c:v".into(),
-                "copy".into(),
-                "-c:a".into(),
-                "aac".into(),
-                "-b:a".into(),
-                "192k".into(),
-                "-movflags".into(),
-                "+faststart".into(),
-            ]);
+            // refuse to play. Already-AAC audio is copied, not
+            // re-encoded (see merge_audio_args, WS-D D3).
+            ff_args.extend(["-c:v".into(), "copy".into()]);
+            ff_args.extend(merge_audio_args(&part_paths[0], components_dir));
+            ff_args.extend(["-movflags".into(), "+faststart".into()]);
         } else {
             ff_args.extend([
                 "-c".into(),
@@ -2921,6 +3181,8 @@ impl VideoJob {
     ) -> EngineAttempt {
         let mut mark_done = 0u64;
         let mut mark_at = Instant::now();
+        // WS-D D2: pair cross-stealing fires at most once per attempt
+        let mut donated = false;
         loop {
             if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
                 for d in dls {
@@ -2958,9 +3220,11 @@ impl VideoJob {
             // reported a probed total — a part that has not probed
             // yet reports 0 and vetoes the lock
             let mut all_totals_known = !dls.is_empty();
+            let mut statuses: Vec<ndm::Status> = Vec::with_capacity(dls.len());
 
             for d in dls {
                 let pr = d.progress();
+                statuses.push(pr.status);
                 if pr.total == 0 {
                     all_totals_known = false;
                 }
@@ -3027,6 +3291,33 @@ impl VideoJob {
                 } else {
                     "starting".to_string()
                 };
+            }
+
+            // WS-D D2 (audit-232 S4): pair cross-stealing. The
+            // moment exactly one side of a two-stream pair has
+            // finished and the other is still downloading, the
+            // finished side's share of the pool is idle by
+            // definition — raise the survivor to the full
+            // connection count so it inherits those connections
+            // live (its parked workers ungate within a tick).
+            // An errored pair neither donates nor receives (the
+            // error path below settles the attempt), and a paused
+            // pair stays parked exactly as it was.
+            if !donated && dls.len() == 2 && !any_error && !any_paused {
+                let survivor = match (statuses[0], statuses[1]) {
+                    (ndm::Status::Finished, ndm::Status::Downloading) => Some(&dls[1]),
+                    (ndm::Status::Downloading, ndm::Status::Finished) => Some(&dls[0]),
+                    _ => None,
+                };
+                if let Some(d) = survivor {
+                    d.set_connection_limit(ndm::global_connections().clamp(1, 32));
+                    // the survivor's tail blocks are now the
+                    // job's finish line and its newly inherited
+                    // workers are dedicated helpers — relax its
+                    // tail byte-split gate accordingly (WS-D D2)
+                    d.mark_pair_survivor();
+                    donated = true;
+                }
             }
 
             if any_error {
@@ -3445,9 +3736,12 @@ impl VideoJob {
     }
 
     fn spawn(self: &Arc<Self>, components_dir: &Path) -> Result<(), String> {
-        // A captured job never invokes yt-dlp (no resolve, no
-        // fallback), so a missing yt-dlp must not refuse it: an
-        // empty path stands in and is never executed.
+        // A captured job invokes yt-dlp only for the WS-A
+        // auth-death re-resolve of its page — never for its
+        // initial streams and never as the download fallback —
+        // so a missing yt-dlp must not refuse it: an empty path
+        // stands in, and a heal that needs it simply fails soft
+        // into the capture-expired error.
         let ytdlp = match find_tool("yt-dlp", components_dir) {
             Some(p) => p,
             None if self.preresolved.is_some() => PathBuf::new(),
@@ -4197,6 +4491,7 @@ mod tests {
                 has_audio: true,
                 cookie: None,
                 referer: None,
+                user_agent: None,
             }],
             expect_audio: true,
             expected_media: Some(1234),
@@ -4497,6 +4792,7 @@ mod tests {
                             has_audio: true,
                             cookie: None,
                             referer: None,
+                            user_agent: None,
                         }],
                     )),
                 })
@@ -4777,6 +5073,7 @@ mod tests {
                     has_audio: true,
                     cookie: None,
                     referer: None,
+                    user_agent: None,
                 }],
                 expect_audio: true,
             },
@@ -4844,6 +5141,1244 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&gen_dir);
     }
+
+    /* ---------------- AUDIT-232 (B3): stall-recovery edges ---------------- */
+
+    /// One permanently-throttling connection for the B3 rigs:
+    /// serves `budget` bytes of the requested range, then holds
+    /// the socket silent — the googlevideo shape, forever.
+    fn audit_throttle_conn(
+        mut sock: std::net::TcpStream,
+        payload: Arc<Vec<u8>>,
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+        budget: u64,
+    ) {
+        use std::io::{Read, Write};
+        conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            match sock.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let total = payload.len() as u64;
+        let (start, end, partial) = if let Some(line) =
+            head.lines().find(|l| l.to_ascii_lowercase().starts_with("range:"))
+        {
+            let spec = line.split('=').nth(1).unwrap_or("").trim();
+            let mut it = spec.splitn(2, '-');
+            let a: u64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let b: u64 = it
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(total - 1);
+            (a, b.min(total - 1), true)
+        } else {
+            (0, total - 1, false)
+        };
+        let is_head = head.starts_with("HEAD");
+        let len = end - start + 1;
+        let headers = if partial {
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            )
+        };
+        if sock.write_all(headers.as_bytes()).is_err() || is_head {
+            return;
+        }
+        let body = &payload[start as usize..=end as usize];
+        let fast = (len.min(budget)) as usize;
+        if sock.write_all(&body[..fast]).is_err() {
+            return;
+        }
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(120)));
+        let mut sink = [0u8; 1024];
+        loop {
+            match sock.read(&mut sink) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => continue,
+            }
+        }
+    }
+
+    fn audit_payload(gen_dir: &Path, secs: u32, bitrate: &str) -> Option<Arc<Vec<u8>>> {
+        let _ = std::fs::remove_dir_all(gen_dir);
+        std::fs::create_dir_all(gen_dir).unwrap();
+        let src = gen_dir.join("src.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", &secs.to_string(), "-vf", "noise=alls=70:allf=t",
+                "-c:v", "libx264", "-preset", "ultrafast", "-b:v", bitrate,
+                "-c:a", "aac", "-shortest",
+            ])
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            eprintln!("ffmpeg unavailable — B3 fixture skipped");
+            return None;
+        }
+        Some(Arc::new(std::fs::read(&src).unwrap()))
+    }
+
+    fn audit_server(
+        payload: Arc<Vec<u8>>,
+        budget: u64,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let conns = conns.clone();
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    match sock {
+                        Ok(s) => {
+                            let p = payload.clone();
+                            let c = conns.clone();
+                            std::thread::spawn(move || audit_throttle_conn(s, p, c, budget));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        (port, conns)
+    }
+
+    /// A stub yt-dlp in the components dir: counts its invocations,
+    /// answers every resolve with one combined stream pointing at
+    /// the throttle server, and (optionally) sleeps before answering
+    /// from the SECOND invocation on — the re-resolve window the
+    /// pause/cancel tests strike into.
+    fn audit_stub_ytdlp(comp: &Path, stream_url: &str, reresolve_sleep_secs: u32) -> PathBuf {
+        let count_file = comp.join("ytdlp-count.txt");
+        let json = format!(
+            "{{\"title\":\"audit fixture\",\"duration\":100,\"requested_formats\":[{{\"format_id\":\"18\",\"url\":\"{stream_url}\",\"ext\":\"mp4\",\"protocol\":\"http\",\"vcodec\":\"avc1.640028\",\"acodec\":\"mp4a.40.2\",\"tbr\":1000}}]}}"
+        );
+        let script = format!(
+            "#!/bin/sh\necho x >> \"{count}\"\nn=$(grep -c '' \"{count}\")\nif [ \"$n\" -ge 2 ]; then sleep {reresolve_sleep_secs}; fi\nprintf '%s\\n' '{json}'\n",
+            count = count_file.display()
+        );
+        let stub = comp.join("yt-dlp");
+        std::fs::write(&stub, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        count_file
+    }
+
+    fn audit_stub_runs(count_file: &Path) -> usize {
+        std::fs::read_to_string(count_file)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    struct AuditJob {
+        job: Arc<VideoJob>,
+        dir: PathBuf,
+        gen_dir: PathBuf,
+        count_file: PathBuf,
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+        payload_len: usize,
+    }
+
+    /// A non-preresolved job (so stall recovery can re-resolve)
+    /// against a permanently throttling server.
+    fn audit_start_job(tag: &str, budget: u64, reresolve_sleep_secs: u32, secs: u32, bitrate: &str) -> Option<AuditJob> {
+        let gen_dir = std::env::temp_dir().join(format!("ndm-b3gen-{tag}-{}", std::process::id()));
+        let payload = audit_payload(&gen_dir, secs, bitrate)?;
+        let payload_len = payload.len();
+        let (port, conns) = audit_server(payload, budget);
+        let stream_url = format!("http://127.0.0.1:{port}/videoplayback");
+        let dir = std::env::temp_dir().join(format!("ndm-b3-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let comp = dir.join("comp");
+        std::fs::create_dir_all(&comp).unwrap();
+        let count_file = audit_stub_ytdlp(&comp, &stream_url, reresolve_sleep_secs);
+        let page_url = format!("https://audit-b3-{tag}.example/watch?v={port}");
+        let job = VideoJob::start(
+            &page_url,
+            &dir,
+            "bv",
+            false,
+            "audit fixture",
+            None,
+            "",
+            "",
+            &comp,
+            payload_len as u64,
+            0.0,
+        )
+        .expect("job must start");
+        Some(AuditJob { job, dir, gen_dir, count_file, conns, payload_len })
+    }
+
+    fn audit_wait_for<F: Fn() -> bool>(deadline_secs: u64, what: &str, f: F) -> bool {
+        let deadline = Instant::now() + std::time::Duration::from_secs(deadline_secs);
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("timed out waiting for {what}");
+        f()
+    }
+
+    /// B3(a): a pause that lands DURING stall recovery's re-resolve
+    /// must park the job: the resolve's result is discarded, no
+    /// stream restarts, the status stays "paused" and the job
+    /// thread exits. The re-resolve runs on a bare child inside
+    /// resolve_streams_core — it is not the job's tracked child,
+    /// so pause() cannot kill it; the attempt loop must honour
+    /// the stop flag when the resolve returns.
+    #[cfg(unix)]
+    #[test]
+    fn pause_during_stall_reresolve_parks_the_job() {
+        let Some(rig) = audit_start_job("pause", 1024, 8, 7, "6M") else { return };
+        let job = &rig.job;
+        // attempts 1+2 each gain <=32 KiB (< the 128 KiB reset
+        // line), so the second stall spends barren=2 and the loop
+        // re-resolves: stub invocation #2 is that re-resolve.
+        assert!(
+            audit_wait_for(150, "the recovery re-resolve to start", || audit_stub_runs(&rig.count_file) >= 2),
+            "recovery never re-resolved (stub runs: {})",
+            audit_stub_runs(&rig.count_file)
+        );
+        job.pause();
+        let done_at_pause = job.progress.lock().unwrap().done;
+        let conns_at_pause = rig.conns.load(std::sync::atomic::Ordering::SeqCst);
+        // the re-resolve returns ~8 s after it started; a loop
+        // that ignores the pause restarts its streams then and
+        // the job thread lives on in the poll loop.
+        assert!(
+            audit_wait_for(40, "the job thread to exit after the pause", || job.is_settled()),
+            "job thread still live 40 s after pausing mid-re-resolve — the pause was ignored (status: {})",
+            job.progress.lock().unwrap().status
+        );
+        assert_eq!(job.progress.lock().unwrap().status, "paused");
+        assert_eq!(
+            job.progress.lock().unwrap().done,
+            done_at_pause,
+            "bytes moved after the pause"
+        );
+        assert_eq!(
+            rig.conns.load(std::sync::atomic::Ordering::SeqCst),
+            conns_at_pause,
+            "new connections opened after the pause"
+        );
+        let _ = std::fs::remove_dir_all(&rig.dir);
+        let _ = std::fs::remove_dir_all(&rig.gen_dir);
+    }
+
+    /// B3(b): a cancel that lands during the re-resolve must stop
+    /// the job outright — no fallback run, no final file, no
+    /// further connections once the job thread is gone (the delete
+    /// path settles on exactly this before sweeping).
+    #[cfg(unix)]
+    #[test]
+    fn cancel_during_stall_reresolve_stops_the_job() {
+        let Some(rig) = audit_start_job("cancel", 1024, 8, 7, "6M") else { return };
+        let job = &rig.job;
+        assert!(
+            audit_wait_for(150, "the recovery re-resolve to start", || audit_stub_runs(&rig.count_file) >= 2),
+            "recovery never re-resolved (stub runs: {})",
+            audit_stub_runs(&rig.count_file)
+        );
+        job.cancel();
+        assert!(
+            audit_wait_for(40, "the job thread to exit after the cancel", || job.is_settled()),
+            "job thread still live 40 s after cancelling mid-re-resolve"
+        );
+        assert_eq!(job.progress.lock().unwrap().status, "cancelled");
+        assert_eq!(
+            audit_stub_runs(&rig.count_file),
+            2,
+            "a cancelled job must not reach the yt-dlp fallback"
+        );
+        let conns_settled = rig.conns.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert_eq!(
+            rig.conns.load(std::sync::atomic::Ordering::SeqCst),
+            conns_settled,
+            "connections opened after the job thread exited — something resurrected it"
+        );
+        assert!(
+            job.progress.lock().unwrap().final_path.is_none(),
+            "a cancelled job must not publish a final file"
+        );
+        let _ = std::fs::remove_dir_all(&rig.dir);
+        let _ = std::fs::remove_dir_all(&rig.gen_dir);
+    }
+
+    /* ---------------- WS-A: preresolved auth-death heal ---------------- */
+
+    /// One connection for the WS-A rigs: `/s?gen=1` (the captured
+    /// stream URL) serves until `die_after` bytes have been served
+    /// in total, then answers 403 to everything; `/s?gen=2` (what
+    /// a yt-dlp re-resolve of the page returns) always serves.
+    fn wsa_stream_conn(
+        mut sock: std::net::TcpStream,
+        payload: Arc<Vec<u8>>,
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+        served: Arc<std::sync::atomic::AtomicU64>,
+        die_after: u64,
+    ) {
+        use std::io::{Read, Write};
+        conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            match sock.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let first = head.lines().next().unwrap_or("");
+        let mut parts = first.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        let gen2 = path.contains("gen=2");
+        if !gen2 && served.load(std::sync::atomic::Ordering::Relaxed) >= die_after {
+            let _ = sock.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nexpired",
+            );
+            return;
+        }
+        let total = payload.len() as u64;
+        let (start, end, partial) = if let Some(line) =
+            head.lines().find(|l| l.to_ascii_lowercase().starts_with("range:"))
+        {
+            let spec = line.split('=').nth(1).unwrap_or("").trim();
+            let mut it = spec.splitn(2, '-');
+            let a: u64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let b: u64 = it
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(total - 1);
+            (a, b.min(total - 1), true)
+        } else {
+            (0, total - 1, false)
+        };
+        let len = end - start + 1;
+        let headers = if partial {
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nETag: \"wsa\"\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nETag: \"wsa\"\r\nConnection: close\r\n\r\n"
+            )
+        };
+        if sock.write_all(headers.as_bytes()).is_err() || method == "HEAD" {
+            return;
+        }
+        let body = &payload[start as usize..=end as usize];
+        if sock.write_all(body).is_ok() {
+            served.fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn wsa_server(
+        payload: Arc<Vec<u8>>,
+        die_after: u64,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let conns = conns.clone();
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    match sock {
+                        Ok(s) => {
+                            let p = payload.clone();
+                            let c = conns.clone();
+                            let sv = served.clone();
+                            std::thread::spawn(move || wsa_stream_conn(s, p, c, sv, die_after));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        (port, conns)
+    }
+
+    /// A stub yt-dlp that sleeps on EVERY invocation (the heal
+    /// re-resolve is a preresolved job's FIRST resolve, unlike
+    /// the B3 stubs which sleep from the second run on).
+    fn wsa_stub_ytdlp(comp: &Path, stream_url: &str, sleep_secs: u32) -> PathBuf {
+        let count_file = comp.join("ytdlp-count.txt");
+        let json = format!(
+            "{{\"title\":\"wsa fixture\",\"duration\":100,\"requested_formats\":[{{\"format_id\":\"18\",\"url\":\"{stream_url}\",\"ext\":\"mp4\",\"protocol\":\"http\",\"vcodec\":\"avc1.640028\",\"acodec\":\"mp4a.40.2\",\"tbr\":1000}}]}}"
+        );
+        let script = format!(
+            "#!/bin/sh\necho x >> \"{count}\"\nsleep {sleep_secs}\nprintf '%s\\n' '{json}'\n",
+            count = count_file.display()
+        );
+        let stub = comp.join("yt-dlp");
+        std::fs::write(&stub, script).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        count_file
+    }
+
+    struct WsaJob {
+        job: Arc<VideoJob>,
+        dir: PathBuf,
+        gen_dir: PathBuf,
+        count_file: PathBuf,
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A preresolved (browser-captured) job whose captured
+    /// stream dies after `die_after` bytes; the stub yt-dlp's
+    /// resolve of the PAGE URL returns the gen=2 stream.
+    fn wsa_start_job(tag: &str, die_after: u64, stub_sleep_secs: u32) -> Option<WsaJob> {
+        let gen_dir = std::env::temp_dir().join(format!("ndm-wsagen-{tag}-{}", std::process::id()));
+        let payload = audit_payload(&gen_dir, 7, "6M")?;
+        let payload_len = payload.len() as u64;
+        let (port, conns) = wsa_server(payload, die_after);
+        let dead_url = format!("http://127.0.0.1:{port}/s?gen=1");
+        let fresh_url = format!("http://127.0.0.1:{port}/s?gen=2");
+        let dir = std::env::temp_dir().join(format!("ndm-wsa-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let comp = dir.join("comp");
+        std::fs::create_dir_all(&comp).unwrap();
+        let count_file = wsa_stub_ytdlp(&comp, &fresh_url, stub_sleep_secs);
+        let page_url = format!("https://wsa-{tag}.example/watch?v={port}");
+        let job = VideoJob::start_with_preresolved(
+            &page_url,
+            &dir,
+            "ndmcap:wsafixture",
+            false,
+            "wsa fixture",
+            None,
+            "",
+            "",
+            &comp,
+            payload_len,
+            0.0,
+            None,
+            Preresolved {
+                title: "wsa fixture".to_string(),
+                streams: vec![PreresolvedStream {
+                    url: dead_url,
+                    ext: "mp4".to_string(),
+                    has_audio: true,
+                    cookie: None,
+                    referer: Some(page_url.clone()),
+                    user_agent: None,
+                }],
+                expect_audio: true,
+            },
+        )
+        .expect("job must start");
+        Some(WsaJob { job, dir, gen_dir, count_file, conns })
+    }
+
+    /// WS-A (audit-232 S5): a preresolved job whose captured
+    /// streams auth-die mid-download must fall back to a yt-dlp
+    /// re-resolve of the PAGE URL and finish — not burn its
+    /// recovery budget retrying the dead capture URLs and fail
+    /// with the capture-expired message (the pre-fix shape: the
+    /// re-resolve was explicitly skipped for preresolved jobs).
+    /// Fixture evidence: local server + stub yt-dlp.
+    #[cfg(unix)]
+    #[test]
+    fn preresolved_auth_death_heals_via_page_reresolve() {
+        let Some(rig) = wsa_start_job("heal", 1024 * 1024, 0) else { return };
+        let job = &rig.job;
+        let terminal = audit_wait_for(240, "the job to reach a terminal status", || {
+            matches!(
+                job.progress.lock().unwrap().status.as_str(),
+                "finished" | "error" | "cancelled"
+            )
+        });
+        assert!(terminal, "job never terminated (status: {})", job.progress.lock().unwrap().status);
+        let err_text = job.progress.lock().unwrap().error.clone();
+        assert_eq!(
+            job.progress.lock().unwrap().status,
+            "finished",
+            "the auth-dead capture must heal via the page re-resolve; error: {err_text:?}"
+        );
+        assert!(
+            audit_stub_runs(&rig.count_file) >= 1,
+            "the heal must re-resolve the page URL through yt-dlp (stub runs: {})",
+            audit_stub_runs(&rig.count_file)
+        );
+        let final_path = job
+            .progress
+            .lock()
+            .unwrap()
+            .final_path
+            .clone()
+            .expect("finished job records its file");
+        assert!(final_path.is_file(), "the healed job's file must exist");
+        let probe = std::process::Command::new("ffmpeg")
+            .args(["-i"])
+            .arg(&final_path)
+            .output()
+            .unwrap();
+        let info = String::from_utf8_lossy(&probe.stderr);
+        assert!(info.contains("Video:"), "final file has no video stream: {info}");
+        assert!(info.contains("Audio:"), "final file has no audio stream: {info}");
+        let _ = std::fs::remove_dir_all(&rig.dir);
+        let _ = std::fs::remove_dir_all(&rig.gen_dir);
+    }
+
+    /// WS-A: a pause that lands DURING the heal re-resolve parks
+    /// the job — the resolve's fresh streams are discarded, no
+    /// stream restarts, the status stays "paused" (the B3-A stop
+    /// gate, on the heal path).
+    #[cfg(unix)]
+    #[test]
+    fn pause_during_preresolved_heal_reresolve_parks_the_job() {
+        let Some(rig) = wsa_start_job("pause", 1024 * 1024, 8) else { return };
+        let job = &rig.job;
+        assert!(
+            audit_wait_for(150, "the heal re-resolve to start", || audit_stub_runs(&rig.count_file) >= 1),
+            "the heal never re-resolved (stub runs: {})",
+            audit_stub_runs(&rig.count_file)
+        );
+        job.pause();
+        assert!(
+            audit_wait_for(40, "the job thread to exit after the pause", || job.is_settled()),
+            "job thread still live 40 s after pausing mid-heal — the pause was ignored (status: {})",
+            job.progress.lock().unwrap().status
+        );
+        assert_eq!(job.progress.lock().unwrap().status, "paused");
+        let conns_settled = rig.conns.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert_eq!(
+            rig.conns.load(std::sync::atomic::Ordering::SeqCst),
+            conns_settled,
+            "connections opened after the paused heal settled — the job resurrected"
+        );
+        let _ = std::fs::remove_dir_all(&rig.dir);
+        let _ = std::fs::remove_dir_all(&rig.gen_dir);
+    }
+
+    /// B3(c) under the line: attempts that each gain < 128 KiB
+    /// spend the recovery budget — after MAX_VIDEO_RECOVERIES+1
+    /// barren attempts the job leaves the engine for the yt-dlp
+    /// fallback (here the stub produces no file, so the job ends
+    /// in error rather than cycling forever).
+    #[cfg(unix)]
+    #[test]
+    fn barren_recoveries_exhaust_the_budget_and_fall_back() {
+        let Some(rig) = audit_start_job("barren", 1024, 0, 7, "6M") else { return };
+        let job = &rig.job;
+        let terminal = audit_wait_for(300, "the job to reach a terminal status", || {
+            matches!(
+                job.progress.lock().unwrap().status.as_str(),
+                "finished" | "error" | "cancelled"
+            )
+        });
+        assert!(terminal, "barren job never terminated (status: {})", job.progress.lock().unwrap().status);
+        assert_eq!(
+            job.progress.lock().unwrap().status,
+            "error",
+            "the fallback stub downloads nothing, so the job must end in error"
+        );
+        assert_eq!(
+            audit_stub_runs(&rig.count_file),
+            4,
+            "expected 1 initial resolve + 2 recovery re-resolves + 1 fallback run"
+        );
+        assert!(
+            job.progress.lock().unwrap().done < (rig.payload_len / 4) as u64,
+            "barren attempts must not have moved much data"
+        );
+        let _ = std::fs::remove_dir_all(&rig.dir);
+        let _ = std::fs::remove_dir_all(&rig.gen_dir);
+    }
+
+    /// One connection for the B3(c)-over rig: serves its range at
+    /// 32 KiB/s, but only inside the shared fast windows (6 s
+    /// every 36 s, the first at once); outside them it holds the
+    /// socket silent. A job therefore banks megabytes in the
+    /// attempt that straddles a window, then stalls; a later
+    /// attempt straddles the next window and banks again — the
+    /// real shape of a route that revives in bursts.
+    fn audit_window_conn(
+        mut sock: std::net::TcpStream,
+        payload: Arc<Vec<u8>>,
+        conns: Arc<std::sync::atomic::AtomicUsize>,
+        t0: Instant,
+    ) {
+        use std::io::{Read, Write};
+        conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let head_end = loop {
+            match sock.read(&mut chunk) {
+                Ok(0) => return,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p;
+                    }
+                    if buf.len() > 64 * 1024 {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        };
+        let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+        let total = payload.len() as u64;
+        let (start, end, partial) = if let Some(line) =
+            head.lines().find(|l| l.to_ascii_lowercase().starts_with("range:"))
+        {
+            let spec = line.split('=').nth(1).unwrap_or("").trim();
+            let mut it = spec.splitn(2, '-');
+            let a: u64 = it.next().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+            let b: u64 = it
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(total - 1);
+            (a, b.min(total - 1), true)
+        } else {
+            (0, total - 1, false)
+        };
+        let is_head = head.starts_with("HEAD");
+        let len = end - start + 1;
+        let headers = if partial {
+            format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            )
+        };
+        if sock.write_all(headers.as_bytes()).is_err() || is_head {
+            return;
+        }
+        let in_window = |t: Instant| {
+            // windows start at once (a stream whose first bytes
+            // wait half a minute is abandoned by the engine's own
+            // deadlines before the recovery loop is even reached)
+            // and recur every 36 s, so successive attempts —
+            // whose cycle is ~17 s — keep straddling new ones
+            t.duration_since(t0).as_secs() % 36 < 6
+        };
+        let body = &payload[start as usize..=end as usize];
+        // probe-sized answers (HEAD above, validator ranges) are
+        // never throttled: the engine will not start workers for
+        // a stream whose probe starves, so pacing them would
+        // stall the rig at zero bytes for a reason that has
+        // nothing to do with the recovery loop under test
+        if body.len() <= 64 * 1024 {
+            let _ = sock.write_all(body);
+            return;
+        }
+        let mut sent = 0usize;
+        while sent < body.len() {
+            // silent stretch: hold the socket and wait for the
+            // next window (if the client gave up meanwhile, the
+            // write at the window fails and ends the thread)
+            while !in_window(Instant::now()) {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let n = (body.len() - sent).min(32 * 1024);
+            if sock.write_all(&body[sent..sent + n]).is_err() {
+                return;
+            }
+            sent += n;
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+
+    /// B3(c) over the line: attempts that each gain >= 128 KiB
+    /// RESET the recovery budget. Against the window server the
+    /// job alternates barren attempts (no window: they spend
+    /// budget) with productive ones (a window: ~4 MiB banked,
+    /// budget reset) — the barren count can therefore never
+    /// reach the cap, and the job must still be in the engine,
+    /// gigabytes short of finished but millions of bytes in,
+    /// long after a purely barren job would have fallen back
+    /// (the barren test above terminates in ~65 s).
+    #[cfg(unix)]
+    #[test]
+    fn productive_recoveries_reset_the_budget() {
+        let gen_dir = std::env::temp_dir().join(format!("ndm-b3gen-reset-{}", std::process::id()));
+        let Some(payload) = audit_payload(&gen_dir, 30, "8M") else { return };
+        let payload_len = payload.len();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let t0 = Instant::now();
+        {
+            let (p, c) = (payload.clone(), conns.clone());
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    match sock {
+                        Ok(s) => {
+                            let (p, c) = (p.clone(), c.clone());
+                            std::thread::spawn(move || audit_window_conn(s, p, c, t0));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        let stream_url = format!("http://127.0.0.1:{port}/videoplayback");
+        let dir = std::env::temp_dir().join(format!("ndm-b3-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let comp = dir.join("comp");
+        std::fs::create_dir_all(&comp).unwrap();
+        let count_file = audit_stub_ytdlp(&comp, &stream_url, 0);
+        let page_url = format!("https://audit-b3-reset.example/watch?v={port}");
+        let job = VideoJob::start(
+            &page_url, &dir, "bv", false, "audit fixture", None, "", "",
+            &comp, payload_len as u64, 0.0,
+        )
+        .expect("job must start");
+        // 170 s covers ~11 stall windows and three fast windows:
+        // a job that only spent budget would have fallen back at
+        // the fourth barren attempt (< ~90 s) and errored on the
+        // fileless stub; a resetting job is still cycling with
+        // >= 8 MiB banked (two windows' worth).
+        let job_start = Instant::now();
+        let ok = audit_wait_for(170, "productive windows banked, still cycling", || {
+            let p = job.progress.lock().unwrap();
+            // 2 MiB is 16x the 128 KiB reset line: reaching it
+            // takes several window-straddling attempts at this
+            // rig's measured rates (attempt/window alignment,
+            // settle time and suite-parallel load eat most of
+            // each window)
+            p.done >= 2 * 1024 * 1024
+                && matches!(p.status.as_str(), "starting" | "downloading" | "resuming")
+        });
+        let (status, done) = {
+            let p = job.progress.lock().unwrap();
+            (p.status.clone(), p.done)
+        };
+        assert!(
+            ok,
+            "job did not stay productive: status {status} at {done} bytes \
+             (payload {payload_len}, stub runs {}, conns {}, error {:?})",
+            audit_stub_runs(&count_file),
+            conns.load(std::sync::atomic::Ordering::SeqCst),
+            job.progress.lock().unwrap().error
+        );
+        // The actual claim: past the point where four barren
+        // attempts would have exhausted the budget and fallen
+        // back (~90 s of stall cycles), the job is STILL in the
+        // engine — productive attempts kept resetting the count.
+        let survived = audit_wait_for(150, "the job to outlive the barren budget", || {
+            job_start.elapsed() >= std::time::Duration::from_secs(110)
+                && matches!(
+                    job.progress.lock().unwrap().status.as_str(),
+                    "starting" | "downloading" | "resuming"
+                )
+        });
+        assert!(
+            survived,
+            "job left the engine by 110 s (status {}) — the budget was spent, not reset",
+            job.progress.lock().unwrap().status
+        );
+        assert!(
+            audit_stub_runs(&count_file) <= 5,
+            "stub runs {} — the fallback must not have run (resolves + re-resolves only)",
+            audit_stub_runs(&count_file)
+        );
+        job.cancel();
+        let _ = audit_wait_for(40, "the job thread to exit after cancel", || job.is_settled());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&gen_dir);
+    }
+
+    // ---------- WS-C (2.3.2): the captured browser User-Agent ----------
+    // Drives the REAL capture chain — a CapturedSet stored exactly
+    // as the drain stores it, capture::preresolved_for, then
+    // VideoJob::start_with_preresolved — against a header-recording
+    // range server, and returns the User-Agent of every request the
+    // engine made (probe and transfer alike). Audit-232 S3 proved
+    // cookies and Referer flow down this chain but the UA was
+    // always the engine's fixed Linux Chrome/126 constant, even
+    // for a Windows/Brave capture.
+    fn run_capture_chain_recording_uas(tag: &str, user_agent: Option<&str>) -> Vec<String> {
+        use std::io::Write as _;
+        let gen_dir = std::env::temp_dir().join(format!("ndm-uagen-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gen_dir);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        let src = gen_dir.join("src.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "2", "-c:v", "libx264", "-preset", "ultrafast",
+                "-c:a", "aac", "-shortest",
+            ])
+            .arg(&src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(made, "ffmpeg fixture generation must work for the UA chain proof");
+        let payload = Arc::new(std::fs::read(&src).unwrap());
+        let total = payload.len() as u64;
+
+        // header-recording range server: keeps the UA of every request
+        let seen: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        {
+            let payload = payload.clone();
+            let seen = seen.clone();
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    let Ok(mut s) = sock else { break };
+                    let p = payload.clone();
+                    let sn = seen.clone();
+                    std::thread::spawn(move || {
+                        let mut rd = BufReader::new(s.try_clone().unwrap());
+                        let mut req_line = String::new();
+                        if rd.read_line(&mut req_line).is_err() {
+                            return;
+                        }
+                        let mut hdrs: Vec<(String, String)> = Vec::new();
+                        loop {
+                            let mut l = String::new();
+                            match rd.read_line(&mut l) {
+                                Ok(0) => return,
+                                Ok(_) => {
+                                    let l = l.trim_end().to_string();
+                                    if l.is_empty() {
+                                        break;
+                                    }
+                                    if let Some((k, v)) = l.split_once(':') {
+                                        hdrs.push((k.trim().to_string(), v.trim().to_string()));
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        let ua = hdrs
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case("User-Agent"))
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or_else(|| "<none>".to_string());
+                        sn.lock().unwrap().push(format!("{} ua=[{ua}]", req_line.trim()));
+                        let is_head = req_line.starts_with("HEAD");
+                        let (start, end, partial) = match hdrs
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case("Range"))
+                        {
+                            Some((_, v)) => {
+                                let v = v.trim_start_matches("bytes=");
+                                let (a, b) = v.split_once('-').unwrap_or(("0", ""));
+                                let a: u64 = a.parse().unwrap_or(0);
+                                let b: u64 = if b.is_empty() {
+                                    total - 1
+                                } else {
+                                    b.parse().unwrap_or(total - 1)
+                                };
+                                (a, b.min(total - 1), true)
+                            }
+                            None => (0, total - 1, false),
+                        };
+                        let len = end - start + 1;
+                        let head_txt = if partial {
+                            format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\nContent-Range: bytes {start}-{end}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                        } else {
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                        };
+                        if s.write_all(head_txt.as_bytes()).is_err() || is_head {
+                            return;
+                        }
+                        let _ = s.write_all(&p[start as usize..=end as usize]);
+                    });
+                }
+            });
+        }
+
+        let stream_url = format!("http://127.0.0.1:{port}/videoplayback?sig=abc");
+        let page_url = format!("http://127.0.0.1:{port}/watch?v=xyz");
+        let dir = std::env::temp_dir().join(format!("ndm-ua-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cap_dir = dir.join("capdata");
+        std::fs::create_dir_all(&cap_dir).unwrap();
+
+        // the capture set, exactly as the host validated + stored it
+        let set = crate::capture::CapturedSet {
+            page_url: page_url.clone(),
+            title: "ua fixture".to_string(),
+            streams: vec![crate::capture::CapturedStream {
+                url: stream_url.clone(),
+                mime_type: "video/mp4".to_string(),
+                quality_label: Some("720p".to_string()),
+                has_audio: true,
+                has_video: true,
+                user_agent: user_agent.map(|s| s.to_string()),
+            }],
+            received_unix: crate::capture::now_unix(),
+            video_key: String::new(),
+        };
+        crate::capture::store_set(Some(&cap_dir), set.clone());
+        let groups = crate::capture::group_streams(&set.streams);
+        assert_eq!(groups.len(), 1);
+        let selector = crate::capture::selector_for(&groups[0]);
+
+        let pre = crate::capture::preresolved_for(
+            Some(&cap_dir),
+            &page_url,
+            &selector,
+            crate::capture::now_unix(),
+        )
+        .expect("preresolved lookup must succeed")
+        .expect("a preresolved set must be found");
+        assert_eq!(pre.streams.len(), 1);
+        assert_eq!(
+            pre.streams[0].user_agent.as_deref(),
+            user_agent,
+            "the preresolved stream must carry the capture's UA"
+        );
+
+        let comp = dir.join("comp");
+        std::fs::create_dir_all(&comp).unwrap();
+        let job = VideoJob::start_with_preresolved(
+            &page_url,
+            &dir,
+            &selector,
+            false,
+            "ua fixture",
+            None,
+            "",
+            "",
+            &comp,
+            total,
+            0.0,
+            None,
+            pre,
+        )
+        .expect("job must start");
+        let deadline = Instant::now() + std::time::Duration::from_secs(120);
+        let final_status = loop {
+            let status = job.progress.lock().unwrap().status.clone();
+            if status == "finished" || status == "error" || status == "cancelled" {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "UA chain job wedged in {status}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let err_text = job.progress.lock().unwrap().error.clone();
+        assert_eq!(final_status, "finished", "job error: {err_text:?}");
+
+        let dump = seen.lock().unwrap().clone();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&gen_dir);
+        dump
+    }
+
+    #[test]
+    fn captured_browser_user_agent_reaches_every_stream_request() {
+        // a Windows/Brave-shaped UA — deliberately NOT the engine's
+        // Linux Chrome/126 constant, so a pass cannot be the fallback
+        const CAPTURED_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+        let dump = run_capture_chain_recording_uas("withua", Some(CAPTURED_UA));
+        assert!(!dump.is_empty(), "the server must record requests");
+        assert!(
+            dump.iter().any(|l| l.starts_with("GET")),
+            "no GET recorded: {dump:?}"
+        );
+        for l in &dump {
+            assert!(
+                l.contains(&format!("ua=[{CAPTURED_UA}]")),
+                "request did not carry the captured browser UA: {l}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_without_user_agent_falls_back_to_engine_ua() {
+        // an old capture (or a sender that never reported a UA)
+        // keeps today's behaviour: the engine's BROWSER_UA constant
+        const ENGINE_UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+        let dump = run_capture_chain_recording_uas("noua", None);
+        assert!(!dump.is_empty(), "the server must record requests");
+        for l in &dump {
+            assert!(
+                l.contains(&format!("ua=[{ENGINE_UA}]")),
+                "request did not fall back to the engine UA: {l}"
+            );
+        }
+    }
+
+    // ---------- WS-D D2: pair cross-stealing ----------
+    // A preresolved video+audio pair under a per-connection cap
+    // (the audit-232 S4 fixture shape: ~90/10 sizes, 256 KiB/s
+    // per connection, 8 connections). Audio finishes at ~4 s
+    // while video needs ~12 s on its (max-2) share. The fix:
+    // when audio finishes, its connections join the video side —
+    // observable on the server as MORE than the video share's
+    // worth of concurrent video GETs after the audio's last
+    // byte (pre-fix the video side can never exceed 6 concurrent
+    // GETs at max_conn 8; post-fix the two parked workers ungate
+    // and it reaches 7-8). Both parts must land byte-identical
+    // and the merged output must be produced.
+    #[test]
+    fn audio_codec_parse_reads_first_audio_stream() {
+        // WS-D D3: the merge's copy-vs-re-encode decision rests on
+        // this parse of `ffmpeg -i` output
+        let aac = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'a.m4a':\n  Stream #0:0[0x1](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 128 kb/s (default)";
+        assert_eq!(audio_codec_in_ffmpeg_info(aac).as_deref(), Some("aac"));
+        let opus = "  Stream #0:0: Video: vp9, yuv420p(tv, bt709), 1280x720, 30 fps\n  Stream #0:1: Audio: opus, 48000 Hz, stereo, fltp";
+        assert_eq!(audio_codec_in_ffmpeg_info(opus).as_deref(), Some("opus"));
+        let none = "  Stream #0:0: Video: h264 (High), yuv420p, 320x240";
+        assert_eq!(audio_codec_in_ffmpeg_info(none), None);
+        let mp3 = "  Stream #0:0: Audio: mp3, 44100 Hz, stereo, fltp, 192 kb/s";
+        assert_eq!(audio_codec_in_ffmpeg_info(mp3).as_deref(), Some("mp3"));
+    }
+
+    #[test]
+    fn pair_survivor_inherits_finished_sides_connections() {
+        use std::io::{BufRead, BufReader, Write};
+        let gen_dir = std::env::temp_dir().join(format!("ndm-d2gen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&gen_dir);
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        let vsrc = gen_dir.join("v.mp4");
+        let asrc = gen_dir.join("a.m4a");
+        let made_v = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=15",
+                "-t", "24", "-vf", "noise=alls=70:allf=t",
+                "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "6M", "-an",
+            ])
+            .arg(&vsrc)
+            .status().map(|s| s.success()).unwrap_or(false);
+        let made_a = std::process::Command::new("ffmpeg")
+            .args([
+                "-y", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=440",
+                "-t", "128", "-c:a", "aac", "-b:a", "128k",
+            ])
+            .arg(&asrc)
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !made_v || !made_a {
+            eprintln!("ffmpeg unavailable — D2 fixture skipped");
+            let _ = std::fs::remove_dir_all(&gen_dir);
+            return;
+        }
+        let vbody = Arc::new(std::fs::read(&vsrc).unwrap());
+        let abody = Arc::new(std::fs::read(&asrc).unwrap());
+
+        // (path, get_start, get_end) for every body-serving GET
+        let gets: Arc<std::sync::Mutex<Vec<(String, f64, f64)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        {
+            let (vb, ab, gg) = (vbody.clone(), abody.clone(), gets.clone());
+            std::thread::spawn(move || {
+                for sock in listener.incoming() {
+                    let Ok(mut s) = sock else { break };
+                    let (vb, ab, gg) = (vb.clone(), ab.clone(), gg.clone());
+                    std::thread::spawn(move || {
+                        let mut rd = BufReader::new(match s.try_clone() { Ok(c) => c, Err(_) => return });
+                        let mut line = String::new();
+                        if rd.read_line(&mut line).is_err() { return; }
+                        let path = if line.contains("/a") { "audio" } else { "video" }.to_string();
+                        let mut range: Option<(u64, u64)> = None;
+                        loop {
+                            let mut h = String::new();
+                            match rd.read_line(&mut h) {
+                                Ok(0) => return,
+                                Ok(_) if h.trim().is_empty() => break,
+                                Ok(_) => {
+                                    let hl = h.to_ascii_lowercase();
+                                    if let Some(v) = hl.strip_prefix("range:") {
+                                        let spec = v.trim().trim_start_matches("bytes=");
+                                        let mut it = spec.splitn(2, '-');
+                                        let a: u64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+                                        let b: u64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(u64::MAX);
+                                        range = Some((a, b));
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                        }
+                        let body: &Arc<Vec<u8>> = if path == "audio" { &ab } else { &vb };
+                        let total = body.len() as u64;
+                        let is_head = line.starts_with("HEAD");
+                        let (a, b) = range.unwrap_or((0, total - 1));
+                        let b = b.min(total - 1);
+                        let slice = &body[a as usize..=b as usize];
+                        let hdr = if range.is_some() {
+                            format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", slice.len())
+                        } else {
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", slice.len())
+                        };
+                        if s.write_all(hdr.as_bytes()).is_err() || is_head { return; }
+                        let started = t0.elapsed().as_secs_f64();
+                        // 256 KiB/s per connection: 32 KiB per 125 ms
+                        for piece in slice.chunks(32 * 1024) {
+                            if s.write_all(piece).is_err() { break; }
+                            std::thread::sleep(std::time::Duration::from_millis(125));
+                        }
+                        gg.lock().unwrap().push((path, started, t0.elapsed().as_secs_f64()));
+                    });
+                }
+            });
+        }
+
+        // the connection setting is process-global and this
+        // suite runs tests in parallel threads: save and restore
+        // it so a concurrently starting job never inherits this
+        // fixture's pool size
+        struct RestoreConns(usize);
+        impl Drop for RestoreConns {
+            fn drop(&mut self) {
+                ndm::set_global_connections(self.0);
+            }
+        }
+        let _conns_guard = RestoreConns(ndm::global_connections());
+        ndm::set_global_connections(8);
+        let dir = std::env::temp_dir().join(format!("ndm-d2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let comp = dir.join("comp");
+        std::fs::create_dir_all(&comp).unwrap();
+        let vurl = format!("http://127.0.0.1:{port}/v");
+        let aurl = format!("http://127.0.0.1:{port}/a");
+        let job = VideoJob::start_with_preresolved(
+            &format!("http://127.0.0.1:{port}/watch"),
+            &dir, "bv", false, "d2 fixture", None, "", "", &comp,
+            (vbody.len() + abody.len()) as u64, 0.0, None,
+            Preresolved {
+                title: "d2 fixture".to_string(),
+                streams: vec![
+                    PreresolvedStream { url: vurl, ext: "mp4".to_string(), has_audio: false, cookie: None, referer: None, user_agent: None },
+                    PreresolvedStream { url: aurl, ext: "m4a".to_string(), has_audio: true, cookie: None, referer: None, user_agent: None },
+                ],
+                expect_audio: true,
+            },
+        ).expect("job must start");
+        let deadline = Instant::now() + std::time::Duration::from_secs(180);
+        // (t, job-wide active connections) sampled while polling —
+        // the client-side truth about the pair's pool: after the
+        // audio side finishes, its own count drops to 0, so any
+        // reading above the video share (6) is the survivor
+        // working on inherited connections
+        let mut conn_samples: Vec<(f64, usize)> = Vec::new();
+        let final_status = loop {
+            let (status, conns) = {
+                let p = job.progress.lock().unwrap();
+                (p.status.clone(), p.conns)
+            };
+            conn_samples.push((t0.elapsed().as_secs_f64(), conns));
+            if status == "finished" || status == "error" || status == "cancelled" { break status; }
+            assert!(Instant::now() < deadline, "D2 job wedged in {status}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let err_text = job.progress.lock().unwrap().error.clone();
+        let job_secs = t0.elapsed().as_secs_f64();
+        assert_eq!(final_status, "finished", "job error: {err_text:?}");
+
+        let gets = gets.lock().unwrap();
+        let audio_last = gets.iter().filter(|g| g.0 == "audio").map(|g| g.2).fold(0.0f64, f64::max);
+        let video_last = gets.iter().filter(|g| g.0 == "video").map(|g| g.2).fold(0.0f64, f64::max);
+        assert!(audio_last > 0.0 && video_last > audio_last,
+            "audio must finish before video: audio {audio_last:.2}s video {video_last:.2}s");
+        // max concurrent video GETs at any instant after audio's
+        // last byte (sweep the video intervals clipped to that era)
+        let mut events: Vec<(f64, i64)> = Vec::new();
+        for g in gets.iter().filter(|g| g.0 == "video" && g.2 > audio_last) {
+            events.push((g.1.max(audio_last), 1));
+            events.push((g.2, -1));
+        }
+        events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(b.1.cmp(&a.1)));
+        let (mut cur, mut peak) = (0i64, 0i64);
+        for (_, d) in &events {
+            cur += d;
+            peak = peak.max(cur);
+        }
+        // client-side: the job's active-connection count after
+        // the audio side's last byte (+ a beat for the poll that
+        // fires the donation) must exceed the video share of 6 —
+        // pre-fix it can never pass 6 once audio is done
+        let max_conns_after = conn_samples.iter()
+            .filter(|(t, _)| *t > audio_last + 0.3)
+            .map(|(_, c)| *c)
+            .max()
+            .unwrap_or(0);
+        eprintln!("D2 RESULT job={job_secs:.2}s audio_last={audio_last:.2}s video_last={video_last:.2}s server_peak_video={peak} max_job_conns_after_audio={max_conns_after}");
+        assert!(max_conns_after >= 7,
+            "survivor never inherited the finished side's connections: job conns after audio finished peaked at {max_conns_after} (pair share is 6)");
+        // the wall-clock gain on this fixture is bounded by
+        // block quantization, not by the fluid bound: the video
+        // side's remaining work at donation is ~13 one-MiB blocks
+        // locked in six 3-block claims, and a block is a ~4 s
+        // quantum at the cap — redistributing whole blocks over
+        // 8 workers still leaves a last wave that cannot start
+        // before the first wave lands. Measured: unhelped 12.40s,
+        // helped 12.0-12.1s. The assertion keeps a real margin
+        // under the unhelped figure without pretending the fluid
+        // bound (~10.3s) is reachable at this block size.
+        assert!(video_last < 12.3,
+            "video stream barely sped up from cross-stealing: last byte at {video_last:.2}s (unhelped shape measures ~12.4s on this fixture)");
+        // the merged output exists and is a real file
+        let merged = std::fs::read_dir(&dir).unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                let n = e.file_name().to_string_lossy().to_string();
+                n.ends_with(".mp4") && !n.contains(".ndm_stream")
+            })
+            .expect("merged output must exist");
+        assert!(merged.metadata().unwrap().len() > 1024 * 1024, "merged output too small");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&gen_dir);
+    }
+
 
     #[test]
     fn finish_sweep_removes_both_engines_temps_only() {

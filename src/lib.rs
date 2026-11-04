@@ -602,6 +602,12 @@ pub struct Progress {
     /// the block index each connection is currently working on,
     /// -1 when it holds no block (strip start markers, G1)
     pub conn_block: Vec<i64>,
+    /// WS-A (audit-232 S5): at least one connection was answered
+    /// 403/410 — the signed ADDRESS died mid-download, as opposed
+    /// to the file being gone (404 stays Permanent). Typed signal
+    /// for the job layer (core), which owns the heal: re-probe the
+    /// original URL and resume on the fresh effective address.
+    pub auth_dead: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -644,6 +650,16 @@ impl Control {
     }
 }
 
+/// WS-D D1: one in-flight block split at a byte offset — the
+/// owner keeps [block_start, split), a helper takes
+/// [split, block_end). See `byte_requeue` / `tail_splits` on Shared.
+#[derive(Clone, Copy)]
+struct TailSplit {
+    split: u64,
+    owner_done: bool,
+    helper_done: bool,
+}
+
 struct Shared {
     state: Mutex<State>,
     state_path: PathBuf,
@@ -653,6 +669,24 @@ struct Shared {
     since_save: AtomicU64,
     last_save: Mutex<Instant>,
     active_limit: AtomicUsize,
+    /// WS-D D2: the governor's live ceiling for active_limit, and
+    /// how many workers were spawned. Normally both equal the
+    /// start's connection count; a video+audio pair member starts
+    /// with the ceiling at its pair share while its sibling lives
+    /// (all of the pair's workers exist, the gate holds the excess
+    /// parked), and set_connection_limit raises both when the
+    /// sibling finishes — the survivor inherits the whole pool
+    /// without a restart.
+    conn_cap: AtomicUsize,
+    worker_count: usize,
+    /// WS-D D2: set on a video+audio pair's surviving stream when
+    /// its sibling finishes (with the connection-limit raise).
+    /// The survivor's tail byte-split gate relaxes for it (see
+    /// tail_split_due_survivor): its helpers are its own parked
+    /// workers, dedicated and already waiting in its claim wait —
+    /// not the churn-busy pool that made uniform-speed splitting
+    /// a loss for ordinary downloads (see tail_split_due).
+    pair_survivor: AtomicBool,
     active_workers: AtomicUsize,
     /// when each 403/429 landed (F3): the governor shrinks the
     /// pool only when throttling is BROAD — at least half the
@@ -672,6 +706,13 @@ struct Shared {
     /// most once per job
     fallback_used: AtomicBool,
     failed: AtomicBool,
+    /// WS-A: a 403/410 was seen on some connection of this job —
+    /// the address died, not necessarily the download (see
+    /// Progress::auth_dead). Set by the block-run and
+    /// single-stream error paths, never cleared within a run: a
+    /// later success on other ranges does not un-die the address
+    /// for the ranges that were refused.
+    auth_dead: AtomicBool,
     error: Mutex<Option<String>>,
     control: Arc<Control>,
     auth: Auth,
@@ -684,6 +725,15 @@ struct Shared {
     /// cumulative bytes fetched per worker this session (never reset
     /// mid-session) — IDM's per-connection "Downloaded" column
     conn_bytes: Vec<AtomicU64>,
+    /// WS-D D1: per-connection delivery rate (B/s) as sampled by
+    /// the governor's 1.5 s tick, and the highest such rate any
+    /// connection has shown this download. The tail byte-split's
+    /// straggler gate reads them: a split only pays when the
+    /// block's owner is demonstrably slower than what this pool
+    /// can do — at uniform per-connection speeds splitting is a
+    /// measured LOSS (see tail_split_due).
+    conn_rate_bps: Vec<AtomicU64>,
+    peak_conn_rate_bps: AtomicU64,
     /// (instant, fetched_session) samples for the sliding-window
     /// transfer rate shown to the user — IDM displays the CURRENT
     /// rate, not a session average diluted by pauses and slow starts
@@ -702,6 +752,22 @@ struct Shared {
     /// pick them up again — a range leaves the pool only by being
     /// downloaded or by the whole download settling
     requeue: Mutex<Vec<(usize, usize)>>,
+    /// WS-D D1: byte ranges carved out of an in-flight block by a
+    /// tail split — (start, end_exclusive) pairs, each wholly
+    /// inside one block, published by that block's owner at the
+    /// moment it caps its own run at the split offset (see
+    /// `tail_split_point`). A range is published ONLY by its owner
+    /// and ONLY before the owner reads another byte, so a helper's
+    /// range and the owner's remaining range are disjoint by
+    /// construction: no byte range is ever owned by two workers.
+    byte_requeue: Mutex<Vec<(u64, u64)>>,
+    /// WS-D D1: per-block tail-split bookkeeping (indexed by block,
+    /// None = never split). A split block is sealed only when BOTH
+    /// halves have landed (note_tail_owner_done /
+    /// note_tail_helper_done) — neither half alone may mark the
+    /// block, so the journal can never credit a block whose tail
+    /// bytes have not landed.
+    tail_splits: Mutex<Vec<Option<TailSplit>>>,
     /// workers parked in the claim wait right now because nothing
     /// was claimable — the signal that lets a busy worker split the
     /// unstarted tail of its claim instead of leaving peers idle
@@ -855,6 +921,26 @@ fn split_point(first_unwritten: usize, end: usize) -> Option<usize> {
     Some(first_unwritten + SPLIT_KEEP_BLOCKS)
 }
 
+/// The split point a pair survivor uses (WS-D D2): when a
+/// video+audio pair's other side finished, this download
+/// inherited the whole pool — but the inherited workers can
+/// only take work the current claims RELEASE, and the normal
+/// split shape (keep 2, steal at least 2) releases nothing from
+/// the short claims a pair member holds. Measured on the audit
+/// fixture, donation without release gained ~0.4 s of 2 s
+/// available: the blocks stayed locked in the original claims
+/// until they drained naturally. A survivor's owner therefore
+/// keeps only its first unwritten block and releases everything
+/// past it, so the inherited pool redistributes the remaining
+/// blocks at once. Only a flagged survivor takes this branch —
+/// ordinary downloads keep the Finding-1 shape exactly.
+fn shed_point(shared: &Shared, first_unwritten: usize, end: usize) -> Option<usize> {
+    if shared.pair_survivor.load(Ordering::Relaxed) && end > first_unwritten + 1 {
+        return Some(first_unwritten + 1);
+    }
+    split_point(first_unwritten, end)
+}
+
 /// Whether a tail split may be armed right now: a peer must
 /// actually be waiting for work (splitting into an empty room only
 /// fragments the claim and abandons a healthy response), and the
@@ -866,6 +952,187 @@ fn split_allowed(shared: &Shared) -> bool {
     match *plock(&shared.last_split) {
         Some(t) => t.elapsed() >= SPLIT_COOLDOWN,
         None => true,
+    }
+}
+
+/// WS-D D1 tail byte-splitting (audit-232 S6). Block-granular
+/// stealing cannot help the end-game: the final blocks are each
+/// IN FLIGHT on one slow connection (a run's unstarted tail is
+/// below SPLIT_MIN_STEAL, so `split_point` rightly refuses), while
+/// the rest of the pool idles. The fix splits the in-flight block
+/// itself at a byte offset. Safety is by construction, mirroring
+/// the block split's ownership rule — the OWNER executes the
+/// split: at a chunk boundary (never mid-write) it picks the
+/// split from its own true write cursor, publishes the helper
+/// range [split, block_end) to `byte_requeue`, and caps its own
+/// remaining reads at split. The helper range therefore starts
+/// exactly where the owner's writes provably stop, and the two
+/// ranges can never overlap. The block seals only when both
+/// halves report done (`note_tail_half_done`).
+
+/// A tail split must leave both sides worth a connection: the
+/// block remainder at the split decision, and each side of it.
+const TAIL_SPLIT_MIN_REMAINDER: u64 = 256 * 1024;
+const TAIL_SPLIT_MIN_SIDE: u64 = 64 * 1024;
+
+/// The byte offset splitting the current block's remainder
+/// [pos, block_end) in two, or None when the remainder is too
+/// small for a second connection to pay off. Pure arithmetic.
+fn tail_split_point(pos: u64, block_end: u64) -> Option<u64> {
+    let rem = block_end.checked_sub(pos)?;
+    if rem < TAIL_SPLIT_MIN_REMAINDER {
+        return None;
+    }
+    let split = pos + rem / 2;
+    if split - pos < TAIL_SPLIT_MIN_SIDE || block_end - split < TAIL_SPLIT_MIN_SIDE {
+        return None;
+    }
+    Some(split)
+}
+
+/// Whether a tail byte-split may be armed right now. This is
+/// deliberately the CONSERVATIVE shape (WS-D D1): the audit's
+/// uniform-cap rig showed that arming whenever a waiter merely
+/// exists can lose time — in that end-game the "waiting" workers
+/// are mostly churning through recycled hand-backs, helper ranges
+/// get claimed late and serially, and the split download finished
+/// ~10% SLOWER (124 s vs 111 s at 100 MiB / 16 conns / 64 KiB/s
+/// per conn). The win shape is narrower and provable: the split
+/// block is among the very last unfinished blocks (at most
+/// TAIL_SPLIT_MAX_REMAINING), the idle pool is at least as large
+/// as ALL the work that remains (so a helper is a genuinely
+/// spare connection, not a transient one), no earlier helper
+/// range is still unclaimed, and the pool-wide split cooldown
+/// (shared with block splits) has elapsed.
+const TAIL_SPLIT_MAX_REMAINING: usize = 4;
+
+fn tail_split_due(shared: &Shared) -> bool {
+    let waiting = shared.waiting_workers.load(Ordering::Relaxed);
+    if waiting == 0 {
+        return false;
+    }
+    if !plock(&shared.byte_requeue).is_empty() {
+        return false;
+    }
+    let total_blocks = shared.block_state.len();
+    let remaining = total_blocks
+        .saturating_sub(shared.done_count.load(Ordering::Relaxed));
+    if remaining == 0 || remaining > TAIL_SPLIT_MAX_REMAINING || waiting < remaining {
+        return false;
+    }
+    match *plock(&shared.last_split) {
+        Some(t) => t.elapsed() >= SPLIT_COOLDOWN,
+        None => true,
+    }
+}
+
+/// The pair-survivor variant of the tail-split gate (WS-D D2):
+/// when a video+audio pair's other side has finished, this
+/// download's remaining blocks are the whole job's finish line,
+/// and the workers that would help are this download's OWN —
+/// parked at its gate until the donation, then dedicated in its
+/// claim wait. The uniform-speed objection to splitting (owner
+/// and helper equally fast, split adds only coordination) does
+/// not hold here: the helpers were contributing NOTHING while
+/// parked, so a split block finishing on two connections is a
+/// strict gain as long as enough blocks remain to matter and at
+/// least one helper is actually waiting. Bounds: at most 8
+/// unfinished blocks, a waiter present, no helper range
+/// outstanding, shared split cooldown respected.
+fn tail_split_due_survivor(shared: &Shared) -> bool {
+    if !shared.pair_survivor.load(Ordering::Relaxed) {
+        return false;
+    }
+    if shared.waiting_workers.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    if !plock(&shared.byte_requeue).is_empty() {
+        return false;
+    }
+    let total_blocks = shared.block_state.len();
+    let remaining = total_blocks
+        .saturating_sub(shared.done_count.load(Ordering::Relaxed));
+    if remaining == 0 || remaining > 8 {
+        return false;
+    }
+    match *plock(&shared.last_split) {
+        Some(t) => t.elapsed() >= SPLIT_COOLDOWN,
+        None => true,
+    }
+}
+
+/// The straggler gate (WS-D D1): the block's owner is currently
+/// delivering at under half the best rate any connection in this
+/// pool has shown. Without it, splitting fires at uniform speeds
+/// too — where the audit rig measured it a net LOSS (owner and
+/// helper are equally fast, so the split only adds coordination:
+/// the abandoned response, the helper-claim latency, the
+/// both-halves seal). With it, splitting is reserved for the
+/// shape it provably wins: one decayed/throttled connection
+/// holding the finish while the pool demonstrably can do better.
+/// No data yet (fresh download, owner not yet sampled) reads as
+/// NOT a straggler — the conservative direction.
+fn tail_owner_is_straggler(shared: &Shared, worker_id: usize) -> bool {
+    let peak = shared.peak_conn_rate_bps.load(Ordering::Relaxed);
+    if peak == 0 {
+        return false;
+    }
+    let owner = shared
+        .conn_rate_bps
+        .get(worker_id)
+        .map(|r| r.load(Ordering::Relaxed))
+        .unwrap_or(0);
+    owner > 0 && owner * 2 < peak
+}
+
+/// Seal a split block whose two halves have both landed.
+fn seal_tail_block(shared: &Shared, block: usize) {
+    {
+        let mut st = plock(&shared.state);
+        if block < st.done.len() && st.done[block] == 0 {
+            st.done[block] = 1;
+            shared.done_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if let Some(b) = shared.block_state.get(block) {
+        b.store(1, Ordering::Relaxed);
+    }
+}
+
+/// The owner half of a split block has landed (the owner stopped
+/// exactly at the split offset): flag it, and seal the block if
+/// the helper half beat the owner to the finish.
+fn note_tail_owner_done(shared: &Shared, block: usize) {
+    let seal = {
+        let mut splits = plock(&shared.tail_splits);
+        match splits.get_mut(block) {
+            Some(Some(ts)) => {
+                ts.owner_done = true;
+                ts.helper_done
+            }
+            _ => false,
+        }
+    };
+    if seal {
+        seal_tail_block(shared, block);
+    }
+}
+
+/// The helper half of a split block has landed: flag it, and seal
+/// the block if the owner half is already in.
+fn note_tail_helper_done(shared: &Shared, block: usize) {
+    let seal = {
+        let mut splits = plock(&shared.tail_splits);
+        match splits.get_mut(block) {
+            Some(Some(ts)) => {
+                ts.helper_done = true;
+                ts.owner_done
+            }
+            _ => false,
+        }
+    };
+    if seal {
+        seal_tail_block(shared, block);
     }
 }
 
@@ -1231,6 +1498,13 @@ pub struct Auth {
     /// full Authorization header value (e.g. "Basic …") from the
     /// Add URL dialog's "Use authorization" fields (IDM parity)
     pub authorization: Option<String>,
+    /// the User-Agent of the browser that captured this download
+    /// (browser-capture door only): a session CDN that bound the
+    /// session to the browser refuses the matching cookies under
+    /// a foreign UA, so capture-sourced requests repeat the
+    /// browser's own UA instead of the BROWSER_UA constant
+    /// (audit-232 S3). None → the constant, as before.
+    pub user_agent: Option<String>,
 }
 
 fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
@@ -1243,6 +1517,12 @@ fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
     }
     if let Some(a) = &auth.authorization {
         req = req.set("Authorization", a);
+    }
+    if let Some(ua) = &auth.user_agent {
+        // a per-request User-Agent wins over the agent's
+        // BROWSER_UA default (ureq only writes its own when the
+        // request carries none)
+        req = req.set("User-Agent", ua);
     }
     req
 }
@@ -1279,6 +1559,12 @@ fn apply_auth_scoped(
     let mut req = req;
     if let Some(r) = &auth.referer {
         req = req.set("Referer", r);
+    }
+    if let Some(ua) = &auth.user_agent {
+        // not a credential either: the browser sends its UA to
+        // every host, and a session CDN on a mirror host is
+        // exactly where the UA binding bites
+        req = req.set("User-Agent", ua);
     }
     req
 }
@@ -1626,7 +1912,7 @@ fn probe_for_download_with(
             .map(|v| v.eq_ignore_ascii_case("bytes"))
             .unwrap_or(false);
         if let Some(total) = total {
-            if total > 0 && header_claim && response_encoding(&resp).is_none() {
+            if total > 0 && resp.status() == 200 && header_claim && response_encoding(&resp).is_none() {
                 return Ok(Probe {
                     total,
                     range_ok: true,
@@ -1889,7 +2175,11 @@ fn probe_once(
             // identity request reports the ENCODED length: never
             // trust it — fall through to the range probe, which
             // checks its own response the same way (finding #3)
-            if total > 0 && response_encoding(&resp).is_none() {
+            // only a 200 HEAD's length is a file size: a terminal
+            // 3xx (redirect loop, hop budget spent) or an error
+            // status wearing a Content-Length is not — fall through
+            // to the range probe, which judges its own answer
+            if total > 0 && resp.status() == 200 && response_encoding(&resp).is_none() {
                 let header_claim = resp
                     .header("Accept-Ranges")
                     .map(|v| v.eq_ignore_ascii_case("bytes"))
@@ -2054,6 +2344,20 @@ fn probe_once(
             range_unverified: false,
         });
     }
+    // Anything that is not a 200 here is not a file body at all:
+    // a terminal 3xx (jar_call spent its hop budget on a redirect
+    // loop and hands back the last redirect) used to have its
+    // Content-Length read as the file size — a 302 with
+    // `Content-Length: 0` probed as a legitimately empty file and
+    // the start then created that empty file and reported
+    // Finished (WS-BUGS B5c). HTTP error statuses never reach
+    // here (ureq returns them as Err); a leftover 3xx is a
+    // definitive answer, not a size.
+    if probe_status != 200 {
+        return Err(ProbeFail::Definitive(format!(
+            "probe: server answered status {probe_status} (redirects not followed to a file)"
+        )));
+    }
     let etag = resp.header("ETag").map(|s| s.to_string());
     let last_modified = resp.header("Last-Modified").map(|s| s.to_string());
     let total: u64 = match resp
@@ -2160,11 +2464,39 @@ fn note_range_loss(shared: &Shared) {
     }
 }
 
+/// WS-A (audit-232 S5): the HTTP statuses that mean the ADDRESS
+/// died — an expired signature or revoked token (403/410) — as
+/// opposed to the file being gone (404). One range's address
+/// death must not nuke a download whose other ranges are still
+/// mid-body, so these classify as Retry at the connection level
+/// and are reported to the job layer through Progress::auth_dead,
+/// which owns the re-probe-and-resume heal.
+pub fn status_is_auth_dead(status: u16) -> bool {
+    matches!(status, 403 | 410)
+}
+
+/// WS-A: does an engine error string carry an auth-death status?
+/// The engine's own error formats ("http: …: status code 410",
+/// "server answered 410 …") are the only inputs; callers outside
+/// the engine use this instead of matching raw text themselves.
+pub fn error_is_auth_dead(e: &str) -> bool {
+    e.contains("status code 403")
+        || e.contains("status code 410")
+        || e.contains("answered 403")
+        || e.contains("answered 410")
+}
+
+fn note_auth_dead(shared: &Shared) {
+    shared.auth_dead.store(true, Ordering::Relaxed);
+}
+
 enum BlockError {
     Retry(String),
-    /// a definitive refusal (404/410): retrying cannot change the
+    /// a definitive refusal (404): retrying cannot change the
     /// answer, so the download fails at once instead of burning the
-    /// stall window
+    /// stall window. (410 left this class with WS-A: it is the
+    /// signed-URL expiry shape, recoverable by re-probing the
+    /// original address — see status_is_auth_dead.)
     Permanent(String),
     Paused,
     Cancelled,
@@ -2178,6 +2510,12 @@ enum BlockError {
     /// unstarted tail can be handed to idle peers. Not an error —
     /// carries the block the claim now ends at
     Yielded(usize),
+    /// WS-D D1: the run stopped exactly at a tail byte-split
+    /// offset inside its current block: this worker's half of the
+    /// block is fully written, and the block's tail range is
+    /// already published for a helper. Not an error — carries the
+    /// split block's index
+    YieldedByte(usize),
 }
 
 struct ActiveWorkerGuard<'a>(&'a AtomicUsize);
@@ -2245,6 +2583,13 @@ fn download_block_run(
         &headers,
     )
     .map_err(|e| {
+        if matches!(e, ureq::Error::Status(403, _) | ureq::Error::Status(410, _)) {
+            // WS-A: this connection's address died. Recorded on
+            // the job (the job layer heals by re-probing the
+            // original URL); the connection itself just retries —
+            // other ranges may still be mid-body at full speed.
+            note_auth_dead(shared);
+        }
         if matches!(e, ureq::Error::Status(403, _) | ureq::Error::Status(429, _)) {
             // F3: a throttle lands on THIS connection only — its
             // timestamp feeds the governor's broad-throttling
@@ -2254,7 +2599,7 @@ fn download_block_run(
             plock(&shared.throttle_times).push(Instant::now());
             std::thread::sleep(Duration::from_millis(900));
         }
-        if matches!(e, ureq::Error::Status(404, _) | ureq::Error::Status(410, _)) {
+        if matches!(e, ureq::Error::Status(404, _)) {
             BlockError::Permanent(format!("http: {e}"))
         } else {
             BlockError::Retry(format!("http: {e}"))
@@ -2325,8 +2670,16 @@ fn download_block_run(
                 ));
             }
         }
-    } else if status == 404 || status == 410 {
+    } else if status == 404 {
         return Err(BlockError::Permanent(format!(
+            "server answered {status} to a range request"
+        )));
+    } else if status_is_auth_dead(status) {
+        // WS-A: same rule as the transport-error arm above — a
+        // 403/410 to THIS range is that range's dead address, not
+        // the download's death sentence
+        note_auth_dead(shared);
+        return Err(BlockError::Retry(format!(
             "server answered {status} to a range request"
         )));
     } else {
@@ -2353,6 +2706,20 @@ fn download_block_run(
     // which this run has not written a single byte of — are
     // fetched fresh by whoever claims them
     let mut cap_block: Option<usize> = None;
+    // WS-D D1: the tail byte-split cap for THIS block, when one is
+    // armed — this run stops at that byte offset and yields the
+    // block's tail to a helper (see the arming check in the loop).
+    // A split registered by an earlier call for the same block
+    // (this run was recycled / paused and re-entered) is resumed
+    // from the registry, never re-decided: the helper may already
+    // be fetching the published range, so the cap must hold.
+    let mut tail_cap: Option<u64> = {
+        let splits = plock(&shared.tail_splits);
+        match splits.get(*cur_block) {
+            Some(Some(ts)) if !ts.owner_done => Some(ts.split),
+            _ => None,
+        }
+    };
     // F2 per-connection progress watermark — the single-stream
     // rule (STALL_PROGRESS_BYTES / STALL_LIMIT) applied to THIS
     // connection: the pool-wide clock is refreshed by any chunk
@@ -2363,6 +2730,21 @@ fn download_block_run(
     // within STALL_LIMIT is recycled by the worker.
     let mut wm_pos = *pos;
     let mut wm_clock = Instant::now();
+    // Decay-window recycling (audit232): the F2 watermark above
+    // only fires when a connection delivers <256 KiB in a full
+    // 30 s — a connection that decays from a fast burst to a
+    // steady 32–64 KiB/s clamp (the googlevideo shape) crosses
+    // 256 KiB every 4–8 s and was NEVER recycled, yet a fresh
+    // request earns a fresh burst. Track this run's delivery in
+    // 10 s windows: the first window is the connection's own
+    // baseline; a later window under half the baseline (and
+    // under 1 MiB absolute, so genuinely fast or steady
+    // connections never churn) recycles the connection from the
+    // current offset — written bytes are never re-fetched.
+    const DECAY_WINDOW: Duration = Duration::from_secs(10);
+    let mut decay_pos = *pos;
+    let mut decay_clock = Instant::now();
+    let mut decay_baseline: Option<u64> = None;
     loop {
         if shared.single_fallback.load(Ordering::Relaxed) {
             // F6: the job switched to single-stream mode — this
@@ -2387,13 +2769,14 @@ fn download_block_run(
         if shared.control.paused.load(Ordering::Relaxed) {
             return Err(BlockError::Paused);
         }
-        let remaining = match cap_block {
-            Some(b) => {
-                let cap_byte = ((b as u64) * block_size).min(total);
-                (resp_end + 1 - *pos).min(cap_byte.saturating_sub(*pos))
-            }
-            None => resp_end + 1 - *pos,
-        };
+        let mut remaining = resp_end + 1 - *pos;
+        if let Some(b) = cap_block {
+            let cap_byte = ((b as u64) * block_size).min(total);
+            remaining = remaining.min(cap_byte.saturating_sub(*pos));
+        }
+        if let Some(split) = tail_cap {
+            remaining = remaining.min(split.saturating_sub(*pos));
+        }
         if remaining == 0 {
             break;
         }
@@ -2469,6 +2852,20 @@ fn download_block_run(
         {
             return Err(BlockError::Recycle);
         }
+        // decay-window check (see the state declared above)
+        if decay_clock.elapsed() >= DECAY_WINDOW {
+            let window_bytes = (*pos).saturating_sub(decay_pos);
+            match decay_baseline {
+                None => decay_baseline = Some(window_bytes),
+                Some(base) => {
+                    if window_bytes < base / 2 && window_bytes < 1024 * 1024 {
+                        return Err(BlockError::Recycle);
+                    }
+                }
+            }
+            decay_pos = *pos;
+            decay_clock = Instant::now();
+        }
 
         // Mark any completed blocks in this contiguous run immediately
         while *cur_block < b_end_excl {
@@ -2522,7 +2919,61 @@ fn download_block_run(
             } else {
                 *cur_block
             };
-            cap_block = split_point(first_unwritten, b_end_excl);
+            cap_block = shed_point(shared, first_unwritten, b_end_excl);
+        }
+        // Arm the tail byte-split (WS-D D1): the end-game shape
+        // the block split above cannot reach — this run's current
+        // block is in flight and its unstarted tail is too small
+        // to split, yet peers are idle. The owner executes the
+        // split itself, here at a chunk boundary: it publishes the
+        // helper range and caps its own reads at the split, so the
+        // two ranges are disjoint by construction (see
+        // tail_split_point). One split per block, ever: a block
+        // already in the registry is resumed via tail_cap above.
+        // The block must be THIS run's: when the marking loop
+        // seals the run's final block it leaves the cursor on the
+        // NEXT block — a stranger's block, owned by another claim —
+        // and splitting that one would hand its tail to a helper
+        // while its real owner writes it whole (a duplicated
+        // range, caught by the regression test's fetched==size
+        // audit). The block-split arming above is safe here only
+        // because its arithmetic refuses an empty tail.
+        // Conservative shape, second half: the owner must not
+        // be nearly done with the block (splitting then saves
+        // less than a fresh connection costs), and it must be a
+        // proven straggler against this pool's own peak rate —
+        // at uniform speeds a split is a measured loss, so the
+        // gate is what confines the mechanism to the shape it
+        // wins (see tail_owner_is_straggler).
+        let block_start = (*cur_block as u64) * block_size;
+        if tail_cap.is_none()
+            && *cur_block < b_end_excl
+            && *pos - block_start <= block_size * 3 / 4
+            && (tail_split_due_survivor(shared)
+                || (tail_split_due(shared) && tail_owner_is_straggler(shared, worker_id)))
+        {
+            let block_end = ((*cur_block as u64 + 1) * block_size).min(total);
+            let registered = plock(&shared.tail_splits)
+                .get(*cur_block)
+                .map(|o| o.is_some())
+                .unwrap_or(true);
+            if !registered {
+                if let Some(split) = tail_split_point(*pos, block_end) {
+                    {
+                        let mut splits = plock(&shared.tail_splits);
+                        if let Some(slot) = splits.get_mut(*cur_block) {
+                            *slot = Some(TailSplit {
+                                split,
+                                owner_done: false,
+                                helper_done: false,
+                            });
+                        }
+                    }
+                    plock(&shared.byte_requeue).push((split, block_end));
+                    *plock(&shared.last_split) = Some(Instant::now());
+                    tail_cap = Some(split);
+                }
+            }
         }
     }
     if let Some(split) = cap_block {
@@ -2533,6 +2984,14 @@ fn download_block_run(
             return Err(BlockError::Yielded(split));
         }
     }
+    if let Some(split) = tail_cap {
+        if *pos == split && *pos < resp_end + 1 {
+            // stopped exactly at the tail-split offset, with this
+            // response's tail bytes unread: the helper range owns
+            // them now (see tail_split_point) — a deliberate yield
+            return Err(BlockError::YieldedByte(*cur_block));
+        }
+    }
     if *pos != resp_end + 1 {
         return Err(BlockError::Retry(format!(
             "short block run: got {} bytes, expected to reach {}",
@@ -2541,6 +3000,285 @@ fn download_block_run(
         )));
     }
     Ok(())
+}
+
+/// WS-D D1: fetch one published tail byte-range [range_start,
+/// range_end) — the helper half of a split block. Mirrors
+/// `download_block_run`'s wire discipline (jar, auth scoping,
+/// range validation, pacing, halt checks, per-connection stall
+/// watermark) for a range that lives inside a single block:
+/// every byte it writes belongs to that block and to no other
+/// range, and `pos` advances only over bytes actually written,
+/// so a retry or recycle resumes the range exactly where it
+/// stopped — never re-fetching a written byte.
+#[allow(clippy::too_many_arguments)]
+fn download_byte_range(
+    agent: &ureq::Agent,
+    url: &str,
+    file: &File,
+    range_start: u64,
+    range_end: u64,
+    pos: &mut u64,
+    shared: &Shared,
+    worker_id: usize,
+) -> Result<(), BlockError> {
+    if *pos >= range_end {
+        return Ok(());
+    }
+    let (block_size, total) = {
+        let st = plock(&shared.state);
+        (st.block_size, st.total)
+    };
+    if block_size == 0 {
+        return Ok(());
+    }
+    let block = (range_start / block_size) as usize;
+    let _active_guard = ActiveWorkerGuard::new(&shared.active_workers);
+    let req_start = *pos;
+    let end = range_end - 1; // inclusive, as on the wire
+    let origin_url = plock(&shared.state).url.clone();
+    let range_header = format!("bytes={req_start}-{end}");
+    let headers: Vec<(&str, &str)> = vec![
+        ("Accept-Encoding", "identity"),
+        ("Range", &range_header),
+    ];
+    if let Some(p) = shared.conn_phase.get(worker_id) {
+        p.store(1, Ordering::Relaxed);
+    }
+    if let Some(b) = shared.conn_block.get(worker_id) {
+        b.store(block, Ordering::Relaxed);
+    }
+    let resp = jar_call(
+        agent,
+        &shared.jar,
+        &shared.auth,
+        &origin_url,
+        "GET",
+        url,
+        &headers,
+    )
+    .map_err(|e| {
+        if matches!(e, ureq::Error::Status(403, _) | ureq::Error::Status(429, _)) {
+            plock(&shared.throttle_times).push(Instant::now());
+            std::thread::sleep(Duration::from_millis(900));
+        }
+        if matches!(e, ureq::Error::Status(404, _) | ureq::Error::Status(410, _)) {
+            BlockError::Permanent(format!("http: {e}"))
+        } else {
+            BlockError::Retry(format!("http: {e}"))
+        }
+    })?;
+    if !shared.ignore_encoding.load(Ordering::Relaxed) {
+        if let Some(enc) = response_encoding(&resp) {
+            if !worker_proves_encoding_lie(agent, shared, url, total) {
+                return Err(BlockError::Permanent(format!(
+                    "server answered with Content-Encoding: {enc} despite an identity request"
+                )));
+            }
+        }
+    }
+    let status = resp.status();
+    let resp_end = if status == 206 {
+        shared.range_200_count.store(0, Ordering::Relaxed);
+        let parsed = resp.header("Content-Range").and_then(parse_content_range);
+        match parsed {
+            Some((s, e, t)) if s == req_start && e <= end && (t.is_none() || t == Some(total)) => e,
+            _ => {
+                return Err(BlockError::Retry(
+                    "server answered a byte-range request with the wrong range".to_string(),
+                ));
+            }
+        }
+    } else if status == 404 || status == 410 {
+        return Err(BlockError::Permanent(format!(
+            "server answered {status} to a byte-range request"
+        )));
+    } else {
+        if status == 200 {
+            note_range_loss(shared);
+        }
+        return Err(BlockError::Retry(format!(
+            "server answered {status} to a byte-range request"
+        )));
+    };
+    if let Some(p) = shared.conn_phase.get(worker_id) {
+        p.store(2, Ordering::Relaxed);
+    }
+    let mut reader = resp.into_reader();
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut wm_pos = *pos;
+    let mut wm_clock = Instant::now();
+    loop {
+        if shared.single_fallback.load(Ordering::Relaxed)
+            || shared.superseded.load(Ordering::Relaxed)
+            || shared.control.cancelled.load(Ordering::Relaxed)
+        {
+            return Err(BlockError::Cancelled);
+        }
+        if shared.control.paused.load(Ordering::Relaxed) {
+            return Err(BlockError::Paused);
+        }
+        let remaining = resp_end + 1 - *pos;
+        if remaining == 0 {
+            break;
+        }
+        let want = (buf.len() as u64).min(remaining) as usize;
+        let grant = pace_grant_size(shared, want);
+        if !pace_before_read(shared, grant as u64) {
+            if shared.control.paused.load(Ordering::Relaxed) {
+                return Err(BlockError::Paused);
+            }
+            return Err(BlockError::Cancelled);
+        }
+        let n = reader.read(&mut buf[..grant]).map_err(|e| {
+            pace_refund_both(shared, grant as u64);
+            BlockError::Retry(format!("read: {e}"))
+        })?;
+        if (n as u64) < grant as u64 {
+            pace_refund_both(shared, grant as u64 - n as u64);
+        }
+        if n == 0 {
+            break;
+        }
+        if shared.superseded.load(Ordering::Relaxed)
+            || shared.control.cancelled.load(Ordering::Relaxed)
+        {
+            return Err(BlockError::Cancelled);
+        }
+        if shared.control.paused.load(Ordering::Relaxed) {
+            return Err(BlockError::Paused);
+        }
+        write_at(file, &buf[..n], *pos).map_err(|e| write_block_error(&e))?;
+        *pos += n as u64;
+        shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
+        {
+            let mut lp = plock(&shared.last_progress);
+            if lp.elapsed() > Duration::from_millis(250) {
+                *lp = Instant::now();
+            }
+        }
+        if let Some(cb) = shared.conn_bytes.get(worker_id) {
+            cb.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        shared.since_save.fetch_add(n as u64, Ordering::Relaxed);
+        shared.bytes_since_sync.fetch_add(n as u64, Ordering::Relaxed);
+        if let Some(p) = shared.partial.get(worker_id) {
+            p.store((*pos).saturating_sub(range_start), Ordering::Relaxed);
+        }
+        if !note_stall_progress(*pos, &mut wm_pos, &mut wm_clock)
+            && wm_clock.elapsed() > STALL_LIMIT
+        {
+            return Err(BlockError::Recycle);
+        }
+    }
+    if *pos != resp_end + 1 {
+        return Err(BlockError::Retry(format!(
+            "short byte range: got {} bytes, expected to reach {}",
+            *pos,
+            resp_end + 1
+        )));
+    }
+    Ok(())
+}
+
+/// WS-D D1: run one published tail byte-range to completion on
+/// this (idle) worker, with the same failure policy as a block
+/// sub-run: partial responses and recycles continue the range
+/// from its write cursor, repeated failures hand the UNWRITTEN
+/// remainder back to `byte_requeue` for another helper, and only
+/// the pool-wide stall policy or a Permanent refusal fails the
+/// download. Returns false when the worker itself must exit
+/// (cancelled, or the download failed through this range).
+fn run_byte_helper(
+    id: usize,
+    agent: &ureq::Agent,
+    url: &str,
+    file: &Arc<File>,
+    shared: &Arc<Shared>,
+    range_start: u64,
+    range_end: u64,
+) -> bool {
+    let block = {
+        let st = plock(&shared.state);
+        if st.block_size == 0 {
+            return true;
+        }
+        (range_start / st.block_size) as usize
+    };
+    let mut pos = range_start;
+    let mut attempt = 0;
+    loop {
+        if shared.superseded.load(Ordering::Relaxed)
+            || shared.failed.load(Ordering::Relaxed)
+            || shared.control.cancelled.load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        let before = pos;
+        let res = download_byte_range(agent, url, file, range_start, range_end, &mut pos, shared, id);
+        // an empty 206 answer is not progress (the F-15 wedge
+        // rule, applied to byte ranges as to block runs)
+        let res = match res {
+            Ok(()) if pos == before && pos < range_end => Err(BlockError::Retry(
+                "server answered a byte-range request with an empty range".to_string(),
+            )),
+            other => other,
+        };
+        match res {
+            Ok(()) => {
+                if pos >= range_end {
+                    shared.partial[id].store(0, Ordering::Relaxed);
+                    note_tail_helper_done(shared, block);
+                    save_state(shared, false, Some(file));
+                    return true;
+                }
+                // partial response: progress, not a failure —
+                // loop and fetch the range's remainder
+                attempt = 0;
+            }
+            Err(BlockError::Recycle) => continue,
+            Err(BlockError::Paused) => {
+                if !wait_while_paused(shared) {
+                    shared.partial[id].store(0, Ordering::Relaxed);
+                    return false;
+                }
+            }
+            Err(BlockError::Cancelled) => {
+                shared.partial[id].store(0, Ordering::Relaxed);
+                return false;
+            }
+            Err(BlockError::Permanent(e)) => {
+                shared.partial[id].store(0, Ordering::Relaxed);
+                let mut err = plock(&shared.error);
+                *err = Some(format!("block {block}: {e}"));
+                shared.failed.store(true, Ordering::Relaxed);
+                return false;
+            }
+            Err(BlockError::Retry(e)) => {
+                if plock(&shared.last_progress).elapsed() > STALL_LIMIT {
+                    shared.partial[id].store(0, Ordering::Relaxed);
+                    let mut err = plock(&shared.error);
+                    *err = Some(format!(
+                        "no progress for {}s (last error: block {block}: {e})",
+                        STALL_LIMIT.as_secs()
+                    ));
+                    shared.failed.store(true, Ordering::Relaxed);
+                    return false;
+                }
+                attempt += 1;
+                if attempt >= 5 {
+                    shared.partial[id].store(0, Ordering::Relaxed);
+                    if pos < range_end {
+                        plock(&shared.byte_requeue).push((pos, range_end));
+                    }
+                    return true;
+                }
+                let backoff = (300u64 << (attempt - 1)).min(5_000);
+                std::thread::sleep(Duration::from_millis(backoff));
+            }
+            Err(BlockError::Yielded(_)) | Err(BlockError::YieldedByte(_)) => return true,
+        }
+    }
 }
 
 fn wait_while_paused(shared: &Shared) -> bool {
@@ -2633,6 +3371,19 @@ fn worker(
             // their unstarted tails for (Finding 1)
             let mut waiter: Option<WaiterGuard> = None;
             loop {
+                // WS-D D1: a published tail byte-range outranks
+                // waiting for a block claim — it holds the
+                // end-game's last unfinished bytes, and this
+                // worker is idle by definition here. Helping is
+                // work, not waiting, so the waiter registration
+                // drops while the helper runs.
+                if let Some((hs, he)) = plock(&shared.byte_requeue).pop() {
+                    waiter = None;
+                    if !run_byte_helper(id, &agent, &url, &file, &shared, hs, he) {
+                        return;
+                    }
+                    continue;
+                }
                 if let Some(range) = try_claim(&shared, total_blocks) {
                     break range;
                 }
@@ -2664,6 +3415,23 @@ fn worker(
         // Process any undone sub-runs inside [claim_start, claim_end)
         let mut cursor = claim_start;
         while cursor < claim_end {
+            // WS-D D1: between sub-runs is a natural break — serve
+            // a queued tail byte-range before starting the next
+            // sub-run. The claim-wait loop alone made a thin,
+            // transient helper pool: in the uniform-cap end-game
+            // most workers sit inside long sub-run retry cycles
+            // when a split arms, and a range queued behind them
+            // was claimed seconds late, serially, erasing the
+            // split's win (rig: 124 s helped vs 111 s unhelped at
+            // 100 MiB / 16 conns / 64 KiB/s). A worker here is
+            // between blocks, so helping costs its claim nothing
+            // it was using.
+            if let Some((hs, he)) = plock(&shared.byte_requeue).pop() {
+                if !run_byte_helper(id, &agent, &url, &file, &shared, hs, he) {
+                    return;
+                }
+                continue;
+            }
             if shared.single_fallback.load(Ordering::Relaxed) {
                 break; // F6: the loop head routes the fallback
             }
@@ -2675,7 +3443,7 @@ fn worker(
             // released tail simply re-enters the pool as a requeue
             // range, under the same bitmap truth as any hand-back.
             if split_allowed(&shared) {
-                if let Some(split) = split_point(cursor, claim_end) {
+                if let Some(split) = shed_point(&shared, cursor, claim_end) {
                     plock(&shared.requeue).push((split, claim_end));
                     claim_end = split;
                     *plock(&shared.last_split) = Some(Instant::now());
@@ -2777,6 +3545,29 @@ fn worker(
                             plock(&shared.requeue).push((split, claim_end));
                             claim_end = split;
                             *plock(&shared.last_split) = Some(Instant::now());
+                        }
+                        break;
+                    }
+                    Err(BlockError::YieldedByte(block)) => {
+                        // WS-D D1: this run stopped at its tail
+                        // byte-split offset — its half of `block`
+                        // is fully written, and the block's tail
+                        // range is already published for a helper.
+                        // Flag the owner half (the block seals
+                        // when the helper half lands, or already
+                        // has), hand this sub-run's remaining whole
+                        // blocks back to the pool, and end the
+                        // claim here. The split block itself is
+                        // owned by the byte-range bookkeeping now —
+                        // it must NOT re-enter the block pool, or a
+                        // second worker would re-fetch its head.
+                        shared.partial[id].store(0, Ordering::Relaxed);
+                        if block < b_last {
+                            shared.block_state[block].store(2, Ordering::Relaxed);
+                        }
+                        note_tail_owner_done(&shared, block);
+                        if block + 1 < b_last {
+                            plock(&shared.requeue).push((block + 1, b_last));
                         }
                         break;
                     }
@@ -2925,7 +3716,13 @@ fn single_fallback_download(
             url,
             &[("Accept-Encoding", "identity")],
         )
-        .map_err(|e| format!("http: {e}"))?;
+        .map_err(|e| {
+            let msg = format!("http: {e}");
+            if error_is_auth_dead(&msg) {
+                note_auth_dead(shared);
+            }
+            msg
+        })?;
         if resp.status() != 200 {
             return Err(format!(
                 "server answered {} to the single-stream restart",
@@ -3066,6 +3863,7 @@ const THROTTLE_WINDOW: Duration = Duration::from_secs(5);
 fn governor(shared: Arc<Shared>, max_conn: usize, total_blocks: usize) {
     let mut last_bytes = 0u64;
     let mut last_check = Instant::now();
+    let mut last_conn_bytes: Vec<u64> = vec![0; max_conn];
     loop {
         std::thread::sleep(Duration::from_millis(1500));
         if shared.done_count.load(Ordering::Relaxed) >= total_blocks
@@ -3075,16 +3873,44 @@ fn governor(shared: Arc<Shared>, max_conn: usize, total_blocks: usize) {
             return;
         }
         let now_bytes = shared.fetched_session.load(Ordering::Relaxed);
-        let rate = (now_bytes - last_bytes) as f64 / last_check.elapsed().as_secs_f64();
+        let tick_secs = last_check.elapsed().as_secs_f64();
+        let rate = (now_bytes - last_bytes) as f64 / tick_secs;
         last_bytes = now_bytes;
         last_check = Instant::now();
+        // WS-D D1: sample each connection's delivery rate over
+        // this tick and remember the pool's peak — the tail
+        // byte-split's straggler gate compares a block owner's
+        // current rate against what this pool has demonstrably
+        // been able to do.
+        if tick_secs > 0.0 {
+            for (i, cb) in shared.conn_bytes.iter().enumerate() {
+                let now = cb.load(Ordering::Relaxed);
+                let prev = last_conn_bytes.get(i).copied().unwrap_or(0);
+                let r = (now.saturating_sub(prev) as f64 / tick_secs) as u64;
+                if let Some(slot) = shared.conn_rate_bps.get(i) {
+                    slot.store(r, Ordering::Relaxed);
+                }
+                if r > shared.peak_conn_rate_bps.load(Ordering::Relaxed) {
+                    shared.peak_conn_rate_bps.store(r, Ordering::Relaxed);
+                }
+                if let Some(slot) = last_conn_bytes.get_mut(i) {
+                    *slot = now;
+                }
+            }
+        }
         let limit = shared.active_limit.load(Ordering::Relaxed);
         let recent_throttles = {
             let mut times = plock(&shared.throttle_times);
             times.retain(|t| t.elapsed() <= THROTTLE_WINDOW);
             times.len()
         };
-        match governor_decision(recent_throttles, limit, limit, max_conn, rate) {
+        match governor_decision(
+            recent_throttles,
+            limit,
+            limit,
+            shared.conn_cap.load(Ordering::Relaxed).max(1),
+            rate,
+        ) {
             GovDecision::Shrink => {
                 shared
                     .active_limit
@@ -3094,9 +3920,10 @@ fn governor(shared: Arc<Shared>, max_conn: usize, total_blocks: usize) {
                 plock(&shared.throttle_times).clear();
             }
             GovDecision::Grow => {
-                shared
-                    .active_limit
-                    .store((limit * 2).min(max_conn), Ordering::Relaxed);
+                shared.active_limit.store(
+                    (limit * 2).min(shared.conn_cap.load(Ordering::Relaxed).max(1)),
+                    Ordering::Relaxed,
+                );
             }
             GovDecision::Hold => {}
         }
@@ -3227,6 +4054,7 @@ impl Download {
                     }
                 })
                 .collect(),
+            auth_dead: self.shared.auth_dead.load(Ordering::Relaxed),
         }
     }
 
@@ -3254,6 +4082,32 @@ impl Download {
             );
             self.shared.own_limit_gen.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// WS-D D2: raise (or lower) how many of this download's
+    /// spawned workers may be active at once, live. Workers park
+    /// at the connection gate when their id is at or above the
+    /// active limit and re-check every 80 ms, so raising the
+    /// limit puts parked workers on the transfer within a tick —
+    /// no restart, no lost progress. The governor's grow ceiling
+    /// moves with it, so the governor will not shrink the pool
+    /// back toward the old share on its next tick (its throttle
+    /// shrink still applies, as for any download). Clamped to
+    /// [1, spawned workers]: a download can never use connections
+    /// it did not spawn. Pair cross-stealing calls this on the
+    /// surviving stream when its sibling finishes.
+    pub fn set_connection_limit(&self, n: usize) {
+        let n = n.clamp(1, self.shared.worker_count.max(1));
+        self.shared.conn_cap.store(n, Ordering::Relaxed);
+        self.shared.active_limit.store(n, Ordering::Relaxed);
+    }
+
+    /// WS-D D2: mark this download as a video+audio pair's
+    /// surviving stream (its sibling just finished). Relaxes its
+    /// tail byte-split gate — see tail_split_due_survivor. Called
+    /// together with set_connection_limit by the pair's poll.
+    pub fn mark_pair_survivor(&self) {
+        self.shared.pair_survivor.store(true, Ordering::Relaxed);
     }
 
     /// The most recent resume-state (journal) save failure for this
@@ -3679,7 +4533,7 @@ pub fn start(
     max_conn: usize,
     block_size: u64,
 ) -> Result<Arc<Download>, String> {
-    start_impl(url, out, max_conn, block_size, &Auth::default(), None)
+    start_impl(url, out, max_conn, max_conn, block_size, &Auth::default(), None)
 }
 
 /// Start a download that repeats the browser session headers in
@@ -3692,7 +4546,26 @@ pub fn start_with_auth(
     block_size: u64,
     auth: Auth,
 ) -> Result<Arc<Download>, String> {
-    start_impl(url, out, max_conn, block_size, &auth, None)
+    start_impl(url, out, max_conn, max_conn, block_size, &auth, None)
+}
+
+/// WS-D D2: start with MORE workers spawned than may be active
+/// at once. The excess workers park at the connection gate until
+/// Download::set_connection_limit raises the active count — a
+/// video+audio pair starts each side with the full pool spawned
+/// but only its pair share active, so when one side finishes the
+/// survivor inherits the whole pool live instead of finishing
+/// the larger stream on its original share while the finished
+/// side's connections idle (audit-232 S4).
+pub fn start_with_auth_limited(
+    url: &str,
+    out: &Path,
+    spawn_conn: usize,
+    active_conn: usize,
+    block_size: u64,
+    auth: Auth,
+) -> Result<Arc<Download>, String> {
+    start_impl(url, out, spawn_conn, active_conn, block_size, &auth, None)
 }
 
 /// Start with a probe the caller has JUST made for this exact URL
@@ -3710,13 +4583,14 @@ pub fn start_with_auth_preprobed(
     auth: Auth,
     probed: Option<Probe>,
 ) -> Result<Arc<Download>, String> {
-    start_impl(url, out, max_conn, block_size, &auth, probed)
+    start_impl(url, out, max_conn, max_conn, block_size, &auth, probed)
 }
 
 fn start_impl(
     url: &str,
     out: &Path,
     max_conn: usize,
+    active_conn: usize,
     block_size: u64,
     auth: &Auth,
     pre_probed: Option<Probe>,
@@ -3727,6 +4601,13 @@ fn start_impl(
     // an absurd block size is clamped, not trusted (overflow bait)
     let block_size = block_size.min(64 * 1024 * 1024);
     let max_conn = max_conn.clamp(1, 64);
+    // WS-D D2: how many of the spawned workers may be ACTIVE at
+    // once (the rest park at the gate). Equals max_conn except
+    // for a video+audio pair member, which starts at its pair
+    // share so its sibling has a pool of its own; the survivor's
+    // share is raised live via Download::set_connection_limit
+    // when the sibling finishes.
+    let active_conn = active_conn.clamp(1, max_conn);
     // one live writer per output path (finding #10): register
     // before any probing or file I/O so a collision fails fast,
     // and hand the guard to whichever thread settles this download
@@ -3957,24 +4838,32 @@ fn start_impl(
         fetched_session: AtomicU64::new(0),
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
-        active_limit: AtomicUsize::new(max_conn.min(total_blocks).max(1)),
+        active_limit: AtomicUsize::new(active_conn.min(total_blocks).max(1)),
+        conn_cap: AtomicUsize::new(active_conn),
+        worker_count: max_conn.max(1),
+        pair_survivor: AtomicBool::new(false),
         active_workers: AtomicUsize::new(0),
         throttle_times: Mutex::new(Vec::new()),
         range_200_count: AtomicUsize::new(0),
         single_fallback: AtomicBool::new(false),
         fallback_used: AtomicBool::new(false),
         failed: AtomicBool::new(false),
+        auth_dead: AtomicBool::new(false),
         error: Mutex::new(None),
         control: control.clone(),
         block_state,
         status: Mutex::new(Status::Downloading),
         partial: (0..max_conn).map(|_| AtomicU64::new(0)).collect(),
         conn_bytes: (0..max_conn).map(|_| AtomicU64::new(0)).collect(),
+        conn_rate_bps: (0..max_conn).map(|_| AtomicU64::new(0)).collect(),
+        peak_conn_rate_bps: AtomicU64::new(0),
         rate_hist: Mutex::new(std::collections::VecDeque::new()),
         own_limit: AtomicU64::new(0),
         own_limit_state: Mutex::new(None),
         last_progress: Mutex::new(Instant::now()),
         requeue: Mutex::new(Vec::new()),
+        byte_requeue: Mutex::new(Vec::new()),
+        tail_splits: Mutex::new((0..total_blocks).map(|_| None).collect()),
         waiting_workers: AtomicUsize::new(0),
         last_split: Mutex::new(None),
         last_journal_error: Mutex::new(None),
@@ -4183,23 +5072,31 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(1),
+        conn_cap: AtomicUsize::new(1),
+        worker_count: 1,
+        pair_survivor: AtomicBool::new(false),
         active_workers: AtomicUsize::new(0),
         throttle_times: Mutex::new(Vec::new()),
         range_200_count: AtomicUsize::new(0),
         single_fallback: AtomicBool::new(false),
         fallback_used: AtomicBool::new(false),
         failed: AtomicBool::new(false),
+        auth_dead: AtomicBool::new(false),
         error: Mutex::new(None),
         control: control.clone(),
         block_state: vec![AtomicU8::new(1)],
         status: Mutex::new(Status::Finished),
         partial: vec![AtomicU64::new(0)],
         conn_bytes: vec![AtomicU64::new(0)],
+        conn_rate_bps: vec![AtomicU64::new(0)],
+        peak_conn_rate_bps: AtomicU64::new(0),
         rate_hist: Mutex::new(std::collections::VecDeque::new()),
         own_limit: AtomicU64::new(0),
         own_limit_state: Mutex::new(None),
         last_progress: Mutex::new(Instant::now()),
         requeue: Mutex::new(Vec::new()),
+        byte_requeue: Mutex::new(Vec::new()),
+        tail_splits: Mutex::new(vec![None]),
         waiting_workers: AtomicUsize::new(0),
         last_split: Mutex::new(None),
         last_journal_error: Mutex::new(None),
@@ -4277,23 +5174,31 @@ fn start_single_stream(
         since_save: AtomicU64::new(0),
         last_save: Mutex::new(Instant::now()),
         active_limit: AtomicUsize::new(1),
+        conn_cap: AtomicUsize::new(1),
+        worker_count: 1,
+        pair_survivor: AtomicBool::new(false),
         active_workers: AtomicUsize::new(1),
         throttle_times: Mutex::new(Vec::new()),
         range_200_count: AtomicUsize::new(0),
         single_fallback: AtomicBool::new(false),
         fallback_used: AtomicBool::new(false),
         failed: AtomicBool::new(false),
+        auth_dead: AtomicBool::new(false),
         error: Mutex::new(None),
         control: control.clone(),
         block_state: vec![AtomicU8::new(0)],
         status: Mutex::new(Status::Downloading),
         partial: vec![AtomicU64::new(0)],
         conn_bytes: vec![AtomicU64::new(0)],
+        conn_rate_bps: vec![AtomicU64::new(0)],
+        peak_conn_rate_bps: AtomicU64::new(0),
         rate_hist: Mutex::new(std::collections::VecDeque::new()),
         own_limit: AtomicU64::new(0),
         own_limit_state: Mutex::new(None),
         last_progress: Mutex::new(Instant::now()),
         requeue: Mutex::new(Vec::new()),
+        byte_requeue: Mutex::new(Vec::new()),
+        tail_splits: Mutex::new(vec![None]),
         waiting_workers: AtomicUsize::new(0),
         last_split: Mutex::new(None),
         last_journal_error: Mutex::new(None),
@@ -4351,7 +5256,15 @@ fn start_single_stream(
                 &url,
                 &[("Accept-Encoding", "identity")],
             )
-            .map_err(|e| format!("http: {e}"))?;
+            .map_err(|e| {
+                // WS-A: a single-stream job's 403/410 is the same
+                // dead-address signal the ranged path records
+                let msg = format!("http: {e}");
+                if error_is_auth_dead(&msg) {
+                    note_auth_dead(&shared);
+                }
+                msg
+            })?;
             if !shared.ignore_encoding.load(Ordering::Relaxed) {
                 if let Some(enc) = response_encoding(&resp) {
                     return Err(format!(
@@ -5104,7 +6017,21 @@ pub fn cap_file_name(name: &str) -> String {
     while end > 0 && !stem.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{}", &stem[..end], ext)
+    let capped = format!("{}{}", &stem[..end], ext);
+    if capped.len() <= 255 {
+        return capped;
+    }
+    // the "extension" alone exceeds the limit (a hostile or
+    // pathological name like `a.<300 x's>`): the stem budget
+    // saturated at 0 and the extension passed through whole, so
+    // the create still failed with ENAMETOOLONG downstream.
+    // Hard-cap the whole name on a char boundary — a truncated
+    // extension beats an uncreatable file.
+    let mut end = 255;
+    while end > 0 && !capped.is_char_boundary(end) {
+        end -= 1;
+    }
+    capped[..end].to_string()
 }
 
 pub fn file_name_of(url: &str) -> String {
@@ -6162,6 +7089,259 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 
+    /// WS-A rig (audit-232 S5): one block's range requests are
+    /// answered `dead_status` (403/410) for the first seconds —
+    /// a signed URL rotting for ONE range — then serve normally.
+    /// Every other range serves at full speed the whole time.
+    fn single_range_death_server(
+        body: Vec<u8>,
+        dead_status: u16,
+        dead_start: u64,
+        dead_for: Duration,
+    ) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = std::sync::Arc::new(body);
+        let until = Instant::now() + dead_for;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nETag: \"wsa1\"\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    if let Some((rs, _)) = range {
+                        if rs == dead_start && Instant::now() < until {
+                            let _ = s.write_all(
+                                format!("HTTP/1.1 {dead_status} Gone\r\nContent-Length: 7\r\nConnection: close\r\n\r\nexpired")
+                                    .as_bytes(),
+                            );
+                            return;
+                        }
+                    }
+                    let (rs, re) = match range {
+                        Some(r) => r,
+                        None => (0, total - 1),
+                    };
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    if range.is_some() {
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            )
+                            .as_bytes(),
+                        );
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                    }
+                    let _ = s.write_all(slice);
+                });
+            }
+        });
+        port
+    }
+
+    /// WS-A (audit-232 S5, requirement 1): a 403/410 answered to
+    /// ONE range while the other ranges flow must not be a
+    /// download-killing Permanent error. The 410 arm failed
+    /// before the fix: the whole download errored at once with
+    /// most connections still mid-body. (The 403 arm already
+    /// retried per-connection and is kept as a regression guard.)
+    #[test]
+    fn single_range_auth_death_does_not_kill_the_download() {
+        for dead_status in [410u16, 403] {
+            let body = pattern_body(2 * 1024 * 1024);
+            // block 1 (512 KiB in, at a 512 KiB block size) dies
+            // for 6 s; everything else serves normally
+            let port = single_range_death_server(
+                body.clone(),
+                dead_status,
+                512 * 1024,
+                Duration::from_secs(6),
+            );
+            let url = format!("http://127.0.0.1:{port}/file.bin");
+            let out = std::env::temp_dir()
+                .join(format!("ndm-wsa-single-{dead_status}-{}.bin", std::process::id()));
+            let _ = std::fs::remove_file(&out);
+            let _ = std::fs::remove_file(state_path_for(&out));
+            let dl = start(&url, &out, 4, 512 * 1024).unwrap();
+            let st = wait_terminal(&dl, Duration::from_secs(60));
+            assert_eq!(
+                st,
+                Some(Status::Finished),
+                "status {dead_status} on one range killed the download: {:?} err={:?}",
+                dl.status(),
+                dl.progress().error
+            );
+            assert_eq!(std::fs::read(&out).unwrap(), body, "status {dead_status}");
+            let _ = std::fs::remove_file(&out);
+        }
+    }
+
+    /// WS-A rig, second shape: EVERY range request is answered
+    /// `dead_status` once `die_after` bytes have been served —
+    /// the audit's expiring-token server at reduced scale.
+    fn total_death_server(body: Vec<u8>, dead_status: u16, die_after: u64) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = std::sync::Arc::new(body);
+        let served = std::sync::Arc::new(AtomicU64::new(0));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                let served = served.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nETag: \"wsa1\"\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    if served.load(Ordering::Relaxed) >= die_after {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 {dead_status} Gone\r\nContent-Length: 7\r\nConnection: close\r\n\r\nexpired")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = match range {
+                        Some(r) => r,
+                        None => (0, total - 1),
+                    };
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    served.fetch_add(slice.len() as u64, Ordering::Relaxed);
+                    if range.is_some() {
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            )
+                            .as_bytes(),
+                        );
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                    }
+                    let _ = s.write_all(slice);
+                });
+            }
+        });
+        port
+    }
+
+    /// WS-A (audit-232 S5): when the whole address dies after
+    /// bytes flowed, the engine ends in Error (the heal belongs
+    /// to the job layer) — but it must say WHY through the typed
+    /// auth_dead signal, with the flowed bytes still counted.
+    /// Before the fix the 410 arm failed instantly as Permanent
+    /// with no signal at all.
+    #[test]
+    fn total_auth_death_reports_the_typed_signal() {
+        for dead_status in [410u16, 403] {
+            let body = pattern_body(4 * 1024 * 1024);
+            let port = total_death_server(body.clone(), dead_status, 1024 * 1024);
+            let url = format!("http://127.0.0.1:{port}/file.bin");
+            let out = std::env::temp_dir()
+                .join(format!("ndm-wsa-total-{dead_status}-{}.bin", std::process::id()));
+            let _ = std::fs::remove_file(&out);
+            let _ = std::fs::remove_file(state_path_for(&out));
+            let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+            let st = wait_terminal(&dl, Duration::from_secs(90));
+            assert_eq!(st, Some(Status::Error), "status {dead_status}");
+            let p = dl.progress();
+            assert!(
+                p.auth_dead,
+                "status {dead_status}: the typed auth-death signal must be set (err={:?})",
+                p.error
+            );
+            assert!(
+                p.done_bytes > 0,
+                "status {dead_status}: bytes flowed before the death"
+            );
+            let _ = std::fs::remove_file(&out);
+            let _ = std::fs::remove_file(state_path_for(&out));
+        }
+    }
+
     /// A range server that drips the first `slow_pieces` body pieces
     /// (64 KiB each) with `drip` of delay before each, then serves at
     /// full speed — so a pause lands deterministically while a chunk
@@ -6331,6 +7511,650 @@ mod tests {
             sanitize_suggested_name("../../bad:file*name?.txt"),
             "bad_file_name_.txt"
         );
+    }
+
+    // ---------- WS-BUGS B5(a): hostile server-suggested names ----------
+
+    #[test]
+    fn sanitize_hostile_names_stay_one_safe_file_name() {
+        // path separators and traversal collapse to the tail —
+        // the result can never escape the target folder
+        assert_eq!(sanitize_suggested_name("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_suggested_name("..\\..\\win.ini"), "win.ini");
+        assert_eq!(sanitize_suggested_name("/abs/path/file.zip"), "file.zip");
+        assert_eq!(sanitize_suggested_name("a/b\\c.zip"), "c.zip");
+        // trailing dots and spaces (illegal on Windows) are trimmed
+        assert_eq!(sanitize_suggested_name("file.txt "), "file.txt");
+        assert_eq!(sanitize_suggested_name("file."), "file");
+        assert_eq!(sanitize_suggested_name("name...  "), "name");
+        // unicode survives untouched
+        assert_eq!(
+            sanitize_suggested_name("রিপোর্ট ২০২৬.pdf"),
+            "রিপোর্ট ২০২৬.pdf"
+        );
+        // a name of nothing but dots/spaces has no usable form
+        assert_eq!(sanitize_suggested_name("..."), "");
+        assert_eq!(sanitize_suggested_name("   "), "");
+        // DOS device names: defused on Windows builds (where they
+        // are uncreatable), byte-identical elsewhere (Linux creates
+        // them fine) — the invariant everywhere is: no separator,
+        // no traversal, non-empty
+        for raw in ["CON", "con.txt", "PRN", "nul.mp3", "COM1", "lpt9.dat"] {
+            let got = sanitize_suggested_name(raw);
+            assert!(!got.is_empty(), "{raw} must keep a usable name");
+            assert!(!got.contains(['/', '\\']), "{raw} -> {got}");
+            if cfg!(target_os = "windows") {
+                let stem = got.split('.').next().unwrap_or("").to_ascii_uppercase();
+                assert!(
+                    !["CON", "PRN", "AUX", "NUL", "COM1", "LPT9"].contains(&stem.as_str()),
+                    "windows device name not defused: {raw} -> {got}"
+                );
+            }
+        }
+        // 300+ characters are capped to the filesystem limit
+        let long = format!("{}.zip", "x".repeat(400));
+        let got = sanitize_suggested_name(&long);
+        assert!(got.len() <= 255, "capped name is {} bytes", got.len());
+        assert!(got.ends_with(".zip"), "extension survives the cap: {got}");
+    }
+
+    #[test]
+    fn cap_file_name_never_exceeds_255_bytes() {
+        // ordinary long stem: stem truncates, extension survives
+        let n = cap_file_name(&format!("{}.bin", "a".repeat(300)));
+        assert!(n.len() <= 255 && n.ends_with(".bin"), "{n}");
+        // pathological: the EXTENSION alone exceeds the limit —
+        // the stem budget saturates at 0 and the old code returned
+        // the whole >255-byte extension untouched, so the create
+        // still failed with ENAMETOOLONG downstream
+        let n = cap_file_name(&format!("a.{}", "x".repeat(300)));
+        assert!(n.len() <= 255, "extension-only overflow: {} bytes", n.len());
+        // a dotfile-shaped name with a huge tail after the dot
+        let n = cap_file_name(&format!(".{}", "y".repeat(400)));
+        assert!(n.len() <= 255, "dotfile overflow: {} bytes", n.len());
+        // unicode stems truncate on a char boundary (no panic, valid)
+        let n = cap_file_name(&format!("{}.pdf", "é".repeat(200)));
+        assert!(n.len() <= 255 && n.ends_with(".pdf"), "{n}");
+        // names within the limit are untouched
+        assert_eq!(cap_file_name("short.txt"), "short.txt");
+    }
+
+    // ---------- WS-BUGS B5(c): redirect loop ----------
+
+    /// A server that 302s every request back to itself, carrying
+    /// `Content-Length: 0` — the shape that used to read as a
+    /// legitimately empty file.
+    fn redirect_loop_server() -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let path = line
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("/")
+                        .to_string();
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let loc = format!("http://127.0.0.1:{port}{path}");
+                    let _ = s.write_all(
+                        format!("HTTP/1.1 302 Found\r\nLocation: {loc}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+                    );
+                });
+            }
+        });
+        port
+    }
+
+    // ---------- WS-BUGS B5(b): the total changes between probe and workers ----------
+
+    /// A range server that answers the probe's 1-byte verify
+    /// request TRUTHFULLY but reports `lie_total` in the
+    /// Content-Range of every real worker range — the size lie
+    /// that only appears mid-download.
+    fn lying_total_server(body: Vec<u8>, lie_total: u64) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = std::sync::Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let Some((rs, re)) = range else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(&body);
+                        return;
+                    };
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    let reported = if rs == 0 && re == 0 { total } else { lie_total };
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{reported}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = s.write_all(slice);
+                });
+            }
+        });
+        port
+    }
+
+    fn size_lie_outcome(lie_total: u64, tag: &str) {
+        let body = pattern_body(600_000);
+        let port = lying_total_server(body.clone(), lie_total);
+        let url = format!("http://127.0.0.1:{port}/lie.bin");
+        let out = std::env::temp_dir()
+            .join(format!("ndm-b5-lie-{tag}-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 2, 256 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(120));
+        assert_eq!(
+            st,
+            Some(Status::Error),
+            "a mid-download total lie must end in a clean error, got {:?}",
+            dl.status()
+        );
+        let err = dl.progress().error.unwrap_or_default();
+        assert!(
+            err.contains("wrong range") || err.contains("no progress"),
+            "the error surface must name the lie: {err}"
+        );
+        assert!(
+            std::fs::read(&out).map(|b| b != body).unwrap_or(true),
+            "the lied-about file must never assemble as the real content"
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    #[test]
+    fn content_range_total_growing_mid_download_fails_clean() {
+        size_lie_outcome(1_200_000, "grow");
+    }
+
+    #[test]
+    fn content_range_total_shrinking_mid_download_fails_clean() {
+        size_lie_outcome(300_000, "shrink");
+    }
+
+    // ---------- WS-BUGS B5(d): encoding proof + chunked regression ----------
+
+    /// Every response is LABELLED gzip; every body is identity.
+    fn gzip_labelled_server(body: Vec<u8>) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = std::sync::Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    if let Some((rs, re)) = range {
+                        let end = re.min(total - 1);
+                        let slice = &body[rs as usize..=end as usize];
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = s.write_all(slice);
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(&body);
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn gzip_labelled_identity_body_still_downloads_exact() {
+        // the lying-header proof (finding #3 / DIAG): bodies are
+        // identity despite the header, so the job keeps its range
+        // path and finishes byte-exact instead of demoting/failing
+        let body = pattern_body(700_000);
+        let port = gzip_labelled_server(body.clone());
+        let url = format!("http://127.0.0.1:{port}/labelled.bin");
+        let p = probe(&url).expect("the proof must accept the labelled probe");
+        assert!(p.range_ok, "a proven header lie must keep range support");
+        assert!(p.ignore_encoding_header);
+        let out = std::env::temp_dir()
+            .join(format!("ndm-b5-gziplabel-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl.status());
+        assert!(dl.progress().resumable, "the ranged path must be kept");
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Range answers arrive chunked (no Content-Length at all).
+    fn chunked_range_server(body: Vec<u8>) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = std::sync::Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    if let Some((rs, re)) = range {
+                        let end = re.min(total - 1);
+                        let slice = &body[rs as usize..=end as usize];
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        );
+                        for piece in slice.chunks(8192) {
+                            let _ = s.write_all(
+                                format!("{:x}\r\n", piece.len()).as_bytes(),
+                            );
+                            let _ = s.write_all(piece);
+                            let _ = s.write_all(b"\r\n");
+                        }
+                        let _ = s.write_all(b"0\r\n\r\n");
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(&body);
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn chunked_range_answers_download_exact() {
+        let body = pattern_body(500_000);
+        let port = chunked_range_server(body.clone());
+        let url = format!("http://127.0.0.1:{port}/chunked.bin");
+        let out = std::env::temp_dir()
+            .join(format!("ndm-b5-chunked-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start(&url, &out, 3, 256 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl.status());
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // ---------- WS-BUGS B5(e): zero-byte and 1-byte files ----------
+
+    fn tiny_server() -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("/").to_string();
+                    let mut has_range = false;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                if h.to_ascii_lowercase().starts_with("range:") {
+                                    has_range = true;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if path.starts_with("/empty") {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        );
+                        return;
+                    }
+                    // /one — a single byte, range-capable
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        );
+                    } else if has_range {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/1\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = s.write_all(&[0xABu8]);
+                    } else {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+                        );
+                        let _ = s.write_all(&[0xABu8]);
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn zero_byte_and_one_byte_files_finish_exact() {
+        let port = tiny_server();
+        let dir = std::env::temp_dir();
+        let out0 = dir.join(format!("ndm-b5-zero-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out0);
+        let _ = std::fs::remove_file(state_path_for(&out0));
+        let dl = start(&format!("http://127.0.0.1:{port}/empty"), &out0, 2, 256 * 1024)
+            .expect("a zero-byte start must succeed");
+        assert_eq!(dl.status(), Status::Finished);
+        assert_eq!(std::fs::metadata(&out0).unwrap().len(), 0);
+
+        let out1 = dir.join(format!("ndm-b5-one-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out1);
+        let _ = std::fs::remove_file(state_path_for(&out1));
+        let dl = start(&format!("http://127.0.0.1:{port}/one"), &out1, 2, 256 * 1024)
+            .expect("a one-byte start must succeed");
+        let st = wait_terminal(&dl, Duration::from_secs(30));
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl.status());
+        assert_eq!(std::fs::read(&out1).unwrap(), vec![0xABu8]);
+        let _ = std::fs::remove_file(&out0);
+        let _ = std::fs::remove_file(&out1);
+    }
+
+    // ---------- WS-BUGS B5(f): truncated engine journal ----------
+
+    #[test]
+    fn truncated_journal_restarts_clean_and_finishes_exact() {
+        let body = pattern_body(700_000);
+        let port = range_server(
+            body.clone(),
+            u64::MAX,
+            TailMode::FailTimes(std::sync::atomic::AtomicUsize::new(0), 0),
+        );
+        let url = format!("http://127.0.0.1:{port}/resume.bin");
+        let out = std::env::temp_dir()
+            .join(format!("ndm-b5-journal-{}.bin", std::process::id()));
+        // a full-size partial of WRONG bytes, plus a sidecar cut
+        // mid-JSON (the power-cut-mid-save shape)
+        std::fs::write(&out, vec![0xEEu8; body.len()]).unwrap();
+        let sidecar = state_path_for(&out);
+        std::fs::write(
+            &sidecar,
+            format!(
+                "{{\"url\":\"{url}\",\"total\":{},\"block_size\":262144,\"done\":[1,1,0",
+                body.len()
+            ),
+        )
+        .unwrap();
+        // the corrupt journal is simply not a resume source…
+        assert!(peek_state(&url, &out).is_none());
+        // …and the start recovers by restarting from byte zero:
+        // no wedge, no splice of the wrong bytes, exact finish
+        let dl = start(&url, &out, 3, 256 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl.status());
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert!(!sidecar.exists(), "state file must be removed at finish");
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // ---------- WS-BUGS B5(a): Content-Disposition shapes end to end ----------
+
+    fn disposition_server() -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut parts = line.split_whitespace();
+                    let method = parts.next().unwrap_or("").to_string();
+                    let path = parts.next().unwrap_or("/").to_string();
+                    let mut has_range = false;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                if h.to_ascii_lowercase().starts_with("range:") {
+                                    has_range = true;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let cd = match path.as_str() {
+                        "/a" => "attachment; filename*=UTF-8''%2e%2e%2f%2e%2e%2fsecret.txt",
+                        "/b" => "attachment; filename=\"..\\..\\win.dll\"",
+                        "/c" => "attachment; filename=\"report final .pdf \"",
+                        _ => "attachment; filename=\"plain.bin\"",
+                    };
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nAccept-Ranges: bytes\r\nContent-Disposition: {cd}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                    } else if has_range {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/4\r\nContent-Length: 1\r\nContent-Disposition: {cd}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(b"d");
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Disposition: {cd}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(b"data");
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn disposition_traversal_names_are_sanitized_at_probe() {
+        let port = disposition_server();
+        let p = probe(&format!("http://127.0.0.1:{port}/a")).unwrap();
+        assert_eq!(p.suggested_name.as_deref(), Some("secret.txt"));
+        let p = probe(&format!("http://127.0.0.1:{port}/b")).unwrap();
+        assert_eq!(p.suggested_name.as_deref(), Some("win.dll"));
+        let p = probe(&format!("http://127.0.0.1:{port}/c")).unwrap();
+        assert_eq!(p.suggested_name.as_deref(), Some("report final .pdf"));
+    }
+
+    #[test]
+    fn redirect_loop_is_an_error_not_an_empty_finished_file() {
+        let port = redirect_loop_server();
+        let url = format!("http://127.0.0.1:{port}/loop.bin");
+        // the probe must refuse: following the loop gives up after
+        // the hop budget and what remains is a bare 302 — never a
+        // verdict that the file is 0 bytes long
+        let err = probe(&url).expect_err("a redirect loop must fail the probe");
+        assert!(!err.is_empty());
+        // and a start must fail with it — pre-fix it created an
+        // empty file and reported Finished
+        let out = std::env::temp_dir()
+            .join(format!("ndm-b5-loop-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let r = start(&url, &out, 2, 256 * 1024);
+        assert!(r.is_err(), "redirect loop start must fail, got a handle");
+        assert!(!out.exists(), "no empty 'finished' file may be created");
     }
 
     // ---------- 2.0.4: video pair split (Finding 2) ----------
@@ -6826,6 +8650,135 @@ mod tests {
         let _ = std::fs::remove_file(&out8);
     }
 
+    /// Regression server for decay-window recycling: a server
+    /// that bursts the first 1 MiB of every
+    /// response at full speed and then clamps that response to
+    /// 32 KiB/s (the googlevideo shape). Returns (port, conns).
+    fn burst_clamp_server(
+        body: Vec<u8>,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count2 = count.clone();
+        let body = std::sync::Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let count = count2.clone();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range:") {
+                                    let spec = v.trim().trim_start_matches("bytes=");
+                                    let mut it = spec.splitn(2, '-');
+                                    let a: u64 = it.next().and_then(|x| x.trim().parse().ok()).unwrap_or(0);
+                                    let b: u64 = it
+                                        .next()
+                                        .and_then(|x| x.trim().parse().ok())
+                                        .unwrap_or(body.len() as u64 - 1);
+                                    range = Some((a, b));
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    let (a, b) = range.unwrap_or((0, total - 1));
+                    let b = b.min(total - 1);
+                    let slice = &body[a as usize..=b as usize];
+                    if line.starts_with("HEAD") {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n").as_bytes(),
+                        );
+                        return;
+                    }
+                    let hdr = if range.is_some() {
+                        format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", slice.len())
+                    } else {
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n", slice.len())
+                    };
+                    if s.write_all(hdr.as_bytes()).is_err() {
+                        return;
+                    }
+                    // burst: first 1 MiB as fast as the socket
+                    // takes it; the rest at 32 KiB/s
+                    const BURST: usize = 1024 * 1024;
+                    const CAP_BPS: u64 = 32 * 1024;
+                    let burst_end = BURST.min(slice.len());
+                    if s.write_all(&slice[..burst_end]).is_err() {
+                        return;
+                    }
+                    let t0 = Instant::now();
+                    let mut sent = 0usize;
+                    for piece in slice[burst_end..].chunks(16 * 1024) {
+                        if s.write_all(piece).is_err() {
+                            return;
+                        }
+                        sent += piece.len();
+                        let target = Duration::from_secs_f64(sent as f64 / CAP_BPS as f64);
+                        if let Some(wait) = target.checked_sub(t0.elapsed()) {
+                            std::thread::sleep(wait);
+                        }
+                    }
+                });
+            }
+        });
+        (port, count)
+    }
+
+    #[test]
+    fn burst_then_clamp_connections_get_recycled() {
+        // 16 MiB, 1 MiB blocks, 4 connections → 4 MiB claims.
+        // Without decay recycling each claim is 1 MiB of burst +
+        // 3 MiB at 32 KiB/s ≈ 94 s, and the F2 watermark (256 KiB
+        // per 30 s) never fires — the connection crosses 256 KiB
+        // every 8 s. (Measured pre-fix: 95.8 s.) With decay
+        // recycling a fresh request earns a fresh burst roughly
+        // every two windows, cutting the run to ~41 s (measured)
+        // and visibly multiplying the request count.
+        let body = pattern_body(20 * 1024 * 1024);
+        let (port, conns) = burst_clamp_server(body.clone());
+        let url = format!("http://127.0.0.1:{port}/burst.bin");
+        let out = std::env::temp_dir().join(format!("ndm-burst-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 4, 1024 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(150));
+        let elapsed = t0.elapsed();
+        assert_eq!(st, Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let n_conns = conns.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            elapsed < Duration::from_secs(75),
+            "burst-then-clamp download took {elapsed:?} — decayed connections were not recycled (conns={n_conns})"
+        );
+        assert!(
+            n_conns >= 10,
+            "expected recycling to multiply requests, saw only {n_conns} connections"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
     #[test]
     fn slow_run_tail_is_stolen_by_idle_workers() {
         // 48 blocks, 4 workers, 12-block claims. The byte-0 claim
@@ -6901,6 +8854,131 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(6000),
             "finish {elapsed:?} must beat the ~12 s un-stolen slow-lane time"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn tail_split_point_splits_only_a_worthwhile_remainder() {
+        // WS-D D1 arithmetic: a sub-256 KiB remainder is never
+        // split (a second connection cannot pay for itself), each
+        // side keeps at least 64 KiB, and the split lands mid-
+        // remainder — always strictly inside (pos, block_end), so
+        // the owner's range and the helper's range are disjoint
+        // and together cover the block exactly
+        let mib = 1024 * 1024;
+        assert_eq!(tail_split_point(0, 128 * 1024), None);
+        assert_eq!(tail_split_point(900 * 1024, mib), None, "124 KiB left: too small");
+        assert_eq!(tail_split_point(mib, mib), None);
+        assert_eq!(tail_split_point(mib, 0), None, "inverted range must not split (or panic)");
+        let s = tail_split_point(0, mib).expect("a full block splits");
+        assert!(s > 0 && s < mib);
+        assert_eq!(tail_split_point(64 * 1024, mib), Some(64 * 1024 + (mib - 64 * 1024) / 2));
+        for pos in (0..mib).step_by(37 * 1024) {
+            if let Some(sp) = tail_split_point(pos, mib) {
+                assert!(sp > pos && sp < mib, "split {sp} must sit inside ({pos}, {mib})");
+                assert!(sp - pos >= 64 * 1024 && mib - sp >= 64 * 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn limited_start_parks_excess_workers_until_limit_raised() {
+        // WS-D D2 engine half: a start with fewer active than
+        // spawned connections parks the excess at the gate — only
+        // worker 0 may move bytes — and set_connection_limit
+        // raises the active count live on the same download.
+        let body = pattern_body(4 * 1024 * 1024);
+        let (port, _conns) = per_conn_cap_server(body.clone());
+        let url = format!("http://127.0.0.1:{port}/lim.bin");
+        let out = std::env::temp_dir().join(format!("ndm-limited-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let dl = start_with_auth_limited(&url, &out, 4, 1, 1024 * 1024, Auth::default()).unwrap();
+        // ~512 KiB/s on the single active connection: after 1.5 s
+        // roughly one block has moved, all of it on worker 0
+        std::thread::sleep(Duration::from_millis(1500));
+        let p = dl.progress();
+        assert!(p.done_bytes > 0, "no progress on the active worker");
+        assert_eq!(
+            p.conn_bytes.iter().filter(|&&b| b > 0).count(),
+            1,
+            "parked workers must not move bytes: {:?}",
+            p.conn_bytes
+        );
+        assert_eq!(p.conn_bytes[0], p.fetched_session);
+        // raising past the spawn count clamps instead of panicking
+        dl.set_connection_limit(99);
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl.status());
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert_eq!(dl.progress().fetched_session, body.len() as u64);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn in_flight_tail_block_is_byte_split_for_idle_workers() {
+        // WS-D D1 (audit-232 S6): the end-game shape in miniature.
+        // 8 blocks, 4 connections, 2-block claims. The byte-0 claim
+        // crawls at 256 KiB/s (the het server's slow lane); the
+        // other claims are wire-fast, so within a second six blocks
+        // are sealed, three workers sit idle, and the finish hangs
+        // on the slow run's two blocks. Block stealing CANNOT help
+        // here: the run's unstarted tail (one block) is below the
+        // split minimum by design. Pre-fix the slow run alone set
+        // the finish: 2 MiB at 256 KiB/s ≈ 8 s. With the tail
+        // byte-split, an idle worker takes the in-flight block's
+        // tail at a byte offset while the owner finishes its head,
+        // and the second block goes back to the pool whole.
+        let body = pattern_body(8 * 1024 * 1024);
+        let port = het_range_server(body.clone(), 256 * 1024);
+        let url = format!("http://127.0.0.1:{port}/big.bin");
+        let out = std::env::temp_dir().join(format!("ndm-tailsplit-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let t0 = Instant::now();
+        let dl = start(&url, &out, 4, 1024 * 1024).unwrap();
+        let st = wait_terminal(&dl, Duration::from_secs(60));
+        let elapsed = t0.elapsed();
+        assert_eq!(st, Some(Status::Finished), "status: {:?}", dl.status());
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            body,
+            "content must be byte-identical"
+        );
+        let p = dl.progress();
+        // duplication audit: every byte was written exactly once —
+        // the owner's head range and the helper's tail range are
+        // disjoint by construction, and any overlap would inflate
+        // the fetched count past the file size
+        assert_eq!(
+            p.fetched_session,
+            body.len() as u64,
+            "fetched must equal the file size exactly — a duplicated range inflates it"
+        );
+        assert_eq!(
+            p.conn_bytes.iter().sum::<u64>(),
+            body.len() as u64,
+            "per-connection bytes must add up to the file, no more"
+        );
+        // structural proof a byte-offset fetch happened: without a
+        // tail split every connection's total is a whole number of
+        // 1 MiB blocks (every run is whole blocks); a split leaves
+        // at least the owner and the helper with a non-block-
+        // aligned share
+        let unaligned = p
+            .conn_bytes
+            .iter()
+            .filter(|&&b| b % (1024 * 1024) != 0)
+            .count();
+        assert!(
+            unaligned >= 2,
+            "no byte-split shares in conn_bytes: {:?}",
+            p.conn_bytes
+        );
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "finish {elapsed:?} must beat the ~8 s un-split slow-lane time"
         );
         let _ = std::fs::remove_file(&out);
     }
@@ -7523,6 +9601,7 @@ mod audit207_tests {
             cookie: Some("session=secret".to_string()),
             referer: Some("http://127.0.0.1/page".to_string()),
             authorization: Some("Basic abc".to_string()),
+            user_agent: None,
         };
         let _ = probe_with_auth(&url, &auth);
         let seen = seen.lock().unwrap();

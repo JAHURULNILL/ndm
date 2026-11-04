@@ -555,6 +555,7 @@ fn handle_probe_file(message: &Value) -> Value {
         cookie: cookie_header_from_netscape(cookies_str, url),
         referer,
         authorization: None,
+        user_agent: None,
     };
     apply_saved_proxy_settings();
     match ndm::probe_with_auth(url, &auth) {
@@ -670,7 +671,10 @@ fn wait_for_ack_and_result(id: &str, timeout_secs: u64, queued_on_timeout: bool)
                 "error": "NDM acknowledged the request but its result could not be read"
             });
         }
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        // 10 ms (was 40): the ack is a local file write, and this
+        // poll's granularity was pure added latency on every
+        // browser click (audit-232 §2)
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if queued_on_timeout {
         // the line IS in the app's queue file — the download was
@@ -763,6 +767,44 @@ fn captured_queue_object(message: &Value) -> Result<Value, String> {
         return Err("title must not contain line breaks".to_string());
     }
     let title: String = title.chars().take(300).collect();
+    // The capturing browser's User-Agent (audit-232 S3) rides on
+    // every stream of the set: capture-sourced downloads repeat
+    // it so a UA-bound session CDN sees the browser it issued
+    // the session to. Sanitised, never fatal — a UA with line
+    // breaks or an absurd length is dropped, not the capture.
+    let user_agent: String = message
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .chars()
+        .take(512)
+        .collect();
+    let user_agent = if user_agent.contains(['\r', '\n']) {
+        String::new()
+    } else {
+        user_agent
+    };
+    // 2.3.2 (WS-B): the recorder's per-video grouping key
+    // ("fb:<id>") when the set names ONE Facebook video — the app
+    // stores a keyed set under that video's own identity, so
+    // streams from different feed videos can never merge into one
+    // stored set. Strictly validated: a malformed key fails the
+    // send rather than letting the set land under a wrong or
+    // attacker-shaped identity. Absent/empty = an unkeyed set
+    // (every pre-2.3.2 sender, and the page-data store path).
+    let video_key = message
+        .get("videoKey")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !video_key.is_empty()
+        && (video_key.len() > 80
+            || !video_key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.')))
+    {
+        return Err("videoKey is malformed".to_string());
+    }
     let raw = message
         .get("streams")
         .and_then(Value::as_array)
@@ -796,6 +838,7 @@ fn captured_queue_object(message: &Value) -> Result<Value, String> {
             "qualityLabel": quality,
             "hasAudio": s.get("hasAudio").and_then(Value::as_bool).unwrap_or(false),
             "hasVideo": s.get("hasVideo").and_then(Value::as_bool).unwrap_or(false),
+            "userAgent": if user_agent.is_empty() { Value::Null } else { json!(user_agent) },
         }));
     }
     Ok(json!({
@@ -803,6 +846,7 @@ fn captured_queue_object(message: &Value) -> Result<Value, String> {
         "url": page_url,
         "pageUrl": page_url,
         "title": title,
+        "videoKey": video_key,
         "streams": streams,
         // 2.3.1 (item 14): the browser picker's page-data send
         // stores the set WITHOUT opening the app's picker on
@@ -1241,6 +1285,8 @@ mod tests {
         let obj = captured_queue_object(&msg).expect("a valid capture is accepted");
         assert_eq!(obj["kind"], json!("captured_streams"));
         assert_eq!(obj["url"], json!("https://www.youtube.com/watch?v=abcDEF123_-"));
+        // an unkeyed send stays unkeyed (empty), never invented
+        assert_eq!(obj["videoKey"], json!(""));
         let streams = obj["streams"].as_array().unwrap();
         assert_eq!(streams.len(), 2);
         assert_eq!(streams[0]["qualityLabel"], json!("720p"));
@@ -1273,6 +1319,73 @@ mod tests {
         // clean {ok:false}, never a queue write or a panic
         let reply = handle_at(&bad_stream, None, 0);
         assert_eq!(reply["ok"], json!(false));
+    }
+
+    #[test]
+    fn captured_streams_carry_the_browser_user_agent() {
+        // audit-232 S3: the message's userAgent is stamped onto
+        // every stream of the queue object; absent or hostile
+        // values degrade to null (the app then falls back to its
+        // engine UA), never to a broken capture
+        let msg = json!({
+            "type": "captured_streams",
+            "pageUrl": "https://www.youtube.com/watch?v=abcDEF123_-",
+            "title": "A Video",
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0",
+            "streams": [
+                { "url": "https://rr1.googlevideo.com/videoplayback?itag=136",
+                  "mimeType": "video/mp4", "hasAudio": false, "hasVideo": true },
+                { "url": "https://rr1.googlevideo.com/videoplayback?itag=140",
+                  "mimeType": "audio/mp4", "hasAudio": true, "hasVideo": false }
+            ]
+        });
+        let obj = captured_queue_object(&msg).expect("a valid capture is accepted");
+        let streams = obj["streams"].as_array().unwrap();
+        for s in streams {
+            assert_eq!(
+                s["userAgent"],
+                json!("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0")
+            );
+        }
+
+        let mut no_ua = msg.clone();
+        no_ua.as_object_mut().unwrap().remove("userAgent");
+        let obj = captured_queue_object(&no_ua).expect("a UA-less capture is accepted");
+        assert_eq!(obj["streams"][0]["userAgent"], Value::Null);
+
+        let mut hostile = msg.clone();
+        hostile["userAgent"] = json!("Evil\r\nInjected: 1");
+        let obj = captured_queue_object(&hostile).expect("a hostile UA must not kill the capture");
+        assert_eq!(obj["streams"][0]["userAgent"], Value::Null);
+    }
+
+    #[test]
+    fn captured_streams_video_key_passes_through_validated() {
+        // 2.3.2 (WS-B): a recorder send naming ONE Facebook video
+        // carries its grouping key to the app's queue line intact
+        let msg = json!({
+            "type": "captured_streams",
+            "pageUrl": "https://www.facebook.com/",
+            "title": "Feed",
+            "videoKey": "fb:1234567890123456",
+            "streams": [ { "url": "https://video.fdhk.example.fbcdn.net/v/1234567890123456_720p.mp4" } ]
+        });
+        let obj = captured_queue_object(&msg).expect("a keyed capture is accepted");
+        assert_eq!(obj["videoKey"], json!("fb:1234567890123456"));
+
+        // a malformed key (spaces, path shapes, oversized) is
+        // refused outright — never stored under a shaped identity
+        for bad in ["fb:12 34", "../etc", "fb:../../x", &"f".repeat(81)] {
+            let m = json!({
+                "pageUrl": "https://www.facebook.com/",
+                "videoKey": bad,
+                "streams": [ { "url": "https://x/y.mp4" } ]
+            });
+            assert!(
+                captured_queue_object(&m).is_err(),
+                "key {bad:?} must be refused"
+            );
+        }
     }
 
     #[test]

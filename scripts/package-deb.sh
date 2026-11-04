@@ -36,10 +36,13 @@ install -m 755 "$BIN" "$STAGE/usr/bin/ndm-app"
 # video use into its app-data components folder, verifying pinned
 # SHA-256 hashes (see src/components.rs). ffmpeg does not ship
 # either: the package Depends on the distro ffmpeg (DEBIAN/control),
-# which find_tool locates on PATH.
+# which find_tool locates on PATH. librsvg2-common is likewise a
+# Depends: it provides the gdk-pixbuf SVG loader the toolbar icons
+# are rendered through — without it a minimal system silently
+# shows no icons (2.3.1 gate finding).
 mkdir -p "$STAGE/usr/lib/ndm" "$STAGE/usr/share/ndm/extension"
 install -m 755 "$HOST_BIN" "$STAGE/usr/lib/ndm/ndm-host"
-for f in manifest.json background.js content.js page-hook.js popup.html popup.js icon16.png icon48.png icon128.png; do
+for f in manifest.json background.js content.js page-hook.js fb-classify.js popup.html popup.js icon16.png icon48.png icon128.png; do
   install -m 644 "extension/$f" "$STAGE/usr/share/ndm/extension/$f"
 done
 install -m 755 scripts/ndm-setup-browser.sh "$STAGE/usr/bin/ndm-setup-browser"
@@ -75,7 +78,7 @@ Architecture: $ARCH
 Installed-Size: $INSTALLED_KB
 Maintainer: Nill
 Priority: optional
-Depends: libgtk-3-0, ffmpeg
+Depends: libgtk-3-0, ffmpeg, librsvg2-common
 Description: NDM — fast, resumable downloads for Linux and Windows
  Nill Download Manager: multi-connection downloads with resume,
  browser integration, a video downloader and a site grabber.

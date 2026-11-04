@@ -12,6 +12,17 @@
 
 const HOST_NAME = 'com.ndm.host';
 
+/* The shared Facebook module (fb-classify.js): the classifier and
+   the pure per-video grouping decisions the recorder below keys
+   its captures by. Loaded once here; if it somehow fails, FBC
+   stays null and the grouping fallback errs toward NOT offering
+   (unknown key) on Facebook rather than pooling a feed's videos. */
+let FBC = null;
+try {
+  importScripts('fb-classify.js');
+  FBC = typeof NdmFbClassify !== 'undefined' ? NdmFbClassify : null;
+} catch (e) {}
+
 /* Streaming services whose videos are DRM-protected — the same list
    content.js uses to suppress its panel. The background layer must
    honour it too: no stream recording and no page-video action on
@@ -268,6 +279,29 @@ function canonicalStreamUrl(raw) {
   }
 }
 
+/* The per-video grouping key for one recorded stream (2.3.2
+   WS-B, audit-232 §2 prerequisite): on Facebook one tab page
+   holds MANY videos, so a stream may only ever be offered under
+   ITS video's key — the page's permalink id, or the video token
+   in the stream's own fbcdn file name. No derivable key → ''
+   (unknown): the stream is recorded but NEVER offered or
+   grouped, so it cannot pair with another video's streams under
+   a shared feed identity. Off Facebook the standing key is
+   'page' — one page, one video, exactly today's behaviour.
+   The derivation is fb-classify's streamGroupKey (unit-tested
+   in extension-tests/); the inline branch only covers the
+   module failing to load, and errs the same safe way. */
+function capturedGroupKeyFor(pageUrl, streamUrl) {
+  if (FBC) return FBC.streamGroupKey(pageUrl, streamUrl);
+  let h = '';
+  try {
+    h = new URL(pageUrl || '').hostname.toLowerCase();
+  } catch (e) {}
+  return h === 'facebook.com' || h.endsWith('.facebook.com') || h === 'fb.watch'
+    ? ''
+    : 'page';
+}
+
 function recordCapturedStream(tabId, rawUrl, reqType) {
   if (tabId == null || tabId < 0 || !rawUrl) return;
   if (!/^https?:\/\//i.test(rawUrl)) return;
@@ -336,6 +370,7 @@ function recordCapturedStream(tabId, rawUrl, reqType) {
     };
   }
   if (!stream) return;
+  stream.groupKey = capturedGroupKeyFor(page, stream.url);
   let rec = tabCaptured.get(tabId);
   if (!rec || rec.page !== page) rec = { page, streams: new Map() };
   for (const [k, v] of rec.streams) {
@@ -348,47 +383,87 @@ function recordCapturedStream(tabId, rawUrl, reqType) {
   tabCaptured.set(tabId, rec);
 }
 
+/* The wire shape of one captured stream (no timestamps, no
+   grouping key — the key travels at set level, see below). */
+function wireCapturedStream(s) {
+  return {
+    url: s.url,
+    mimeType: s.mimeType || '',
+    qualityLabel: s.qualityLabel || '',
+    hasAudio: !!s.hasAudio,
+    hasVideo: !!s.hasVideo,
+  };
+}
+
+/* The tab's captured streams partitioned into the groups that
+   may be OFFERED (2.3.2 WS-B): one group per video key, via
+   fb-classify's offerableGroups. Streams with an unknown key
+   ('' — a Facebook stream whose video could not be determined)
+   are in NO group: under a feed page identity they could pair
+   with another video's streams, so they are never offered at
+   all. Off Facebook every stream shares the 'page' key and the
+   single group is exactly the pre-2.3.2 tab set. */
+function capturedGroupsForTab(tabId) {
+  const rec = tabCaptured.get(tabId);
+  if (!rec) return [];
+  const now = Date.now();
+  const live = [...rec.streams.values()].filter(s => now - s.ts < CAPTURE_TTL_MS);
+  if (!live.length) return [];
+  if (FBC) {
+    return FBC.offerableGroups(live).map(g => ({
+      key: g.key,
+      latestTs: g.latestTs,
+      streams: g.streams.map(wireCapturedStream),
+    }));
+  }
+  // Module unavailable: only the page group can be vouched for.
+  const pageStreams = live.filter(s => s.groupKey === 'page').map(wireCapturedStream);
+  return pageStreams.length
+    ? [{ key: 'page', latestTs: now, streams: pageStreams }]
+    : [];
+}
+
 /* The tab's captured set as the popup / send path consumes it:
-   live entries only, wire-shaped (no timestamps). */
+   offerable streams only (unknown-key streams are invisible
+   here by design), wire-shaped. */
 function capturedStateForTab(tabId) {
   const rec = tabCaptured.get(tabId);
   if (!rec) return { count: 0, pageUrl: '', streams: [] };
-  const now = Date.now();
-  const streams = [...rec.streams.values()]
-    .filter(s => now - s.ts < CAPTURE_TTL_MS)
-    .map(s => ({
-      url: s.url,
-      mimeType: s.mimeType || '',
-      qualityLabel: s.qualityLabel || '',
-      hasAudio: !!s.hasAudio,
-      hasVideo: !!s.hasVideo,
-    }));
+  const streams = capturedGroupsForTab(tabId).flatMap(g => g.streams);
   return { count: streams.length, pageUrl: rec.page || '', streams };
 }
 
 /* Send one tab's captured set to the app through the host — the
    popup's capture click lands here. Nothing downloads yet: the
-   app stores the set and opens its picker on the page. */
+   app stores the set and opens its picker on the page.
+   One send names ONE video: when the tab's groups span several
+   videos (a Facebook feed), only the most recently played
+   video's group goes, carrying its videoKey so the app stores
+   it under that video's own identity. */
 async function ndmSendCapturedForTab(tabId) {
-  const state = capturedStateForTab(tabId);
-  if (!state.count) {
+  const groups = capturedGroupsForTab(tabId);
+  if (!groups.length) {
     return { ok: false, error: 'Nothing captured on this tab yet — play the video first.' };
   }
+  const group = groups.reduce((a, b) => (b.latestTs > a.latestTs ? b : a));
   let tab = null;
   try {
     tab = await chrome.tabs.get(tabId);
   } catch (e) {}
-  const pageUrl = (tab && tab.url) || state.pageUrl;
+  const pageUrl = (tab && tab.url) || capturedStateForTab(tabId).pageUrl;
   const title = (tab && tab.title) || '';
   const cookies = await captureCookies(pageUrl, pageUrl);
-  return sendCapturedNative({
+  const msg = {
     type: 'captured_streams',
     pageUrl,
     title,
-    streams: state.streams,
+    streams: group.streams,
     cookies,
+    userAgent: navigator.userAgent || '',
     ext_version: chrome.runtime.getManifest().version,
-  });
+  };
+  if (group.key.startsWith('fb:')) msg.videoKey = group.key;
+  return sendCapturedNative(msg);
 }
 
 function sendCapturedNative(msg) {
@@ -1256,6 +1331,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         streams,
         cookies,
         storeOnly: true,
+        userAgent: message.userAgent || '',
         ext_version: chrome.runtime.getManifest().version,
       });
       sendResponse(res);
@@ -1643,7 +1719,7 @@ async function openFileModalInTab(tabId, payload) {
       if (chrome.scripting && chrome.scripting.executeScript) {
         await chrome.scripting.executeScript({
           target: { tabId },
-          files: ['content.js'],
+          files: ['fb-classify.js', 'content.js'],
         });
         const res = await chrome.tabs.sendMessage(tabId, {
           action: 'ndm-open-file-modal',

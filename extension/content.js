@@ -32,6 +32,13 @@
   const host = location.hostname.toLowerCase();
   if (DRM_HOSTS.some(d => host === d || host.endsWith('.' + d))) return;
 
+  /* The shared Facebook module (fb-classify.js, loaded before
+     this script wherever the manifest or the background's
+     fallback injection brings content.js in): classifier +
+     the pure FB URL/target/grouping decisions. Absent only in
+     exotic injection paths — every use below is guarded. */
+  const FBC = typeof NdmFbClassify !== 'undefined' ? NdmFbClassify : null;
+
   let panelHost = null;   // shadow-DOM host element
   let shadowRoot = null;  // closed shadow root
   let cardEl = null;      // the floating pill element
@@ -263,7 +270,22 @@
       } catch (e) {}
     }
 
-    return href;
+    // 5. Nothing above identified a video. Off Facebook the page
+    //    URL is the standing last resort (a dedicated page IS its
+    //    video). On Facebook it is NOT: the page is a feed of many
+    //    videos, and probing it as if it were the clicked video
+    //    could download a different video under this post's title
+    //    (audit-232 §2 — the feed fallthrough). The FB answer is
+    //    '' — unidentified — and the picker shows its honest
+    //    could-not-identify state instead of probing anything.
+    //    The decision itself is fb-classify's fallbackTargetFor,
+    //    unit-tested in extension-tests/; the inline host check
+    //    below only covers the module somehow not being loaded.
+    const isFbPage = FBC
+      ? FBC.isFacebookHostname(host)
+      : host === 'facebook.com' || host.endsWith('.facebook.com') || host === 'fb.watch';
+    if (FBC) return FBC.fallbackTargetFor(isFbPage, href);
+    return isFbPage ? '' : href;
   }
 
   function guessFallbackThumbnail(targetUrl, videoEl) {
@@ -623,6 +645,11 @@
   const flyEntryRegistry = new Map();
   let lastPreProbedUrl = '';
   let onInstantInfoCallback = null;
+  /* 2.3.2 (WS-B): the FB page-hook answers per video id, so the
+     picker names the ONE id it is opening for — on a feed, an
+     answer for any other id is cached under its own key and
+     never applied to this picker. Cleared with the callback. */
+  let fbInfoWantedId = '';
 
   function canonicalVideoKey(urlStr) {
     try {
@@ -723,6 +750,62 @@
 
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || e.data.source !== 'ndm-page-hook') return;
+    if (e.data.type === 'ndm-fb-info' && e.data.info) {
+      // 2.3.2 (WS-B): Facebook page data, keyed by the video's
+      // OWN id — the mirror of the YouTube branch below, with
+      // the feed correction: the info is cached ONLY under this
+      // video's canonical URLs, never under the page/feed URL
+      // the message arrived on (one feed, many videos).
+      if (!FBC || !FBC.isFacebookHostname(location.hostname)) return;
+      const info = e.data.info;
+      const videoId = String(info.videoId || '');
+      if (!/^\d{5,}$/.test(videoId)) return;
+      if (!Array.isArray(info.options) || !info.options.length) return;
+      const validOptions = [];
+      const SAFE_SELECTOR_RE = /^[a-zA-Z0-9_\-*+/[\]=<>. ]+$/;
+      for (const opt of info.options) {
+        if (!opt || typeof opt !== 'object') continue;
+        if (typeof opt.selector !== 'string' || !SAFE_SELECTOR_RE.test(opt.selector)) continue;
+        if (typeof opt.ext !== 'string' || !/^[a-zA-Z0-9]{2,5}$/.test(opt.ext)) continue;
+        // Page-data streams (item 14's door): keep them only if
+        // they sanitize, and name their group — the picker send
+        // then starts from the page's own streams, exactly like
+        // a YouTube page-data quality.
+        const streams = sanitizeOptionStreams(opt.streams);
+        if (streams) {
+          opt.streams = streams;
+          opt.capSelector = captureGroupKey(streams);
+        } else {
+          delete opt.streams;
+          delete opt.capSelector;
+        }
+        validOptions.push(opt);
+      }
+      if (!validOptions.length) return;
+      const fbInfo = {
+        videoId,
+        url: `https://www.facebook.com/videos/${videoId}`,
+        // No title from the hook: the picker's own name chain
+        // (caption → og:title → "Facebook video <id>", item 13)
+        // names FB videos, and applyInfo only overrides the
+        // field when an info title exists.
+        title: '',
+        options: validOptions,
+      };
+      probeCacheSet(canonicalVideoKey(fbInfo.url), fbInfo, false);
+      probeCacheSet(
+        canonicalVideoKey(`https://www.facebook.com/reel/${videoId}`),
+        fbInfo,
+        false
+      );
+      if (
+        fbInfoWantedId === videoId &&
+        typeof onInstantInfoCallback === 'function'
+      ) {
+        onInstantInfoCallback(fbInfo);
+      }
+      return;
+    }
     if (e.data.type === 'ndm-player-info' && e.data.info) {
       // Validate origin: only trust YouTube pages
       const host = location.hostname.toLowerCase();
@@ -771,6 +854,24 @@
     } catch (e) {}
   }
 
+  /* 2.3.2 (WS-B): ask the FB page-hook for THIS target's video —
+     per click, per video (feed posts load lazily, so the open is
+     the reliable moment to look). Also (re)aims fbInfoWantedId:
+     a non-FB target clears it, so a late FB answer can never be
+     applied to another picker's open. */
+  function requestFbInfoFor(targetUrl) {
+    if (!FBC) return;
+    const id = FBC.facebookVideoId(targetUrl || '');
+    fbInfoWantedId = id;
+    if (!id) return;
+    try {
+      window.postMessage(
+        { source: 'ndm-content', type: 'ndm-request-fb-info', videoId: id },
+        '*'
+      );
+    } catch (e) {}
+  }
+
   /* 2.3.1 (item 14, browser-primary): before a picker send
      that names a page-data group, hand the page's whole stream
      set to the app (store-only). The set lives in the probe
@@ -802,6 +903,10 @@
         pageUrl: targetUrl,
         title: title || (info && info.title) || '',
         streams,
+        // the browser's own UA rides with the set: a session CDN
+        // that bound the session to this browser refuses the same
+        // cookies under a foreign UA (audit-232 S3)
+        userAgent: navigator.userAgent || '',
       });
     } catch (e) {}
   }
@@ -873,15 +978,26 @@
     // session cookies (see fetchOrReuseProbe).
     if (queryMediaDeep('video, audio').length > 3) return;
     const targetUrl = await resolveVideoUrl(curAnchor);
+    // An unidentified target ('' — the FB feed closure) names no
+    // video: never warm-probe the page URL in its place.
+    if (!targetUrl) return;
     const key = canonicalVideoKey(targetUrl);
     if (!key || key === lastPreProbedUrl || probeCacheGet(key, false)) return;
     lastPreProbedUrl = key;
-    // Wait briefly for MAIN-world page-hook on YouTube; if not populated, warm cache via ndm-host
-    setTimeout(() => {
+    // Wait briefly for the MAIN-world page-hook — but the hook is
+    // injected on youtube.com only (manifest content_scripts), so
+    // off-YouTube the 120 ms wait buys nothing before the warm
+    // probe fires. Pay it only where a hook can actually answer.
+    const warmProbe = () => {
       if (!probeCacheGet(key, false)) {
         fetchOrReuseProbe(key, true).catch(() => {});
       }
-    }, 120);
+    };
+    if (host === 'youtube.com' || host.endsWith('.youtube.com')) {
+      setTimeout(warmProbe, 120);
+    } else {
+      warmProbe();
+    }
   }
 
   function showBrowserToast(title, qualityLabel, sizeLabel, later, badgeText) {
@@ -917,6 +1033,7 @@
   function closeBrowserModal() {
     activeProbeToken++;
     onInstantInfoCallback = null;
+    fbInfoWantedId = '';
     modalOpen = false;
     activeModalDismiss = null;
     // The flyout's progress poll dies with the card — the download
@@ -1065,6 +1182,7 @@
     const currentAnchor = explicitUrl ? null : (srcAnchor || anchor || pickAnchor());
     const rawTargetUrl = explicitUrl || (await resolveVideoUrl(currentAnchor));
     const targetUrl = canonicalVideoKey(rawTargetUrl);
+    requestFbInfoFor(targetUrl);
     const fallbackTitle = pageVideoTitle(currentAnchor, targetUrl);
     const fallbackThumb = guessFallbackThumbnail(targetUrl, currentAnchor);
 
@@ -1422,6 +1540,18 @@
       setStatus('This page is not a downloadable video.', true);
     }
 
+    /* 2.3.2 (WS-B): the click named a player but no per-video
+       permalink/id could be determined for it (a Facebook feed
+       post whose container carries no permalink). Probing the
+       page URL instead could download a different video under
+       this post's title, so the picker says so plainly: no rows,
+       no probe — and the one action that identifies the video. */
+    function showUnidentified() {
+      rendered = true;
+      qListEl.innerHTML = '<div class="ndm-vp-empty">Couldn’t identify this video.</div>';
+      setStatus('Open the video itself, then try again.', true);
+    }
+
     function probeFailed(errText) {
       rendered = true;
       // Belt and braces (R2-EXT-08, kept): a probe target that IS
@@ -1626,6 +1756,16 @@
       }
     });
 
+    // 2.3.2 (WS-B): an unidentified target ('' from
+    // resolveVideoUrl — the FB feed closure) must never reach
+    // the cache or the probe: canonicalVideoKey('') quietly
+    // becomes this page's own URL, which on a feed is exactly
+    // the wrong video. Show the honest state and stop.
+    if (!rawTargetUrl) {
+      showUnidentified();
+      return;
+    }
+
     // 1. Instant cache (0ms on YouTube or pre-probed pages)
     const cached =
       probeCacheGet(targetUrl, true) ||
@@ -1707,6 +1847,7 @@
     const rawTargetUrl =
       handoff && handoff.url ? handoff.url : await resolveVideoUrl(currentAnchor);
     const targetUrl = canonicalVideoKey(rawTargetUrl);
+    if (!handoff) requestFbInfoFor(targetUrl);
     const fallbackTitle = pageVideoTitle(currentAnchor, targetUrl);
 
     let savedDir = '~/Downloads';
@@ -3556,6 +3697,19 @@
       `;
     }
 
+    /* 2.3.2 (WS-B): the modal's closure, mirrored — the click
+       named a player but no per-video permalink/id could be
+       determined (Facebook feed). A plain statement, never a
+       probe of the page URL under this post's title. */
+    function showUnidentified() {
+      rendered = true;
+      probeSettled = true;
+      btnAll.style.display = 'none';
+      bodyEl.innerHTML = `
+        <div class="ndm-fly-note">Couldn’t identify this video — open the video itself, then try again.</div>
+      `;
+    }
+
     function probeFailed(errText) {
       rendered = true;
       // Belt and braces (R2-EXT-08): if the probe target IS this
@@ -3620,6 +3774,14 @@
         // static progress state a row-click timeout degrades to.
         showProgress({ id: null, name: handoff.name });
       }
+      return;
+    }
+
+    // 2.3.2 (WS-B): an unidentified target ('' from
+    // resolveVideoUrl — the FB feed closure) never reaches the
+    // cache or the probe; see the modal's note on why.
+    if (!rawTargetUrl) {
+      showUnidentified();
       return;
     }
 
