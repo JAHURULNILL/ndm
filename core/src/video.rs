@@ -5272,6 +5272,7 @@ mod tests {
     /// the throttle server, and (optionally) sleeps before answering
     /// from the SECOND invocation on — the re-resolve window the
     /// pause/cancel tests strike into.
+    #[cfg(unix)]
     fn audit_stub_ytdlp(comp: &Path, stream_url: &str, reresolve_sleep_secs: u32) -> PathBuf {
         let count_file = comp.join("ytdlp-count.txt");
         let json = format!(
@@ -5290,12 +5291,14 @@ mod tests {
         count_file
     }
 
+    #[cfg(unix)]
     fn audit_stub_runs(count_file: &Path) -> usize {
         std::fs::read_to_string(count_file)
             .map(|s| s.lines().count())
             .unwrap_or(0)
     }
 
+    #[cfg(unix)]
     struct AuditJob {
         job: Arc<VideoJob>,
         dir: PathBuf,
@@ -5307,6 +5310,7 @@ mod tests {
 
     /// A non-preresolved job (so stall recovery can re-resolve)
     /// against a permanently throttling server.
+    #[cfg(unix)]
     fn audit_start_job(tag: &str, budget: u64, reresolve_sleep_secs: u32, secs: u32, bitrate: &str) -> Option<AuditJob> {
         let gen_dir = std::env::temp_dir().join(format!("ndm-b3gen-{tag}-{}", std::process::id()));
         let payload = audit_payload(&gen_dir, secs, bitrate)?;
@@ -5337,6 +5341,7 @@ mod tests {
         Some(AuditJob { job, dir, gen_dir, count_file, conns, payload_len })
     }
 
+    #[cfg(unix)]
     fn audit_wait_for<F: Fn() -> bool>(deadline_secs: u64, what: &str, f: F) -> bool {
         let deadline = Instant::now() + std::time::Duration::from_secs(deadline_secs);
         while Instant::now() < deadline {
@@ -5441,6 +5446,7 @@ mod tests {
     /// stream URL) serves until `die_after` bytes have been served
     /// in total, then answers 403 to everything; `/s?gen=2` (what
     /// a yt-dlp re-resolve of the page returns) always serves.
+    #[cfg(unix)]
     fn wsa_stream_conn(
         mut sock: std::net::TcpStream,
         payload: Arc<Vec<u8>>,
@@ -5514,6 +5520,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn wsa_server(
         payload: Arc<Vec<u8>>,
         die_after: u64,
@@ -5544,6 +5551,7 @@ mod tests {
     /// A stub yt-dlp that sleeps on EVERY invocation (the heal
     /// re-resolve is a preresolved job's FIRST resolve, unlike
     /// the B3 stubs which sleep from the second run on).
+    #[cfg(unix)]
     fn wsa_stub_ytdlp(comp: &Path, stream_url: &str, sleep_secs: u32) -> PathBuf {
         let count_file = comp.join("ytdlp-count.txt");
         let json = format!(
@@ -5562,6 +5570,7 @@ mod tests {
         count_file
     }
 
+    #[cfg(unix)]
     struct WsaJob {
         job: Arc<VideoJob>,
         dir: PathBuf,
@@ -5573,6 +5582,7 @@ mod tests {
     /// A preresolved (browser-captured) job whose captured
     /// stream dies after `die_after` bytes; the stub yt-dlp's
     /// resolve of the PAGE URL returns the gen=2 stream.
+    #[cfg(unix)]
     fn wsa_start_job(tag: &str, die_after: u64, stub_sleep_secs: u32) -> Option<WsaJob> {
         let gen_dir = std::env::temp_dir().join(format!("ndm-wsagen-{tag}-{}", std::process::id()));
         let payload = audit_payload(&gen_dir, 7, "6M")?;
@@ -5741,6 +5751,7 @@ mod tests {
     /// attempt that straddles a window, then stalls; a later
     /// attempt straddles the next window and banks again — the
     /// real shape of a route that revives in bursts.
+    #[cfg(unix)]
     fn audit_window_conn(
         mut sock: std::net::TcpStream,
         payload: Arc<Vec<u8>>,
