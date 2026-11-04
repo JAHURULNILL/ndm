@@ -57,7 +57,7 @@ jobs:
       - name: Extension version matches app version
         run: python3 -c "import json,re,sys; e=json.load(open('extension/manifest.json'))['version']; t=re.search(r'^version = \"(.*)\"', open('Cargo.toml').read(), re.M).group(1); print(f'extension {e} vs app {t}'); sys.exit(0 if e == t else 'extension/manifest.json version != Cargo.toml version')"
       - name: Build extension ZIPs (Chromium + Firefox, for the artifact and the release upload)
-              run: bash scripts/package-extension.sh .
+        run: bash scripts/package-extension.sh .
                     - uses: actions/upload-artifact@v4
         with:
           name: ndm-linux
