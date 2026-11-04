@@ -69,7 +69,7 @@ jobs:
           v=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           cd extension && zip -q ../ndm-extension-$v.zip manifest.json background.js content.js page-hook.js fb-classify.js popup.html popup.js icon16.png icon48.png icon128.png com.ndm.host.chrome.json.tmpl com.ndm.host.firefox.json.tmpl install-host.sh README.md && cd ..
           ls -la ndm-extension-$v.zip
-          python3 -c "import json,zipfile,sys; z=zipfile.ZipFile('          ndm-extension-$v.zip'); m=json.loads(z.read('manifest.json')); need=[f for cs in m.get('content_scripts',[]) for f in cs.get('js',[])]; missing=[f for f in need if f not in z.namelist()]; print('extension zip check:', 'OK' if not missing else 'MISSING '+str(missing)); sys.exit(1 if missing else 0)"
+          python3 -c "import json,zipfile,sys; z=zipfile.ZipFile('ndm-extension-$v.zip'); m=json.loads(z.read('manifest.json')); need=[f for cs in m.get('content_scripts',[]) for f in cs.get('js',[])]; missing=[f for f in need if f not in z.namelist()]; print('extension zip check:', 'OK' if not missing else 'MISSING '+str(missing)); sys.exit(1 if missing else 0)"
       - name: Attach Linux assets to their GitHub release (dispatch runs only)
         if: github.event_name == 'workflow_dispatch'
         env:
