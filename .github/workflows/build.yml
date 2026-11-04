@@ -119,7 +119,7 @@ jobs:
           # 7/8 resolve ndm-app.exe's remaining api-ms-win-crt-*
           # forwarders app-locally. The installer packages this
           # same folder (SRCROOT), so one copy covers both.
-          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist\" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
+          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.DirectoryName -match 'x64' } | Select-Object -First 1
           if (-not $ucrtBase) { throw "UCRT redist set (x64) not found on this runner" }
           Copy-Item (Join-Path $ucrtBase.DirectoryName "*.dll") $dir/
           Copy-Item extension $dir/extension -Recurse
@@ -219,7 +219,7 @@ jobs:
           # 7/8 resolve ndm-app.exe's remaining api-ms-win-crt-*
           # forwarders app-locally. The installer packages this
           # same folder (SRCROOT), so one copy covers both.
-          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist\" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'x86' } | Select-Object -First 1
+          $ucrtBase = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Redist" -Recurse -Filter ucrtbase.dll -ErrorAction SilentlyContinue | Where-Object { $_.Directory.Name -eq 'x86' } | Select-Object -First 1
           if (-not $ucrtBase) { throw "UCRT redist set (x86) not found on this runner" }
           Copy-Item (Join-Path $ucrtBase.DirectoryName "*.dll") $dir/
           Copy-Item extension $dir/extension -Recurse
