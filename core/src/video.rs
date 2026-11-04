@@ -5918,12 +5918,26 @@ mod tests {
             while !in_window(Instant::now()) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            let n = (body.len() - sent).min(32 * 1024);
-            if sock.write_all(&body[sent..sent + n]).is_err() {
-                return;
+            // Burst up to 256 KiB back to back, then pace 8 s
+            // before the next burst: the same per-connection
+            // average over the 36 s cycle as the original
+            // 32 KiB-per-second pacing (~5-7 KiB/s), but one
+            // scheduler wake per burst instead of one per
+            // chunk. The 1 s pacing let a loaded runner (the
+            // full suite's hundreds of threads on a few cores)
+            // deschedule a connection's thread for a whole 6 s
+            // window at a time; two CI runs banked exactly
+            // 56 chunks before their windows starved shut
+            // (CI #77/#78). A burst survives a late wake.
+            let burst_end = (sent + 8 * 32 * 1024).min(body.len());
+            while sent < burst_end {
+                let n = (burst_end - sent).min(32 * 1024);
+                if sock.write_all(&body[sent..sent + n]).is_err() {
+                    return;
+                }
+                sent += n;
             }
-            sent += n;
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            std::thread::sleep(std::time::Duration::from_secs(8));
         }
     }
 
@@ -5985,8 +5999,13 @@ mod tests {
         // yet failed CI #77 at 1.75 MiB still-downloading: a
         // slower runner, not a barren job. So: succeed at
         // 2 MiB banked while cycling; fail only if the job
-        // leaves the cycling states or banks NOTHING for 60 s
-        // (a genuinely stuck job), with a 600 s outer cap.
+        // leaves the cycling states or banks NOTHING for a
+        // long dry spell (a genuinely stuck job), with a
+        // 900 s outer cap. The dry-spell bound is 150 s:
+        // the fixture's own cadence can legitimately starve
+        // a job for a full 36 s cycle plus a ~17 s recovery
+        // cycle, and suite load stretches both — 60 s failed
+        // CI #78 against a job parked in-attempt, not stuck.
         let job_start = Instant::now();
         let ok = {
             let mut last_done = 0u64;
@@ -6010,8 +6029,8 @@ mod tests {
                     last_done = done;
                     last_progress = Instant::now();
                 }
-                if last_progress.elapsed() > std::time::Duration::from_secs(60)
-                    || outer.elapsed() > std::time::Duration::from_secs(600)
+                if last_progress.elapsed() > std::time::Duration::from_secs(150)
+                    || outer.elapsed() > std::time::Duration::from_secs(900)
                 {
                     eprintln!("timed out waiting for productive windows banked, still cycling");
                     break false;
