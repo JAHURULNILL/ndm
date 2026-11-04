@@ -22,6 +22,11 @@ try {
   importScripts('fb-classify.js');
   FBC = typeof NdmFbClassify !== 'undefined' ? NdmFbClassify : null;
 } catch (e) {}
+// Firefox runs the background as an event page, not a service
+// worker: importScripts does not exist there, and the Firefox
+// manifest preloads fb-classify.js as a background script
+// instead — take the classifier from that shared global.
+if (!FBC && typeof NdmFbClassify !== 'undefined') FBC = NdmFbClassify;
 
 /* Streaming services whose videos are DRM-protected — the same list
    content.js uses to suppress its panel. The background layer must
@@ -53,7 +58,7 @@ function isDrmUrl(url) {
 const VIDEO_HOST_PATTERNS = [
   /(^|\.)youtube\.com\/(watch|shorts\/|live\/|embed\/)/,
   /(^|\.)youtu\.be\//,
-  /(^|\.)facebook\.com\/.*(\/videos\/|\/watch|\/reel\/|\/share\/(r|v)\/|watch\/?\?v=)/,
+  /(^|\.)facebook\.com\/.*(videos\/|watch|reel\/|share\/(r|v)\/|watch\/?\?v=)/,
   /(^|\.)fb\.watch\//,
   /(^|\.)vimeo\.com\/\d+/,
   // Embedded-player shapes (F4): player.vimeo.com/video/<id> and
@@ -869,7 +874,11 @@ function sendToNdm(message) {
           // when the app drains its queue. (The warm path's
           // `queued` is a COUNT, not this flag — strict === true
           // keeps it on the normal mapping.)
-          finish({ ok: true, unknown: true, dupe: false, error: '' });
+          // The queue id now rides along AS a queue id (never as
+          // an entry id): the card polls the host's result store
+          // with it and adopts the real entry id once the app has
+          // drained the line (field bug Y-2).
+          finish({ ok: true, unknown: true, queueId: (response && response.id) || '', dupe: false, error: '' });
           return;
         }
         finish({
@@ -879,6 +888,9 @@ function sendToNdm(message) {
           // entry that started while the dialog was open)
           id: response && response.id,
           dupe: !!(response && response.dupe),
+          // the app opened its own progress dialog for this
+          // start: the in-page card steps aside (one surface)
+          dialog: !!(response && response.dialog),
           error: ok ? '' : (response && response.error) || 'Download rejected by NDM.',
         });
       });
@@ -1585,6 +1597,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === 'ndm-entry-progress') {
     sendNativeFull({ type: 'progress', id: String(message.id || '') })
+      .then(r => sendResponse(r || { ok: false }))
+      .catch(() => sendResponse({ ok: false }));
+    return true;
+  }
+
+  if (message.action === 'ndm-start-result') {
+    sendNativeFull({ type: 'result', id: String(message.queueId || '') })
       .then(r => sendResponse(r || { ok: false }))
       .catch(() => sendResponse({ ok: false }));
     return true;

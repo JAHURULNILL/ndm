@@ -2388,6 +2388,19 @@ impl VideoJob {
         ytdlp: &Path,
         components_dir: &Path,
     ) -> Option<(Vec<DirectStream>, String)> {
+        // A Facebook page that names no single video (a feed, a
+        // profile) must never be re-resolved as "the" video:
+        // yt-dlp would hand back whatever item the page surfaces
+        // first — a different video than this job's, downloaded
+        // under this job's title. The heal fails honestly instead
+        // (independent review, 4 Nov 2026).
+        let host = crate::url_host(&self.url).unwrap_or_default();
+        let is_fb_page = host == "facebook.com"
+            || host.ends_with(".facebook.com")
+            || host == "fb.watch";
+        if is_fb_page && crate::capture::facebook_video_id(&self.url).is_none() {
+            return None;
+        }
         let heal_sel = if self.audio {
             "ba[ext=m4a]/ba/b".to_string()
         } else {

@@ -440,9 +440,9 @@ pub const COLUMN_DEFS: [(&str, &str, i32, bool); 10] = [
     ("status", "Status", 92, false),
     ("timeleft", "Time left", 96, false),
     ("rate", "Transfer rate", 96, false),
-    ("lasttry", "Last Try Date", 138, false),
+    ("lasttry", "Last Try Date", 168, false),
     ("desc", "Description", 150, false),
-    ("added", "Date Added", 138, true),
+    ("added", "Date Added", 168, true),
     ("saveto", "Save To", 240, true),
 ];
 

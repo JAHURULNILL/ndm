@@ -140,7 +140,23 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
         ));
     }
     let result = (|| {
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&path)?;
+        // a queue line can carry the browser's whole cookie
+        // export: the file is owner-only, tightened on every
+        // append (mode() alone only applies at creation, so a
+        // queue file an older version left at 0644 heals here)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         file.write_all(line.as_bytes())
     })();
     if let Some(f) = guard.take() {
@@ -427,6 +443,7 @@ fn handle_at(message: &Value, stamp_path: Option<&std::path::Path>, now_secs: u6
         Some("resume_entry") => handle_entry_control(message, "resume_entry"),
         Some("set_speed_limit") => handle_set_speed_limit(message),
         Some("progress") => handle_progress(message),
+        Some("result") => handle_result(message),
         Some("captured_streams") => handle_captured_streams(message),
         Some(other) => json!({ "ok": false, "error": format!("unknown type: {other}") }),
         None => json!({ "ok": false, "error": "missing type" }),
@@ -1022,6 +1039,31 @@ fn handle_progress(message: &Value) -> Value {
             v
         }
         None => json!({ "ok": false, "error": "no progress" }),
+    }
+}
+
+/// The stored result of a queued start, looked up by the QUEUE
+/// LINE's id after the ack wait already timed out: the app writes
+/// results/<queue-id>.json when it drains the line, so a card
+/// that opened in the unknown state can still learn the real
+/// entry id it should track (field bug Y-2: the card polled a
+/// dead id forever and never showed progress or completion).
+/// Read-only — the file's 120 s prune is the cleanup.
+fn handle_result(message: &Value) -> Value {
+    let id = message.get("id").and_then(Value::as_str).unwrap_or("");
+    if !valid_entry_id(id) {
+        return json!({ "ok": false, "error": "invalid id" });
+    }
+    let Ok(base) = app_data_dir() else {
+        return json!({ "ok": false, "pending": true });
+    };
+    let path = base.join("results").join(format!("{id}.json"));
+    match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    {
+        Some(v) => v,
+        None => json!({ "ok": false, "pending": true }),
     }
 }
 

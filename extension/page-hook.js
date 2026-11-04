@@ -160,8 +160,19 @@
       const fps = parseInt(f.fps || '0', 10) || 30;
 
       const prev = byHeight.get(h);
-      // Prefer mp4 with known size, or higher bitrate within same container preference
-      const score = (isMp4 ? 1000000000000 : 0) + (vBytes > 0 ? vBytes : br);
+      // Class first, the way the row's own selector resolves:
+      // a video-only stream (paired with the m4a below) outranks
+      // a muxed format at the same height — the old largest-bytes
+      // rule let the chunky legacy muxed encode (e.g. a 10 MB
+      // 360p) win its row while every neighbouring height showed
+      // a DASH pair, so the sizes read non-monotonic and the row
+      // downloaded a different shape than its selector implies.
+      // Then mp4, then fps, then the larger size.
+      const score =
+        (hasBundledAudio ? 0 : 1000000000000000) +
+        (isMp4 ? 1000000000000 : 0) +
+        fps * 1000000000 +
+        (vBytes > 0 ? vBytes : br);
       if (!prev || score > prev.score) {
         byHeight.set(h, {
           height: h,

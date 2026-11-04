@@ -90,9 +90,15 @@ function facebookVideoId(urlStr) {
    wrong download could wear the right post's title. So on
    Facebook the unresolved target is '' — "unidentified" — and
    the picker shows its honest could-not-identify state instead
-   of probing anything. */
+   of probing anything. One exception: a page URL that itself
+   names ONE video (facebookVideoId non-empty — a dedicated
+   /reel/<id>, /videos/<id> or watch?v=<id> page) is not a feed,
+   so it stays a valid target; without this, bare Reel pages
+   whose permalink the caller's patterns missed landed here and
+   were declared unidentified on their own page (field bug F-1). */
 function fallbackTargetFor(isFacebookPage, pageUrl) {
-  return isFacebookPage ? '' : (pageUrl || '');
+  if (!isFacebookPage) return pageUrl || '';
+  return facebookVideoId(pageUrl) ? pageUrl : '';
 }
 
 /* Recursively collect objects that look like one FB video:

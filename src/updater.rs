@@ -388,6 +388,16 @@ fn download_file_with_ceiling(
         let _ = std::fs::remove_file(&tmp);
         return Err("the update failed its integrity check and was discarded".to_string());
     }
+    // The destination is a fixed name in the updates folder, so
+    // every later update renames onto the previous attempt's
+    // file — on Windows that rename fails when the old file is
+    // read-only or still held by a just-finished installer/AV
+    // scan. Clear it first: the verified bytes are already safe
+    // in `tmp`, and a removal failure surfaces at the rename
+    // with the same error either way.
+    if dest.exists() {
+        let _ = std::fs::remove_file(dest);
+    }
     std::fs::rename(&tmp, dest).map_err(|e| format!("cannot install file: {e}"))?;
     on_progress(downloaded, total.max(downloaded));
     Ok(())
@@ -646,6 +656,12 @@ mod tests {
         let url = serve_plain(&body, "");
         download_file(&url, &dest, &sha256_hex(&body), &|_, _| {}).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), body);
+        // a second update lands on the SAME fixed destination
+        // name: installing over the existing file must work
+        let body2 = b"the next update package".to_vec();
+        let url2 = serve_plain(&body2, "");
+        download_file(&url2, &dest, &sha256_hex(&body2), &|_, _| {}).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), body2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

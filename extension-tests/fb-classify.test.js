@@ -129,6 +129,18 @@ test('fallthrough closure: an unresolved Facebook target is NEVER the page (feed
   assert.equal(fallbackTargetFor(true, feed), '');
   assert.equal(fallbackTargetFor(true, 'https://www.facebook.com/SomePage'), '');
   assert.equal(fallbackTargetFor(true, 'https://www.facebook.com/watch'), '');
+  // …but a dedicated permalink page names ONE video, so it is a
+  // valid target, not a feed (field bug F-1: bare Reel pages
+  // were declared unidentified on the video's own page)
+  assert.equal(
+    fallbackTargetFor(true, 'https://www.facebook.com/reel/2501272810378759'),
+    'https://www.facebook.com/reel/2501272810378759');
+  assert.equal(
+    fallbackTargetFor(true, 'https://www.facebook.com/SomePage/videos/1234567890'),
+    'https://www.facebook.com/SomePage/videos/1234567890');
+  assert.equal(
+    fallbackTargetFor(true, 'https://www.facebook.com/watch?v=1234567890'),
+    'https://www.facebook.com/watch?v=1234567890');
   // off Facebook the page URL remains the standing last resort
   assert.equal(fallbackTargetFor(false, 'https://example.com/watch/42'), 'https://example.com/watch/42');
   assert.equal(fallbackTargetFor(false, ''), '');

@@ -217,7 +217,12 @@
     if (
       /youtube\.com\/(watch|shorts\/|live\/|embed\/)/i.test(href) ||
       /youtu\.be\//i.test(href) ||
-      /facebook\.com\/.*(\/videos\/|\/reel\/|\/share\/(r|v)\/|watch\/?\?v=)/i.test(href) ||
+      // The .* may be empty: the canonical permalink shapes sit
+      // at the domain root (facebook.com/reel/<id>), so requiring
+      // a slash before reel/videos made the pattern miss exactly
+      // those pages (field bug F-1: every bare Reel page reported
+      // "Couldn't identify this video").
+      /facebook\.com\/.*(videos\/|reel\/|share\/(r|v)\/|watch\/?\?v=)/i.test(href) ||
       /instagram\.com\/(reel|p|tv)\//i.test(href) ||
       /tiktok\.com\/@[^/]+\/video\//i.test(href)
     ) {
@@ -254,7 +259,7 @@
         for (const a of links) {
           const h = a.href || '';
           if (
-            /facebook\.com\/.*(\/reel\/\d+|\/videos\/\d+|watch\/?\?v=\d+|\/share\/(r|v)\/)/i.test(h) ||
+            /facebook\.com\/.*(reel\/\d+|videos\/\d+|watch\/?\?v=\d+|share\/(r|v)\/)/i.test(h) ||
             /instagram\.com\/(reel|p|tv)\/[^/?#]+/i.test(h) ||
             /tiktok\.com\/@[^/]+\/video\/\d+/i.test(h) ||
             /(twitter|x)\.com\/[^/]+\/status\/\d+/i.test(h) ||
@@ -343,12 +348,16 @@
     return `${v.toFixed(i >= 2 ? 1 : 0)} ${units[i]}`;
   }
 
-  /* IDM's own number formats (progress dialog): sizes always
-     carry 3 decimals with the unit picked by magnitude, the
-     rate is "<v> KB/sec" under 1 MB/s and "<v> MB/sec" above,
-     and the time left reads "57 min 5 sec" / "1 hour(s) 18 min"
-     / "0 sec". Used only by the flyout's progress view, which
-     mirrors IDM's dialog element for element. */
+  /* IDM's own number formats (progress dialog), adapted to
+     NDM's one-format rule: sizes and rates carry 2 decimals —
+     the same precision the app's own list and progress dialog
+     use everywhere — so one download never reads as two
+     different totals on two surfaces (32.176 MB on the card
+     vs 32.18 MB in the dialog). The rate is "<v> KB/sec" under
+     1 MB/s and "<v> MB/sec" above, and the time left reads
+     "57 min 5 sec" / "1 hour(s) 18 min" / "0 sec". Used only
+     by the flyout's progress view, which mirrors the app's
+     progress dialog element for element. */
   function fmtIdmSize(n) {
     const b = Number(n) || 0;
     const units = ['KB', 'MB', 'GB', 'TB'];
@@ -358,13 +367,13 @@
       v /= 1024;
       i++;
     }
-    return `${v.toFixed(3)} ${units[i]}`;
+    return `${v.toFixed(2)} ${units[i]}`;
   }
 
   function fmtIdmRate(bps) {
     const r = Number(bps) || 0;
-    if (r >= 1024 * 1024) return `${(r / 1048576).toFixed(3)} MB/sec`;
-    return `${(r / 1024).toFixed(3)} KB/sec`;
+    if (r >= 1024 * 1024) return `${(r / 1048576).toFixed(2)} MB/sec`;
+    return `${(r / 1024).toFixed(2)} KB/sec`;
   }
 
   // approx (V6): the app flags eta_secs as an estimate via the
@@ -1799,11 +1808,11 @@
           // again": the one deliberate forced second copy.
           force: dupeMode === 'again',
         });
-        if (resp && resp.ok && resp.id && !resp.dupe) res = { id: resp.id };
+        if (resp && resp.ok && resp.id && !resp.dupe) res = { id: resp.id, dialog: !!resp.dialog };
         else if (resp && resp.dupe) res = { duplicate: true, id: resp.id || null };
         else if (resp && typeof resp.error === 'string' && resp.error.startsWith('duplicate:')) {
           res = { duplicate: true, id: resp.error.slice('duplicate:'.length).trim() || resp.id || null };
-        } else if (resp && resp.unknown) res = { unknown: true };
+        } else if (resp && resp.unknown) res = { unknown: true, queueId: resp.queueId || '' };
         else {
           res = {
             error:
@@ -1841,6 +1850,8 @@
         const handoff = {
           id: res.id || null,
           unknown: !!res.unknown,
+          queueId: res.queueId || '',
+          dialog: !!res.dialog,
           name,
           q,
           url: targetUrl,
@@ -2335,7 +2346,7 @@
           total: Number(q.size_bytes) || 0,
           force: !!force,
         });
-        if (resp && resp.ok && resp.id && !resp.dupe) return { id: resp.id };
+        if (resp && resp.ok && resp.id && !resp.dupe) return { id: resp.id, dialog: !!resp.dialog };
         if (resp && resp.dupe) return { duplicate: true, id: resp.id || null };
         if (
           resp &&
@@ -2353,7 +2364,7 @@
         // A send timeout is not a refusal: the request may still
         // land in the app — but with no entry id there is nothing
         // to poll, so the card degrades to the static state.
-        if (resp && resp.unknown) return { unknown: true };
+        if (resp && resp.unknown) return { unknown: true, queueId: resp.queueId || '' };
         return {
           error:
             (resp && resp.error) ||
@@ -2374,11 +2385,18 @@
       card.classList.remove('busy');
       if (res.id && !res.duplicate) {
         flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
+        if (res.dialog) {
+          // The app's progress dialog owns this start — the
+          // card steps aside (one progress surface, I-1).
+          showNote('Downloading in NDM — progress is in the app.');
+          setTimeout(closeFly, 900);
+          return;
+        }
         setProgressVideo(q);
         showProgress({ id: res.id, name: fileNameFor(q), regKey: regKeyFor(q) });
       } else if (res.unknown) {
         setProgressVideo(q);
-        showProgress({ id: null, name: fileNameFor(q) });
+        showProgress({ id: null, queueId: res.queueId || '', name: fileNameFor(q), regKey: regKeyFor(q) });
       } else if (res.duplicate) {
         showDuplicate(q, res.id);
       } else {
@@ -2397,6 +2415,7 @@
       const started = [];
       let skipped = 0;
       let unknown = 0;
+      let inApp = 0;
       for (const q of list) {
         const res = await startQuality(q, false);
         // Closing the card mid-loop does NOT abandon the
@@ -2413,11 +2432,17 @@
         // skipped, exactly like refusals.
         if (res.id && !res.duplicate) {
           flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
-          started.push({
-            id: res.id,
-            regKey: regKeyFor(q),
-            name: `${probedTitle || fallbackTitle} — ${qualityText(q)}`,
-          });
+          // Starts the app dialog owns are not this card's to
+          // track (one progress surface, I-1) — counted apart.
+          if (res.dialog) {
+            inApp++;
+          } else {
+            started.push({
+              id: res.id,
+              regKey: regKeyFor(q),
+              name: `${probedTitle || fallbackTitle} — ${qualityText(q)}`,
+            });
+          }
         } else if (res.unknown) {
           // A timed-out send may still land in the app: it is
           // neither a start nor a skip, and must be reported as
@@ -2430,6 +2455,9 @@
       card.classList.remove('busy');
       if (closed) return;
       const notes = [];
+      if (inApp) {
+        notes.push(`${inApp} format${inApp > 1 ? 's' : ''} downloading in the NDM app.`);
+      }
       if (skipped) {
         notes.push(`${skipped} format${skipped > 1 ? 's' : ''} skipped (already in the list or refused).`);
       }
@@ -2438,6 +2466,11 @@
       }
       if (started.length) {
         showMultiProgress(started, notes.join(' '));
+      } else if (inApp) {
+        startBusy = false;
+        btnAll.disabled = false;
+        showNote(notes.join(' '));
+        setTimeout(closeFly, 1200);
       } else if (unknown) {
         startBusy = false;
         btnAll.disabled = false;
@@ -2566,11 +2599,16 @@
         if (closed) return;
         if (res.id) {
           flyEntryRegistry.set(regKeyFor(q), { id: res.id, name: fileNameFor(q) });
+          if (res.dialog) {
+            showNote('Downloading in NDM — progress is in the app.');
+            setTimeout(closeFly, 900);
+            return;
+          }
           setProgressVideo(q);
           showProgress({ id: res.id, name: fileNameFor(q), regKey: regKeyFor(q) });
         } else if (res.unknown) {
           setProgressVideo(q);
-          showProgress({ id: null, name: fileNameFor(q) });
+          showProgress({ id: null, queueId: res.queueId || '', name: fileNameFor(q), regKey: regKeyFor(q) });
         } else {
           btn.disabled = false;
           showNote(res.error || 'NDM refused the second copy.');
@@ -2971,6 +3009,12 @@
       let last = null;       // last good progress reply
       let uiPaused = false;  // Pause pressed here (poll may lag/never answer)
       let terminal = false;
+      // Ticks spent waiting for a queued start's entry id
+      // (entry.id null, entry.queueId set): the host's result
+      // store answers for ~120 s before its prune, so the wait
+      // gives up shortly after that and the card settles into
+      // its unconfirmed state instead of polling forever.
+      let waited = 0;
       // V4: previous poll's done/total, for the sustained
       // done>=total check in render() — a dishonest total can
       // pin done==total while bytes still arrive, so one poll
@@ -2997,7 +3041,16 @@
 
       function render() {
         if (!last && !uiPaused) {
-          statusEl.textContent = 'Downloading in NDM…';
+          // No poll has ever spoken. With an entry id that is
+          // the honest pre-data "Downloading"; without one the
+          // start is only queued, so the card says it is waiting
+          // (or, past the result store's life, unconfirmed) —
+          // never a download in progress (field bug Y-2).
+          statusEl.textContent = entry.id
+            ? 'Downloading in NDM…'
+            : entry.unresolved
+              ? 'Sent to NDM — the start was never confirmed. Open NDM to check.'
+              : 'Waiting for NDM…';
           setStatusLive(false);
           rowsEl.fsize.style.display = 'none';
           rowsEl.down.style.display = 'none';
@@ -3006,9 +3059,9 @@
           rowsEl.resume.style.display = 'none';
           paintDetails(progEls);
           syncLimiter();
-          btnPause.style.display = '';
+          btnPause.style.display = entry.id ? '' : 'none';
           btnResume.style.display = 'none';
-          btnShow.style.display = 'none';
+          btnShow.style.display = entry.id ? 'none' : '';
           return;
         }
         if (!last && uiPaused) {
@@ -3345,6 +3398,33 @@
 
       const tick = async () => {
         if (closed || terminal) return;
+        if (!entry.id && entry.queueId) {
+          // The start was queued but never acked in time (the
+          // app was cold): ask the host's result store whether
+          // the app has since drained the line and named the
+          // entry. Until it has, the card waits honestly — it
+          // must not render a download that may not exist
+          // (field bug Y-2: a dead-id card sat on "Downloading
+          // in NDM…" through a whole download and its finish).
+          try {
+            const rr = await chrome.runtime.sendMessage({
+              action: 'ndm-start-result',
+              queueId: entry.queueId,
+            });
+            if (rr && rr.ok && rr.id) {
+              entry.id = rr.id;
+              if (entry.regKey) {
+                flyEntryRegistry.set(entry.regKey, { id: rr.id, name: entry.name });
+              }
+            }
+          } catch (e) {}
+          if (!entry.id) {
+            waited++;
+            if (waited > 150) entry.unresolved = true;
+            render();
+            return;
+          }
+        }
         const r = await pollOnce(entry.id);
         if (closed || terminal) return;
         if (r) {
@@ -3884,11 +3964,21 @@
       }
       if (handoff.id) {
         flyEntryRegistry.set(hKey, { id: handoff.id, name: handoff.name });
+        if (handoff.dialog) {
+          // The app's own progress dialog opened for this start:
+          // it is the ONE progress surface (IDM's rule) — this
+          // card steps aside instead of shadowing it with a
+          // second, diverging progress view (field bug I-1).
+          bodyEl.innerHTML = '<div class="ndm-fly-note">Downloading in NDM — progress is in the app.</div>';
+          setTimeout(closeFly, 900);
+          return;
+        }
         showProgress({ id: handoff.id, name: handoff.name, regKey: hKey });
       } else {
-        // The send may have landed but returned no id: the same
-        // static progress state a row-click timeout degrades to.
-        showProgress({ id: null, name: handoff.name });
+        // The send may have landed but returned no id: the card
+        // waits on the queue id and adopts the entry id when the
+        // app drains the line (see showProgress's tick).
+        showProgress({ id: null, queueId: handoff.queueId || '', name: handoff.name, regKey: hKey });
       }
       return;
     }

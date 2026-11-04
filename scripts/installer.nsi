@@ -245,11 +245,23 @@ Section "Uninstall"
   DeleteRegKey HKCU "${UNREGKEY}"
   DeleteRegKey HKCU "${REGKEY}"
 
+  ; The browser NativeMessagingHosts keys point at the host
+  ; executable this section deletes: left behind, every browser
+  ; keeps a live registration for a program that no longer
+  ; exists and the extension fails against a dead host. The
+  ; app re-writes these keys on every launch, so a reinstall
+  ; restores them by itself — removing them here costs nothing.
+  DeleteRegKey HKCU "Software\Google\Chrome\NativeMessagingHosts\com.ndm.host"
+  DeleteRegKey HKCU "Software\Chromium\NativeMessagingHosts\com.ndm.host"
+  DeleteRegKey HKCU "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\com.ndm.host"
+  DeleteRegKey HKCU "Software\Microsoft\Edge\NativeMessagingHosts\com.ndm.host"
+  DeleteRegKey HKCU "Software\Mozilla\NativeMessagingHosts\com.ndm.host"
+
   ; Program files only. User data under %APPDATA%\
   ; com.ndm.downloadmanager (settings, queue, native-messaging
-  ; manifests) and the browser NativeMessagingHosts keys are
-  ; deliberately left behind, so a reinstall picks everything
-  ; back up — the standard per-user app behaviour.
+  ; manifests) is deliberately left behind, so a reinstall
+  ; picks everything back up — the standard per-user app
+  ; behaviour.
   ; uninstall file list — same names, native shell
   ; binary; no WebView2Loader.dll delete.
   Delete "$INSTDIR\ndm-app.exe"

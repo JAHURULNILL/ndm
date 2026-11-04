@@ -4631,6 +4631,9 @@ pub fn rehome_if_finished_conflict(
     state: &AppState,
     stub: &Arc<Entry>,
 ) -> Arc<Entry> {
+    // the rehome pick + replacement install is a name allocation
+    // too (see NAME_GATE)
+    let _name_gate = NAME_GATE.lock_ok();
     if stub.download.is_some() || stub.video.is_some() {
         return stub.clone();
     }
@@ -4842,6 +4845,8 @@ pub fn register_http_stub(
     password: &str,
     dir_explicit: bool,
 ) -> Result<Arc<Entry>, String> {
+    // pick + insert under one gate (see NAME_GATE)
+    let _name_gate = NAME_GATE.lock_ok();
     // a name the browser suggested (Content-Disposition) wins over
     // the URL tail — run through the engine's full sanitiser, not
     // just separator stripping: illegal characters and the Windows
@@ -5785,6 +5790,19 @@ pub fn maybe_reveal_progress_dialog(app: &Ctx, state: &AppState, entry: &Entry) 
     }
 }
 
+/// Whether the progress-dialog setting creates the app's dialog
+/// for a start (the same predicate maybe_reveal_progress_dialog
+/// acts on). The incoming-queue results carry it to the browser
+/// so the in-page card can step aside: one download, one
+/// progress surface (field bug I-1 — the card and the dialog
+/// showed the same download with different numbers).
+pub fn progress_dialog_will_show(state: &AppState) -> bool {
+    matches!(
+        current_settings(state).progress_dialog_view.as_str(),
+        "show" | "minimized"
+    )
+}
+
 /// Fill free simultaneous-download slots from the queues. The cap is
 /// per queue (IDM: each queue downloads N files at a time).
 pub fn pump_queue(app: &Ctx) {
@@ -6354,6 +6372,16 @@ pub fn start_all(app: Ctx) -> usize {
 /// start path: two starts landing together must not both pass the
 /// simultaneous-cap check before either has claimed its slot.
 pub static START_GATE: Mutex<()> = Mutex::new(());
+
+/// Serializes name allocation: unique_out_path's taken-check and
+/// the winning entry's insertion into the state map must be one
+/// atomic step — two same-name adds starting together (a drain
+/// batch, a double send) both passed the check before either
+/// inserted, and landed on ONE output path and ONE engine state
+/// file (independent review, 4 Nov 2026). Held for the whole
+/// body of the registration funnels and the rehome swap — the
+/// pickers themselves stay pure.
+pub static NAME_GATE: Mutex<()> = Mutex::new(());
 
 
 pub async fn add_download(
@@ -8207,16 +8235,20 @@ pub fn refresh_url(app: Ctx, id: String, new_url: String) -> Result<(), String> 
     if let Some(job) = &entry.video {
         job.cancel();
     }
+    // The engine must settle before its journal is touched:
+    // the supervisor's final save writes the definitive sealed
+    // state (still under the old URL), and the rebind below must
+    // land after it, not race it. This is NOT best-effort: on a
+    // settle timeout the old code proceeded anyway, so the old
+    // engine's late final save could overwrite the rebound
+    // journal, its emit loop kept writing for an entry the list
+    // had already replaced, and the fresh entry (download: None)
+    // had no handle to cancel the zombie with (independent
+    // review, 4 Nov 2026). Refuse instead — nothing has been
+    // rebound or replaced, and the entry keeps its old address.
+    settle_entry_engines(&entry)
+        .map_err(|_| "the download is still settling — try again in a moment".to_string())?;
     entry.removed.store(true, Ordering::SeqCst); // stop a stray emit loop
-    // let the engine settle before touching its journal: the
-    // supervisor's final save writes the definitive sealed state
-    // (still under the old URL), and the rebind below must land
-    // after it, not race it. Best-effort — if the settle cap
-    // expires, the refresh proceeds as it always did and the
-    // worst case is the old behaviour at the next start (a
-    // restart), never corruption: start_engine's accounting
-    // covers any bytes a lost race leaves uncredited.
-    let _ = settle_entry_engines(&entry);
     // keep what can be kept: re-point the journal at the new
     // address, then read the kept progress back from the journal
     // itself — the journal, not this record, is the resume truth.
@@ -8644,6 +8676,8 @@ pub fn do_add_video(
     dir_explicit: bool,
     from_browser: bool,
 ) -> Result<String, String> {
+    // pick + insert under one gate (see NAME_GATE)
+    let _name_gate = NAME_GATE.lock_ok();
     if state.update_required.load(Ordering::SeqCst) {
         return Err("please install the required update before starting new downloads".to_string());
     }
@@ -10865,32 +10899,40 @@ pub fn sweep_video_temps(entry: &Entry) {
     }
 }
 
-pub fn discard_entry(app: &Ctx, state: &AppState, entry: &Arc<Entry>) {
+/// Discard an entry and everything it owns on disk. Returns
+/// false when the discard was REFUSED — an engine that would
+/// not settle in time — in which case nothing is touched and
+/// the caller must not report success: the previous shape
+/// latched `removed` and dropped the retry/heal bookkeeping
+/// BEFORE the HTTP engine's settle ran, so a settle timeout
+/// left the entry half-discarded in memory, its files and
+/// journal unswept, while the browser was told the cancel
+/// worked (independent review, 4 Nov 2026).
+pub fn discard_entry(app: &Ctx, state: &AppState, entry: &Arc<Entry>) -> bool {
     // a finished download is the user's completed file, not a
     // dialog session: the browser dialog's Cancel/Esc arriving
     // after the download already finished must never delete its
     // list entry while the file stays on disk (F-EXT-12). No-op —
     // the caller still answers ok, and the entry (and file) stay.
     if entry_is_finished(entry) {
-        return;
+        return true;
     }
-    // A video job SETTLES before anything is removed. Its engine
-    // streams write their resume state on the way out; sweeping
-    // immediately raced those final writes and an orphan sidecar
-    // survived on disk (F-EXT-08) — the HTTP branch below already
-    // waits for its engine the same way. And if the job finishes
-    // during the wait, the finish has WON against the cancel: the
-    // discard aborts with nothing touched, under the same rule as
-    // the finished guard above (R2-EXT-05).
-    if entry.video.is_some() {
-        // M-6: a job that will not settle (a merge still running)
-        // refuses the discard too — nothing is touched and the
-        // entry stays, exactly as with the finished guard above
+    // BOTH engines SETTLE before anything is removed or marked.
+    // Their streams write their resume state on the way out;
+    // sweeping immediately raced those final writes and an
+    // orphan sidecar survived on disk (F-EXT-08). M-6: a job
+    // that will not settle (a merge still running) refuses the
+    // discard — nothing is touched and the entry stays.
+    if entry.video.is_some() || entry.download.is_some() {
         if settle_entry_engines(entry).is_err() {
-            return;
+            return false;
         }
+        // if the job finishes during the wait, the finish has
+        // WON against the cancel: the discard aborts with
+        // nothing touched, under the same rule as the finished
+        // guard above (R2-EXT-05)
         if entry_is_finished(entry) {
-            return;
+            return true;
         }
     }
     entry.removed.store(true, Ordering::SeqCst);
@@ -10898,15 +10940,6 @@ pub fn discard_entry(app: &Ctx, state: &AppState, entry: &Arc<Entry>) {
     // C-3: same per-entry session-state cleanup as remove_entry_inner
     state.heals.lock_ok().remove(&entry.id);
     quota_note_removed(state, entry);
-    if entry.download.is_some() {
-        // wait for the engine to actually stop: its shutdown writes
-        // the resume state one last time, and deleting the files
-        // before that would leave an orphan state file behind (a
-        // later download of the same name could trust stale blocks)
-        if settle_entry_engines(entry).is_err() {
-            return;
-        }
-    }
     state.entries.lock_ok().remove(&entry.id);
     state.order.lock_ok().retain(|x| x != &entry.id);
     // the engine's final state write can land just after the
@@ -10945,6 +10978,7 @@ pub fn discard_entry(app: &Ctx, state: &AppState, entry: &Arc<Entry>) {
     let _ = app.emit(AppEvent::EntryRemoved(serde_json::json!({ "id": entry.id }),));
     persist(state);
     pump_queue(app);
+    true
 }
 
 pub fn handle_incoming_line(handle: &Ctx, line: &str) {
@@ -10981,8 +11015,17 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
                     let _ = pause_download(handle.clone(), entry_id.to_string());
                     serde_json::json!({ "ok": true })
                 } else if kind == "cancel_entry" {
-                    discard_entry(handle, &state, &entry);
-                    serde_json::json!({ "ok": true })
+                    // a refused discard (engine still settling)
+                    // is NOT a success: the entry and its files
+                    // are untouched and the browser must say so
+                    if discard_entry(handle, &state, &entry) {
+                        serde_json::json!({ "ok": true })
+                    } else {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": "the download is still settling — try again in a moment"
+                        })
+                    }
                 } else if kind == "set_speed_limit" {
                     // The progress card's Speed Limiter tab: the
                     // SAME command the app's own per-file limiter
@@ -11208,7 +11251,11 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
             Ok(entry_id) => write_ack_and_result(
                 handle,
                 ack_id.as_deref(),
-                serde_json::json!({ "ok": true, "id": entry_id }),
+                serde_json::json!({
+                    "ok": true,
+                    "id": entry_id,
+                    "dialog": !later && progress_dialog_will_show(&state),
+                }),
             ),
             Err(err) => {
                 drop_cookies_token(&state, &token);
@@ -11298,6 +11345,10 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
         ) {
             Ok(stub) => {
                 let entry_id = stub.id.clone();
+                // Set where the reveal fires below: the result
+                // tells the browser whether the app's progress
+                // dialog owns this start (one progress surface).
+                let mut dialog = false;
                 let max = effective_cap(&current_settings(&state), &entry_queue(&stub));
                 // the same gate + slot pre-claim discipline as the
                 // dialog path: several catches landing in one drain
@@ -11361,13 +11412,14 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
                     // closes. Download Later stays unrevealed:
                     // nothing has started.
                     if !later {
+                        dialog = progress_dialog_will_show(&state);
                         maybe_reveal_progress_dialog(handle, &state, &stub_for_reveal);
                     }
                 }
                 write_ack_and_result(
                     handle,
                     ack_id.as_deref(),
-                    serde_json::json!({ "ok": true, "id": entry_id }),
+                    serde_json::json!({ "ok": true, "id": entry_id, "dialog": dialog }),
                 );
             }
             Err(err) => {
@@ -11447,6 +11499,32 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
                 handle,
                 ack_id.as_deref(),
                 serde_json::json!({ "ok": false, "error": "videoKey is malformed" }),
+            );
+            return;
+        }
+        // A Facebook page that names no single video (a feed, a
+        // profile) plus a capture with NO recorder video key: the
+        // streams cannot be attributed to ONE video. Stored under
+        // the page's identity they would be served to a later
+        // lookup as whatever video the user opens next on that
+        // page — the wrong download wearing the right title
+        // (independent review, 4 Nov 2026). The extension's
+        // recorder errs the same way (unknown key on Facebook =
+        // never offered); the core must not trust that alone.
+        let host = url_host(url).unwrap_or_default();
+        let is_fb_page = host == "facebook.com"
+            || host.ends_with(".facebook.com")
+            || host == "fb.watch";
+        if is_fb_page && video_key.is_empty() && capture::facebook_video_id(url).is_none() {
+            eprintln!("[ndm] incoming captured_streams line dropped: unkeyed capture on a Facebook page that names no video");
+            drop_cookies_token(&state, &token);
+            write_ack_and_result(
+                handle,
+                ack_id.as_deref(),
+                serde_json::json!({
+                    "ok": false,
+                    "error": "this Facebook page does not name one video — open the video itself and try again"
+                }),
             );
             return;
         }
@@ -14473,6 +14551,32 @@ mod tests {
             "restart_pc"
         );
         assert_eq!(legacy_completion_of(&["show_complete".into()]), "");
+    }
+
+    #[test]
+    fn deleting_a_queue_via_settings_moves_its_entries_to_main() {
+        // The scheduler dialogs delete a queue by saving settings
+        // without it (save_base → set_settings): the entries that
+        // belonged to it must land on the Main queue — the promise
+        // the delete confirmation makes — never stay assigned to
+        // a queue that no longer exists (orphaned: invisible to
+        // every queue filter and never claimed by the pump).
+        let dir = std::env::temp_dir().join(format!("ndm-qdel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        *state.settings_file.lock().unwrap() = dir.join("settings.json");
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let mut e = restored_entry("night.bin", "http", 10, dir.join("night.bin"));
+        *e.queue.lock().unwrap() = "Night".to_string();
+        state.entries.lock().unwrap().insert("dl-q".to_string(), Arc::new(e));
+        state.order.lock().unwrap().push("dl-q".to_string());
+
+        // settings as the delete leaves them: Main only
+        set_settings(ctx, Settings::default()).unwrap();
+        let entry = state.get("dl-q").unwrap();
+        assert_eq!(entry_queue(&entry), "Main download queue");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

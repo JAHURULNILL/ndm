@@ -4762,11 +4762,15 @@ fn start_impl(
         return start_single_stream(url, out, probed, control, state_path, auth, in_flight);
     }
 
+    // the journal records an FTP target's redacted address
+    // (credentials never reach the .ndm.json), so the compare
+    // runs against the same redacted form (ftp::journal_url)
+    let journal = ftp::journal_url(url);
     let mut existing_state = std::fs::read(&state_path)
         .ok()
         .and_then(|raw| serde_json::from_slice::<State>(&raw).ok())
         .filter(|s| {
-            s.url == url
+            s.url == journal
                 && s.total == probed.total
                 && s.block_size > 0
                 && s.block_size <= 64 * 1024 * 1024
@@ -4948,7 +4952,7 @@ fn start_impl(
             s
         }
         None => State {
-            url: url.to_string(),
+            url: journal.clone(),
             total: probed.total,
             block_size,
             etag: probed.etag.clone(),

@@ -134,6 +134,17 @@ pub(crate) fn parse_target(url: &str, auth: &Auth) -> Result<FtpTarget, String> 
     if path.is_empty() {
         return Err("the FTP address does not name a file".to_string());
     }
+    // USER/PASS and the RETR path are written onto the control
+    // connection as command lines: a decoded CR or LF in any of
+    // them would break out of its own command and inject new
+    // ones (a crafted ftp:// URL with %0d%0a in the userinfo or
+    // path). No legitimate credential or path needs a line break.
+    if [user.as_str(), pass.as_str(), path.as_str()]
+        .iter()
+        .any(|s| s.contains('\r') || s.contains('\n'))
+    {
+        return Err("the FTP address contains a line break".to_string());
+    }
     let display = format!("ftp://{host}:{port}/{path}");
     Ok(FtpTarget {
         host,
@@ -143,6 +154,23 @@ pub(crate) fn parse_target(url: &str, auth: &Auth) -> Result<FtpTarget, String> 
         path,
         display,
     })
+}
+
+/// The URL as the resume journal may record it. Credentials
+/// travel in Auth and the entry record — never in the .ndm.json
+/// beside the partial file, where a raw URL's userinfo would
+/// leave the password in plaintext in the download folder.
+/// Redacting through parse_target keeps the journal form
+/// identical at write and at the resume filter's compare; a URL
+/// parse_target refuses cannot be downloaded anyway, so it
+/// passes through unchanged.
+pub(crate) fn journal_url(url: &str) -> String {
+    if is_ftp_url(url) {
+        if let Ok(t) = parse_target(url, &Auth::default()) {
+            return t.display;
+        }
+    }
+    url.to_string()
 }
 
 fn parse_hostport(s: &str) -> Option<(String, u16)> {
@@ -1188,7 +1216,7 @@ pub(crate) fn start_ftp_single_stream(
     let target = parse_target(url, auth)?;
     let shared = Arc::new(Shared {
         state: Mutex::new(State {
-            url: url.to_string(),
+            url: journal_url(url),
             total: probed.total,
             block_size: 1,
             etag: probed.etag.clone(),
@@ -1621,6 +1649,38 @@ mod tests {
         let anon = parse_target("ftp://127.0.0.1/f.bin", &Auth::default()).unwrap();
         assert_eq!(anon.user, "anonymous");
         assert_eq!(anon.port, 21);
+    }
+
+    #[test]
+    fn parse_target_rejects_crlf_injection() {
+        // %0d%0a in the password would inject a second command
+        // into the PASS line; in the path, into RETR.
+        assert!(parse_target(
+            "ftp://user:pa%0d%0aDELE%20x@127.0.0.1/f.bin",
+            &Auth::default()
+        )
+        .is_err());
+        assert!(parse_target(
+            "ftp://127.0.0.1/f%0aDELE%20other.bin",
+            &Auth::default()
+        )
+        .is_err());
+        assert!(parse_target(
+            "ftp://us%0der@127.0.0.1/f.bin",
+            &Auth::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn journal_url_never_carries_the_password() {
+        let j = journal_url("ftp://nill:s3cret@127.0.0.1:2121/dir/f.bin");
+        assert!(!j.contains("s3cret"), "journal url leaked the password: {j}");
+        assert!(!j.contains("nill"), "journal url leaked the user: {j}");
+        assert!(j.contains("127.0.0.1"), "journal url lost the host: {j}");
+        // non-FTP and credential-free URLs pass through untouched
+        assert_eq!(journal_url("https://example.com/f.bin"), "https://example.com/f.bin");
+        assert_eq!(journal_url("ftp://127.0.0.1/f.bin"), "ftp://127.0.0.1:21/f.bin");
     }
 
     #[test]

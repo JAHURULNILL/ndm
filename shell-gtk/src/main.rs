@@ -3638,7 +3638,62 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
     }
 }
 
+/// Single-instance guard, independent of GtkApplication's
+/// D-Bus forwarding: an exclusive flock on <data dir>/instance.lock
+/// held for the process's whole life (the returned File must stay
+/// alive — dropping it releases the lock). Returns None when
+/// another instance already holds it: that instance is asked to
+/// raise its window through the incoming queue (the show_app line
+/// its drain already honours) and this process exits before any
+/// state bootstrap, so two instances can never hold divergent
+/// copies of the journal and overwrite each other's entries
+/// (field bug I-2: a paused download vanished from the list —
+/// the second instance's view of the journal is the one
+/// mechanism that fits, and a second process was observed
+/// running alongside the first in the test rig). GtkApplication
+/// forwarding stays as the fast path where the session bus
+/// supports it; this guard is the floor that always holds.
+/// flock releases on process death, so a crash leaves no stale
+/// lock behind. Non-Unix and unexpected fs errors fail open —
+/// the Windows shell carries its own guard, and a broken lock
+/// file must never keep the app itself from starting.
+#[cfg(unix)]
+fn acquire_instance_guard(dir: &std::path::Path) -> Option<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    if std::fs::create_dir_all(dir).is_err() {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(dir.join("instance.lock"))
+        .ok()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Some(file);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        if let Ok(mut q) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("incoming.jsonl"))
+        {
+            use std::io::Write;
+            let _ = q.write_all(b"{\"kind\":\"show_app\"}\n");
+        }
+        std::process::exit(0);
+    }
+    Some(file)
+}
+
 fn main() {
+    // The single-instance floor runs before ANY state work:
+    // a second process must not sweep, restore or persist
+    // against the shared journal. The guard File lives in this
+    // binding until main returns — i.e. for the app's whole run.
+    #[cfg(unix)]
+    let _instance_guard = acquire_instance_guard(&app_data_dir());
     // The one channel between core threads and the GTK thread.
     #[allow(deprecated)]
     let (sender, receiver) = gtk::glib::MainContext::channel::<UiMessage>(
@@ -3678,6 +3733,23 @@ fn main() {
     let app = gtk::Application::builder()
         .application_id("tech.zahurul.ndm")
         .build();
+    // The native host cold-starts the app with --background
+    // (browser capture while NDM is closed). GApplication runs
+    // argv through GOption inside run() and exits on any option
+    // it does not know, so the flag must be registered here —
+    // without this, a cold-start spawn died with "Unknown option
+    // --background" before activate ever fired and the queued
+    // download sat untouched until the user opened the app by
+    // hand (field failure, 4 Nov 2026). build_ui still reads
+    // the flag from env::args; registration only admits it.
+    app.add_main_option(
+        "background",
+        gtk::glib::Char(0),
+        gtk::glib::OptionFlags::NONE,
+        gtk::glib::OptionArg::None,
+        "Start hidden; the browser capture queue is drained in the background",
+        None,
+    );
 
     let receiver = gtksink::ReceiverSlot::new(receiver);
     // GtkApplication is single-instance: launching NDM again
