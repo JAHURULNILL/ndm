@@ -5165,13 +5165,20 @@ fn start_impl(
                 let _ = file.sync_all();
                 save_state(&s, true, Some(&*file));
             }
-            // the LAST write this download will ever make has
-            // landed: removal paths waiting on is_settled may now
-            // sweep the state file without racing this thread (R4)
-            s.settled.store(true, Ordering::SeqCst);
-            // the path is free for a future download only now that
-            // this one has fully settled (finding #10)
+            // Release the path BEFORE publishing settled: the
+            // contract is_settled() waiters rely on (core's
+            // restart/removal gates) is "settled ⇒ this download
+            // will never write again AND its output path is
+            // free". The old order stored settled first, leaving
+            // a hairline where a waiter could start on the path
+            // and be rejected by this guard — invisible locally,
+            // hit by the B-4 rig test on a loaded CI runner
+            // (CI #75). The last write this download will ever
+            // make has landed above, so removal paths waiting on
+            // is_settled may still sweep the state file without
+            // racing this thread (R4).
             drop(in_flight);
+            s.settled.store(true, Ordering::SeqCst);
         });
     }
     // status tracker: keeps Paused/Downloading fresh while running
@@ -5617,10 +5624,11 @@ fn start_single_stream(
             }
         }
         // this path never writes a resume-state file, but the
-        // settled contract is uniform: the terminal status above
-        // is the last write, so removal paths may proceed (R4)
-        shared.settled.store(true, Ordering::SeqCst);
+        // settled contract is uniform: the guard drops FIRST,
+        // so settled ⇒ path released (see the supervisor's
+        // settle; CI #75), and removal paths may proceed (R4)
         drop(in_flight);
+        shared.settled.store(true, Ordering::SeqCst);
     });
     Ok(download)
 }
@@ -12457,6 +12465,22 @@ mod perf220_tests {
             wait_terminal(&dl, Duration::from_secs(30)),
             Some(Status::Cancelled)
         );
+        // phase 2 starts a fresh job on the SAME path, so this
+        // phase must clear the same gate production uses before
+        // a restart: is_settled (the sibling rig tests' loop),
+        // not mere terminal status — a status can publish while
+        // the supervisor is still saving the journal and holding
+        // the path guard (CI #75 caught exactly that here).
+        {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !dl.is_settled() {
+                assert!(
+                    Instant::now() < deadline,
+                    "the cancelled job never settled"
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
         // the journal ON DISK after settle carries the prefix
         let s: State =
             serde_json::from_slice(&std::fs::read(state_path_for(&out)).unwrap()).unwrap();

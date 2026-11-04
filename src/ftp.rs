@@ -1421,8 +1421,10 @@ pub(crate) fn start_ftp_single_stream(
                 set_status(&shared, Status::Error);
             }
         }
-        shared.settled.store(true, Ordering::SeqCst);
+        // guard first, settled second — settled ⇒ path
+        // released (the uniform contract; see lib.rs, CI #75)
         drop(in_flight);
+        shared.settled.store(true, Ordering::SeqCst);
     });
     Ok(download)
 }
