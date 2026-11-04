@@ -8367,6 +8367,28 @@ mod tests {
         tail_hold_below: u64,
         tail_hold: Duration,
     ) -> u16 {
+        het_range_server_impl(body, slow_bps, tail_hold_below, tail_hold, false)
+    }
+
+    /// Control-lane variant: EVERY response drips at `slow_bps`,
+    /// so no redistribution strategy can gain anything — the
+    /// finish is total bytes / (connections × slow_bps) whatever
+    /// the engine does. Tests use it as a same-process un-stolen
+    /// control: its wall time is dominated by the same scripted
+    /// sleeps that dominate the shape under test, so a ratio
+    /// against it survives the CI scheduling that breaks absolute
+    /// wall-clock thresholds.
+    fn het_range_server_slow_all(body: Vec<u8>, slow_bps: u64) -> u16 {
+        het_range_server_impl(body, slow_bps, 0, Duration::ZERO, true)
+    }
+
+    fn het_range_server_impl(
+        body: Vec<u8>,
+        slow_bps: u64,
+        tail_hold_below: u64,
+        tail_hold: Duration,
+        slow_all: bool,
+    ) -> u16 {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -8424,7 +8446,11 @@ mod tests {
                         )
                         .as_bytes(),
                     );
-                    let slow = rs == 0 && slice.len() > 1024 * 1024;
+                    let slow = if slow_all {
+                        true
+                    } else {
+                        rs == 0 && slice.len() > 1024 * 1024
+                    };
                     if tail_hold_below > 0 && rs > 0 && rs < tail_hold_below {
                         std::thread::sleep(tail_hold);
                     }
@@ -8806,7 +8832,45 @@ mod tests {
         // (kept share + first slice) far below a full claim while
         // every peer necessarily ends above one. The hold changes
         // only timing — bytes, ranges and counts are untouched.
+        // The finish-time verdict is a RATIO against a control
+        // run in this same process, not an absolute threshold:
+        // the old `elapsed < 6 s` compared a locally measured
+        // ~3 s against a fixed bound and flaked in CI at
+        // 6.02 s, where every thread (engine, server, poll
+        // loops) stretches together. The control downloads the
+        // same body through the same 4 workers from a server
+        // whose EVERY lane drips at the slow rate — redistribution
+        // conserves time there by construction, so its finish is
+        // the un-stolen shape (48 MiB / (4 × 1 MiB/s) ≈ 12 s)
+        // measured under the same machine load and dominated by
+        // the same scripted sleeps. A broken steal finishes the
+        // main run at ≈ the control (ratio ≈ 1) and fails; the
+        // working steal lands near 0.25. The structural share
+        // assertions below remain the primary proof; this ratio
+        // is the wall-clock guard.
         let body = pattern_body(48 * 1024 * 1024);
+        let ctl_port = het_range_server_slow_all(body.clone(), 1024 * 1024);
+        let ctl_url = format!("http://127.0.0.1:{ctl_port}/big.bin");
+        let ctl_out =
+            std::env::temp_dir().join(format!("ndm-steal-ctl-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&ctl_out);
+        let _ = std::fs::remove_file(state_path_for(&ctl_out));
+        let ct0 = Instant::now();
+        let ctl = start(&ctl_url, &ctl_out, 4, 1024 * 1024).unwrap();
+        let ctl_st = wait_terminal(&ctl, Duration::from_secs(120));
+        let ctl_elapsed = ct0.elapsed();
+        assert_eq!(ctl_st, Some(Status::Finished), "control status: {:?}", ctl.status());
+        assert_eq!(
+            std::fs::read(&ctl_out).unwrap(),
+            body,
+            "control content must be byte-identical"
+        );
+        assert!(
+            ctl_elapsed >= Duration::from_secs(8),
+            "control finished in {ctl_elapsed:?} — the all-slow lane did not drip at its scripted rate, so a ratio against it would be meaningless"
+        );
+        let _ = std::fs::remove_file(&ctl_out);
+        let _ = std::fs::remove_file(state_path_for(&ctl_out));
         let port = het_range_server_ex(
             body.clone(),
             1024 * 1024,
@@ -8852,8 +8916,8 @@ mod tests {
             p.conn_bytes
         );
         assert!(
-            elapsed < Duration::from_millis(6000),
-            "finish {elapsed:?} must beat the ~12 s un-stolen slow-lane time"
+            elapsed * 4 <= ctl_elapsed * 3,
+            "finish {elapsed:?} must beat 3/4 of the same-process all-slow control {ctl_elapsed:?} (the un-stolen shape)"
         );
         let _ = std::fs::remove_file(&out);
     }
@@ -8930,7 +8994,38 @@ mod tests {
         // byte-split, an idle worker takes the in-flight block's
         // tail at a byte offset while the owner finishes its head,
         // and the second block goes back to the pool whole.
+        // The finish verdict is a ratio against a same-process
+        // all-slow control (every lane at 256 KiB/s, where a byte
+        // split conserves time by construction: 8 MiB / (4 ×
+        // 256 KiB/s) ≈ 8 s) — not an absolute bound. See
+        // slow_run_tail_is_stolen_by_idle_workers for why fixed
+        // wall-clock thresholds flake under CI scheduling. The
+        // unaligned-share assertion below is the structural proof
+        // a byte split happened; this ratio is the time guard,
+        // and an un-split finish (≈ the control) fails it.
         let body = pattern_body(8 * 1024 * 1024);
+        let ctl_port = het_range_server_slow_all(body.clone(), 256 * 1024);
+        let ctl_url = format!("http://127.0.0.1:{ctl_port}/big.bin");
+        let ctl_out =
+            std::env::temp_dir().join(format!("ndm-tailsplit-ctl-{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&ctl_out);
+        let _ = std::fs::remove_file(state_path_for(&ctl_out));
+        let ct0 = Instant::now();
+        let ctl = start(&ctl_url, &ctl_out, 4, 1024 * 1024).unwrap();
+        let ctl_st = wait_terminal(&ctl, Duration::from_secs(120));
+        let ctl_elapsed = ct0.elapsed();
+        assert_eq!(ctl_st, Some(Status::Finished), "control status: {:?}", ctl.status());
+        assert_eq!(
+            std::fs::read(&ctl_out).unwrap(),
+            body,
+            "control content must be byte-identical"
+        );
+        assert!(
+            ctl_elapsed >= Duration::from_secs(5),
+            "control finished in {ctl_elapsed:?} — the all-slow lane did not drip at its scripted rate, so a ratio against it would be meaningless"
+        );
+        let _ = std::fs::remove_file(&ctl_out);
+        let _ = std::fs::remove_file(state_path_for(&ctl_out));
         let port = het_range_server(body.clone(), 256 * 1024);
         let url = format!("http://127.0.0.1:{port}/big.bin");
         let out = std::env::temp_dir().join(format!("ndm-tailsplit-{}.bin", std::process::id()));
@@ -8977,8 +9072,8 @@ mod tests {
             p.conn_bytes
         );
         assert!(
-            elapsed < Duration::from_secs(6),
-            "finish {elapsed:?} must beat the ~8 s un-split slow-lane time"
+            elapsed * 4 <= ctl_elapsed * 3,
+            "finish {elapsed:?} must beat 3/4 of the same-process all-slow control {ctl_elapsed:?} (the un-split shape)"
         );
         let _ = std::fs::remove_file(&out);
     }

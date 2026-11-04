@@ -6354,18 +6354,33 @@ mod tests {
         eprintln!("D2 RESULT job={job_secs:.2}s audio_last={audio_last:.2}s video_last={video_last:.2}s server_peak_video={peak} max_job_conns_after_audio={max_conns_after}");
         assert!(max_conns_after >= 7,
             "survivor never inherited the finished side's connections: job conns after audio finished peaked at {max_conns_after} (pair share is 6)");
+        // (the server-side concurrency sweep above stays a
+        // diagnostic only: its interval overlap also counts
+        // handlers still draining after a client-side close, so
+        // it can read above the pool size — the client-side count
+        // asserted above is the donation proof)
         // the wall-clock gain on this fixture is bounded by
         // block quantization, not by the fluid bound: the video
         // side's remaining work at donation is ~13 one-MiB blocks
         // locked in six 3-block claims, and a block is a ~4 s
         // quantum at the cap — redistributing whole blocks over
         // 8 workers still leaves a last wave that cannot start
-        // before the first wave lands. Measured: unhelped 12.40s,
-        // helped 12.0-12.1s. The assertion keeps a real margin
-        // under the unhelped figure without pretending the fluid
-        // bound (~10.3s) is reachable at this block size.
-        assert!(video_last < 12.3,
-            "video stream barely sped up from cross-stealing: last byte at {video_last:.2}s (unhelped shape measures ~12.4s on this fixture)");
+        // before the first wave lands. Measured locally: unhelped
+        // 12.40 s, helped 12.0–12.1 s — a few percent, inside any
+        // loaded CI machine's timing noise, so no tight absolute
+        // threshold can carry the claim (a < 12.3 s bound against
+        // the locally measured 12.4 s flaked in CI). The donation
+        // is therefore proven structurally above, and the guard
+        // that remains here is a gross-regression tripwire
+        // computed from the fixture's own constants: even the
+        // UNHELPED shape cannot take longer than the video bytes
+        // at 6 connections × the server's scripted per-connection
+        // rate (32 KiB per 125 ms); three times that fluid bound,
+        // counted from the audio finish, only trips if the pair
+        // machinery itself is broken.
+        let fluid_unhelped = vbody.len() as f64 / (6.0 * 262_144.0);
+        assert!(video_last < audio_last + 3.0 * fluid_unhelped,
+            "video stream finished at {video_last:.2}s — beyond 3x the unhelped fluid bound (audio {audio_last:.2}s + 3 x {fluid_unhelped:.1}s)");
         // the merged output exists and is a real file
         let merged = std::fs::read_dir(&dir).unwrap()
             .filter_map(|e| e.ok())
