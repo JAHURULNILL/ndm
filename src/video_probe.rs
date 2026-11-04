@@ -348,8 +348,53 @@ pub const THUMBNAIL_MAX_RAW_BYTES: usize = 384 * 1024;
 /// Fetch a thumbnail URL into a self-contained `data:image/...;base64,...` URI
 /// so that strict page CSPs, Facebook/Instagram CORP headers, or expiring signed
 /// URLs never break the preview image inside the browser overlay or desktop app.
+/// W3-14: is this thumbnail URL's host a public destination?
+/// The URL is page-controlled metadata: if its host is a literal
+/// IP in a loopback / link-local / private / otherwise
+/// non-public range, the fetch is refused (blind-SSRF guard).
+/// HostNAMES pass here — resolving a name and checking every
+/// answer (DNS-rebinding grade) is out of scope for this guard
+/// and is noted as such.
+fn thumbnail_host_is_public(url: &str) -> bool {
+    let rest = match url.split_once("://") {
+        Some((_, r)) => r,
+        None => return false,
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(h) = authority.strip_prefix('[') {
+        h.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return true; // a hostname, not a literal IP
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
+        }
+        std::net::IpAddr::V6(v6) => {
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00  // unique-local fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80) // link-local fe80::/10
+        }
+    }
+}
+
 fn fetch_thumbnail_data_uri(url: &str) -> Option<String> {
     if url.is_empty() || !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    if !thumbnail_host_is_public(url) {
         return None;
     }
     let agent = crate::apply_proxy_for(ureq::AgentBuilder::new(), url)
@@ -365,12 +410,13 @@ fn fetch_thumbnail_data_uri(url: &str) -> Option<String> {
     if crate::response_encoding(&resp).is_some() {
         return None;
     }
+    // W3-14: only a real image/* body may become a data URI —
+    // a non-image response is dropped, never relabelled jpeg
     let mime = resp
         .header("Content-Type")
         .and_then(|ct| ct.split(';').next())
         .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| s.starts_with("image/"))
-        .unwrap_or_else(|| "image/jpeg".to_string());
+        .filter(|s| s.starts_with("image/"))?;
     use std::io::Read as _;
     let mut buf = Vec::new();
     resp.into_reader()
@@ -1293,6 +1339,34 @@ mod tests {
         let p = std::env::temp_dir().join(format!("ndm-test-cookies-{name}-{}.txt", std::process::id()));
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn thumbnail_host_guard_refuses_non_public_ip_literals() {
+        // W3-14: literal non-public IPs are refused; public IPs
+        // and hostnames (resolution check out of scope) pass
+        for u in [
+            "http://127.0.0.1:8080/x.jpg",
+            "https://10.0.0.5/x.jpg",
+            "https://192.168.1.1/x.jpg",
+            "https://172.16.0.9/x.jpg",
+            "https://169.254.1.1/x.jpg",
+            "https://100.64.0.1/x.jpg",
+            "https://[::1]/x.jpg",
+            "https://[fe80::1]/x.jpg",
+            "https://[fd00::1]/x.jpg",
+            "https://user@127.0.0.1/x.jpg",
+        ] {
+            assert!(!thumbnail_host_is_public(u), "must refuse {u}");
+            assert_eq!(fetch_thumbnail_data_uri(u), None, "no fetch for {u}");
+        }
+        for u in [
+            "https://8.8.8.8/x.jpg",
+            "https://i.ytimg.com/vi/x/hq.jpg",
+            "http://thumbs.example.com:8080/x.jpg",
+        ] {
+            assert!(thumbnail_host_is_public(u), "must allow {u}");
+        }
     }
 
     #[test]

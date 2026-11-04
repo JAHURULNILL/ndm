@@ -182,10 +182,6 @@ pub fn user_closed(id: &str) -> bool {
 pub fn note_explicit_open(id: &str) {
     USER_CLOSED.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
 }
-/// The dialog whose payload currently feeds the (single) strip
-/// snapshot in winui::customdraw — set on apply/activation.
-static STRIP_OWNER: Mutex<String> = Mutex::new(String::new());
-
 fn h(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
 }
@@ -714,7 +710,11 @@ fn button_states(status: &str) -> (bool, bool, bool) {
         "starting" | "resuming" => (false, true, true),
         "queued" | "paused" => (true, false, true),
         "error" | "cancelled" => (true, false, false),
-        _ => (false, false, false), // merging, finished, anything else
+        // A finished download's Cancel acts as Close (it just
+        // dismisses the dialog) — enabled for parity with the GTK
+        // matrix (ea0ee58, audit-233).
+        "finished" => (false, false, true),
+        _ => (false, false, false), // merging, anything else
     }
 }
 
@@ -857,31 +857,27 @@ fn update_strip(d: &mut ProgDlg, view: &ProgressView) {
         return;
     }
     d.strip_sig = sig;
-    // The strip snapshot is shared: only the strip's owner (the
-    // active dialog) publishes, so two open dialogs never fight
-    // over the painter's data. A non-owner's inputs stay recorded
-    // in its strip_sig and are published when it is activated.
-    let is_owner = {
-        let owner = STRIP_OWNER.lock().unwrap_or_else(|e| e.into_inner());
-        *owner == d.id
-    };
-    if is_owner {
-        publish_strip(d);
-    }
+    publish_strip(d);
 }
 
-/// Publish this dialog's recorded strip inputs to the shared
-/// painter snapshot and repaint its strip.
+/// Publish this dialog's recorded strip inputs to the painter
+/// under its OWN strip control and repaint it. (The snapshot
+/// used to be one shared slot owned by the "active" dialog, so
+/// every other open dialog painted that download's block map —
+/// audit-233.)
 fn publish_strip(d: &ProgDlg) {
     let (blocks, partial, block, state, finished, total) = &d.strip_sig;
-    crate::winui::customdraw::set_strip_data(crate::winui::customdraw::StripData {
-        blocks: blocks.clone(),
-        conns_partial: partial.clone(),
-        conns_block: block.clone(),
-        conns_state: state.clone(),
-        total: *total,
-        finished: *finished,
-    });
+    crate::winui::customdraw::set_strip_data(
+        d.strip,
+        crate::winui::customdraw::StripData {
+            blocks: blocks.clone(),
+            conns_partial: partial.clone(),
+            conns_block: block.clone(),
+            conns_state: state.clone(),
+            total: *total,
+            finished: *finished,
+        },
+    );
     unsafe {
         let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(h(d.strip)), None, true);
     }
@@ -1274,26 +1270,13 @@ unsafe extern "system" fn prog_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
                 let mut wins = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
                 wins.insert(id.clone(), raw(hwnd));
             }
-            {
-                let mut owner = STRIP_OWNER.lock().unwrap_or_else(|e| e.into_inner());
-                if owner.is_empty() {
-                    *owner = id.clone();
-                }
-            }
             // Page 1 is the opening tab; pages 2/3 start hidden.
             with_dlg(hwnd, |d| refresh_visibility(d));
             apply(hwnd, &view);
-            // If this dialog is the strip owner and its first
-            // payload matched the empty signature, the shared
-            // snapshot could still hold a closed dialog's map —
-            // publish unconditionally once at open.
-            let is_owner = {
-                let owner = STRIP_OWNER.lock().unwrap_or_else(|e| e.into_inner());
-                *owner == id
-            };
-            if is_owner {
-                with_dlg(hwnd, |d| publish_strip(d));
-            }
+            // Publish unconditionally once at open, so the strip
+            // never paints a stale snapshot from an earlier
+            // signature match.
+            with_dlg(hwnd, |d| publish_strip(d));
             LRESULT(0)
         }
         WM_PD_PROGRESS => {
@@ -1320,23 +1303,16 @@ unsafe extern "system" fn prog_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
         WM_DRAWITEM => {
             let dis = l.0 as *const DRAWITEMSTRUCT;
             if !dis.is_null() && (*dis).CtlID == ID_STRIP as u32 {
-                // SS_OWNERDRAW: paint the strip snapshot into the
-                // item rect on the item DC (the platform pairing).
-                crate::winui::customdraw::paint_segment_strip((*dis).hDC, &(*dis).rcItem);
+                // SS_OWNERDRAW: paint this strip's own snapshot
+                // into the item rect on the item DC.
+                crate::winui::customdraw::paint_segment_strip(
+                    (*dis).hDC,
+                    &(*dis).rcItem,
+                    (*dis).hwndItem.0 as isize,
+                );
                 return LRESULT(1);
             }
             DefWindowProcW(hwnd, msg, w, l)
-        }
-        WM_ACTIVATE => {
-            // Becoming the active dialog makes this dialog the
-            // strip owner: republish its recorded strip inputs.
-            if (w.0 & 0xffff) != 0 {
-                if let Some(id) = id_of(hwnd) {
-                    *STRIP_OWNER.lock().unwrap_or_else(|e| e.into_inner()) = id;
-                    with_dlg(hwnd, |d| publish_strip(d));
-                }
-            }
-            LRESULT(0)
         }
         WM_CLOSE => {
             // Closing never stops the download (only the Cancel
@@ -1346,16 +1322,15 @@ unsafe extern "system" fn prog_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARA
         }
         WM_DESTROY => {
             if let Some(id) = id_of(hwnd) {
+                with_dlg(hwnd, |d| {
+                    crate::winui::customdraw::clear_strip_data(d.strip);
+                });
                 DLGS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 WINDOWS.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                 USER_CLOSED
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(id.clone());
-                let mut owner = STRIP_OWNER.lock().unwrap_or_else(|e| e.into_inner());
-                if *owner == id {
-                    owner.clear();
-                }
             }
             let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
             if p != 0 {

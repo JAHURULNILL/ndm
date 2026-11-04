@@ -42,7 +42,23 @@ struct VideoDlg {
     ready: Cell<bool>,
     waiting: Cell<bool>,
     cookies: RefCell<Option<String>>,
+    /// The page the cookie token was captured for. The token may
+    /// ride a probe/add ONLY for that exact page — it used to
+    /// ride whatever URL sat in the box (audit-233: a captured
+    /// facebook.com session sent to an arbitrary probe URL).
+    cookies_url: RefCell<String>,
     token_consumed: Cell<bool>,
+}
+
+/// The captured-session token, when the URL it would ride with
+/// is the page it was captured on; otherwise None.
+fn session_cookies(d: &VideoDlg, current_url: &str) -> Option<String> {
+    let tok = d.cookies.borrow().clone()?;
+    if !tok.is_empty() && d.cookies_url.borrow().as_str() == current_url {
+        Some(tok)
+    } else {
+        None
+    }
 }
 
 /// app.js routedDirFor: the category's own folder, else default.
@@ -99,6 +115,21 @@ pub fn show(ui: Rc<Ui>, url: Option<String>, cookies: Option<String>) {
     if let Some(d) = DLG.with(|d| d.borrow().clone()) {
         d.window.present();
         if let Some(u) = &url {
+            // Reopening for another entry REPLACES the captured
+            // session: the old code kept entry A's token, so A's
+            // session rode B's probe and B's fresh token was
+            // ignored entirely (audit-233). An unconsumed replaced
+            // token is discarded, not left behind in core.
+            if !d.token_consumed.get() {
+                if let Some(old) = d.cookies.borrow().clone() {
+                    if !old.is_empty() && Some(&old) != cookies.as_ref() {
+                        sink::discard_cookies(d.ctx.clone(), old);
+                    }
+                }
+            }
+            *d.cookies.borrow_mut() = cookies;
+            *d.cookies_url.borrow_mut() = u.clone();
+            d.token_consumed.set(false);
             d.url.set_text(u);
             start_fetch(&d);
         }
@@ -200,6 +231,7 @@ pub fn show(ui: Rc<Ui>, url: Option<String>, cookies: Option<String>) {
         ready: Cell::new(ready),
         waiting: Cell::new(false),
         cookies: RefCell::new(cookies),
+        cookies_url: RefCell::new(url.clone().unwrap_or_default()),
         token_consumed: Cell::new(false),
     });
     DLG.with(|d| *d.borrow_mut() = Some(dlg.clone()));
@@ -325,10 +357,7 @@ fn start_fetch(d: &Rc<VideoDlg>) {
         gtk::glib::Priority::DEFAULT,
     );
     let ctx = d.ctx.clone();
-    let cookies = d.cookies.borrow().clone().filter(|_| {
-        // the captured session only rides with its own page
-        true
-    });
+    let cookies = session_cookies(d, &url);
     std::thread::spawn(move || {
         let r = sink::rt::block_on(sink::probe_video(ctx, url, cookies))
             .map(|info| sink::to_json(&info));
@@ -540,7 +569,7 @@ fn add_args(d: &Rc<VideoDlg>, opt: &serde_json::Value, later: bool) -> VideoAddA
         selector: js(opt, "selector"),
         audio: jb(opt, "audio", false),
         title,
-        cookies: d.cookies.borrow().clone(),
+        cookies: session_cookies(d, d.url.text().trim()),
         later,
         size_bytes: ju(opt, "size_bytes"),
         duration: ju(&info, "duration") as f64,
@@ -610,7 +639,14 @@ fn spawn_video_add(d: &Rc<VideoDlg>, args: Rc<VideoAddArgs>, force: bool, may_co
                 ) {
                     spawn_video_add(&d2, args.clone(), true, false);
                 } else {
-                    settle_video_add(&d2, Ok(String::new())); // user kept the existing entry
+                    // User kept the existing entry: close WITHOUT
+                    // settle's "Video added" — nothing was added,
+                    // and an empty/wrong notice in its place was
+                    // an audit-233 minor.
+                    let ui = d2.ui.clone();
+                    close(&d2);
+                    refresh_list(&ui);
+                    set_notice(&ui, "Kept the existing download");
                 }
             }
             other => settle_video_add(&d2, other),

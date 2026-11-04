@@ -14,14 +14,15 @@
 //! compiler step in CI) while using the same standard controls a
 //! template would instantiate.
 
-use super::{instance, pcw, send, wide, window_text};
+use super::{instance, pcw, send, wide};
 use std::sync::Mutex;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, LoadCursorW,
-    RegisterClassW, ShowWindow, TranslateMessage, BM_GETCHECK, BM_SETCHECK,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    IsDialogMessageW, LoadCursorW, RegisterClassW, ShowWindow, TranslateMessage, BM_GETCHECK,
+    BM_SETCHECK,
     BS_AUTOCHECKBOX, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CS_HREDRAW,
     CS_VREDRAW, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MSG, SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
     WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
@@ -128,17 +129,32 @@ impl DialogSpec {
         } else {
             // rows (a multiline row is taller) + button row +
             // title/caption allowance
-            self.fields.iter().map(|f| row_height(&f.kind)).sum::<i32>() + 96
+            self.fields.iter().map(|f| row_height(f, self.width)).sum::<i32>() + 96
         }
     }
 }
 
 /// Layout height of one field row.
-fn row_height(kind: &FieldKind) -> i32 {
-    match kind {
+fn row_height(field: &FieldSpec, width: i32) -> i32 {
+    match field.kind {
         FieldKind::Multiline => 118,
+        // A Label row is body text in a fixed-height STATIC: one
+        // hard-coded line silently CLIPS any body that wraps —
+        // the Delete confirmation's "the files on disk will be
+        // deleted too" line vanished exactly that way
+        // (audit-233). Size the row to the wrapped line count
+        // (conservative ~6px/char + word-wrap headroom; a little
+        // extra height is harmless, a clipped warning is not).
+        FieldKind::Label => label_lines(field.label, width - 40) * 16 + 14,
         _ => 30,
     }
+}
+
+fn label_lines(text: &str, text_width: i32) -> i32 {
+    let cpl = ((text_width / 6).max(20)) as usize;
+    let chars = text.chars().count();
+    let effective = chars + chars / 7;
+    (((effective + cpl - 1) / cpl) as i32).max(1)
 }
 
 #[derive(Clone, Debug)]
@@ -150,11 +166,17 @@ pub struct DialogOutcome {
 }
 
 // ----------------------------------------------------------------
-// Modal plumbing. Dialogs are shown one at a time from the UI
-// thread, so a single shared state slot is honest and sufficient.
+// Modal plumbing. A modal runs its own message loop, and messages
+// for OTHER windows still dispatch inside it — a background event
+// (a download completing) can therefore open a second modal while
+// the first is up. A single shared state slot would be clobbered
+// by the inner dialog, orphaning the outer one mid-loop
+// (audit-233, suspected → proven by construction). The state is
+// a STACK keyed by dialog hwnd; every operation names its dialog.
 // HWNDs are stored as isize so the state is Send.
 // ----------------------------------------------------------------
 struct DialogState {
+    hwnd: isize,
     fields: Vec<(FieldKind, isize, Vec<String>)>, // kind, hwnd, combo options
     accepted: bool,
     extra: bool,
@@ -162,7 +184,7 @@ struct DialogState {
     outcome: Option<DialogOutcome>,
 }
 
-static DIALOG_STATE: Mutex<Option<DialogState>> = Mutex::new(None);
+static DIALOG_STATE: Mutex<Vec<DialogState>> = Mutex::new(Vec::new());
 
 fn hwnd_of(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
@@ -184,9 +206,9 @@ unsafe fn full_window_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 
-unsafe fn collect_values() -> Vec<FieldValue> {
+unsafe fn collect_values(dialog: HWND) -> Vec<FieldValue> {
     let guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(state) = guard.as_ref() else { return Vec::new() };
+    let Some(state) = guard.iter().find(|s| s.hwnd == dialog.0 as isize) else { return Vec::new() };
     state
         .fields
         .iter()
@@ -194,7 +216,7 @@ unsafe fn collect_values() -> Vec<FieldValue> {
             let hwnd = hwnd_of(*raw);
             match kind {
                 FieldKind::Label => FieldValue::Label,
-                FieldKind::Edit => FieldValue::Text(window_text(hwnd)),
+                FieldKind::Edit => FieldValue::Text(full_window_text(hwnd)),
                 FieldKind::Multiline => FieldValue::Text(full_window_text(hwnd)),
                 FieldKind::Combo => {
                     let idx = send(hwnd, CB_GETCURSEL, WPARAM(0), LPARAM(0));
@@ -212,10 +234,10 @@ unsafe fn collect_values() -> Vec<FieldValue> {
 }
 
 unsafe fn finish_dialog(hwnd: HWND, accepted: bool, extra: bool) {
-    let values = collect_values();
+    let values = collect_values(hwnd);
     {
         let mut guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(state) = guard.as_mut() {
+        if let Some(state) = guard.iter_mut().find(|s| s.hwnd == hwnd.0 as isize) {
             state.accepted = accepted;
             state.extra = extra;
             state.finished = true;
@@ -345,11 +367,12 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
         for (i, field) in spec.fields.iter().enumerate() {
             let id = FIELD_ID_BASE + i as i32;
             let this_y = y;
-            y += row_height(&field.kind);
+            let row_h = row_height(field, spec.width);
+            y += row_h;
             let y = this_y;
             match field.kind {
                 FieldKind::Label => {
-                    let h = create_child(hwnd, "STATIC", field.label, WS_CHILD | WS_VISIBLE, margin, y + 3, spec.width - 2 * margin - 16, 20, id);
+                    let h = create_child(hwnd, "STATIC", field.label, WS_CHILD | WS_VISIBLE, margin, y + 3, spec.width - 2 * margin - 16, row_h - 10, id);
                     handles.push((field.kind.clone(), h.0 as isize, Vec::new()));
                 }
                 FieldKind::Edit => {
@@ -415,7 +438,8 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
 
         {
             let mut guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(DialogState {
+            guard.push(DialogState {
+                hwnd: hwnd.0 as isize,
                 fields: handles,
                 accepted: false,
                 extra: false,
@@ -431,7 +455,11 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
         loop {
             let done = {
                 let guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());
-                guard.as_ref().map(|s| s.finished).unwrap_or(false)
+                guard
+                    .iter()
+                    .find(|s| s.hwnd == hwnd.0 as isize)
+                    .map(|s| s.finished)
+                    .unwrap_or(true)
             };
             if done {
                 break;
@@ -442,14 +470,25 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
                 windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0);
                 break;
             }
+            // Dialog keyboard navigation (Tab order, mnemonics,
+            // arrow keys in groups) — without IsDialogMessageW
+            // the modal's controls were mouse-only (audit-233).
+            if IsDialogMessageW(hwnd, &msg).as_bool() {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
         let _ = EnableWindow(parent, true);
 
-        let mut guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        let state = guard.take();
-        match state.and_then(|s| s.outcome) {
+        let outcome = {
+            let mut guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.iter().position(|s| s.hwnd == hwnd.0 as isize) {
+                Some(pos) => guard.remove(pos).outcome,
+                None => None,
+            }
+        };
+        match outcome {
             Some(outcome) => outcome,
             None => DialogOutcome { accepted: false, extra: false, values: Vec::new() },
         }

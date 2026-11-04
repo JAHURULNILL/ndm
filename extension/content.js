@@ -46,7 +46,20 @@
   let flyCardEl = null;   // the video flyout card (inside modalEl while open)
   let flyPollTimer = null; // 1s progress poll for the flyout's progress view
   let anchor = null;      // the <video> the pill is attached to
-  let dismissed = false;  // user closed the pill on this page
+  /* C-COSMETIC-1: a pill dismissal is persisted per page/video
+     in sessionStorage, so it survives a reload of the SAME
+     page but does not hide the pill for a different video.
+     sessionStorage dies with the tab/session by design. */
+  function pillDismissKey() {
+    return 'ndm-pill-dismissed:' + canonicalVideoKey(location.href);
+  }
+  function pillDismissedStored() {
+    try { return sessionStorage.getItem(pillDismissKey()) === '1'; } catch (e) { return false; }
+  }
+  function storePillDismissed() {
+    try { sessionStorage.setItem(pillDismissKey(), '1'); } catch (e) {}
+  }
+  let dismissed = pillDismissedStored();  // user closed the pill on this page/video
   let modalOpen = false;  // whether the in-browser modal is currently open
   let activeProbeToken = 0;
   // The open modal's own dismiss logic. Every close path —
@@ -674,11 +687,16 @@
         // resolver gets its best-supported form instead of a
         // tracking-laden feed URL. Reels keep their own shape:
         // they are a separate extractor path.
-        const vm = u.pathname.match(/\/videos\/(\d+)/);
-        const vParam = u.searchParams.get('v');
-        const vid = (vm && vm[1]) || (vParam && /^\d+$/.test(vParam) ? vParam : '');
+        // W2-7: aligned to core/facebookVideoId exactly — a
+        // segment must be ALL digits (the old prefix regex
+        // rewrote /videos/12345extra/ to a DIFFERENT video,
+        // /videos/12345) and the watch param is read RAW
+        // (searchParams percent-decodes; core does not).
+        const vm = u.pathname.match(/\/videos\/(\d+)(?=\/|$)/);
+        const rawV = (u.search.match(/[?&]v=([^&]*)/) || [])[1] || '';
+        const vid = (vm && vm[1]) || (/^\d+$/.test(rawV) ? rawV : '');
         if (vid) return `https://www.facebook.com/videos/${vid}`;
-        const rm = u.pathname.match(/\/reel\/(\d+)/);
+        const rm = u.pathname.match(/\/reel\/(\d+)(?=\/|$)/);
         if (rm) return `https://www.facebook.com/reel/${rm[1]}`;
       }
       return u.href;
@@ -748,8 +766,34 @@
     return out;
   }
 
+  /* W2-2 helper: is this FB video id derivable from the
+     current page — its URL, or a permalink anchor in the DOM?
+     Bounded anchor scan (a feed carries many links; the ids
+     that matter are the posts', and 500 anchors is generous). */
+  function fbIdDerivableFromPage(videoId) {
+    if (!FBC || !videoId) return false;
+    if (FBC.facebookVideoId(location.href) === videoId) return true;
+    try {
+      const anchors = document.querySelectorAll('a[href]');
+      const n = Math.min(anchors.length, 500);
+      for (let i = 0; i < n; i++) {
+        if (FBC.facebookVideoId(anchors[i].href || '') === videoId) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || e.data.source !== 'ndm-page-hook') return;
+    // W2-3: cheap pathological-message caps at the top — a
+    // MAIN-world poster handing over a huge option list is
+    // dropped before any validation loop, cache write or
+    // picker render runs. Real hook messages carry a handful.
+    if (
+      e.data.info &&
+      Array.isArray(e.data.info.options) &&
+      e.data.info.options.length > 64
+    ) return;
     if (e.data.type === 'ndm-fb-info' && e.data.info) {
       // 2.3.2 (WS-B): Facebook page data, keyed by the video's
       // OWN id — the mirror of the YouTube branch below, with
@@ -761,11 +805,24 @@
       const videoId = String(info.videoId || '');
       if (!/^\d{5,}$/.test(videoId)) return;
       if (!Array.isArray(info.options) || !info.options.length) return;
+      // W2-2: bind the info to THIS page before it may enter
+      // the cache. A claimed id is trusted only when the
+      // picker explicitly requested it (fbInfoWantedId, set by
+      // the ndm-request-fb-info round-trip) or the id is
+      // derivable from the current page itself — the page URL
+      // or a permalink anchor in the DOM. A forged id for a
+      // video that is not on this page never enters the cache
+      // (the YouTube branch below binds to the URL id the
+      // same way).
+      if (videoId !== fbInfoWantedId && !fbIdDerivableFromPage(videoId)) return;
       const validOptions = [];
       const SAFE_SELECTOR_RE = /^[a-zA-Z0-9_\-*+/[\]=<>. ]+$/;
       for (const opt of info.options) {
         if (!opt || typeof opt !== 'object') continue;
-        if (typeof opt.selector !== 'string' || !SAFE_SELECTOR_RE.test(opt.selector)) continue;
+        if (typeof opt.selector !== 'string' || opt.selector.length > 256 || !SAFE_SELECTOR_RE.test(opt.selector)) continue;
+        if (typeof opt.label === 'string' && opt.label.length > 256) continue;
+        if (typeof opt.note === 'string' && opt.note.length > 256) continue;
+        if (typeof opt.size_text === 'string' && opt.size_text.length > 64) continue;
         if (typeof opt.ext !== 'string' || !/^[a-zA-Z0-9]{2,5}$/.test(opt.ext)) continue;
         // Page-data streams (item 14's door): keep them only if
         // they sanitize, and name their group — the picker send
@@ -821,7 +878,10 @@
       const SAFE_SELECTOR_RE = /^[a-zA-Z0-9_\-*+/[\]=<>. ]+$/;
       for (const opt of info.options) {
         if (!opt || typeof opt !== 'object') continue;
-        if (typeof opt.selector !== 'string' || !SAFE_SELECTOR_RE.test(opt.selector)) continue;
+        if (typeof opt.selector !== 'string' || opt.selector.length > 256 || !SAFE_SELECTOR_RE.test(opt.selector)) continue;
+        if (typeof opt.label === 'string' && opt.label.length > 256) continue;
+        if (typeof opt.note === 'string' && opt.note.length > 256) continue;
+        if (typeof opt.size_text === 'string' && opt.size_text.length > 64) continue;
         if (typeof opt.ext !== 'string' || !/^[a-zA-Z0-9]{2,5}$/.test(opt.ext)) continue;
         // Page-data streams (item 14): keep them only if they
         // sanitize, and name their group. An option without
@@ -838,6 +898,10 @@
       }
       if (!validOptions.length) return;
       info.options = validOptions;
+      // W2-3: per-field size caps on the info's own strings.
+      if (typeof info.title === 'string') info.title = info.title.slice(0, 512);
+      if (typeof info.uploader === 'string') info.uploader = info.uploader.slice(0, 256);
+      if (typeof info.thumbnail === 'string' && info.thumbnail.length > 2048) info.thumbnail = '';
 
       if (info.url) probeCacheSet(canonicalVideoKey(info.url), info, false);
       if (e.data.pageUrl) probeCacheSet(canonicalVideoKey(e.data.pageUrl), info, false);
@@ -895,10 +959,13 @@
         }
       }
       if (!streams.length) return;
-      const key = `${targetUrl}|${streams.length}|${streams[0].url}`;
+      // W2-4: the memo key covers the FULL set (every URL, in
+      // order) — a rotated later stream is a different set —
+      // and the memo is set only AFTER a successful store, so
+      // a failed store never latches and later clicks retry.
+      const key = `${targetUrl}|${streams.map(s => s.url).join('|')}`;
       if (pageStreamsStoredKey === key) return;
-      pageStreamsStoredKey = key;
-      await chrome.runtime.sendMessage({
+      const res = await chrome.runtime.sendMessage({
         action: 'ndm-capture-store',
         pageUrl: targetUrl,
         title: title || (info && info.title) || '',
@@ -908,6 +975,7 @@
         // cookies under a foreign UA (audit-232 S3)
         userAgent: navigator.userAgent || '',
       });
+      if (res && res.ok) pageStreamsStoredKey = key;
     } catch (e) {}
   }
 
@@ -1048,6 +1116,15 @@
       modalEl = null;
     }
     place();
+  }
+
+  /* C-MINOR-1: the host-not-registered shape, shared by the
+     cards' degraded states — when the bridge/app is absent a
+     card must say so plainly (the popup's "NDM is not
+     reachable" honesty), never present fallback data as if
+     it were probed data. */
+  function isHostMissingErrorText(raw) {
+    return /not registered|native host is not|no such native/i.test(String(raw || ''));
   }
 
   /* Map a raw probe/engine error to plain language for the
@@ -1284,6 +1361,7 @@
     const durBadge = dialog.querySelector('.ndm-m-dur');
     const uploaderEl = dialog.querySelector('.ndm-vp-uploader');
     const qListEl = dialog.querySelector('.ndm-m-qlist');
+    const qHeadEl = dialog.querySelector('.ndm-m-qhead');
     const statusEl = dialog.querySelector('.ndm-vp-status');
     const btnClose = dialog.querySelector('.ndm-m-x');
     const btnCancel = dialog.querySelector('.ndm-vp-cancel');
@@ -1564,6 +1642,31 @@
         canonicalVideoKey(targetUrl) === canonicalVideoKey(location.href)
       ) {
         showNoMedia();
+        return;
+      }
+      // C-MINOR-1: with the host not registered there is no
+      // probe data at all — the card must not present the page
+      // title as a file name, nor an empty File Size column
+      // over invented automatic rows, as if data were coming.
+      // The honest degraded state: no rows, no size column,
+      // Download disabled, and the plain state labelled. A
+      // direct media file's own URL name is real data, so
+      // that (stem only) may stand as the name; anything else
+      // leaves the field empty.
+      if (isHostMissingErrorText(errText)) {
+        qListEl.innerHTML = '<div class="ndm-vp-empty">NDM is not reachable.</div>';
+        if (qHeadEl) qHeadEl.style.display = 'none';
+        let stem = '';
+        try {
+          const tail = decodeURIComponent(new URL(targetUrl).pathname.split('/').pop() || '');
+          if (/\.(mp4|webm|mov|mkv|m4v|mp3|m4a|aac|flac|wav|ogg|opus)$/i.test(tail)) {
+            stem = tail.replace(/\.[^.]+$/, '');
+          }
+        } catch (e) {}
+        titleIn.value = stem;
+        titleIn.placeholder = stem ? 'Video title' : 'NDM is not reachable';
+        btnStart.disabled = true;
+        setStatus('NDM is not reachable — open the NDM desktop app, then try again.', true);
         return;
       }
       renderQualities([]);
@@ -3725,6 +3828,19 @@
         showNoMedia();
         return;
       }
+      // C-MINOR-1: host not registered — no probe data exists,
+      // so no rows built from the page title and no empty size
+      // figures: the plain not-reachable state only.
+      if (isHostMissingErrorText(errText)) {
+        qualities = [];
+        probeSettled = true;
+        wantAll = false;
+        btnAll.style.display = 'none';
+        bodyEl.innerHTML = `
+          <div class="ndm-fly-note">NDM is not reachable — open the NDM desktop app, then try again.</div>
+        `;
+        return;
+      }
       qualities = [];
       // The automatic choices stay available (as before), the
       // error is a note above them, and the app fallback link —
@@ -4209,6 +4325,15 @@
         resumeEl.textContent = res.resumable !== false
           ? 'Resumable'
           : 'Single-stream download';
+      } else if (res && isHostMissingErrorText(res.error)) {
+        // C-MINOR-1: no bridge means no size was ever read —
+        // say so plainly instead of "Ready to download" over
+        // an empty size field.
+        resumeEl.textContent = '—';
+        if (currentBytes <= 0) sizeEl.textContent = 'Size unavailable — NDM is not reachable';
+        statusEl.style.display = 'block';
+        statusEl.className = 'ndm-m-status err';
+        statusEl.textContent = 'NDM is not reachable — open the NDM desktop app, then try again.';
       } else {
         resumeEl.textContent = '—';
         if (currentBytes <= 0) sizeEl.textContent = 'Ready to download';
@@ -5138,6 +5263,7 @@
     close.addEventListener('click', e => {
       e.stopPropagation();
       dismissed = true;
+      storePillDismissed();
       removePanel();
     });
 
@@ -5598,7 +5724,11 @@
   setInterval(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
-      dismissed = false;
+      // A different video/page has its own dismissal state:
+      // re-read it instead of unconditionally reviving the
+      // pill (C-COSMETIC-1) — a page the user dismissed stays
+      // dismissed when SPA navigation returns to it.
+      dismissed = pillDismissedStored();
       dismissActiveModal();
       // SPA navigation: tell the background to drop this tab's
       // sniffed streams — they belong to the video just left, and

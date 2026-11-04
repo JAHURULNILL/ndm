@@ -105,6 +105,12 @@ fn main() {
                     eprintln!("invalid -c value");
                     std::process::exit(2);
                 });
+                // W3-15: 0 connections is a usage error, not a
+                // silent clamp to 1 inside the engine
+                if max_conn == 0 {
+                    eprintln!("invalid -c value: connections must be at least 1");
+                    std::process::exit(2);
+                }
                 i += 2;
             }
             "--block-mib" => {
@@ -114,6 +120,12 @@ fn main() {
                         eprintln!("invalid --block-mib value");
                         std::process::exit(2);
                     });
+                // W3-15: a 0 MiB block is a usage error here, not
+                // a late download failure after probe + update check
+                if mib == 0 {
+                    eprintln!("invalid --block-mib value: block size must be at least 1 MiB");
+                    std::process::exit(2);
+                }
                 block_size = mib.checked_shl(20).unwrap_or_else(|| {
                     eprintln!("--block-mib value too large");
                     std::process::exit(2);

@@ -282,8 +282,12 @@ fn render_files() {
 /// Save the working queue list (create/delete paths save at
 /// once, exactly like app.js's schedNew / schedDelete).
 fn persist_queues(d: &SchedDlg) -> Result<(), String> {
+    persist_queue_list(&d.queues)
+}
+
+fn persist_queue_list(queues: &[serde_json::Value]) -> Result<(), String> {
     let mut out = crate::settings_value();
-    out["queues"] = serde_json::Value::Array(d.queues.clone());
+    out["queues"] = serde_json::Value::Array(queues.to_vec());
     crate::save_settings_value(out)
 }
 
@@ -512,12 +516,28 @@ fn save(hwnd: HWND) {
     // 1) the edited queue's fields into the working list, then the
     // whole settings object through core (sanitize mirrors the
     // legacy global scheduler fields from Main itself)
-    let (sel, staged) = {
-        let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(d) = guard.as_mut() else { return };
+    let (sel, staged, new_queues) = {
+        let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = guard.as_ref() else { return };
         let max: u64 = unsafe { window_text(h(d.max)) }.trim().parse().unwrap_or(0);
         let start_s = unsafe { window_text(h(d.start)) }.trim().to_string();
         let stop_s = unsafe { window_text(h(d.stop)) }.trim().to_string();
+        let one_time_s = unsafe { window_text(h(d.one_time)) }.trim().to_string();
+        // F4 parity with shell-gtk (audit-233): an invalid time
+        // or date must refuse the save in words — core's
+        // sanitizer used to replace "99:99" with a default
+        // silently, destroying the value the user had typed.
+        let hhmm_ok = |s: &str| {
+            s.is_empty() || !ndm_core::normalize_hhmm(s, String::new()).is_empty()
+        };
+        if !hhmm_ok(&start_s) || !hhmm_ok(&stop_s) {
+            set_status(d, "That start/stop time could not be read (use HH:MM, e.g. 21:30) — nothing was saved.");
+            return;
+        }
+        if !one_time_s.is_empty() && !ndm_core::valid_ymd(&one_time_s) {
+            set_status(d, "That one-time date could not be read (use YYYY-MM-DD) — nothing was saved.");
+            return;
+        }
         let power_s = {
             let idx = unsafe { send(h(d.power), 0x0147, WPARAM(0), LPARAM(0)) };
             POWER.get(idx.max(0) as usize).map(|(v, _)| *v).unwrap_or("").to_string()
@@ -528,25 +548,37 @@ fn save(hwnd: HWND) {
             "start": start_s,
             "stop": stop_s,
             "days": d.days.iter().map(|day| dlg::is_checked(h(*day))).collect::<Vec<_>>(),
-            "one_time": unsafe { window_text(h(d.one_time)) }.trim().to_string(),
+            "one_time": one_time_s,
             "sync": dlg::is_checked(h(d.sync)),
             "exit_when_done": dlg::is_checked(h(d.exit)),
             "power_when_done": power_s,
             "max_simultaneous": max.min(10),
         });
-        for q in d.queues.iter_mut() {
+        // Clone-mutate-swap (audit-233): the dialog's working
+        // list is only replaced AFTER the save succeeds — a
+        // failed persist used to leave the edited queue in
+        // d.queues while core kept the old one, and a later
+        // create/delete save would silently persist the edit
+        // the user was told had failed.
+        let mut new_queues = d.queues.clone();
+        for q in new_queues.iter_mut() {
             if js(q, "name") == d.sel {
                 *q = edited.clone();
             }
         }
-        (d.sel.clone(), d.staged_order.clone())
+        (d.sel.clone(), d.staged_order.clone(), new_queues)
     };
-    {
+    if let Err(e) = persist_queue_list(&new_queues) {
         let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(d) = guard.as_ref() else { return };
-        if let Err(e) = persist_queues(d) {
+        if let Some(d) = guard.as_ref() {
             set_status(d, &format!("Could not save the scheduler: {e}"));
-            return;
+        }
+        return;
+    }
+    {
+        let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(d) = guard.as_mut() {
+            d.queues = new_queues;
         }
     }
     // 2) the staged file order, via move_in_queue walks (app.js's

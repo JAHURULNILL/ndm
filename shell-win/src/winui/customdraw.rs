@@ -93,19 +93,29 @@ pub struct StripData {
     pub finished: bool,
 }
 
-static STRIP_DATA: Mutex<StripData> = Mutex::new(StripData {
-    blocks: String::new(),
-    conns_partial: Vec::new(),
-    conns_block: Vec::new(),
-    conns_state: Vec::new(),
-    total: 0,
-    finished: false,
-});
+/// Strip snapshots keyed by the strip control's HWND value.
+/// One shared snapshot for all dialogs meant a non-active
+/// dialog painted the ACTIVE download's block map (audit-233:
+/// "strip shows wrong download's blocks"); each strip now
+/// paints only its own dialog's data.
+static STRIP_DATA: std::sync::LazyLock<Mutex<std::collections::HashMap<isize, StripData>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
-/// Replace the strip snapshot (called by the progress dialog only
-/// when its strip inputs changed — never per progress tick).
-pub fn set_strip_data(data: StripData) {
-    *STRIP_DATA.lock().unwrap_or_else(|e| e.into_inner()) = data;
+/// Replace one strip's snapshot (called by the progress dialog
+/// only when its strip inputs changed — never per progress tick).
+pub fn set_strip_data(key: isize, data: StripData) {
+    STRIP_DATA
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, data);
+}
+
+/// Drop a strip's snapshot when its dialog dies.
+pub fn clear_strip_data(key: isize) {
+    STRIP_DATA
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
 }
 
 /// The engine's block size (ndm::DEFAULT_BLOCK, 1 MiB): the
@@ -116,9 +126,15 @@ pub fn set_strip_data(data: StripData) {
 const ENGINE_BLOCK: u64 = 1 << 20;
 
 /// Paint the segment strip into `rc` (the strip control's client
-/// rect). The bottom 4 px are the start-tick row.
-pub unsafe fn paint_segment_strip(hdc: HDC, rc: &RECT) {
-    let data = STRIP_DATA.lock().unwrap_or_else(|e| e.into_inner()).clone();
+/// rect). The bottom 4 px are the start-tick row. `key` is the
+/// strip control's HWND value — its own dialog's snapshot only.
+pub unsafe fn paint_segment_strip(hdc: HDC, rc: &RECT, key: isize) {
+    let data = STRIP_DATA
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+        .unwrap_or_default();
     let width = rc.right - rc.left;
     let cell_bottom = rc.bottom - 4;
     if width <= 0 || cell_bottom <= rc.top {

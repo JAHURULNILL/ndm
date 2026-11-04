@@ -14,6 +14,7 @@ const assert = require('node:assert');
 const {
   classifyFacebook, parseDashManifest, classifyPerformanceEntry,
   facebookVideoId, fallbackTargetFor, streamGroupKey, offerableGroups,
+  findVideoObjects,
 } = require('../extension/fb-classify');
 const F = require('./fb-fixture');
 
@@ -169,6 +170,61 @@ test('grouping: a Facebook permalink page keys its streams by the page id (fixtu
   const page = 'https://www.facebook.com/SomePage/videos/1234567890123456/';
   const s = 'https://video.fdhk.example.fbcdn.net/v/t42.1790-2/tokenless_modelled.mp4?_nc_cat=100';
   assert.equal(streamGroupKey(page, s), 'fb:1234567890123456');
+});
+
+test('W2-1: an unknown page never keys an FB CDN stream as page', () => {
+  const s = 'https://video.fdhk.example.fbcdn.net/v/t42.1790-2/111111111111111_720p_a.mp4?_nc_cat=100';
+  const tokenless = 'https://video.fdhk.example.fbcdn.net/v/t42.1790-2/tokenless_modelled.mp4?_nc_cat=100';
+  // SW-restart shape: page URL unknown/empty — the key is
+  // UNKNOWN ('') even when the file name carries a token:
+  // the recorder must not vouch for a video it cannot tie to
+  // any known page, so the capture is not offered at all.
+  assert.equal(streamGroupKey('', s), '');
+  assert.equal(streamGroupKey('', tokenless), '', 'tokenless FB stream on an unknown page stays unkeyed');
+  // the audit harness case: never 'page' for an FB CDN stream
+  assert.notEqual(streamGroupKey('', s), 'page');
+  assert.notEqual(streamGroupKey('', tokenless), 'page');
+  // unknown page + non-FB stream keeps the standing page key
+  assert.equal(streamGroupKey('', 'https://cdn.example.com/movie.mp4'), 'page');
+});
+
+test('W2-7: facebookVideoId matches core — all-digit segments, raw watch param', () => {
+  // digit PREFIX segments name nothing (core returns None)
+  assert.equal(facebookVideoId('https://www.facebook.com/videos/12345extra/'), '');
+  assert.equal(facebookVideoId('https://www.facebook.com/reel/9876xyz'), '');
+  // percent-encoded watch digits are not digits in the raw param
+  assert.equal(facebookVideoId('https://www.facebook.com/watch/?v=%31%32%33'), '');
+  // canonical shapes still agree with core
+  assert.equal(facebookVideoId('https://www.facebook.com/SomePage/videos/12345/'), '12345');
+  assert.equal(facebookVideoId('https://www.facebook.com/videos/12345'), '12345');
+  assert.equal(facebookVideoId('https://www.facebook.com/watch/?v=12345&x=1'), '12345');
+});
+
+test('W2-6: DASH BaseURLs get scheme validation — only https is emitted as a stream', () => {
+  const mpd = `<MPD><Period><AdaptationSet mimeType="video/mp4"><Representation id="v1" bandwidth="100" width="640" height="360" mimeType="video/mp4"><BaseURL>http://evil.example/steal.mp4</BaseURL></Representation><Representation id="v2" bandwidth="200" width="1280" height="720" mimeType="video/mp4"><BaseURL>https://video.x.fbcdn.net/ok.mp4</BaseURL></Representation></AdaptationSet></Period></MPD>`;
+  const { videos } = parseDashManifest(mpd);
+  assert.equal(videos.find(v => v.id === 'v1').url, '');
+  assert.equal(videos.find(v => v.id === 'v2').url, 'https://video.x.fbcdn.net/ok.mp4');
+  const { options } = classifyFacebook({ dashManifest: mpd });
+  assert.ok(!options.some(o => o.streams.some(s => s.url.includes('evil.example'))));
+  assert.ok(options.some(o => o.streams.some(s => s.url.includes('ok.mp4'))));
+});
+
+test('W2-5: findVideoObjects survives a 10k-deep blob (no RangeError, partial results)', () => {
+  let deep = { playable_url: 'https://video.x.fbcdn.net/deep.mp4' };
+  for (let i = 0; i < 10000; i++) deep = { child: deep };
+  const out = [];
+  assert.doesNotThrow(() => findVideoObjects(deep, out, new Set()));
+  assert.doesNotThrow(() => classifyFacebook({ mainWorld: [deep] }));
+});
+
+test('W2-5: findVideoObjects bounds a 50k-wide walk and keeps what it found first', () => {
+  const wide = { first: { playable_url: 'https://video.x.fbcdn.net/wide.mp4' } };
+  for (let i = 0; i < 50000; i++) wide['k' + i] = { n: i };
+  const out = [];
+  assert.doesNotThrow(() => findVideoObjects(wide, out, new Set()));
+  assert.equal(out.length, 1);
+  assert.equal(out[0].playable_url, 'https://video.x.fbcdn.net/wide.mp4');
 });
 
 test('grouping: off Facebook the standing page key is unchanged', () => {

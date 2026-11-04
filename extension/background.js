@@ -132,6 +132,26 @@ const tabMediaStreams = new Map();
    was seen on, so one tab's registry can tell two videos apart
    (two players on one page, or SPA navigation between videos). */
 const tabPageUrls = new Map();
+/* W2-1: rehydrate tabPageUrls on service-worker startup. MV3
+   workers are killed after ~30 s idle and may restart with
+   tabs already open; without this, media requests from those
+   tabs arrive while the map is empty and their page is
+   UNKNOWN — FB CDN captures then stay unkeyed by design (see
+   streamGroupKey) instead of being grouped, and the DRM gate
+   sees an empty page. Seeding from chrome.tabs closes most of
+   that window; only fill tabs the map does not already know,
+   so a live navigation is never overwritten by a stale seed. */
+try {
+  const seedTabs = tabs => {
+    for (const t of tabs || []) {
+      if (t && t.id != null && t.url && !tabPageUrls.has(t.id)) {
+        tabPageUrls.set(t.id, t.url);
+      }
+    }
+  };
+  const q = chrome.tabs.query({}, seedTabs);
+  if (q && typeof q.catch === 'function') q.catch(() => {});
+} catch (e) {}
 const STREAM_TTL_MS = 15 * 60 * 1000;
 const STREAMS_PER_TAB = 12;
 
@@ -297,9 +317,17 @@ function capturedGroupKeyFor(pageUrl, streamUrl) {
   try {
     h = new URL(pageUrl || '').hostname.toLowerCase();
   } catch (e) {}
-  return h === 'facebook.com' || h.endsWith('.facebook.com') || h === 'fb.watch'
-    ? ''
-    : 'page';
+  if (h === 'facebook.com' || h.endsWith('.facebook.com') || h === 'fb.watch') return '';
+  // W2-1 mirror of the classifier rule: unknown page + an FB
+  // CDN stream is UNKNOWN, never the made-up 'page' identity.
+  if (!h) {
+    let sh = '';
+    try {
+      sh = new URL(streamUrl || '').hostname.toLowerCase();
+    } catch (e) {}
+    if (sh.endsWith('fbcdn.net') || sh.includes('videodelivery')) return '';
+  }
+  return 'page';
 }
 
 function recordCapturedStream(tabId, rawUrl, reqType) {
@@ -376,11 +404,22 @@ function recordCapturedStream(tabId, rawUrl, reqType) {
   for (const [k, v] of rec.streams) {
     if (Date.now() - v.ts > CAPTURE_TTL_MS) rec.streams.delete(k);
   }
+  // W2-11: set() on an existing URL must refresh its insertion
+  // order (delete+set) — a continuously re-requested live
+  // stream is the NEWEST entry, not the eviction candidate.
+  rec.streams.delete(stream.url);
   rec.streams.set(stream.url, stream);
   while (rec.streams.size > CAPTURE_PER_TAB) {
     rec.streams.delete(rec.streams.keys().next().value);
   }
+  // Same refresh at tab level, plus the tab-count cap its
+  // sibling tabMediaStreams already has (300): growth was
+  // bounded only by however many tabs stayed open.
+  tabCaptured.delete(tabId);
   tabCaptured.set(tabId, rec);
+  if (tabCaptured.size > 300) {
+    tabCaptured.delete(tabCaptured.keys().next().value);
+  }
 }
 
 /* The wire shape of one captured stream (no timestamps, no

@@ -394,9 +394,10 @@
     }
 
     /* Scan the page's serialised video objects, keyed by video
-       id. Bounded: at most 24 candidate blobs, 1.5 MB each —
-       a feed page carries many scripts and the scan runs on
-       picker requests, so it must stay cheap. */
+       id. Bounded: at most 24 candidate blobs, 1.5 MB each,
+       at most 300 script elements walked (W2-8) — a feed page
+       carries many scripts and the scan runs on picker
+       requests, so it must stay cheap. */
     function collectFbVideos() {
       const byId = new Map();
       const pageId = FBC.facebookVideoId(location.href);
@@ -412,10 +413,24 @@
         if (!byId.has(id)) byId.set(id, opts);
       };
       let scanned = 0;
+      let walked = 0;
       for (const s of document.querySelectorAll('script')) {
         if (scanned >= 24) break;
+        // W2-8: bound the WALK too, not just the parses — the
+        // old loop read every script's full textContent on
+        // every picker request. External scripts carry no
+        // inline blob, so they are skipped without reading
+        // their (empty) text at all, and the walk stops after
+        // a bounded number of elements regardless.
+        if (++walked > 300) break;
+        if (s.src) continue;
         const t = s.textContent || '';
         if (t.length < 40 || t.length > 1500000) continue;
+        // Only a whole-JSON script can JSON.parse below; a
+        // script whose first non-space character is not { or [
+        // is skipped fast instead of being scanned-and-failing.
+        const first = t.trimStart().charAt(0);
+        if (first !== '{' && first !== '[') continue;
         if (!t.includes('dash_manifest') && !t.includes('playable_url')) continue;
         scanned++;
         let parsed = null;
@@ -449,6 +464,10 @@
         // loaded after the first broadcast and missed it.
         if (!onlyId && fbSent.get(id) === sig) continue;
         fbSent.set(id, sig);
+        // W2-8: fbSent lives for the page's whole lifetime —
+        // cap it (oldest first) so an infinite-scroll feed
+        // session cannot grow it without bound.
+        while (fbSent.size > 300) fbSent.delete(fbSent.keys().next().value);
         window.postMessage(
           {
             source: 'ndm-page-hook',

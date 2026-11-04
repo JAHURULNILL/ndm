@@ -164,10 +164,25 @@ fn refill_combo(s: &Rc<Sched>) {
 }
 
 fn save_base(s: &Rc<Sched>) -> Result<(), String> {
+    // This dialog owns only the "queues" array. Merge it into
+    // the CURRENT settings rather than writing the dialog's
+    // whole-settings copy back: a long-open Scheduler otherwise
+    // silently reverted anything saved meanwhile (an Options
+    // save, a grabber last_run stamp) — audit-233 F2.
+    let mut fresh = settings_json(&s.ui);
+    let queues = s
+        .base
+        .borrow()
+        .get("queues")
+        .cloned()
+        .unwrap_or(serde_json::json!([]));
+    if let Some(obj) = fresh.as_object_mut() {
+        obj.insert("queues".into(), queues);
+    }
     let settings: sink::Settings =
-        serde_json::from_value(s.base.borrow().clone()).map_err(|e| e.to_string())?;
+        serde_json::from_value(fresh.clone()).map_err(|e| e.to_string())?;
     sink::set_settings(s.ui.ctx.clone(), settings)?;
-    *s.base.borrow_mut() = settings_json(&s.ui);
+    *s.base.borrow_mut() = fresh;
     Ok(())
 }
 
@@ -532,6 +547,42 @@ fn save(s: &Rc<Sched>) -> Result<(), String> {
     let sel = s.sel.borrow().clone();
     let start_t = s.start.text().trim().to_string();
     let stop_t = s.stop.text().trim().to_string();
+    // Validate BEFORE writing: core's sanitize used to silently
+    // substitute 22:00 / 06:00 / a weekly mask for an invalid
+    // time or date, so the user saved 21:30, typed "99:99", and
+    // reopened to a schedule they never chose (audit-233 F4).
+    // The dialog now refuses with the reason and saves nothing;
+    // a valid time is stored in core's zero-padded form.
+    const BAD: &str = "\u{1}bad";
+    let start_v = if start_t.is_empty() {
+        "22:00".to_string()
+    } else {
+        let n = ndm_core::normalize_hhmm(&start_t, BAD.to_string());
+        if n == BAD {
+            return Err(format!(
+                "Start time \"{start_t}\" is not a 24-hour time (like 21:30) — nothing was saved."
+            ));
+        }
+        n
+    };
+    let stop_v = if stop_t.is_empty() {
+        "06:00".to_string()
+    } else {
+        let n = ndm_core::normalize_hhmm(&stop_t, BAD.to_string());
+        if n == BAD {
+            return Err(format!(
+                "Stop time \"{stop_t}\" is not a 24-hour time (like 06:00) — nothing was saved."
+            ));
+        }
+        n
+    };
+    let one_time_t = s.one_time.text().trim().to_string();
+    if !one_time_t.is_empty() && !ndm_core::valid_ymd(&one_time_t) {
+        return Err(format!(
+            "One-time date \"{one_time_t}\" is not a real date (like 2026-12-31) — nothing was saved."
+        ));
+    }
+    s.max.update(); // commit typed spinbutton text (A-F1 class)
     {
         let mut base = s.base.borrow_mut();
         if let Some(qs) = base.get_mut("queues").and_then(|x| x.as_array_mut()) {
@@ -539,22 +590,13 @@ fn save(s: &Rc<Sched>) -> Result<(), String> {
                 if js(q, "name") == sel {
                     if let Some(o) = q.as_object_mut() {
                         o.insert("use_schedule".into(), serde_json::json!(s.enabled.is_active()));
-                        o.insert(
-                            "start".into(),
-                            serde_json::json!(if start_t.is_empty() { "22:00" } else { &start_t }),
-                        );
-                        o.insert(
-                            "stop".into(),
-                            serde_json::json!(if stop_t.is_empty() { "06:00" } else { &stop_t }),
-                        );
+                        o.insert("start".into(), serde_json::json!(start_v));
+                        o.insert("stop".into(), serde_json::json!(stop_v));
                         o.insert(
                             "days".into(),
                             serde_json::json!(s.days.iter().map(|d| d.is_active()).collect::<Vec<_>>()),
                         );
-                        o.insert(
-                            "one_time".into(),
-                            serde_json::json!(s.one_time.text().trim().to_string()),
-                        );
+                        o.insert("one_time".into(), serde_json::json!(one_time_t));
                         o.insert("sync".into(), serde_json::json!(s.sync.is_active()));
                         o.insert("exit_when_done".into(), serde_json::json!(s.exit_done.is_active()));
                         o.insert("power_when_done".into(), serde_json::json!(combo_text(&s.power)));

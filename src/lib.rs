@@ -620,6 +620,21 @@ struct State {
     #[serde(default)]
     last_modified: Option<String>,
     done: Vec<u8>,
+    /// B-4 (audit-233): per-block PARTIAL progress — for each
+    /// unsealed block, how many of its leading bytes are already
+    /// written in the output file at the block's offset. Partial
+    /// bytes are written at offset as they arrive (see
+    /// download_block_run's write_at), so the journal only needs
+    /// the counts to resume MID-BLOCK instead of re-fetching the
+    /// whole in-flight block (up to a full block per connection
+    /// per restart). Serde-default empty = every pre-B-4 journal:
+    /// old files load exactly as before, and old binaries ignore
+    /// the field. Values are never trusted raw: start_impl
+    /// normalizes (length, per-block cap, sealed ⇒ 0) and, when
+    /// no validator pair is usable, sample-verifies the prefixes
+    /// like sealed blocks.
+    #[serde(default)]
+    partial: Vec<u64>,
 }
 
 impl State {
@@ -629,6 +644,51 @@ impl State {
         // overflow this multiply — the guard below rejects those files,
         // but this function must stay safe for any State value
         full.saturating_mul(self.block_size).min(self.total)
+    }
+
+    /// bytes held by unsealed blocks' written prefixes, each
+    /// clamped to its block's real length — safe for any State
+    /// value, normalized or not
+    fn partial_bytes(&self) -> u64 {
+        let mut sum: u64 = 0;
+        for (i, &p) in self.partial.iter().enumerate() {
+            if self.done.get(i).copied().unwrap_or(0) != 0 || p == 0 {
+                continue;
+            }
+            let start = (i as u64).saturating_mul(self.block_size);
+            let len = ((i as u64 + 1)
+                .saturating_mul(self.block_size)
+                .min(self.total))
+            .saturating_sub(start);
+            sum = sum.saturating_add(p.min(len));
+        }
+        sum.min(self.total)
+    }
+
+    /// B-4: make `partial` safe to index and trust: exactly one
+    /// entry per block, no more than that block's length, and 0
+    /// for sealed blocks. Anything else in a journal is dropped
+    /// to 0 for the affected entries — the sealed map is never
+    /// discarded over partial bookkeeping.
+    fn normalize_partial(&mut self) {
+        let n = self.done.len();
+        if self.partial.len() != n {
+            self.partial.resize(n, 0);
+        }
+        for i in 0..n {
+            if self.done[i] != 0 {
+                self.partial[i] = 0;
+                continue;
+            }
+            let start = (i as u64).saturating_mul(self.block_size);
+            let len = ((i as u64 + 1)
+                .saturating_mul(self.block_size)
+                .min(self.total))
+            .saturating_sub(start);
+            if self.partial[i] > len {
+                self.partial[i] = 0;
+            }
+        }
     }
 }
 
@@ -1091,6 +1151,10 @@ fn seal_tail_block(shared: &Shared, block: usize) {
         let mut st = plock(&shared.state);
         if block < st.done.len() && st.done[block] == 0 {
             st.done[block] = 1;
+            // B-4: a sealed block carries no partial claim
+            if let Some(p) = st.partial.get_mut(block) {
+                *p = 0;
+            }
             shared.done_count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2880,6 +2944,10 @@ fn download_block_run(
                     let mut st = plock(&shared.state);
                     if st.done[*cur_block] == 0 {
                         st.done[*cur_block] = 1;
+                        // B-4: a sealed block carries no partial claim
+                        if let Some(p) = st.partial.get_mut(*cur_block) {
+                            *p = 0;
+                        }
                         shared.done_count.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -2893,6 +2961,21 @@ fn download_block_run(
                 }
             } else {
                 break;
+            }
+        }
+        // B-4: record the in-flight block's written prefix in
+        // the journal state — the bytes are already in the file
+        // at their offsets (write_at above), so this count is
+        // all a restart needs to resume mid-block. Updated per
+        // chunk alongside the sealed marks, so it rides the same
+        // save_state throttling below: a crash loses at most the
+        // same window the sealed marks already lose.
+        if *cur_block < b_end_excl {
+            let blk_start = (*cur_block as u64) * block_size;
+            let in_block = (*pos).saturating_sub(blk_start).min(block_size);
+            let mut st = plock(&shared.state);
+            if let Some(p) = st.partial.get_mut(*cur_block) {
+                *p = in_block;
             }
         }
         // persist completions continuously (save_state throttles
@@ -3452,7 +3535,7 @@ fn worker(
                     }
                 }
             }
-            let (b_first, b_last) = {
+            let (b_first, b_last, resume_off) = {
                 let st = plock(&shared.state);
                 while cursor < claim_end && st.done[cursor] == 1 {
                     cursor += 1;
@@ -3462,15 +3545,32 @@ fn worker(
                 }
                 let first = cursor;
                 while cursor < claim_end && st.done[cursor] == 0 {
+                    // B-4: a group may START on a block with a
+                    // journaled partial prefix (it resumes inside
+                    // it below), but a partial block in the
+                    // group's MIDDLE ends the group before it —
+                    // the run advances linearly and would
+                    // otherwise plough over that block's prefix
+                    // from its start, re-fetching it (harmless
+                    // bytes, wasted work) instead of resuming it
+                    // as its own group's head
+                    if cursor > first
+                        && st.partial.get(cursor).copied().unwrap_or(0) > 0
+                    {
+                        break;
+                    }
                     cursor += 1;
                 }
-                (first, cursor)
+                let resume_off = st.partial.get(first).copied().unwrap_or(0);
+                (first, cursor, resume_off)
             };
 
             let start = b_first as u64 * block_size;
             let end = ((b_last as u64) * block_size - 1).min(total - 1);
             let mut cur_block = b_first;
-            let mut cur_pos = start;
+            // B-4: resume inside the first block at its journaled
+            // prefix — those bytes are already in the file
+            let mut cur_pos = start + resume_off;
             let mut attempt = 0;
             shared.block_state[cur_block].store(2, Ordering::Relaxed);
             if let Some(b) = shared.conn_block.get(id) {
@@ -4687,6 +4787,13 @@ fn start_impl(
                 // (peek_state applies this same guard)
                 && out.metadata().map(|m| m.len()).unwrap_or(0) == s.total
         });
+    // B-4: partial prefixes are trusted exactly as far as they
+    // are normalized — right length, within their block, zero
+    // for sealed blocks. A hostile or torn journal loses only
+    // its partial claims, never its sealed map.
+    if let Some(s) = &mut existing_state {
+        s.normalize_partial();
+    }
 
     // A state whose validators cannot be compared (the server sends
     // no ETag/Last-Modified, or the save predates them) passes the
@@ -4715,13 +4822,39 @@ fn start_impl(
                 .filter(|(_, &b)| b == 1)
                 .map(|(i, _)| i)
                 .collect();
-            if !done_idx.is_empty() {
-                let last = done_idx.len() - 1;
+            // B-4: partial prefixes get the same scepticism as
+            // sealed blocks — a prefix that cannot be proven is
+            // not skipped over, the whole state is discarded
+            let partial_idx: Vec<usize> = s
+                .done
+                .iter()
+                .enumerate()
+                .filter(|(i, &b)| b == 0 && s.partial.get(*i).copied().unwrap_or(0) > 0)
+                .map(|(i, _)| i)
+                .collect();
+            if !done_idx.is_empty() || !partial_idx.is_empty() {
+                let last = done_idx.len().saturating_sub(1);
                 let mut picks: Vec<usize> = Vec::new();
-                for &at in &[0usize, last / 3, (2 * last) / 3, last] {
-                    let idx = done_idx[at];
-                    if !picks.contains(&idx) {
-                        picks.push(idx);
+                if !done_idx.is_empty() {
+                    for &at in &[0usize, last / 3, (2 * last) / 3, last] {
+                        let idx = done_idx[at];
+                        if !picks.contains(&idx) {
+                            picks.push(idx);
+                        }
+                    }
+                }
+                // up to two partial prefixes (first + last),
+                // verified over exactly their claimed length
+                let mut partial_picks: Vec<(u64, u64)> = Vec::new();
+                if !partial_idx.is_empty() {
+                    let mut cand = vec![partial_idx[0]];
+                    let tail = partial_idx[partial_idx.len() - 1];
+                    if tail != partial_idx[0] {
+                        cand.push(tail);
+                    }
+                    for b in cand {
+                        let start = b as u64 * s.block_size;
+                        partial_picks.push((start, start + s.partial[b]));
                     }
                 }
                 let bs = s.block_size;
@@ -4731,7 +4864,7 @@ fn start_impl(
                 let final_url_ref = &probed.final_url;
                 let ignore_enc = probed.ignore_encoding_header;
                 let all_match = std::thread::scope(|scope| {
-                    let handles: Vec<_> = picks
+                    let mut handles: Vec<_> = picks
                         .iter()
                         .map(|&b| {
                             let start = b as u64 * bs;
@@ -4751,6 +4884,23 @@ fn start_impl(
                             })
                         })
                         .collect();
+                    // B-4: the sampled partial prefixes verify
+                    // over exactly their journaled length
+                    handles.extend(partial_picks.iter().map(|&(start, end)| {
+                        scope.spawn(move || {
+                            verify_block_bytes(
+                                agent_ref,
+                                final_url_ref,
+                                auth,
+                                url,
+                                jar_ref,
+                                out,
+                                start,
+                                end,
+                                ignore_enc,
+                            )
+                        })
+                    }));
                     // a panicked verifier is a failed verification:
                     // the safe direction is the fresh start
                     handles
@@ -4804,6 +4954,7 @@ fn start_impl(
             etag: probed.etag.clone(),
             last_modified: probed.last_modified.clone(),
             done: vec![0u8; total_blocks],
+            partial: vec![0u64; total_blocks],
         },
     };
 
@@ -5064,6 +5215,7 @@ fn finished_empty_download(control: Arc<Control>, state_path: PathBuf) -> Arc<Do
             etag: None,
             last_modified: None,
             done: vec![1u8; 1],
+            partial: vec![0u64; 1],
         }),
         state_path,
         next_block: AtomicUsize::new(0),
@@ -5166,6 +5318,7 @@ fn start_single_stream(
             etag: probed.etag.clone(),
             last_modified: probed.last_modified.clone(),
             done: vec![0u8; 1],
+            partial: Vec::new(),
         }),
         state_path,
         next_block: AtomicUsize::new(0),
@@ -5501,7 +5654,10 @@ pub fn peek_state(url: &str, out: &Path) -> Option<Peeked> {
     }
     Some(Peeked {
         total: s.total,
-        done_bytes: s.done_bytes(),
+        // B-4: bytes on disk include unsealed blocks' written
+        // prefixes (partial_bytes clamps every claim to its
+        // block, so an unnormalized journal cannot inflate this)
+        done_bytes: s.done_bytes() + s.partial_bytes(),
         blocks: s.done.clone(),
     })
 }
@@ -9121,6 +9277,13 @@ mod tests {
             done_blocks >= 1 && done_blocks < 24,
             "journal credits {done_blocks} blocks — the cut did not land mid-download"
         );
+        // B-4: the journal also credits partial prefixes of
+        // unsealed blocks — the resumed session must fetch
+        // exactly what NEITHER credit covers
+        let partial_bytes: u64 = journal["partial"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_u64()).sum())
+            .unwrap_or(0);
         let t1 = Instant::now();
         let dl2 = start(&url, &out, 4, 1024 * 1024).unwrap();
         let st = wait_terminal(&dl2, Duration::from_secs(60));
@@ -9133,8 +9296,9 @@ mod tests {
         );
         assert_eq!(
             dl2.progress().fetched_session,
-            (24 - done_blocks) * 1024 * 1024,
-            "resumed session must fetch exactly the uncredited blocks"
+            (24 - done_blocks) * 1024 * 1024 - partial_bytes,
+            "resumed session must fetch exactly the uncredited bytes \
+             (unsealed blocks minus their journaled partial prefixes)"
         );
         assert!(
             elapsed2 < Duration::from_secs(10),
@@ -12115,6 +12279,7 @@ mod perf220_tests {
             etag: None,
             last_modified: None,
             done: vec![1, 1, 1, 1, 1, 1, 1, 0],
+            partial: Vec::new(),
         };
         std::fs::write(state_path_for(&out), serde_json::to_vec(&state).unwrap()).unwrap();
         let dl = start(&url, &out, 2, block).unwrap();
@@ -12151,6 +12316,194 @@ mod perf220_tests {
                 );
             }
         }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    // --- B-4 (audit-233): partial-block journaling ---
+
+    /// A range server that records every GET range it SERVES
+    /// (start, end inclusive) and, while `slow` is set, drips
+    /// GET bodies in 4 KiB chunks — the byte accounting a
+    /// partial-resume assertion needs.
+    fn partial_server(
+        body: Vec<u8>,
+    ) -> (u16, Arc<Mutex<Vec<(u64, u64)>>>, Arc<AtomicBool>) {
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let slow = Arc::new(AtomicBool::new(true));
+        let served2 = served.clone();
+        let slow2 = slow.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                let served = served2.clone();
+                let slow = slow2.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let (rs, re) = range.unwrap_or((0, total - 1));
+                    let end = re.min(total - 1);
+                    let slice = &body[rs as usize..=end as usize];
+                    let _ = s.write_all(
+                        format!(
+                            "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            slice.len()
+                        )
+                        .as_bytes(),
+                    );
+                    served.lock().unwrap().push((rs, end));
+                    if slow.load(Ordering::Relaxed) {
+                        for chunk in slice.chunks(4096) {
+                            std::thread::sleep(Duration::from_millis(40));
+                            if s.write_all(chunk).is_err() {
+                                return;
+                            }
+                        }
+                    } else {
+                        let _ = s.write_all(slice);
+                    }
+                });
+            }
+        });
+        (port, served, slow)
+    }
+
+    #[test]
+    fn state_json_without_a_partial_field_loads_as_all_zero() {
+        // backwards compatibility in the small: a pre-B-4
+        // journal has no `partial` key at all
+        let raw = br#"{"url":"http://x/f","total":10,"block_size":4,"etag":null,"last_modified":null,"done":[1,0,1]}"#;
+        let s: State = serde_json::from_slice(raw).unwrap();
+        assert!(s.partial.is_empty());
+        assert_eq!(s.partial_bytes(), 0);
+    }
+
+    #[test]
+    fn partial_block_prefix_is_journaled_and_never_refetched() {
+        let block = 64 * 1024u64;
+        let body = pattern_body((6 * block) as usize);
+        let (port, served, slow) = partial_server(body.clone());
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let out = tmp_out("partial-b4");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+
+        // phase 1: slow download, one connection; pause it
+        // mid-block once the journal shows a sealed block AND a
+        // live partial prefix
+        let dl = start(&url, &out, 1, block).unwrap();
+        let mut journaled: Option<State> = None;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            if let Ok(raw) = std::fs::read(state_path_for(&out)) {
+                if let Ok(s) = serde_json::from_slice::<State>(&raw) {
+                    if s.done.iter().any(|&b| b == 1)
+                        && s.partial.iter().any(|&p| p >= 16 * 1024)
+                    {
+                        journaled = Some(s);
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let s = journaled.expect("the journal must show a sealed block and a partial prefix");
+        let _ = s;
+        // the job is DROPPED mid-block (cancel settles it: the
+        // supervisor force-saves the journal and releases the
+        // path — the same on-disk shape a process exit leaves,
+        // and the only settle a fresh start can follow)
+        dl.control.cancel();
+        assert_eq!(
+            wait_terminal(&dl, Duration::from_secs(30)),
+            Some(Status::Cancelled)
+        );
+        // the journal ON DISK after settle carries the prefix
+        let s: State =
+            serde_json::from_slice(&std::fs::read(state_path_for(&out)).unwrap()).unwrap();
+        let k = s
+            .partial
+            .iter()
+            .position(|&p| p > 0)
+            .expect("a partial prefix is journaled");
+        assert_eq!(s.done[k], 0, "the partial block is unsealed");
+        let p = s.partial[k];
+        assert!(p < block, "a prefix is smaller than its block");
+        // and the claimed bytes really are in the file at offset
+        let on_disk = std::fs::read(&out).unwrap();
+        let ks = (k as u64 * block) as usize;
+        assert_eq!(
+            &on_disk[ks..ks + p as usize],
+            &body[ks..ks + p as usize],
+            "the journaled prefix matches the bytes on disk"
+        );
+        drop(dl);
+
+        // phase 2: fast server, fresh job object, same files.
+        // Byte accounting over block k: the prefix-verification
+        // GET (validator-less resume samples it, exactly P
+        // bytes) plus the resumed remainder (block - P) must
+        // total EXACTLY one block — any re-fetch of the prefix
+        // by a worker inflates it past that.
+        served.lock().unwrap().clear();
+        slow.store(false, Ordering::Relaxed);
+        let dl = start(&url, &out, 1, block).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body, "the resumed file is byte-identical");
+        let kstart = k as u64 * block;
+        let kend = kstart + block - 1;
+        let mut overlap: u64 = 0;
+        for &(rs, re) in served.lock().unwrap().iter() {
+            let lo = rs.max(kstart);
+            let hi = re.min(kend);
+            if hi >= lo {
+                overlap += hi - lo + 1;
+            }
+        }
+        assert_eq!(
+            overlap, block,
+            "block {k} was served {overlap} bytes across the resume — \
+             exactly one block means the {p}-byte prefix was never re-fetched"
+        );
         let _ = std::fs::remove_file(&out);
     }
 

@@ -39,8 +39,12 @@ pub struct ColumnCfg {
     pub width: i32,
 }
 
-/// (id, label, default width, default-off) — app.js COLUMN_DEFS.
-pub const COLUMN_DEFS: [(&str, &str, i32, bool); 10] = [
+/// (id, label, default width, default-off) — app.js COLUMN_DEFS
+/// plus this shell's own Blocks column (audit-233: it existed
+/// only as a hard-appended extra, so the Columns chooser could
+/// not hide or move it; as a cfg entry it behaves like the rest,
+/// and load_columns appends it for existing users).
+pub const COLUMN_DEFS: [(&str, &str, i32, bool); 11] = [
     ("name", "File Name", 0, false),
     ("q", "Q", 30, false),
     ("size", "Size", 84, false),
@@ -51,6 +55,7 @@ pub const COLUMN_DEFS: [(&str, &str, i32, bool); 10] = [
     ("desc", "Description", 150, false),
     ("added", "Date Added", 138, true),
     ("saveto", "Save To", 240, true),
+    ("blocks", "Blocks", 160, false),
 ];
 
 pub fn default_columns() -> Vec<ColumnCfg> {

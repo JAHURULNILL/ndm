@@ -57,10 +57,26 @@ function facebookVideoId(urlStr) {
   let u;
   try { u = new URL(String(urlStr || '')); } catch (e) { return ''; }
   if (!isFacebookHostname(u.hostname)) return '';
-  const m = u.pathname.match(/\/(?:videos|reel)\/(\d+)/);
-  if (m) return m[1];
-  const v = u.searchParams.get('v');
-  if (v && /^\d+$/.test(v)) return v;
+  // Aligned to core's facebook_video_id exactly (W2-7): a path
+  // segment must be ALL digits (a digit prefix like
+  // /videos/12345extra/ names nothing), and the watch param is
+  // read RAW — percent-encoded digits are not digits, so no
+  // decoding divergence from core's raw query_param.
+  const segs = u.pathname.split('/').filter(s => s !== '');
+  for (let i = 0; i + 1 < segs.length; i++) {
+    if ((segs[i] === 'videos' || segs[i] === 'reel') && /^\d+$/.test(segs[i + 1])) {
+      return segs[i + 1];
+    }
+  }
+  const rawQuery = (u.search || '').replace(/^\?/, '');
+  for (const pair of rawQuery.split('&')) {
+    const eq = pair.indexOf('=');
+    if (eq > 0 && pair.slice(0, eq) === 'v') {
+      const v = pair.slice(eq + 1);
+      if (/^\d+$/.test(v)) return v;
+      break;
+    }
+  }
   return '';
 }
 
@@ -80,19 +96,29 @@ function fallbackTargetFor(isFacebookPage, pageUrl) {
 }
 
 /* Recursively collect objects that look like one FB video:
-   they carry a dash_manifest and/or playable_url* fields. */
-function findVideoObjects(root, out, seen) {
+   they carry a dash_manifest and/or playable_url* fields.
+   Bounded (W2-5): depth and node budgets shared across one
+   top-level walk — a pathological blob stops that walk
+   gracefully (partial results, no RangeError) instead of
+   aborting the caller's whole scan. */
+const FIND_MAX_DEPTH = 200;
+const FIND_MAX_NODES = 20000;
+function findVideoObjects(root, out, seen, _state, _depth) {
   if (!root || typeof root !== 'object') return out;
+  const state = _state || { nodes: 0 };
+  const depth = _depth || 0;
+  if (depth > FIND_MAX_DEPTH || ++state.nodes > FIND_MAX_NODES) return out;
   if (seen.has(root)) return out;
   seen.add(root);
   const hasDash = typeof root.dash_manifest === 'string' && root.dash_manifest.includes('<MPD');
   const hasPlayable = VIDEO_FIELDS.some(f => isHttpUrl(root[f]));
   if (hasDash || hasPlayable) out.push(root);
   for (const v of Object.values(root)) {
-    if (v && typeof v === 'object') findVideoObjects(v, out, seen);
+    if (state.nodes > FIND_MAX_NODES) break;
+    if (v && typeof v === 'object') findVideoObjects(v, out, seen, state, depth + 1);
     else if (typeof v === 'string' && v.length > 200 && v.includes('dash_manifest')) {
       // Comet data-sjs blobs sometimes double-encode the payload.
-      try { findVideoObjects(JSON.parse(v), out, seen); } catch (e) {}
+      try { findVideoObjects(JSON.parse(v), out, seen, state, depth + 1); } catch (e) {}
     }
   }
   return out;
@@ -116,7 +142,15 @@ function parseDashManifest(xml) {
         return m ? m[1] : '';
       };
       const mime = attr('mimeType') || setMime;
-      const base = (rep.match(/<BaseURL>([^<]+)<\/BaseURL>/) || [])[1] || '';
+      const baseRaw = (rep.match(/<BaseURL>([^<]+)<\/BaseURL>/) || [])[1] || '';
+      // W2-6: only https BaseURLs are streams at all — the same
+      // test the YouTube extractor in this file applies per
+      // format. An http/other-scheme BaseURL is dropped here,
+      // at the layer that mints the URL, not left for a
+      // downstream consumer to remember to check.
+      const base = baseRaw && isHttpUrl(baseRaw.replace(/&amp;/g, '&'))
+        ? baseRaw
+        : '';
       const segTpl = (set.match(/<SegmentTemplate[^>]*media="([^"]+)"/) || [])[1] || '';
       const r = {
         id: attr('id'),
@@ -338,10 +372,27 @@ function fbcdnVideoToken(url) {
   return idm ? idm[1] : '';
 }
 
+function isFbCdnUrl(url) {
+  if (!isHttpUrl(url)) return false;
+  let u;
+  try { u = new URL(url); } catch (e) { return false; }
+  const host = u.hostname.toLowerCase();
+  return host.endsWith('fbcdn.net') || host.includes('videodelivery');
+}
+
 function streamGroupKey(pageUrl, streamUrl) {
   let pageHost = '';
   try { pageHost = new URL(String(pageUrl || '')).hostname; } catch (e) {}
-  if (!isFacebookHostname(pageHost)) return 'page';
+  if (!isFacebookHostname(pageHost)) {
+    // W2-1: an UNKNOWN page (empty/unparseable — e.g. after an
+    // MV3 service-worker restart emptied the tab→page map) must
+    // never stamp a made-up 'page' identity on an FB CDN
+    // stream: different feed videos would merge into one
+    // unkeyed group. Unknown page + FB CDN stream = unknown
+    // key (''), so the capture is not offered or merged.
+    if (!pageHost && isFbCdnUrl(streamUrl)) return '';
+    return 'page';
+  }
   const fromPage = facebookVideoId(pageUrl);
   if (fromPage) return 'fb:' + fromPage;
   const token = fbcdnVideoToken(streamUrl);
@@ -373,7 +424,7 @@ return {
   classifyFacebook, parseDashManifest, findVideoObjects,
   classifyPerformanceEntry, optionsFromVideoObject,
   facebookVideoId, isFacebookHostname, fallbackTargetFor,
-  streamGroupKey, offerableGroups, fbcdnVideoToken,
+  streamGroupKey, offerableGroups, fbcdnVideoToken, isFbCdnUrl,
 };
 
 })();

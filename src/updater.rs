@@ -61,20 +61,41 @@ pub struct ReleaseInfo {
     pub win_x86_setup_sha256: String,
 }
 
-fn parse_version(v: &str) -> Vec<u64> {
-    v.trim()
-        .trim_start_matches('v')
+/// One parsed version: numeric components (saturating — a
+/// component past u128 keeps a huge value instead of collapsing
+/// to 0, W3-7) plus the pre-release suffix after the first '-',
+/// if any ("2.3.2-beta" → components [2,3,2], suffix "beta").
+fn parse_version(v: &str) -> (Vec<u128>, Option<String>) {
+    let v = v.trim();
+    let v = v.strip_prefix('v').unwrap_or(v);
+    let (core, suffix) = match v.split_once('-') {
+        Some((c, s)) if !s.is_empty() => (c, Some(s.to_string())),
+        _ => (v, None),
+    };
+    let comps = core
         .split('.')
         .map(|p| {
-            let digits: String = p.chars().take_while(|c| c.is_ascii_digit()).collect();
-            digits.parse().unwrap_or(0)
+            let mut n: u128 = 0;
+            for c in p.chars().take_while(|c| c.is_ascii_digit()) {
+                n = n
+                    .saturating_mul(10)
+                    .saturating_add(c as u128 - '0' as u128);
+            }
+            n
         })
-        .collect()
+        .collect();
+    (comps, suffix)
 }
 
 /// Compare dotted numeric versions ("1.5.0" > "1.0.7").
+/// A pre-release suffix sorts BEFORE the bare release
+/// ("2.3.2-beta" < "2.3.2", semver-style, W3-7); two suffixes
+/// compare lexically. Well-formed plain releases compare
+/// exactly as before.
 pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let (va, vb) = (parse_version(a), parse_version(b));
+    use std::cmp::Ordering;
+    let (va, sa) = parse_version(a);
+    let (vb, sb) = parse_version(b);
     let n = va.len().max(vb.len());
     for i in 0..n {
         let (x, y) = (va.get(i).copied().unwrap_or(0), vb.get(i).copied().unwrap_or(0));
@@ -82,7 +103,43 @@ pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
             return x.cmp(&y);
         }
     }
-    std::cmp::Ordering::Equal
+    match (sa, sb) {
+        (None, None) => Ordering::Equal,
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(x), Some(y)) => x.cmp(&y),
+    }
+}
+
+/// W3-8: feed-supplied URLs must not downgrade the update chain
+/// to plain http. https is required for any remote host; plain
+/// http is tolerated only for loopback, which no network
+/// attacker can intercept (and which the test fixtures and the
+/// debug manifest override run on).
+pub fn update_url_allowed(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(h) = host.strip_prefix('[') {
+        h.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit('@').next().unwrap_or("").split(':').next().unwrap_or("")
+    };
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn require_update_scheme(url: &str) -> Result<(), String> {
+    if update_url_allowed(url) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refused a non-https update URL ({url}): update packages and manifests are fetched over https only"
+        ))
+    }
 }
 
 /// Overall budget for ONE whole manifest check, across every
@@ -123,6 +180,7 @@ fn manifest_agent() -> ureq::Agent {
 /// package — instead of failing cleanly like every other
 /// transfer path in the crate.
 fn fetch_manifest_body(agent: &ureq::Agent, url: &str, timeout: Duration) -> Result<String, String> {
+    require_update_scheme(url)?;
     let resp = agent
         .get(url)
         .timeout(timeout)
@@ -252,6 +310,7 @@ fn download_file_with_ceiling(
     on_progress: &dyn Fn(u64, u64),
     ceiling: u64,
 ) -> Result<(), String> {
+    require_update_scheme(url)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("cannot create folder: {e}"))?;
     }
@@ -523,6 +582,47 @@ mod tests {
         assert!(info.win_x86_sha256.is_empty());
         assert!(info.win_x86_setup_url.is_empty());
         assert!(info.win_x86_setup_sha256.is_empty());
+    }
+
+    #[test]
+    fn version_cmp_saturates_huge_components_and_orders_prereleases() {
+        use std::cmp::Ordering::*;
+        // W3-7: a component beyond u64 used to collapse to 0 and
+        // sort the whole version as 0.x
+        assert_eq!(version_cmp("99999999999999999999999999.0", "1.0"), Greater);
+        assert_eq!(version_cmp("1.0", "99999999999999999999999999.0"), Less);
+        // a pre-release is LESS than its own release (semver-ish)
+        assert_eq!(version_cmp("2.3.2-beta", "2.3.2"), Less);
+        assert_eq!(version_cmp("2.3.2", "2.3.2-beta"), Greater);
+        assert_eq!(version_cmp("2.3.2-rc1", "2.3.3"), Less);
+        assert_eq!(version_cmp("2.3.2-beta", "2.3.2-beta"), Equal);
+        // well-formed behaviour is unchanged
+        assert_eq!(version_cmp("2.3.10", "2.3.2"), Greater);
+        assert_eq!(version_cmp("2.3", "2.3.0"), Equal);
+        assert_eq!(version_cmp("2.3.2.1", "2.3.2"), Greater);
+        assert_eq!(version_cmp("v2.3.2", "2.3.2"), Equal);
+    }
+
+    #[test]
+    fn update_urls_must_be_https_except_loopback() {
+        // W3-8: a feed-supplied http URL to a remote host is
+        // refused before any network traffic happens
+        assert!(update_url_allowed("https://example.com/pkg"));
+        assert!(update_url_allowed("http://127.0.0.1:8080/pkg"));
+        assert!(update_url_allowed("http://localhost/pkg"));
+        assert!(!update_url_allowed("http://example.com/pkg"));
+        assert!(!update_url_allowed("http://192.0.2.1/pkg"));
+        assert!(!update_url_allowed("ftp://example.com/pkg"));
+        let dir = temp_dir("scheme");
+        let dest = dir.join("pkg.bin");
+        let err = download_file("http://192.0.2.1/pkg", &dest, "abc", &|_, _| {}).unwrap_err();
+        assert!(err.contains("https"), "unexpected error: {err}");
+        assert!(!dest.exists());
+        let agent = crate::build_agent();
+        let err = fetch_manifest_body(&agent, "http://192.0.2.1/release.json", Duration::from_secs(5))
+            .unwrap_err();
+        assert!(err.contains("https"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

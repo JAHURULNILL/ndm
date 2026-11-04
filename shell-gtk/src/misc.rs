@@ -46,7 +46,7 @@ pub fn show_columns(ui: &Rc<Ui>) {
         *ui.col_cfg.borrow_mut() = cfg;
         apply_columns(ui);
     }
-    dlg.hide();
+    dlg.close(); // one-shot dialog: close (destroys), not hide (hidden-window leak, audit-233)
 }
 
 fn build_column_rows(rows_box: &gtk::Box, edit: &Rc<RefCell<Vec<prefs::ColumnCfg>>>) {
@@ -337,5 +337,5 @@ pub fn show_toolbar_cfg(ui: &Rc<Ui>) {
         });
         apply_toolbar(ui);
     }
-    dlg.hide();
+    dlg.close(); // one-shot dialog: close (destroys), not hide (hidden-window leak, audit-233)
 }

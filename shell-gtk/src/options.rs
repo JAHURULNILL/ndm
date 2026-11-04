@@ -589,7 +589,7 @@ pub fn show(ui: &Rc<Ui>) {
         if run(&dlg) != gtk::ResponseType::Ok {
             break;
         }
-        match save(ui, &s, &o) {
+        match save(ui, &o) {
             Ok(()) => {
                 rebuild_category_tree(ui);
                 break;
@@ -604,8 +604,23 @@ pub fn show(ui: &Rc<Ui>) {
     dlg.hide();
 }
 
-fn save(ui: &Rc<Ui>, base: &serde_json::Value, o: &Opt) -> Result<(), String> {
+fn save(ui: &Rc<Ui>, o: &Opt) -> Result<(), String> {
+    // Merge into the CURRENT settings, never the open-time
+    // snapshot: while this dialog sits open, other writers move
+    // state (the grabber stamps last_run, the scheduler saves,
+    // this dialog's own category rename/delete calls write
+    // through core). Saving the stale snapshot silently reverted
+    // all of it — and dropped renamed/deleted categories back in
+    // (audit-233 F1/F2). Fields this dialog owns come from the
+    // widgets; everything else passes through untouched.
+    let base = settings_json(ui);
     let mut v = base.clone();
+    // Typed spinbutton text commits only on focus-out/activate;
+    // a Save click can read the pre-edit value. Force every
+    // spinbutton to interpret its text first (audit-233 A-F1).
+    for sp in [&o.conns, &o.limit_val, &o.quota_mb, &o.quota_hours, &o.simul, &o.proxy_port] {
+        sp.update();
+    }
     let obj = v.as_object_mut().ok_or("settings unavailable")?;
     let ins = |obj: &mut serde_json::Map<String, serde_json::Value>, k: &str, val: serde_json::Value| {
         obj.insert(k.to_string(), val);
@@ -659,8 +674,18 @@ fn save(ui: &Rc<Ui>, base: &serde_json::Value, o: &Opt) -> Result<(), String> {
     ins(obj, "power_force", serde_json::json!(o.power_force.is_active()));
     ins(obj, "completion_program", serde_json::json!(o.completion_program.text().trim()));
     ins(obj, "completion_args", serde_json::json!(o.completion_args.text().trim()));
-    // category folders: only non-empty entries are stored
+    // category folders: only non-empty entries are stored;
+    // non-built-in keys (user categories) pass through from the
+    // current settings — rebuilding from the six built-ins alone
+    // silently wiped every user category's folder (audit-233 F1)
     let mut dirs = serde_json::Map::new();
+    if let Some(old) = base.get("category_dirs").and_then(|x| x.as_object()) {
+        for (k, val) in old {
+            if !CATS.contains(&k.as_str()) {
+                dirs.insert(k.clone(), val.clone());
+            }
+        }
+    }
     for (i, c) in CATS.iter().enumerate() {
         let val = o.cat_dirs[i].text().trim().to_string();
         if !val.is_empty() {

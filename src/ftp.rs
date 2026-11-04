@@ -267,6 +267,42 @@ impl FtpConn {
         self.read_reply()
     }
 
+    /// W3-13: read ONE reply line with a hard length cap. The
+    /// line count was already bounded (100) but a single line
+    /// was not: read_line would buffer an endless line until the
+    /// socket timeout. Reading through fill_buf keeps the cap
+    /// real — the buffer never holds more than the cap plus one
+    /// buffered chunk. Ok(None) = clean EOF before any byte.
+    fn read_reply_line(&mut self) -> Result<Option<String>, FtpErr> {
+        const MAX_REPLY_LINE: usize = 8 * 1024;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let buf = self
+                .reader
+                .fill_buf()
+                .map_err(|e| FtpErr::Retry(format!("could not read from the FTP server at {}: {e}", self.display)))?;
+            if buf.is_empty() {
+                return Ok(if out.is_empty() { None } else { Some(String::from_utf8_lossy(&out).into_owned()) });
+            }
+            let room = MAX_REPLY_LINE + 1 - out.len().min(MAX_REPLY_LINE + 1);
+            let (take, done) = match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => ((i + 1).min(room), true),
+                None => (buf.len().min(room), false),
+            };
+            out.extend_from_slice(&buf[..take]);
+            self.reader.consume(take);
+            if out.len() > MAX_REPLY_LINE {
+                return Err(FtpErr::Retry(format!(
+                    "the FTP server at {} sent a reply line longer than {MAX_REPLY_LINE} bytes",
+                    self.display
+                )));
+            }
+            if done {
+                return Ok(Some(String::from_utf8_lossy(&out).into_owned()));
+            }
+        }
+    }
+
     fn read_reply(&mut self) -> Result<(u16, String), FtpErr> {
         // RFC 959 replies: "NNN text", or multi-line "NNN-..." up
         // to the closing "NNN text". Bounded so a hostile server
@@ -274,11 +310,8 @@ impl FtpConn {
         let mut code: Option<u16> = None;
         let text: String;
         for _ in 0..100 {
-            let mut line = String::new();
-            let n = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|e| FtpErr::Retry(format!("could not read from the FTP server at {}: {e}", self.display)))?;
+            let line = self.read_reply_line()?.unwrap_or_default();
+            let n = line.len();
             if n == 0 {
                 return Err(FtpErr::Retry(format!(
                     "the FTP server at {} closed the connection",
@@ -1161,6 +1194,7 @@ pub(crate) fn start_ftp_single_stream(
             etag: probed.etag.clone(),
             last_modified: probed.last_modified.clone(),
             done: vec![0u8; 1],
+            partial: Vec::new(),
         }),
         state_path,
         next_block: AtomicUsize::new(0),
@@ -1508,6 +1542,42 @@ mod tests {
         while !dl.is_settled() {
             assert!(t0.elapsed() < deadline, "download never settled");
             std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn reply_lines_are_length_capped() {
+        // W3-13: a server streaming one endless line must fail as
+        // a protocol Retry, not grow the line buffer unbounded
+        let _serial = SERIAL.lock().unwrap();
+        for (payload, expect_ok) in [
+            (b"220 ready\r\n".to_vec(), true),
+            (vec![b'x'; 9000], false),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().unwrap();
+                use std::io::Write as _;
+                let _ = sock.write_all(&payload);
+                std::thread::sleep(Duration::from_millis(300));
+            });
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut conn = FtpConn {
+                reader: BufReader::new(stream),
+                display: "test".to_string(),
+            };
+            let res = conn.read_reply();
+            if expect_ok {
+                match res {
+                    Ok((code, _)) => assert_eq!(code, 220),
+                    Err(e) => panic!("expected a 220 reply, got: {}", e.message()),
+                }
+            } else {
+                let msg = res.unwrap_err().message();
+                assert!(msg.contains("longer than"), "unexpected error: {msg}");
+            }
+            let _ = server.join();
         }
     }
 

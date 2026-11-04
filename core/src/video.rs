@@ -2747,13 +2747,6 @@ impl VideoJob {
                 EngineAttempt::Stopped => return true,
                 EngineAttempt::Errored | EngineAttempt::Stalled => {
                     let done_now = self.progress.lock().unwrap().done;
-                    // An error before ANY byte moved is a start
-                    // failure, not a stall: the yt-dlp fallback
-                    // stays the fast answer, exactly as before.
-                    if outcome == EngineAttempt::Errored && done_now == 0 {
-                        self.active_downloads.lock().unwrap().clear();
-                        return false;
-                    }
                     // WS-A accounting: a preresolved auth-death
                     // spends one recovery unit for the attempt
                     // even when the attempt gained real bytes
@@ -2766,7 +2759,32 @@ impl VideoJob {
                     // budget exists.
                     let auth_heal_case = self.preresolved.is_some()
                         && attempt_auth_dead
-                        && outcome == EngineAttempt::Errored;
+                        && (outcome == EngineAttempt::Errored
+                            || (outcome == EngineAttempt::Stalled && done_now == 0));
+                    // An error before ANY byte moved is a start
+                    // failure, not a stall: the yt-dlp fallback
+                    // stays the fast answer, exactly as before.
+                    // C-2 (audit-233) exception: a preresolved
+                    // auth death at byte 0 — the start probe's
+                    // HEAD passed but every range GET was refused
+                    // (403) — is the same dead capture as a
+                    // mid-download death and heals through the
+                    // recovery flow below instead of ending the
+                    // job with the capture-expired message. The
+                    // heal case above also covers this shape's
+                    // Stalled verdict: the poll's stall window
+                    // fires before the engine's own error does,
+                    // and at byte 0 with a typed auth death there
+                    // are no bytes for fresh connections to
+                    // protect — the re-resolve is the only remedy.
+                    // (A Stalled attempt WITH bytes keeps the
+                    // existing fresh-connections-first behaviour
+                    // and self-corrects on its next Errored
+                    // attempt, as before.)
+                    if outcome == EngineAttempt::Errored && done_now == 0 && !auth_heal_case {
+                        self.active_downloads.lock().unwrap().clear();
+                        return false;
+                    }
                     // barren accounting: an attempt that gained
                     // real bytes resets the count; only nearly
                     // motionless attempts spend it
@@ -5453,6 +5471,7 @@ mod tests {
         conns: Arc<std::sync::atomic::AtomicUsize>,
         served: Arc<std::sync::atomic::AtomicU64>,
         die_after: u64,
+        gen1_head_ok: bool,
     ) {
         use std::io::{Read, Write};
         conns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -5481,6 +5500,18 @@ mod tests {
         let path = parts.next().unwrap_or("");
         let gen2 = path.contains("gen=2");
         if !gen2 && served.load(std::sync::atomic::Ordering::Relaxed) >= die_after {
+            // C-2 fixture shape: HEAD still answers (the start
+            // probe passes) while every range GET is refused
+            if gen1_head_ok && method == "HEAD" {
+                let total = payload.len();
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nETag: \"wsa\"\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+                return;
+            }
             let _ = sock.write_all(
                 b"HTTP/1.1 403 Forbidden\r\nContent-Length: 7\r\nConnection: close\r\n\r\nexpired",
             );
@@ -5525,6 +5556,15 @@ mod tests {
         payload: Arc<Vec<u8>>,
         die_after: u64,
     ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        wsa_server_ex(payload, die_after, false)
+    }
+
+    #[cfg(unix)]
+    fn wsa_server_ex(
+        payload: Arc<Vec<u8>>,
+        die_after: u64,
+        gen1_head_ok: bool,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -5538,7 +5578,7 @@ mod tests {
                             let p = payload.clone();
                             let c = conns.clone();
                             let sv = served.clone();
-                            std::thread::spawn(move || wsa_stream_conn(s, p, c, sv, die_after));
+                            std::thread::spawn(move || wsa_stream_conn(s, p, c, sv, die_after, gen1_head_ok));
                         }
                         Err(_) => break,
                     }
@@ -5584,10 +5624,20 @@ mod tests {
     /// resolve of the PAGE URL returns the gen=2 stream.
     #[cfg(unix)]
     fn wsa_start_job(tag: &str, die_after: u64, stub_sleep_secs: u32) -> Option<WsaJob> {
+        wsa_start_job_ex(tag, die_after, stub_sleep_secs, false)
+    }
+
+    #[cfg(unix)]
+    fn wsa_start_job_ex(
+        tag: &str,
+        die_after: u64,
+        stub_sleep_secs: u32,
+        gen1_head_ok: bool,
+    ) -> Option<WsaJob> {
         let gen_dir = std::env::temp_dir().join(format!("ndm-wsagen-{tag}-{}", std::process::id()));
         let payload = audit_payload(&gen_dir, 7, "6M")?;
         let payload_len = payload.len() as u64;
-        let (port, conns) = wsa_server(payload, die_after);
+        let (port, conns) = wsa_server_ex(payload, die_after, gen1_head_ok);
         let dead_url = format!("http://127.0.0.1:{port}/s?gen=1");
         let fresh_url = format!("http://127.0.0.1:{port}/s?gen=2");
         let dir = std::env::temp_dir().join(format!("ndm-wsa-{tag}-{}", std::process::id()));
@@ -5673,6 +5723,40 @@ mod tests {
         let info = String::from_utf8_lossy(&probe.stderr);
         assert!(info.contains("Video:"), "final file has no video stream: {info}");
         assert!(info.contains("Audio:"), "final file has no audio stream: {info}");
+        let _ = std::fs::remove_dir_all(&rig.dir);
+        let _ = std::fs::remove_dir_all(&rig.gen_dir);
+    }
+
+    /// C-2 (audit-233): the byte-0 video shape — the captured
+    /// stream's HEAD answers 200 (the start probe passes) but
+    /// every range GET is refused 403, so the first attempt ends
+    /// Errored having moved ZERO bytes. Pre-fix the attempt loop
+    /// returned at once on done == 0 and the job ended with the
+    /// capture-expired message; post-fix the typed auth death
+    /// heals via the page re-resolve and the job finishes.
+    #[cfg(unix)]
+    #[test]
+    fn preresolved_range_refusal_at_byte_zero_heals_via_page_reresolve() {
+        let Some(rig) = wsa_start_job_ex("byte0", 0, 0, true) else { return };
+        let job = &rig.job;
+        let terminal = audit_wait_for(300, "the job to reach a terminal status", || {
+            matches!(
+                job.progress.lock().unwrap().status.as_str(),
+                "finished" | "error" | "cancelled"
+            )
+        });
+        assert!(terminal, "job never terminated (status: {})", job.progress.lock().unwrap().status);
+        let err_text = job.progress.lock().unwrap().error.clone();
+        assert_eq!(
+            job.progress.lock().unwrap().status,
+            "finished",
+            "the byte-0 range-refused capture must heal via the page re-resolve; error: {err_text:?}"
+        );
+        assert!(
+            audit_stub_runs(&rig.count_file) >= 1,
+            "the heal must re-resolve the page URL through yt-dlp (stub runs: {})",
+            audit_stub_runs(&rig.count_file)
+        );
         let _ = std::fs::remove_dir_all(&rig.dir);
         let _ = std::fs::remove_dir_all(&rig.gen_dir);
     }

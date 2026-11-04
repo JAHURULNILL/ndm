@@ -361,6 +361,15 @@ fn unix_now_secs() -> u64 {
 /// app's job. Failures are swallowed: a stamp that cannot be
 /// written must never change the ping reply.
 fn record_ext_seen(stamp_path: &std::path::Path, message: &Value, now_secs: u64) {
+    // W2-9: a PRESENT but non-string ext_version (a number, an
+    // object, an explicit null from a malformed sender) must not
+    // clobber a good stamp with null — only a MISSING field is
+    // the pre-handshake signal.
+    if let Some(v) = message.get("ext_version") {
+        if !v.is_string() {
+            return;
+        }
+    }
     let version: Option<String> = message
         .get("ext_version")
         .and_then(Value::as_str)
@@ -1587,6 +1596,30 @@ mod tests {
         assert!(v["ext_version"].is_null(), "absent field stamps null: {v}");
         assert_eq!(v["at"], json!(2_000));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_string_ext_version_does_not_clobber_the_stamp() {
+        // W2-9: a ping whose ext_version is present but not a
+        // string must leave a good stamp untouched — only a
+        // MISSING field records the pre-handshake null
+        let (dir, stamp) = stamp_test_path("nonstr");
+        handle_at(&json!({ "type": "ping", "ext_version": "2.0.8" }), Some(&stamp), 1_000);
+        let before = std::fs::read_to_string(&stamp).unwrap();
+        for bad in [json!(2.08), json!(null), json!({ "v": 1 }), json!(["2.0.8"])] {
+            handle_at(&json!({ "type": "ping", "ext_version": bad }), Some(&stamp), 9_999);
+            assert_eq!(
+                std::fs::read_to_string(&stamp).unwrap(),
+                before,
+                "a non-string ext_version must not modify the stamp"
+            );
+        }
+        // and with no prior stamp it creates none either
+        let (dir2, stamp2) = stamp_test_path("nonstr-fresh");
+        handle_at(&json!({ "type": "ping", "ext_version": 42 }), Some(&stamp2), 1_000);
+        assert!(!stamp2.exists(), "a non-string ext_version must not create a stamp");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

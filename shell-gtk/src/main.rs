@@ -582,7 +582,9 @@ pub(crate) fn refresh_toolbar_states(ui: &Ui) {
             }
         }
     }
-    let any_downloading = entries.values().any(|d| d.status == "downloading");
+    let any_downloading = entries
+        .values()
+        .any(|d| matches!(d.status.as_str(), "downloading" | "starting" | "resuming"));
     let any_finished = entries.values().any(|d| d.status == "finished");
     let states: [(&str, bool); 5] = [
         ("btnResume", any_resumable),
@@ -891,6 +893,22 @@ fn show_file_info(
     probe: Result<serde_json::Value, String>,
     on_done: Rc<dyn Fn()>,
 ) {
+    show_file_info_inner(ui, flow, probe, on_done, None)
+}
+
+/// A failed Start re-presents the card with the user's edits
+/// intact and the failure shown in it (audit-233: the dialog
+/// used to close on any Start error, discarding every field
+/// the user had just typed — the Options F-4 discipline says a
+/// failed save keeps the dialog). `retry` carries the exact
+/// arguments of the failed attempt plus its error.
+fn show_file_info_inner(
+    ui: &Rc<Ui>,
+    flow: &Rc<AddFlow>,
+    probe: Result<serde_json::Value, String>,
+    on_done: Rc<dyn Fn()>,
+    retry: Option<(Rc<AddArgs>, String)>,
+) {
     let url = flow.url.clone();
     let (total, size_text, resume_text, probed_category, probed_dir, suggested, probe_note) =
         match &probe {
@@ -939,16 +957,25 @@ fn show_file_info(
             ),
         };
 
+    // A retry re-presents the failed attempt's own values.
+    let (total, probed_category, probe_note) = match &retry {
+        Some((args, err)) => (
+            args.total_arg.unwrap_or(total),
+            args.category.clone().unwrap_or(probed_category),
+            format!("Could not add the download: {}", sink::display_error(err)),
+        ),
+        None => (total, probed_category, probe_note),
+    };
     let s = settings_json(ui);
     let default_dir = s
         .get("default_dir")
         .and_then(|x| x.as_str())
         .unwrap_or("~/Downloads")
         .to_string();
-    let dir_initial = if probed_dir.is_empty() {
-        default_dir
-    } else {
-        probed_dir
+    let dir_initial = match &retry {
+        Some((args, _)) => args.dir.clone(),
+        None if probed_dir.is_empty() => default_dir,
+        None => probed_dir,
     };
     // app.js: the offered title's basename is the name; the
     // probe's suggested name only fills a name left empty.
@@ -960,7 +987,11 @@ fn show_file_info(
             .unwrap_or("")
             .trim()
             .to_string();
-        if base.is_empty() { suggested.clone() } else { base }
+        let from_title = if base.is_empty() { suggested.clone() } else { base };
+        match &retry {
+            Some((args, _)) => args.name.clone().unwrap_or(from_title),
+            None => from_title,
+        }
     };
 
     let info_title = match flow.source.as_str() {
@@ -997,11 +1028,16 @@ fn show_file_info(
     ));
     title_lbl.set_halign(gtk::Align::Start);
     title_lbl.set_line_wrap(true);
+    // WordChar: a long filename is one unbroken word; plain word
+    // wrap made this card 1637px wide on a 1400px screen
+    // (audit-233 B-2 — same fix as modals::note_label).
+    title_lbl.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
     title_lbl.set_max_width_chars(72);
     header.pack_start(&title_lbl, false, false, 0);
     let addr_lbl = gtk::Label::new(Some(&url));
     addr_lbl.set_halign(gtk::Align::Start);
     addr_lbl.set_line_wrap(true);
+    addr_lbl.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
     addr_lbl.set_max_width_chars(72);
     addr_lbl.set_selectable(true);
     header.pack_start(&addr_lbl, false, false, 0);
@@ -1056,15 +1092,24 @@ fn show_file_info(
             .iter()
             .map(|n| (n.as_str(), n.as_str()))
             .collect::<Vec<_>>(),
-        &pick_queue_name(ui),
+        &match &retry {
+            Some((args, _)) => args.queue.clone().unwrap_or_else(|| pick_queue_name(ui)),
+            None => pick_queue_name(ui),
+        },
     );
     y = form::row(&g, y, "Queue", &queue_c);
     let name_e = form::entry(&name_initial);
     y = form::row(&g, y, "File name", &name_e);
-    let desc_e = form::entry("");
+    let desc_e = form::entry(match &retry {
+        Some((args, _)) => args.description.as_deref().unwrap_or(""),
+        None => "",
+    });
     desc_e.set_placeholder_text(Some("(optional note)"));
     y = form::row(&g, y, "Description", &desc_e);
-    let later_c = form::check("Download later", false);
+    let later_c = form::check(
+        "Download later",
+        matches!(&retry, Some((args, _)) if args.later),
+    );
     form::check_row(&g, y, &later_c);
     body.pack_start(&g, false, false, 0);
     dlg.content_area().pack_start(&body, false, false, 0);
@@ -1192,7 +1237,7 @@ fn spawn_add(
                     finish_add_flow(&on_done);
                 }
             }
-            result => settle_add(&ui2, result, before.as_ref(), &on_done),
+            result => settle_add(&ui2, &flow2, &args2, result, before.as_ref(), &on_done),
         }
         gtk::glib::ControlFlow::Break
     });
@@ -1203,6 +1248,8 @@ fn spawn_add(
 /// narrate the failure — then close the flow out.
 fn settle_add(
     ui: &Rc<Ui>,
+    flow: &Rc<AddFlow>,
+    args: &Rc<AddArgs>,
     result: Result<String, String>,
     before: &std::collections::HashSet<String>,
     on_done: &Rc<dyn Fn()>,
@@ -1224,10 +1271,24 @@ fn settle_add(
             // toolbar once more with the final state
             refresh_toolbar_states(ui);
             set_notice(ui, "Download added");
+            finish_add_flow(on_done);
         }
-        Err(e) => set_notice(ui, &format!("Could not add the download: {}", e)),
+        Err(e) => {
+            // Re-present the card with the user's edits and the
+            // failure inside it; the flow stays open (no finish)
+            // so Cancel/Start behave exactly as the first time.
+            // The probe is not re-run — the facts it gathered
+            // (size, resume) are carried in a synthetic result.
+            let probe = Ok(serde_json::json!({
+                "total": args.total_arg.unwrap_or(0),
+                "resumable": serde_json::Value::Null,
+                "category": args.category.clone().unwrap_or_else(|| "General".to_string()),
+                "dir": args.dir.clone(),
+                "suggested_name": args.name.clone().unwrap_or_default(),
+            }));
+            show_file_info_inner(ui, flow, probe, on_done.clone(), Some((args.clone(), e)));
+        }
     }
-    finish_add_flow(on_done);
 }
 
 /// Close an add flow out: release the one-at-a-time gate and
@@ -1374,8 +1435,12 @@ fn pause_ids(ui: &Rc<Ui>, ids: &[String]) {
 }
 
 /// The toolbar's Stop All and the Downloads menu's Pause All
-/// share the web UI's shape: pause every entry whose status is
-/// "downloading", keep going past individual failures.
+/// share the web UI's shape: pause every live entry, keep going
+/// past individual failures. "Live" includes the resolve
+/// ("starting") and stall-recovery ("resuming") phases — core
+/// parks the job in both, so leaving them out made Stop All
+/// silently skip downloads that had not reached steady state
+/// (audit-233).
 fn pause_all_downloading(ui: &Rc<Ui>) {
     let ids: Vec<String> = ui
         .order
@@ -1385,7 +1450,7 @@ fn pause_all_downloading(ui: &Rc<Ui>) {
             ui.entries
                 .borrow()
                 .get(*id)
-                .map(|d| d.status == "downloading")
+                .map(|d| matches!(d.status.as_str(), "downloading" | "starting" | "resuming"))
                 .unwrap_or(false)
         })
         .cloned()
@@ -2531,6 +2596,40 @@ pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
         if c.width > 0 {
             col.set_fixed_width(c.width);
             col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+        } else if matches!(c.id.as_str(), "name" | "desc" | "saveto") {
+            // Width 0 means "automatic", but an autosized column
+            // holding unbounded text (a 187-char filename, a long
+            // path) requisitions its full text width and drags
+            // the whole main window wider — permanently, for the
+            // session (audit-233 B-2). These three get a capped
+            // fixed width instead (the name cell ellipsizes);
+            // short-content columns keep true autosize.
+            let def = prefs::COLUMN_DEFS
+                .iter()
+                .find(|(id, _, _, _)| *id == c.id)
+                .map(|(_, _, w, _)| *w)
+                .unwrap_or(0);
+            col.set_fixed_width(if def > 0 { def } else { 380 });
+            col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+            if c.id == "name" {
+                col.set_expand(true);
+            }
+        }
+        if c.id == "blocks" {
+            // Block map — custom renderer (blockmap.rs), fed by
+            // the model's blocks + fraction columns. A cfg entry
+            // like the rest since audit-233 (hideable/movable in
+            // the Columns chooser); width already applied above.
+            if c.width <= 0 {
+                col.set_fixed_width(160);
+                col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
+            }
+            let cell = blockmap::BlockMapRenderer::new();
+            gtk::prelude::CellLayoutExt::pack_start(&col, &cell, true);
+            gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "blocks", COL_BLOCKS as i32);
+            gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "fraction", COL_FRACTION as i32);
+            view.append_column(&col);
+            continue;
         }
         if model_col == COL_NAME {
             // Per-type row glyph (item 17), packed ahead of the
@@ -2554,18 +2653,6 @@ pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
         gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "text", model_col as i32);
         view.append_column(&col);
     }
-    // Block map — custom renderer (blockmap.rs), fed by the
-    // model's blocks + fraction columns.
-    let col = gtk::TreeViewColumn::new();
-    col.set_title("Blocks");
-    col.set_resizable(true);
-    col.set_fixed_width(160);
-    col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
-    let cell = blockmap::BlockMapRenderer::new();
-    gtk::prelude::CellLayoutExt::pack_start(&col, &cell, true);
-    gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "blocks", COL_BLOCKS as i32);
-    gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "fraction", COL_FRACTION as i32);
-    view.append_column(&col);
 }
 
 pub(crate) fn apply_columns(ui: &Ui) {
@@ -2601,25 +2688,61 @@ fn build_context_menu(ui: &Rc<Ui>, name: &str, id: Option<String>) -> gtk::Menu 
         item.connect_activate(move |_| f());
         menu.add(&item);
     };
+    // State gating for the row's own actions (audit-233: every
+    // item used to be live in every state — Resume on a running
+    // download, Pause on a finished one, Open File before any
+    // file exists).
+    let status = id
+        .as_ref()
+        .and_then(|i| ui.entries.borrow().get(i).map(|d| d.status.clone()))
+        .unwrap_or_default();
+    let gated = |label: &str, on: bool, f: Box<dyn Fn()>| {
+        let item = menu_item(label);
+        item.set_sensitive(on);
+        item.connect_activate(move |_| f());
+        menu.add(&item);
+    };
 
     {
+        // Resume/Pause follow the same target rule Delete
+        // states below (app.js openDeleteConfirm's rule): the
+        // whole multi-selection when the menu's row is part of
+        // one, else just that row. They used to act on the
+        // clicked row alone, silently ignoring a selection the
+        // right-click had deliberately kept (audit-233).
         let (u, id) = (ui.clone(), id.clone());
-        real(
+        gated(
             "Resume",
+            id.is_some()
+                && !matches!(status.as_str(), "downloading" | "starting" | "merging" | "resuming"),
             Box::new(move || {
-                if let Some(id) = &id {
-                    resume_ids(&u, std::slice::from_ref(id));
+                let sel = selected_ids(&u);
+                let ids: Vec<String> = match &id {
+                    Some(i) if sel.len() > 1 && sel.iter().any(|x| x == i) => sel,
+                    Some(i) => vec![i.clone()],
+                    None => sel,
+                };
+                if !ids.is_empty() {
+                    resume_ids(&u, &ids);
                 }
             }),
         );
     }
     {
         let (u, id) = (ui.clone(), id.clone());
-        real(
+        gated(
             "Pause",
+            id.is_some()
+                && matches!(status.as_str(), "downloading" | "starting" | "resuming" | "queued"),
             Box::new(move || {
-                if let Some(id) = &id {
-                    pause_ids(&u, std::slice::from_ref(id));
+                let sel = selected_ids(&u);
+                let ids: Vec<String> = match &id {
+                    Some(i) if sel.len() > 1 && sel.iter().any(|x| x == i) => sel,
+                    Some(i) => vec![i.clone()],
+                    None => sel,
+                };
+                if !ids.is_empty() {
+                    pause_ids(&u, &ids);
                 }
             }),
         );
@@ -2628,6 +2751,7 @@ fn build_context_menu(ui: &Rc<Ui>, name: &str, id: Option<String>) -> gtk::Menu 
         // The per-download progress dialog (PROGRESS-DIALOG-SPEC
         // §1.3: the row menu's "Show progress").
         let item = menu_item("Show progress");
+        item.set_sensitive(id.is_some());
         let (u, id) = (ui.clone(), id.clone());
         item.connect_activate(move |_| {
             if let Some(id) = &id {
@@ -2815,6 +2939,13 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                             &iter,
                             &[
                                 (COL_STATUS, &"Complete" as &dyn gtk::glib::ToValue),
+                                // The raw status is the Status
+                                // column's SORT KEY: leaving it at
+                                // "downloading" kept finished rows
+                                // sorted as active until the next
+                                // full refresh (audit-233).
+                                (COL_STATUS_RAW, &"finished" as &dyn gtk::glib::ToValue),
+                                (COL_Q, &"" as &dyn gtk::glib::ToValue),
                                 (COL_FRACTION, &1.0f64 as &dyn gtk::glib::ToValue),
                                 (COL_RATE, &"" as &dyn gtk::glib::ToValue),
                                 (COL_TIMELEFT, &"" as &dyn gtk::glib::ToValue),
@@ -3091,11 +3222,28 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
     ]);
     debug_assert_eq!(store.n_columns() as usize, NCOLS);
 
+    // The remembered window size wins over the spec default
+    // (audit-233: geometry was never remembered — every launch
+    // reset to 1120x720 wherever the user had left it). Only the
+    // size is kept; position is the window manager's business
+    // and a stale one can strand the window off-screen.
+    let (def_w, def_h) = prefs::get("ndm-window-size")
+        .and_then(|v| {
+            let a = v.as_array()?;
+            let w = a.first()?.as_i64()? as i32;
+            let h = a.get(1)?.as_i64()? as i32;
+            if w >= 860 && h >= 540 && w <= 7680 && h <= 4320 {
+                Some((w, h))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((1120, 720)); // §1.1 main-window spec
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Nill Download Manager")
-        .default_width(1120) // §1.1 main-window spec
-        .default_height(720)
+        .default_width(def_w)
+        .default_height(def_h)
         .build();
     window.set_size_request(860, 540); // §1.1 minimum size
 
@@ -3105,7 +3253,19 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
     // therefore quits the application outright.
     {
         let app = app.clone();
+        // Track the live size on every allocation: at destroy
+        // time gtk_window_get_size already reports the builder
+        // defaults (the GdkWindow is gone), which silently
+        // saved 1120x720 whatever the user had resized to —
+        // caught by the FIX-233 rig proof, not by reading.
+        let live_size = Rc::new(std::cell::Cell::new((def_w, def_h)));
+        let track = live_size.clone();
+        window.connect_size_allocate(move |_, alloc| {
+            track.set((alloc.width(), alloc.height()));
+        });
         window.connect_destroy(move |_| {
+            let (w, h) = live_size.get();
+            prefs::set("ndm-window-size", serde_json::json!([w, h]));
             app.quit();
         });
     }
@@ -3520,7 +3680,22 @@ fn main() {
         .build();
 
     let receiver = gtksink::ReceiverSlot::new(receiver);
+    // GtkApplication is single-instance: launching NDM again
+    // forwards an activate to THIS process. Building the UI a
+    // second time produced a dead twin window — its ReceiverSlot
+    // take() had already been spent on the first window, so it
+    // never received a core event, and closing it quit the whole
+    // app (audit-233). Build once; later activations just raise
+    // the existing window.
+    let built = std::cell::Cell::new(false);
     app.connect_activate(move |app| {
+        if built.get() {
+            if let Some(w) = app.windows().first() {
+                w.present();
+            }
+            return;
+        }
+        built.set(true);
         build_ui(app, &ctx, &receiver);
     });
     app.run();

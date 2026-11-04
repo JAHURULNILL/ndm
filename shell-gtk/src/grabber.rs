@@ -95,6 +95,10 @@ struct GrabDlg {
     unchecked: RefCell<HashSet<usize>>,
     kinds_off: RefCell<HashSet<String>>,
     exploring: Cell<bool>,
+    /// Bumped by reset() so an exploration launched before a
+    /// close/reopen cannot land its results in the fresh wizard
+    /// (audit-233 F6).
+    explore_gen: Cell<u64>,
 }
 
 fn exts_of(text: &str) -> Vec<String> {
@@ -108,6 +112,11 @@ fn exts_of(text: &str) -> Vec<String> {
 
 /// app.js grabWizardState — the project's full field set.
 fn wizard_state(d: &GrabDlg) -> serde_json::Value {
+    // Commit typed spinbutton text before reading values
+    // (the Options A-F1 lesson: a click can read pre-edit text).
+    for sp in [&d.depth_same, &d.depth_other, &d.min_kb, &d.max_mb] {
+        sp.update();
+    }
     serde_json::json!({
         "name": d.proj_name.text().trim().to_string(),
         "start_url": d.url.text().trim().to_string(),
@@ -261,8 +270,31 @@ fn grab_dir_for(base: &str, start_url: &str, item_url: &str) -> String {
     }
 }
 
+/// Does the item pass the step-4 extension lists as they stand
+/// NOW? The lists are explore-time filters, but the results view
+/// must honour them too: changing the template/preset after an
+/// exploration rewrites these entries, and a results list that
+/// ignored them showed files the current filter excludes
+/// (audit-233 F5).
+fn ext_ok(d: &GrabDlg, it: &serde_json::Value) -> bool {
+    let name = js(it, "name");
+    let ext = if name.contains('.') {
+        name.rsplit('.').next().unwrap_or("").to_lowercase()
+    } else {
+        String::new() // no dot — no extension
+    };
+    let incl = exts_of(&d.incl.text());
+    if !incl.is_empty() && !incl.iter().any(|e| *e == ext) {
+        return false;
+    }
+    !exts_of(&d.excl.text()).iter().any(|e| *e == ext)
+}
+
 fn visible(d: &GrabDlg, it: &serde_json::Value) -> bool {
     if d.kinds_off.borrow().contains(&js(it, "kind")) {
+        return false;
+    }
+    if !ext_ok(d, it) {
         return false;
     }
     let q = d.filter.text().trim().to_lowercase();
@@ -294,6 +326,9 @@ fn render_kinds(d: &Rc<GrabDlg>) {
     }
     let mut counts: Vec<(String, usize)> = Vec::new();
     for it in d.items.borrow().iter() {
+        if !ext_ok(d, it) {
+            continue; // kind rows reflect the current ext filter (F5)
+        }
         let k = js(it, "kind");
         if let Some(slot) = counts.iter_mut().find(|(n, _)| *n == k) {
             slot.1 += 1;
@@ -387,6 +422,7 @@ fn fetch(d: &Rc<GrabDlg>) {
         return;
     };
     d.exploring.set(true);
+    let gen = d.explore_gen.get();
     d.btn_fetch.set_sensitive(false);
     d.status.set_text("Exploring…");
     let (tx, rx) = gtk::glib::MainContext::channel::<Result<serde_json::Value, String>>(
@@ -401,6 +437,12 @@ fn fetch(d: &Rc<GrabDlg>) {
     }
     let d2 = d.clone();
     rx.attach(None, move |r| {
+        if d2.explore_gen.get() != gen {
+            // The wizard was reset (closed/reopened) while this
+            // exploration was in flight — its results belong to
+            // the previous session, not this fresh wizard (F6).
+            return gtk::glib::ControlFlow::Break;
+        }
         d2.exploring.set(false);
         d2.btn_fetch.set_sensitive(true);
         match r {
@@ -790,6 +832,7 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
         unchecked: RefCell::new(HashSet::new()),
         kinds_off: RefCell::new(HashSet::new()),
         exploring: Cell::new(false),
+        explore_gen: Cell::new(0),
     });
     DLG.with(|c| *c.borrow_mut() = Some(d.clone()));
 
@@ -893,6 +936,22 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
         d.filter.connect_changed(move |_| render_list(&d2));
     }
     {
+        // Step-4 ext lists are part of the results view filter
+        // (F5): editing them — directly, or via the template /
+        // preset combos which write these entries — re-derives
+        // the kind rows and the list at once.
+        let d2 = d.clone();
+        d.incl.connect_changed(move |_| {
+            render_kinds(&d2);
+            render_list(&d2);
+        });
+        let d2 = d.clone();
+        d.excl.connect_changed(move |_| {
+            render_kinds(&d2);
+            render_list(&d2);
+        });
+    }
+    {
         let d = d.clone();
         btn_all.connect_clicked(move |_| {
             d.unchecked.borrow_mut().clear();
@@ -941,6 +1000,19 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
                 .and_then(|x| x.as_array())
                 .cloned()
                 .unwrap_or_default();
+            // Carry over the replaced project's last_run: it is
+            // core's change-detection record, not a wizard field,
+            // and rebuilding the entry from wizard_state alone
+            // wiped it on every re-save (audit-233 F3).
+            let mut p = p;
+            if let Some(old) = list
+                .iter()
+                .find(|x| js(x, "name").eq_ignore_ascii_case(&name))
+            {
+                if let (Some(lr), Some(obj)) = (old.get("last_run"), p.as_object_mut()) {
+                    obj.insert("last_run".into(), lr.clone());
+                }
+            }
             list.retain(|x| !js(x, "name").eq_ignore_ascii_case(&name));
             list.push(p);
             match save_projects(&d.ui, serde_json::Value::Array(list)) {
@@ -985,11 +1057,32 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
 
 /// app.js openGrabber: fresh state every open.
 fn reset(d: &Rc<GrabDlg>) {
+    // Invalidate any in-flight exploration and restore the
+    // build-time field defaults: reopening used to resurrect the
+    // previous session wholesale — old template/filters in the
+    // fields, and the old explore landing its results into the
+    // "fresh" wizard when it finished (audit-233 F6).
+    d.explore_gen.set(d.explore_gen.get() + 1);
+    d.exploring.set(false);
+    d.btn_fetch.set_sensitive(true);
     d.items.borrow_mut().clear();
     d.unchecked.borrow_mut().clear();
     d.kinds_off.borrow_mut().clear();
     d.url.set_text("");
     d.proj_name.set_text("");
+    d.template.set_active_id(Some("custom"));
+    d.incl.set_text("");
+    d.excl.set_text("");
+    d.depth_same.set_value(1.0);
+    d.depth_other.set_value(0.0);
+    d.mode_whole.set_active(false);
+    d.no_parent.set_active(false);
+    d.subfolders.set_active(false);
+    d.add_queue.set_active(false);
+    d.convert.set_active(true);
+    d.same_site.set_active(true);
+    d.min_kb.set_value(0.0);
+    d.max_mb.set_value(0.0);
     let def = js(&settings_json(&d.ui), "default_dir");
     d.dir.set_text(if def.is_empty() { "~/Downloads" } else { &def });
     d.filter.set_text("");

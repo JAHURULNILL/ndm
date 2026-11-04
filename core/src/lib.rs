@@ -233,7 +233,9 @@ impl AppState {
             update_busy: AtomicBool::new(false),
             probe_handoff: Mutex::new(None),
             persist_error: Mutex::new(None),
+            downloads_corrupt: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
+            settings_repaired: Mutex::new(None),
         }
     }
 
@@ -573,6 +575,16 @@ pub struct GrabProject {
 
 /// User preferences, persisted to <app data>/settings.json. Field names are
 /// the exact contract the frontend Options/Scheduler dialogs use.
+///
+/// A-F10 (audit-233): this file carries SECRETS — site-login
+/// passwords (`site_logins`) and the proxy password (`proxy_pass`)
+/// are stored in PLAINTEXT inside it. The mitigation today is
+/// the file's permissions: every write goes through
+/// create_private (0600 on Unix) + rename — including the very
+/// first creation, whose tmp file is born 0600 and renamed into
+/// place — so the file is never world-readable on Unix. Moving
+/// these secrets to the OS keyring is the recorded follow-up;
+/// do NOT add home-grown obfuscation/encryption here.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "def_dir")]
@@ -1612,31 +1624,174 @@ pub fn route_category_dir(state: &AppState, category: &str, dir: std::path::Path
     }
 }
 
+/// W3-1 (audit-233): repair a parsed settings object
+/// field-by-field. Returns the settings plus the names of the
+/// fields that had to be reset to their defaults (or salvaged
+/// element-wise). One wrong-typed field used to fail the whole
+/// all-or-nothing parse and silently factory-reset EVERY
+/// preference — queues, category rules, site logins, proxy
+/// credentials — with the next save making the loss permanent.
+///
+/// The repair works on the JSON object: array/map fields first
+/// get the element-wise mercy (a bad element is dropped, its
+/// good siblings kept — the pre-existing queues rescue, extended
+/// to the other collections), then every top-level field is
+/// tested on its own against a candidate built from the
+/// defaults: a field that deserializes stays exactly as the
+/// user left it; a field that does not falls back to ITS
+/// default alone and is named in the returned list.
+pub fn repair_settings_object(mut v: serde_json::Value) -> Option<(Settings, Vec<String>)> {
+    let obj = v.as_object_mut()?;
+    let mut repaired: Vec<String> = Vec::new();
+    // element-wise salvage for the collection fields
+    fn salvage_array<T: serde::de::DeserializeOwned>(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        repaired: &mut Vec<String>,
+    ) {
+        if let Some(arr) = obj.get_mut(key).and_then(|x| x.as_array_mut()) {
+            let before = arr.len();
+            arr.retain(|el| serde_json::from_value::<T>(el.clone()).is_ok());
+            if arr.len() != before {
+                repaired.push(key.to_string());
+            }
+        }
+    }
+    fn salvage_map<V: serde::de::DeserializeOwned>(
+        obj: &mut serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        repaired: &mut Vec<String>,
+    ) {
+        if let Some(map) = obj.get_mut(key).and_then(|x| x.as_object_mut()) {
+            let before = map.len();
+            map.retain(|_, el| serde_json::from_value::<V>(el.clone()).is_ok());
+            if map.len() != before {
+                repaired.push(key.to_string());
+            }
+        }
+    }
+    salvage_array::<QueueCfg>(obj, "queues", &mut repaired);
+    salvage_array::<SiteLogin>(obj, "site_logins", &mut repaired);
+    salvage_array::<GrabProject>(obj, "grab_projects", &mut repaired);
+    salvage_array::<String>(obj, "conn_exceptions", &mut repaired);
+    salvage_map::<String>(obj, "category_dirs", &mut repaired);
+    salvage_map::<Vec<String>>(obj, "category_exts", &mut repaired);
+    salvage_map::<Vec<String>>(obj, "category_sites", &mut repaired);
+    // per-field validation against the defaults
+    let defaults = serde_json::to_value(Settings::default()).ok()?;
+    let default_obj = defaults.as_object()?;
+    let keys: Vec<String> = obj.keys().cloned().collect();
+    for key in keys {
+        if !default_obj.contains_key(&key) {
+            continue; // an unknown field: serde ignores it, as before
+        }
+        let mut candidate = default_obj.clone();
+        candidate.insert(key.clone(), obj.get(&key).cloned().unwrap_or(serde_json::Value::Null));
+        if serde_json::from_value::<Settings>(serde_json::Value::Object(candidate)).is_err() {
+            obj.insert(key.clone(), default_obj.get(&key).cloned().unwrap_or(serde_json::Value::Null));
+            if !repaired.contains(&key) {
+                repaired.push(key);
+            }
+        }
+    }
+    let s = serde_json::from_value::<Settings>(v).ok()?;
+    Some((s, repaired))
+}
+
+/// W3-1: record a settings repair/reset where the shells can
+/// surface it — the dedicated slot (take_settings_repaired_note)
+/// and, when the startup-notice slot is still free, that slot
+/// too, mirroring how a quarantined downloads.json reaches the
+/// UI today.
+fn note_settings_repaired(state: &AppState, note: String) {
+    *state.settings_repaired.lock_ok() = Some(note.clone());
+    let mut slot = state.startup_notice.lock_ok();
+    if slot.is_none() {
+        *slot = Some(note);
+    }
+}
+
+/// Take the settings repair/reset note recorded by load_settings
+/// (W3-1), if any: delivered once, like the startup notice.
+pub fn take_settings_repaired_note(state: &AppState) -> Option<String> {
+    state.settings_repaired.lock_ok().take()
+}
+
 pub fn load_settings(state: &AppState) {
     let path = state.settings_file.lock().unwrap().clone();
     if path.as_os_str().is_empty() {
         return;
     }
-    if let Ok(raw) = std::fs::read(&path) {
-        let parsed = serde_json::from_slice::<Settings>(&raw).ok().or_else(|| {
-            // tolerant second pass: one malformed element inside the
-            // queues array must not discard EVERY preference (the
-            // downloads store already parses per-record; settings now
-            // gets the same mercy — keep the queues that do parse)
-            let mut v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-            if let Some(arr) = v.get_mut("queues").and_then(|q| q.as_array_mut()) {
-                arr.retain(|el| serde_json::from_value::<QueueCfg>(el.clone()).is_ok());
+    let Ok(raw) = std::fs::read(&path) else {
+        return;
+    };
+    // Fast path first: a fully valid file loads exactly as it
+    // always did, untouched and unnoted.
+    if let Ok(mut s) = serde_json::from_slice::<Settings>(&raw) {
+        s.sanitize();
+        ndm::set_global_limit(s.speed_limit_bps);
+        ndm::set_global_connections(s.max_connections);
+        apply_proxy_to_engine(&s);
+        *state.settings.lock().unwrap() = s;
+        return;
+    }
+    // W3-1: the whole-struct parse failed. If the file is still
+    // a JSON object, repair it field-by-field instead of
+    // resetting everything.
+    let as_value: Option<serde_json::Value> = serde_json::from_slice(&raw).ok();
+    if let Some(v) = as_value {
+        if v.is_object() {
+            if let Some((mut s, repaired)) = repair_settings_object(v) {
+                if !repaired.is_empty() {
+                    eprintln!(
+                        "[ndm] settings.json: reset unreadable field(s) to their defaults: {}",
+                        repaired.join(", ")
+                    );
+                    note_settings_repaired(
+                        state,
+                        format!(
+                            "Some settings could not be read and were reset to their defaults ({}). Everything else was kept as it was.",
+                            repaired.join(", ")
+                        ),
+                    );
+                }
+                s.sanitize();
+                ndm::set_global_limit(s.speed_limit_bps);
+                ndm::set_global_connections(s.max_connections);
+                apply_proxy_to_engine(&s);
+                *state.settings.lock().unwrap() = s;
+                return;
             }
-            serde_json::from_value::<Settings>(v).ok()
-        });
-        if let Some(mut s) = parsed {
-            s.sanitize();
-            ndm::set_global_limit(s.speed_limit_bps);
-            ndm::set_global_connections(s.max_connections);
-            apply_proxy_to_engine(&s);
-            *state.settings.lock().unwrap() = s;
         }
     }
+    // The file cannot be loaded at all (not JSON, or not an
+    // object): quarantine it beside the original — the same
+    // treatment downloads.json gets in restore_saved — keep the
+    // factory defaults already in state, and say so. The next
+    // save writes a fresh settings.json; the damaged bytes
+    // survive under the quarantine name for inspection.
+    let stamp = chrono::Utc::now().timestamp();
+    let quarantine = path.with_extension(format!("json.corrupt-{stamp}"));
+    let kept = std::fs::copy(&path, &quarantine).is_ok();
+    eprintln!(
+        "[ndm] settings.json could not be read at all; defaults are in use{}",
+        if kept {
+            format!(" and the damaged file was set aside as {}", quarantine.display())
+        } else {
+            String::new()
+        }
+    );
+    note_settings_repaired(
+        state,
+        if kept {
+            format!(
+                "NDM could not read its settings file, so it was set aside as {} and defaults are in use. Your other preferences files are untouched.",
+                quarantine.display()
+            )
+        } else {
+            "NDM could not read its settings file, so defaults are in use.".to_string()
+        },
+    );
 }
 
 pub fn save_settings(state: &AppState) {
@@ -1663,13 +1818,16 @@ pub fn save_settings_result(state: &AppState) -> Result<(), String> {
     let settings = current_settings(state);
     let tmp = path.with_extension("json.tmp");
     let mut f = create_private(&tmp).map_err(|e| format!("cannot write the settings file: {e}"))?;
-    use std::io::Write;
     serde_json::to_writer(&mut f, &settings)
         .map_err(|e| format!("cannot write the settings file: {e}"))?;
-    f.flush()
+    // W3-2: sync the tmp file before the rename and the
+    // directory after it (the engine journal's discipline), so
+    // the rename is power-loss durable, not just crash-atomic
+    f.sync_all()
         .map_err(|e| format!("cannot write the settings file: {e}"))?;
     drop(f);
     std::fs::rename(&tmp, &path).map_err(|e| format!("cannot write the settings file: {e}"))?;
+    sync_parent_dir(&path);
     Ok(())
 }
 
@@ -1708,7 +1866,11 @@ pub struct Entry {
     // (last sample time, last done_bytes, smoothed rate) for a live rate readout
     sample: Mutex<(Instant, u64, f64)>,
     /// an emit loop is currently running for this entry (spawn guard)
-    emitting: AtomicBool,
+    /// shared across the entry's category-relabel clones
+    /// (W3-11): the emit loop and its exit-time flag reset act
+    /// on whichever Arc is current — a fresh flag on the clone
+    /// let a second loop spawn for the same download
+    emitting: Arc<AtomicBool>,
     /// the engine is starting (probe in flight) — counts against the cap
     starting: AtomicBool,
     /// a simultaneous-cap slot was reserved for this entry's pending
@@ -1817,11 +1979,26 @@ pub struct AppState {
     /// surfaced to the UI as a visible banner instead of living
     /// only in an eprintln nobody reads (2.0.7 #1)
     persist_error: Mutex<Option<String>>,
+    /// W3-3: set when downloads.json's top level was unparseable
+    /// at startup and the original was quarantined: persist must
+    /// then never write an EMPTY list over the (new) file, or
+    /// the quarantine is the only copy of the user's history and
+    /// the app looks factory-fresh. This was a process-global
+    /// static until audit-233: every AppState in the process
+    /// shared one guard, which coupled unrelated states and
+    /// flaked the persist test pair against each other.
+    downloads_corrupt: AtomicBool,
     /// a one-time notice produced while restoring the list at
     /// startup (a quarantined or partially unreadable journal):
     /// the frontend drains it once on load, so a history that was
     /// set aside never looks like a list that was "just empty"
     startup_notice: Mutex<Option<String>>,
+    /// W3-1: a one-time note produced while LOADING SETTINGS at
+    /// startup — which fields were reset to their defaults, or
+    /// that the file was quarantined whole. The shells drain it
+    /// via take_settings_repaired_note; load_settings also
+    /// mirrors it into startup_notice when that slot is free.
+    settings_repaired: Mutex<Option<String>>,
 }
 
 /// A dialog probe result awaiting its Start. The handoff is valid
@@ -2413,11 +2590,20 @@ pub fn create_private(tmp: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-/// Set when downloads.json's top level was unparseable at startup
-/// and the original was quarantined: persist must then never write
-/// an EMPTY list over the (new) file, or the quarantine is the only
-/// copy of the user's history and the app looks factory-fresh.
-pub static DOWNLOADS_CORRUPT: AtomicBool = AtomicBool::new(false);
+/// W3-2: best-effort sync of the directory holding `path`,
+/// after a rename into it — the last step of the engine
+/// journal's durability discipline (data file → journal file →
+/// directory), so a renamed store is durable against power
+/// loss, not merely process crash. Failures are ignored: some
+/// filesystems/platforms cannot sync directories, and the
+/// rename itself has already landed.
+pub fn sync_parent_dir(path: &Path) {
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+}
 
 pub fn persist(state: &AppState) {
     let _guard = state.save_lock.lock_ok();
@@ -2566,7 +2752,7 @@ pub fn persist(state: &AppState) {
     // in-flight placeholder stubs (filtered out of the snapshot
     // above) must not lift the guard and let an empty write land
     // over the journal
-    if DOWNLOADS_CORRUPT.load(Ordering::Relaxed) && saved.is_empty() {
+    if state.downloads_corrupt.load(Ordering::Relaxed) && saved.is_empty() {
         return;
     }
     let tmp = path.with_extension("json.tmp");
@@ -2581,12 +2767,16 @@ pub fn persist(state: &AppState) {
     // screen and the user must know that before they trust it.
     let written = (|| -> std::io::Result<()> {
         let mut f = create_private(&tmp)?;
-        use std::io::Write;
         serde_json::to_writer(&mut f, &saved)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        f.flush()?;
+        // W3-2: sync before rename + directory sync after (the
+        // engine journal's discipline): rename alone survives a
+        // process crash but not power loss
+        f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, &path)
+        std::fs::rename(&tmp, &path)?;
+        sync_parent_dir(&path);
+        Ok(())
     })();
     match written {
         Ok(()) => {
@@ -2598,7 +2788,7 @@ pub fn persist(state: &AppState) {
             // forever and deleted entries resurrect next launch.
             // The quarantined file itself is a different name and
             // is never touched by this write.
-            DOWNLOADS_CORRUPT.store(false, Ordering::Relaxed);
+            state.downloads_corrupt.store(false, Ordering::Relaxed);
         }
         Err(e) => {
             // no .tmp litter behind a failed write
@@ -2681,9 +2871,18 @@ pub fn open_target(path: &Path) -> Result<(), String> {
         c.arg(path);
         c
     };
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("cannot open: {e}"))
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // Reap on a side thread: dropping the Child unwaited
+            // leaves one zombie per open on Unix (audit-233;
+            // the completion-hook fix W3-6 set the pattern).
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(())
+        }
+        Err(e) => Err(format!("cannot open: {e}")),
+    }
 }
 
 /// m-9: the DURABLE byte figure for a video entry — what is
@@ -3010,12 +3209,20 @@ pub const RETRY_MAX: u32 = 10;
 pub const MAX_HEAL_ATTEMPTS: u32 = 3;
 
 /// WS-A: the heal gate as a pure decision — the address must
-/// have died (the engine's typed auth_dead signal), bytes must
-/// have flowed (a download refused from byte 0 has nothing to
-/// resume and its error is the honest one), the budget must have
-/// room, and a user-stopped job (paused / removed) never heals.
-pub fn heal_decision(auth_dead: bool, done_bytes: u64, attempts: u32, user_stopped: bool) -> bool {
-    auth_dead && done_bytes > 0 && attempts < MAX_HEAL_ATTEMPTS && !user_stopped
+/// have died (the engine's typed auth_dead signal), the budget
+/// must have room, and a user-stopped job (paused / removed)
+/// never heals. C-2 (audit-233): the byte count no longer
+/// gates — a server that answers HEAD 200 but refuses every
+/// range GET (403) kills a FRESH download at byte 0, and that
+/// shape is the same dead address as a mid-download death; the
+/// typed signal is what separates it from a plain 404 (never
+/// auth_dead), and the attempt budget is what stops a
+/// genuinely-permanent auth failure from looping (each heal
+/// re-probes once, at most MAX_HEAL_ATTEMPTS times, then the
+/// error stands honestly). `done_bytes` stays a parameter for
+/// the caller's context/logging shape; it does not gate.
+pub fn heal_decision(auth_dead: bool, _done_bytes: u64, attempts: u32, user_stopped: bool) -> bool {
+    auth_dead && attempts < MAX_HEAL_ATTEMPTS && !user_stopped
 }
 
 /// WS-A: heal backoff per attempt (2 s, 4 s, 8 s) — long enough
@@ -3075,9 +3282,17 @@ fn maybe_heal_expiry(app: &Ctx, entry: &Arc<Entry>) -> bool {
     if !dl.is_settled() {
         return false;
     }
-    // spend the attempt up front: a heal whose re-probe still
-    // finds a dead address has spent its shot either way
-    state.heals.lock_ok().insert(entry.id.clone(), attempts + 1);
+    // C-1 (audit-233): re-read the stop flags on the ORIGINAL
+    // entry after the settle wait — a pause that landed during
+    // the wait was recorded there (pause_download latches a
+    // terminal engine's press; demote_terminal_live now copies
+    // the latch onto the stub). The demote below still runs, so
+    // the job parks as a paused stub, and the stub stop gate
+    // after the demote honours the press: no restart, and (the
+    // spend now happens only when a re-probe actually starts)
+    // no heal budget burned on a heal that never ran.
+    let stopped_during_settle = entry.removed.load(Ordering::SeqCst)
+        || entry.pause_requested.load(Ordering::SeqCst);
     // Demote BEFORE the backoff: with the dead handle replaced
     // by a stub, a pause pressed during the heal lands on the
     // stub's pause latch — the form pause_download records for
@@ -3101,12 +3316,12 @@ fn maybe_heal_expiry(app: &Ctx, entry: &Arc<Entry>) -> bool {
     let backoff = heal_backoff(attempts);
     let t0 = Instant::now();
     while t0.elapsed() < backoff {
-        if stopped(&stub) {
+        if stopped(&stub) || stopped_during_settle {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    if stopped(&stub) {
+    if stopped(&stub) || stopped_during_settle {
         // the user's stop wins: the entry stays parked exactly
         // as the demote recorded it (paused, journal intact, a
         // manual Resume still possible), the heal's detail
@@ -3116,6 +3331,12 @@ fn maybe_heal_expiry(app: &Ctx, entry: &Arc<Entry>) -> bool {
         persist(&state);
         return true;
     }
+    // spend the attempt only now, at the moment the re-probe
+    // actually starts: a heal whose re-probe still finds a dead
+    // address has spent its shot either way, but a heal the user
+    // stopped during the settle wait or the backoff never ran a
+    // re-probe and must not burn budget on it
+    state.heals.lock_ok().insert(entry.id.clone(), attempts + 1);
     start_entry(app, stub);
     true
 }
@@ -3310,9 +3531,12 @@ pub fn save_quota(state: &AppState) {
         let mut f = create_private(&tmp)?;
         use std::io::Write;
         f.write_all(body.as_bytes())?;
-        f.flush()?;
+        // W3-2: same fsync discipline as the other core stores
+        f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, &path)
+        std::fs::rename(&tmp, &path)?;
+        sync_parent_dir(&path);
+        Ok(())
     })();
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -3590,26 +3814,44 @@ pub fn split_completion_args(s: &str) -> Vec<String> {
 }
 
 /// Build the argument vector for the completion program from its
-/// template. Substitution happens BEFORE splitting: `{file}` is
-/// replaced by the file's full path first and the result is then
-/// split with quote awareness, so a path containing spaces
-/// survives intact when the template quotes it
-/// (e.g. `--scan "{file}"`). A template with no `{file}` gets the
-/// path appended as a final argument.
+/// template. A template with no `{file}` gets the path appended
+/// as a final argument.
+///
+/// W3-4/W3-5 (audit-233): substitution happens AFTER splitting.
+/// The old order — substitute, then split — corrupted two path
+/// shapes: the quote-aware splitter DELETED a `"` inside the
+/// substituted path (a download folder may legally contain one),
+/// handing the hook a different, nonexistent path; and an
+/// UNQUOTED `{file}` let a spaced path split into several
+/// arguments. Now `{file}` is first swapped for a sentinel token
+/// (no spaces, no quotes, nothing the splitter can mangle), the
+/// template is split, and the sentinel inside each resulting
+/// argument is replaced by the real path — so the substituted
+/// path always lands as exactly the argument (or argument part)
+/// the template's token described, quoted or not.
 pub fn completion_program_args(template: &str, file: &Path) -> Vec<String> {
+    const SENTINEL: &str = "\u{1}ndm-file\u{1}";
     let path = file.to_string_lossy().into_owned();
     let has_file = template.contains("{file}");
-    let mut args = split_completion_args(&template.replace("{file}", &path));
+    let mut args: Vec<String> = split_completion_args(&template.replace("{file}", SENTINEL))
+        .into_iter()
+        .map(|a| a.replace(SENTINEL, &path))
+        .collect();
     if !has_file {
         args.push(path);
     }
     args
 }
 
+/// How long a completion program may run before the waiter
+/// kills it (W3-6): a scanner hook is a seconds-scale job; five
+/// minutes is generous headroom, not a schedule anyone waits on.
+pub const COMPLETION_PROGRAM_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// Run the configured completion program (if any) for a finished
-/// entry's file, detached and never waited on. An empty program
-/// is a no-op; a missing or failing program is only logged — it
-/// must never fail or block the download's own completion.
+/// entry's file. An empty program is a no-op; a missing or
+/// failing program is only logged — it must never fail or block
+/// the download's own completion.
 pub fn run_completion_program(settings: &Settings, file: &Path) {
     let program = settings.completion_program.trim();
     if program.is_empty() {
@@ -3624,8 +3866,31 @@ pub fn run_completion_program(settings: &Settings, file: &Path) {
         .stderr(std::process::Stdio::null())
         .spawn()
     {
-        // dropping the Child handle leaves the program running
-        Ok(_) => eprintln!("[ndm] completion program started: {program} (file: {})", file.display()),
+        Ok(mut child) => {
+            eprintln!("[ndm] completion program started: {program} (file: {})", file.display());
+            // W3-6: the Child used to be dropped unwaited — on
+            // Unix every finished hook left a zombie behind for
+            // the life of the app, and a hung hook ran forever.
+            // A detached waiter thread reaps it, with a generous
+            // timeout after which it is killed and reaped.
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => {
+                            if t0.elapsed() >= COMPLETION_PROGRAM_TIMEOUT {
+                                let _ = child.kill();
+                                let _ = child.wait();
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
         Err(e) => eprintln!("[ndm] completion program could not start ({program}): {e}"),
     }
 }
@@ -3939,7 +4204,7 @@ pub fn swap_live(
         restored: Mutex::new(None),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), done0, 0.0)),
-        emitting: AtomicBool::new(false),
+        emitting: Arc::new(AtomicBool::new(false)),
         starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
@@ -4405,7 +4670,7 @@ pub fn rehome_if_finished_conflict(
         restored: Mutex::new(stub.restored.lock().unwrap().clone()),
         queued: AtomicBool::new(stub.queued.load(Ordering::Relaxed)),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
-        emitting: AtomicBool::new(false),
+        emitting: Arc::new(AtomicBool::new(false)),
         starting: AtomicBool::new(false),
         slot_preclaimed: AtomicBool::new(stub.slot_preclaimed.load(Ordering::Relaxed)),
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
@@ -4643,7 +4908,7 @@ pub fn register_http_stub(
         restored: Mutex::new(None),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
-        emitting: AtomicBool::new(false),
+        emitting: Arc::new(AtomicBool::new(false)),
         starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(false),
@@ -4740,11 +5005,19 @@ pub fn demote_terminal_live(state: &AppState, entry: &Arc<Entry>) -> Option<Arc<
         })),
         queued: AtomicBool::new(entry.queued.load(Ordering::Relaxed)),
         sample: Mutex::new((Instant::now(), snap_done, 0.0)),
-        emitting: AtomicBool::new(false),
+        emitting: Arc::new(AtomicBool::new(false)),
         starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
-        pause_requested: AtomicBool::new(false),
+        // C-1 (audit-233): a pause recorded on the live entry —
+        // e.g. one pressed while the expiry heal was waiting for
+        // this engine to settle — must survive the demote, like
+        // `removed` does; rebuilding it false orphaned the pause
+        // on the discarded object and the heal restarted the
+        // download behind the user's back. The resume caller
+        // clears the flag on the original entry before demoting,
+        // so copying is correct there too.
+        pause_requested: AtomicBool::new(entry.pause_requested.load(Ordering::SeqCst)),
         completion: Mutex::new(entry.completion.lock().unwrap().clone()),
         completion_actions: Mutex::new(entry.completion_actions.lock().unwrap().clone()),
         show_complete_override: Mutex::new(*entry.show_complete_override.lock().unwrap()),
@@ -4980,7 +5253,7 @@ pub fn start_entry(app: &Ctx, entry: Arc<Entry>) {
                 restored: Mutex::new(prev_restored),
                 queued: AtomicBool::new(false),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
-                emitting: AtomicBool::new(false),
+                emitting: Arc::new(AtomicBool::new(false)),
                 starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
@@ -6386,6 +6659,16 @@ pub fn pause_download(app: Ctx, id: String) -> Result<(), String> {
         return Ok(());
     }
     if let Some(dl) = &entry.download {
+        // C-1 (audit-233): a TERMINAL engine will never honour
+        // control.pause() — its workers have already exited. A
+        // pause pressed in that state (exactly the expiry heal's
+        // settle-wait window) needs the entry-level latch as its
+        // only record, or the demote that follows has nothing to
+        // carry and the heal restarts the download. A live
+        // engine's pause keeps the existing control-only shape.
+        if dl.is_terminal() {
+            entry.pause_requested.store(true, Ordering::SeqCst);
+        }
         dl.control.pause();
     }
     if let Some(job) = &entry.video {
@@ -6587,7 +6870,7 @@ pub async fn resume_download(
                 restored: Mutex::new(prev_restored),
                 queued: AtomicBool::new(false),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
-                emitting: AtomicBool::new(false),
+                emitting: Arc::new(AtomicBool::new(false)),
                 starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
                 removed: AtomicBool::new(entry.removed.load(Ordering::Relaxed)),
@@ -6741,6 +7024,12 @@ pub fn remove_entry_inner(
         }
     }
     state.retries.lock_ok().remove(id);
+    // C-3 (audit-233): the heal budget is per-entry session
+    // state, exactly like the retry budget beside it — a deleted
+    // entry's counter must leave with it, not leak for the
+    // session (ids are unique, so this is hygiene, not a
+    // behavioural fix)
+    state.heals.lock_ok().remove(id);
     delete_progress_file(app, id);
     // its downloaded bytes stay on the quota meter even though
     // the entry leaves the list (deleting must not refund quota)
@@ -7002,7 +7291,13 @@ pub fn clone_entry_with_category(e: &Entry, category: &str) -> Arc<Entry> {
         restored: Mutex::new(e.restored.lock_ok().clone()),
         queued: AtomicBool::new(e.queued.load(Ordering::Relaxed)),
         sample: Mutex::new(*e.sample.lock_ok()),
-        emitting: AtomicBool::new(false),
+        // W3-11: SHARE the emit-loop guard with the original —
+        // a loop running on the pre-rename Arc is still this
+        // entry's loop (same handles), and its exit reset must
+        // clear the flag the map's current Arc reads. A fresh
+        // false here let resume/spawn start a SECOND loop for
+        // the same download, double-firing completion actions.
+        emitting: e.emitting.clone(),
         starting: AtomicBool::new(e.starting.load(Ordering::Relaxed)),
         slot_preclaimed: AtomicBool::new(e.slot_preclaimed.load(Ordering::Relaxed)),
         removed: AtomicBool::new(e.removed.load(Ordering::Relaxed)),
@@ -7012,8 +7307,34 @@ pub fn clone_entry_with_category(e: &Entry, category: &str) -> Arc<Entry> {
         password: e.password.clone(),
         description: Mutex::new(e.description.lock_ok().clone()),
         speed_limit: Mutex::new(*e.speed_limit.lock_ok()),
-        detail: Mutex::new(String::new()),
+        // the live detail line is this entry's too — a relabel
+        // must not blank it mid-download
+        detail: Mutex::new(e.detail.lock_ok().clone()),
     })
+}
+
+/// W3-10 (audit-233): remove EVERY key of `map` that matches
+/// `canonical` case-insensitively, returning the first value
+/// found. Settings maps are keyed by user-typed spellings
+/// accumulated over versions, so one category can sit in the
+/// three maps under DIFFERENT cases (category_dirs "docs" vs
+/// category_exts "Docs") — an exact-case remove re-keys one map
+/// and silently strands the others.
+fn remove_category_folded<V>(map: &mut HashMap<String, V>, canonical: &str) -> Option<V> {
+    let keys: Vec<String> = map
+        .keys()
+        .filter(|k| k.eq_ignore_ascii_case(canonical))
+        .cloned()
+        .collect();
+    let mut value = None;
+    for k in keys {
+        if let Some(v) = map.remove(&k) {
+            if value.is_none() {
+                value = Some(v);
+            }
+        }
+    }
+    value
 }
 
 /// m-16: rename a category — the settings maps (extension
@@ -7040,13 +7361,16 @@ pub fn rename_category_in(state: &AppState, old: &str, new: &str) -> Result<(), 
     {
         return Err("a category with that name already exists".to_string());
     }
-    if let Some(v) = s.category_exts.remove(&canonical) {
+    // W3-10: fold case when re-keying — a map may hold this
+    // category under a different spelling than the canonical
+    // one, and an exact-case remove would strand it
+    if let Some(v) = remove_category_folded(&mut s.category_exts, &canonical) {
         s.category_exts.insert(new.to_string(), v);
     }
-    if let Some(v) = s.category_dirs.remove(&canonical) {
+    if let Some(v) = remove_category_folded(&mut s.category_dirs, &canonical) {
         s.category_dirs.insert(new.to_string(), v);
     }
-    if let Some(v) = s.category_sites.remove(&canonical) {
+    if let Some(v) = remove_category_folded(&mut s.category_sites, &canonical) {
         s.category_sites.insert(new.to_string(), v);
     }
     *state.settings.lock().unwrap() = s;
@@ -7054,7 +7378,7 @@ pub fn rename_category_in(state: &AppState, old: &str, new: &str) -> Result<(), 
     let ids: Vec<String> = state.order.lock().unwrap().clone();
     for id in ids {
         if let Some(e) = state.get(&id) {
-            if e.category == canonical {
+            if e.category.eq_ignore_ascii_case(&canonical) {
                 let fresh = clone_entry_with_category(&e, new);
                 state.entries.lock().unwrap().insert(id, fresh);
             }
@@ -7078,15 +7402,15 @@ pub fn delete_category_in(state: &AppState, name: &str) -> Result<(), String> {
     if category_is_builtin(&canonical) {
         return Err("built-in categories cannot be deleted".to_string());
     }
-    s.category_exts.remove(&canonical);
-    s.category_dirs.remove(&canonical);
-    s.category_sites.remove(&canonical);
+    remove_category_folded(&mut s.category_exts, &canonical);
+    remove_category_folded(&mut s.category_dirs, &canonical);
+    remove_category_folded(&mut s.category_sites, &canonical);
     *state.settings.lock().unwrap() = s;
     save_settings(state);
     let ids: Vec<String> = state.order.lock().unwrap().clone();
     for id in ids {
         if let Some(e) = state.get(&id) {
-            if e.category == canonical {
+            if e.category.eq_ignore_ascii_case(&canonical) {
                 let fresh = clone_entry_with_category(&e, "General");
                 state.entries.lock().unwrap().insert(id, fresh);
             }
@@ -7944,7 +8268,7 @@ pub fn refresh_url(app: Ctx, id: String, new_url: String) -> Result<(), String> 
         // demote_terminal_live — seeding 0 would divide the kept
         // history by the first live seconds on the next start
         sample: Mutex::new((Instant::now(), kept_done, 0.0)),
-        emitting: AtomicBool::new(false),
+        emitting: Arc::new(AtomicBool::new(false)),
         starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(false),
@@ -8475,7 +8799,7 @@ pub fn do_add_video(
                 })),
                 queued: AtomicBool::new(queued_flag),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
-                emitting: AtomicBool::new(false),
+                emitting: Arc::new(AtomicBool::new(false)),
                 starting: AtomicBool::new(starting_flag),
                 slot_preclaimed: AtomicBool::new(false),
                 removed: AtomicBool::new(false),
@@ -8614,7 +8938,7 @@ pub fn do_add_video(
         restored: Mutex::new(initial_restored),
         queued: AtomicBool::new(false),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
-        emitting: AtomicBool::new(false),
+        emitting: Arc::new(AtomicBool::new(false)),
         starting: AtomicBool::new(false),
         slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(stub.removed.load(Ordering::Relaxed)),
@@ -9225,6 +9549,13 @@ pub fn grab_subdir_for(base: &str, start_url: &str, item_url: &str) -> String {
     }
     let mut p = PathBuf::from(base);
     for seg in parts {
+        // W3-16: a literal `.`/`..` segment (e.g. arriving via a
+        // redirect-final URL) must never become a path component
+        // — pushing `..` would walk the subfolder out of the
+        // project's own save dir. Skip both segment kinds.
+        if seg == "." || seg == ".." {
+            continue;
+        }
         p.push(seg);
     }
     p.to_string_lossy().to_string()
@@ -9428,7 +9759,7 @@ pub fn restore_saved(state: &AppState) {
             let stamp = chrono::Utc::now().timestamp();
             let quarantine = path.with_extension(format!("json.corrupt-{stamp}"));
             let _ = std::fs::rename(&path, &quarantine);
-            DOWNLOADS_CORRUPT.store(true, Ordering::Relaxed);
+            state.downloads_corrupt.store(true, Ordering::Relaxed);
             // the quarantine must not be silent in the UI: the
             // list starting empty is indistinguishable from a
             // fresh install unless the app says what happened
@@ -9593,7 +9924,7 @@ pub fn restore_saved(state: &AppState) {
                 })),
                 queued: AtomicBool::new(s.status == "queued" && !finished),
                 sample: Mutex::new((Instant::now(), 0, 0.0)),
-                emitting: AtomicBool::new(false),
+                emitting: Arc::new(AtomicBool::new(false)),
                 starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
                 removed: AtomicBool::new(false),
@@ -9691,7 +10022,7 @@ pub fn restore_saved(state: &AppState) {
             restored: Mutex::new(Some(restored)),
             queued: AtomicBool::new(s_queued),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
-            emitting: AtomicBool::new(false),
+            emitting: Arc::new(AtomicBool::new(false)),
             starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
             removed: AtomicBool::new(false),
@@ -10000,8 +10331,38 @@ pub fn take_spool_claim(queue_dir: &Path, claim: &Path) -> Option<String> {
             eprintln!("[ndm] incoming queue claim failed: {e}");
             return None;
         }
-        match std::fs::read_to_string(claim) {
-            Ok(t) if !t.is_empty() => return Some(t),
+        // W3-9: cap the claim read (8 MiB) — the spool is
+        // appendable by any local process, and the old
+        // read_to_string loaded a pathologically large claim
+        // whole into memory. An oversized claim is refused with
+        // a log and left in place, like an unreadable one, so
+        // its lines survive for inspection instead of being
+        // silently dropped.
+        const MAX_CLAIM_BYTES: u64 = 8 * 1024 * 1024;
+        if std::fs::metadata(claim).map(|m| m.len()).unwrap_or(0) > MAX_CLAIM_BYTES {
+            eprintln!(
+                "[ndm] incoming queue claim {} exceeds the {} MiB cap and was refused",
+                claim.display(),
+                MAX_CLAIM_BYTES / (1024 * 1024)
+            );
+            return None;
+        }
+        match std::fs::File::open(claim)
+            .map_err(|e| std::io::Error::new(e.kind(), e))
+            .and_then(|f| {
+                use std::io::Read;
+                let mut s = String::new();
+                f.take(MAX_CLAIM_BYTES + 1).read_to_string(&mut s).map(|_| s)
+            }) {
+            Ok(t) if !t.is_empty() && (t.len() as u64) <= MAX_CLAIM_BYTES => return Some(t),
+            Ok(t) if !t.is_empty() => {
+                let _ = t;
+                eprintln!(
+                    "[ndm] incoming queue claim {} exceeds the size cap and was refused",
+                    claim.display()
+                );
+                return None;
+            }
             Ok(_) => {
                 // zero-line claim: delete it and move on to the
                 // next source within this same drain
@@ -10107,6 +10468,23 @@ pub fn drain_incoming(handle: &Ctx, queue_dir: &Path) {
     let _ = std::fs::remove_file(&claim);
 }
 
+
+/// W2-10 (audit-233): the drain-side videoKey rule — the SAME
+/// rule the host enforces on send (ndm-host's captured_streams
+/// validation), so a queue line that never passed through the
+/// current host cannot store a set under an arbitrary identity:
+/// empty = an unkeyed set (valid); otherwise at most 80 BYTES
+/// of ASCII alphanumerics plus `:` `-` `_` `.`. Over-long or
+/// off-charset keys are REJECTED, never truncated (the old
+/// chars().take(80) could collide two different keys at the
+/// truncation boundary).
+pub fn valid_video_key(key: &str) -> bool {
+    key.is_empty()
+        || (key.len() <= 80
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '-' | '_' | '.')))
+}
 
 pub fn sanitize_ack_id(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
@@ -10517,6 +10895,8 @@ pub fn discard_entry(app: &Ctx, state: &AppState, entry: &Arc<Entry>) {
     }
     entry.removed.store(true, Ordering::SeqCst);
     state.retries.lock_ok().remove(&entry.id);
+    // C-3: same per-entry session-state cleanup as remove_entry_inner
+    state.heals.lock_ok().remove(&entry.id);
     quota_note_removed(state, entry);
     if entry.download.is_some() {
         // wait for the engine to actually stop: its shutdown writes
@@ -10569,6 +10949,13 @@ pub fn discard_entry(app: &Ctx, state: &AppState, entry: &Arc<Entry>) {
 
 pub fn handle_incoming_line(handle: &Ctx, line: &str) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        // W3-9: a malformed line used to vanish silently — no
+        // log, no ack — so a corrupted line was indistinguishable
+        // from a lost one. Log its head (bounded) so the drop is
+        // visible; it still cannot ack (its id is unknowable
+        // until it parses).
+        let head: String = line.chars().take(120).collect();
+        eprintln!("[ndm] incoming queue line dropped (not valid JSON): {head}");
         return;
     };
     let ack_id = v["id"].as_str().and_then(sanitize_ack_id);
@@ -11048,6 +11435,21 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
             .chars()
             .take(300)
             .collect();
+        // W2-10: the videoKey is validated HERE with the host's
+        // own rule — a malformed key drops the line (with a log
+        // and a refusal ack), it is never silently truncated
+        // into a possibly-colliding identity
+        let video_key = v["videoKey"].as_str().unwrap_or("").to_string();
+        if !valid_video_key(&video_key) {
+            eprintln!("[ndm] incoming captured_streams line dropped: malformed videoKey");
+            drop_cookies_token(&state, &token);
+            write_ack_and_result(
+                handle,
+                ack_id.as_deref(),
+                serde_json::json!({ "ok": false, "error": "videoKey is malformed" }),
+            );
+            return;
+        }
         capture::store_set(
             data_dir(&state).as_deref(),
             capture::CapturedSet {
@@ -11058,12 +11460,7 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
                 // 2.3.2 (WS-B): the recorder's per-video grouping
                 // key when this set names one Facebook video —
                 // store_set derives the per-video identity from it
-                video_key: v["videoKey"]
-                    .as_str()
-                    .unwrap_or("")
-                    .chars()
-                    .take(80)
-                    .collect(),
+                video_key,
             },
         );
         // 2.3.1 (item 14): a store-only send is the browser
@@ -11419,7 +11816,7 @@ fn sync_reset_entry(state: &AppState, entry: &Arc<Entry>, probe: &ndm::Probe) ->
         })),
         queued: AtomicBool::new(true),
         sample: Mutex::new((Instant::now(), 0, 0.0)),
-        emitting: AtomicBool::new(false),
+        emitting: Arc::new(AtomicBool::new(false)),
         starting: AtomicBool::new(false),
         slot_preclaimed: AtomicBool::new(false),
         removed: AtomicBool::new(false),
@@ -12013,7 +12410,9 @@ mod tests {
             heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
+            downloads_corrupt: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
+            settings_repaired: Mutex::new(None),
         };
         save_settings(&state);
         state.settings.lock().unwrap().max_connections = 32;
@@ -12026,6 +12425,109 @@ mod tests {
         load_settings(&state);
         assert_eq!(state.settings.lock().unwrap().max_connections, 16);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A state whose settings_file points inside `dir`, for the
+    /// W3-1 load_settings tests.
+    fn state_with_settings_file(dir: &Path) -> AppState {
+        let mut s = AppState::new();
+        s.settings_file = Mutex::new(dir.join("settings.json"));
+        s
+    }
+
+    #[test]
+    fn settings_wrong_typed_scalar_resets_only_that_field() {
+        // W3-1: one string where a number belongs used to fail
+        // the whole parse and factory-reset EVERY preference
+        let dir = std::env::temp_dir().join(format!("ndm-w31-scalar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"max_connections": "8", "quota_mb": 250, "default_dir": "/tmp/keepme", "proxy_port": "8080", "sound_events": false}"#,
+        )
+        .unwrap();
+        let state = state_with_settings_file(&dir);
+        load_settings(&state);
+        let s = state.settings.lock().unwrap();
+        assert_eq!(s.quota_mb, 250, "a good field must survive another field's repair");
+        assert_eq!(s.default_dir, "/tmp/keepme");
+        assert!(!s.sound_events, "a good bool must survive");
+        assert_eq!(s.max_connections, 8, "the bad field falls back to ITS default (8)");
+        assert_eq!(s.proxy_port, 0, "the bad field falls back to ITS default (0)");
+        drop(s);
+        let note = take_settings_repaired_note(&state).expect("a repair must be surfaced");
+        assert!(note.contains("max_connections"), "note names the field: {note}");
+        assert!(note.contains("proxy_port"), "note names the field: {note}");
+        assert!(take_settings_repaired_note(&state).is_none(), "the note is delivered once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_garbage_file_is_quarantined_with_defaults() {
+        // W3-1: a file that is not JSON at all is set aside as
+        // settings.json.corrupt-<ts> (the downloads.json
+        // treatment), defaults load, and the loss is surfaced —
+        // never a silent factory reset
+        let dir = std::env::temp_dir().join(format!("ndm-w31-garbage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), b"this is not json {{{").unwrap();
+        let state = state_with_settings_file(&dir);
+        load_settings(&state);
+        assert_eq!(state.settings.lock().unwrap().max_connections, 8, "defaults are in use");
+        let quarantined: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("settings.json.corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "exactly one quarantine copy: {quarantined:?}");
+        let kept = std::fs::read(dir.join(&quarantined[0])).unwrap();
+        assert_eq!(kept, b"this is not json {{{", "the damaged bytes survive for inspection");
+        assert!(take_settings_repaired_note(&state).is_some(), "the reset must be surfaced");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_valid_file_loads_untouched_and_unnoted() {
+        let dir = std::env::temp_dir().join(format!("ndm-w31-valid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"max_connections": 16, "quota_mb": 42}"#,
+        )
+        .unwrap();
+        let state = state_with_settings_file(&dir);
+        load_settings(&state);
+        assert_eq!(state.settings.lock().unwrap().max_connections, 16);
+        assert_eq!(state.settings.lock().unwrap().quota_mb, 42);
+        assert!(take_settings_repaired_note(&state).is_none(), "a valid file earns no note");
+        assert!(
+            std::fs::read_dir(&dir).unwrap().flatten().count() == 1,
+            "no quarantine file may appear for a valid settings file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_file_is_created_owner_only() {
+        // A-F10: the file carries plaintext site-login/proxy
+        // passwords — its FIRST creation must already be 0600
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ndm-af10-perms-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_with_settings_file(&dir);
+        save_settings(&state);
+        let mode = std::fs::metadata(dir.join("settings.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "settings.json must be created 0600, got {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12049,6 +12551,33 @@ mod tests {
         assert_eq!(
             completion_program_args("--scan \"{file}\"", file),
             vec!["--scan", "/tmp/my downloads/big file.iso"]
+        );
+    }
+
+    #[test]
+    fn completion_args_unquoted_path_with_spaces_stays_one_argument() {
+        // W3-5: the natural unquoted template must not shred a
+        // spaced path into several arguments
+        let file = Path::new("/tmp/my dir/file name.bin");
+        assert_eq!(
+            completion_program_args("--scan {file}", file),
+            vec!["--scan", "/tmp/my dir/file name.bin"]
+        );
+    }
+
+    #[test]
+    fn completion_args_path_containing_a_quote_char_survives() {
+        // W3-4: a `"` inside the download DIRECTORY is legal on
+        // Linux; the splitter used to delete it and hand the
+        // hook a different, nonexistent path
+        let file = Path::new("/tmp/we\"ird/file.bin");
+        assert_eq!(
+            completion_program_args("--scan \"{file}\"", file),
+            vec!["--scan", "/tmp/we\"ird/file.bin"]
+        );
+        assert_eq!(
+            completion_program_args("--scan {file}", file),
+            vec!["--scan", "/tmp/we\"ird/file.bin"]
         );
     }
 
@@ -12222,7 +12751,9 @@ mod tests {
             heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
+            downloads_corrupt: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
+            settings_repaired: Mutex::new(None),
         };
 
         let entry = Arc::new(Entry {
@@ -12250,7 +12781,7 @@ mod tests {
             })),
             queued: AtomicBool::new(false),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
-            emitting: AtomicBool::new(false),
+            emitting: Arc::new(AtomicBool::new(false)),
             starting: AtomicBool::new(false),
                 slot_preclaimed: AtomicBool::new(false),
             removed: AtomicBool::new(false),
@@ -12304,7 +12835,9 @@ mod tests {
             heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
+            downloads_corrupt: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
+            settings_repaired: Mutex::new(None),
         }
     }
 
@@ -12514,7 +13047,7 @@ mod tests {
             })),
             queued: AtomicBool::new(false),
             sample: Mutex::new((Instant::now(), 0, 0.0)),
-            emitting: AtomicBool::new(false),
+            emitting: Arc::new(AtomicBool::new(false)),
             starting: AtomicBool::new(false),
             slot_preclaimed: AtomicBool::new(false),
             removed: AtomicBool::new(false),
@@ -12618,7 +13151,9 @@ mod tests {
             heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
+            downloads_corrupt: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
+            settings_repaired: Mutex::new(None),
         };
         let mint = |st: &AppState| st.seq.fetch_add(1, Ordering::Relaxed) + 1;
         // mint dl-2, release it → the next mint reuses 2
@@ -12674,7 +13209,9 @@ mod tests {
             heals: Mutex::new(HashMap::new()),
             had_active: AtomicBool::new(false),
             persist_error: Mutex::new(None),
+            downloads_corrupt: AtomicBool::new(false),
             startup_notice: Mutex::new(None),
+            settings_repaired: Mutex::new(None),
         };
 
         let stub = restored_entry("f.bin", "http", 0, dir.join("f.bin"));
@@ -13573,7 +14110,7 @@ mod tests {
         state.entries.lock().unwrap().insert("dl-1".to_string(), entry);
         state.order.lock().unwrap().push("dl-1".to_string());
         persist(&state);
-        assert!(!DOWNLOADS_CORRUPT.load(Ordering::Relaxed));
+        assert!(!state.downloads_corrupt.load(Ordering::Relaxed));
 
         // and now the emptied list persists as empty — the
         // deleted entry must NOT resurrect on the next launch
@@ -13979,6 +14516,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// W3-10 (audit-233): the drift is real — canonical spelling
+    /// comes from the FIRST map that names the category, so a
+    /// second map (or an entry) spelled with different case was
+    /// stranded by the exact-case remove/rewrite. Rename and
+    /// delete now fold case on every store they touch.
+    #[test]
+    fn category_rename_delete_fold_case_across_maps_and_entries() {
+        let dir = std::env::temp_dir().join(format!("ndm-w310-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = state_with_data_file(dir.join("downloads.json"));
+        *state.settings_file.lock().unwrap() = dir.join("settings.json");
+        {
+            let mut s = state.settings.lock().unwrap();
+            // three stores, three spellings of one category
+            s.category_exts.insert("Docs".to_string(), vec!["xyz".to_string()]);
+            s.category_dirs.insert("docs".to_string(), "/tmp/docs".to_string());
+            s.category_sites.insert("DOCS".to_string(), vec!["ex.com".to_string()]);
+        }
+        let mut e = restored_entry("d.bin", "http", 10, dir.join("d.bin"));
+        e.category = "dOcS".to_string();
+        state.entries.lock().unwrap().insert("dl-1".to_string(), Arc::new(e));
+        state.order.lock().unwrap().push("dl-1".to_string());
+
+        rename_category_in(&state, "docs", "Guides").unwrap();
+        {
+            let s = state.settings.lock().unwrap();
+            assert_eq!(s.category_exts.get("Guides").map(|v| v.len()), Some(1));
+            assert_eq!(s.category_dirs.get("Guides").map(|d| d.as_str()), Some("/tmp/docs"));
+            assert_eq!(s.category_sites.get("Guides").map(|v| v.len()), Some(1));
+            assert!(!s.category_exts.keys().any(|k| k.eq_ignore_ascii_case("docs")));
+            assert!(!s.category_dirs.keys().any(|k| k.eq_ignore_ascii_case("docs")));
+            assert!(!s.category_sites.keys().any(|k| k.eq_ignore_ascii_case("docs")));
+        }
+        assert_eq!(state.get("dl-1").unwrap().category, "Guides");
+
+        delete_category_in(&state, "GUIDES").unwrap();
+        assert_eq!(state.get("dl-1").unwrap().category, "General");
+        let s = state.settings.lock().unwrap();
+        assert!(!s.category_exts.keys().any(|k| k.eq_ignore_ascii_case("guides")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W3-11 (audit-233): the category relabel clone SHARES the
+    /// emit-loop guard with the original entry — so a loop
+    /// running on the pre-rename Arc still counts (no second
+    /// loop can spawn for the renamed Arc) and its exit reset
+    /// clears the flag for the clone too. The detail line is
+    /// carried across as well.
+    #[test]
+    fn category_clone_shares_the_emitting_guard_and_detail() {
+        let dir = std::env::temp_dir().join(format!("ndm-w311-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = restored_entry("x.bin", "http", 10, dir.join("x.bin"));
+        *e.detail.lock().unwrap() = "Resolving the address…".to_string();
+        e.emitting.store(true, Ordering::SeqCst);
+        let clone = clone_entry_with_category(&e, "Other");
+        assert!(
+            clone.emitting.load(Ordering::SeqCst),
+            "the clone must see the running loop's guard"
+        );
+        e.emitting.store(false, Ordering::SeqCst);
+        assert!(
+            !clone.emitting.load(Ordering::SeqCst),
+            "the loop's exit reset on the old Arc clears the clone's flag (same guard)"
+        );
+        assert_eq!(clone.detail.lock().unwrap().as_str(), "Resolving the address…");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn ext_notice_decision_matrix() {
         // EXT §1c/§5: the full decision matrix
@@ -14293,6 +14901,18 @@ mod tests {
             dl_img
         );
         assert_eq!(grab_subdir_for("/dl", "http://h/a/index.html", "http://h/top.png"), "/dl");
+        // W3-16: literal dot segments never become path
+        // components — a `..` must not walk out of the save dir
+        assert_eq!(
+            grab_subdir_for("/dl", "http://h/a/index.html", "http://h/a/../img/x.png"),
+            dl_img,
+            "a .. segment is skipped, not pushed"
+        );
+        assert_eq!(
+            grab_subdir_for("/dl", "http://h/a/index.html", "http://h/a/./img/x.png"),
+            dl_img,
+            "a . segment is skipped, not pushed"
+        );
     }
 
     struct NullSink;
@@ -14608,6 +15228,94 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// W2-10 (audit-233): the drain validates videoKey with the
+    /// host's rule and REJECTS malformed keys (drop + refusal
+    /// ack, nothing stored) instead of truncating them into a
+    /// possibly-colliding identity.
+    #[test]
+    fn captured_streams_line_with_malformed_video_key_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("ndm-capkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let feed = "https://www.facebook.com/w210-feed";
+        let line = |id: &str, key: &str| {
+            serde_json::json!({
+                "id": id,
+                "kind": "captured_streams",
+                "url": feed,
+                "pageUrl": feed,
+                "title": "Feed video",
+                "storeOnly": true,
+                "videoKey": key,
+                "streams": [
+                    { "url": "https://video.example.fbcdn.net/x.mp4", "mimeType": "video/mp4",
+                      "qualityLabel": "720p", "hasAudio": true, "hasVideo": true }
+                ]
+            })
+            .to_string()
+        };
+        // the pure rule, host-identical: bytes not chars for the cap
+        assert!(valid_video_key(""));
+        assert!(valid_video_key("fb:1234567890"));
+        assert!(valid_video_key(&"a".repeat(80)));
+        assert!(!valid_video_key(&"a".repeat(81)), "81 bytes is over the cap");
+        assert!(!valid_video_key("fb:12 34"), "spaces are off-charset");
+        assert!(!valid_video_key("fb:12/34"), "slashes are off-charset");
+        assert!(!valid_video_key("fb:১২৩"), "non-ASCII is off-charset");
+        assert!(!valid_video_key(&"é".repeat(41)), "82 bytes of é is over the byte cap");
+        for (id, key) in [
+            ("key-space", "fb:12 34"),
+            ("key-long", "a".repeat(81).as_str()),
+            ("key-unicode", "fb:১২৩"),
+        ] {
+            handle_incoming_line(&ctx, &line(id, key));
+            let result = std::fs::read_to_string(dir.join("results").join(format!("{id}.json")))
+                .expect("a refusal result is written");
+            assert!(result.contains("\"ok\":false"), "refusal for {key:?}: {result}");
+            assert!(result.contains("videoKey"), "refusal names the cause: {result}");
+        }
+        assert!(
+            capture::get_set(Some(&dir), &capture::video_identity(feed)).is_none(),
+            "no set may be stored under any identity for a dropped key"
+        );
+        assert!(state.pending_videos.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W3-9: an oversized spool claim is refused (and left in
+    /// place for inspection), while an ordinary claim is taken
+    /// exactly as before.
+    #[test]
+    fn spool_claim_over_the_size_cap_is_refused_not_read() {
+        let dir = std::env::temp_dir().join(format!("ndm-spoolcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // ordinary claim: taken whole
+        std::fs::write(dir.join("incoming.jsonl"), "{\"kind\":\"show_app\"}\n").unwrap();
+        let claim = dir.join("incoming.claim-test-0");
+        assert_eq!(
+            take_spool_claim(&dir, &claim).as_deref(),
+            Some("{\"kind\":\"show_app\"}\n")
+        );
+        let _ = std::fs::remove_file(&claim);
+        // oversized claim: refused, bytes left on disk
+        let big = "x".repeat(8 * 1024 * 1024 + 1);
+        std::fs::write(dir.join("incoming.jsonl"), &big).unwrap();
+        assert_eq!(take_spool_claim(&dir, &claim), None, "an oversized claim is refused");
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            left.iter().any(|n| n.starts_with("incoming.claim-")),
+            "the refused claim stays on disk: {left:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A captured line with no usable stream stores nothing and
     /// queues nothing — the ack still answers (with the refusal),
     /// so the extension can tell the user instead of hanging.
@@ -14890,6 +15598,142 @@ mod tests {
 
     fn core_pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
+    }
+
+    /// A server whose HEAD claims range support but whose range
+    /// GETs are a permanent 404 — the download dies terminally
+    /// with its engine handle still attached (C-1 fixture).
+    fn core_dead_range_server(body: Vec<u8>) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let total = body.len() as u64;
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    if method == "HEAD" {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nETag: \"dead\"\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                    } else {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// C-2 fixture: HEAD always answers 200 with range support;
+    /// range GETs are refused 403 until the SECOND HEAD has been
+    /// seen (the heal's re-probe), after which ranges serve the
+    /// body. The first start's workers therefore die at byte 0
+    /// on a typed auth death while its start probe passed.
+    fn core_head_ok_range_dead_server(
+        body: Vec<u8>,
+        heads: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> u16 {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = Arc::new(body);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut s) = stream else { continue };
+                let body = body.clone();
+                let heads = heads.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(match s.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    });
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let method = line.split_whitespace().next().unwrap_or("").to_string();
+                    let mut range: Option<(u64, u64)> = None;
+                    loop {
+                        let mut h = String::new();
+                        match reader.read_line(&mut h) {
+                            Ok(0) => break,
+                            Ok(_) if h == "\r\n" || h == "\n" => break,
+                            Ok(_) => {
+                                let hl = h.to_ascii_lowercase();
+                                if let Some(v) = hl.strip_prefix("range: bytes=") {
+                                    if let Some((a, b)) = v.trim().split_once('-') {
+                                        range = Some((
+                                            a.trim().parse().unwrap_or(0),
+                                            b.trim().parse().unwrap_or(0),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let total = body.len() as u64;
+                    if method == "HEAD" {
+                        heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nETag: \"byte0\"\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        return;
+                    }
+                    let healed = heads.load(std::sync::atomic::Ordering::Relaxed) >= 2;
+                    if !healed {
+                        let _ = s.write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                        return;
+                    }
+                    if let Some((rs, re)) = range {
+                        let end = re.min(total - 1);
+                        let slice = &body[rs as usize..=end as usize];
+                        let _ = s.write_all(
+                            format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {rs}-{end}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            )
+                            .as_bytes(),
+                        );
+                        let _ = s.write_all(slice);
+                    } else {
+                        let _ = s.write_all(
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        );
+                        let _ = s.write_all(&body);
+                    }
+                });
+            }
+        });
+        port
     }
 
     /// WS-A rig (audit-232 S5 at reduced scale): a redirector
@@ -15200,6 +16044,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// C-1 (audit-233) regression: a pause pressed while the
+    /// heal waits for a TERMINAL engine to settle must survive
+    /// the demote. The engine here dies permanently (404 ranges)
+    /// so the entry sits terminal-errored — the settle-window
+    /// shape: pause_download can only latch the press (the dead
+    /// engine ignores its control), and demote_terminal_live
+    /// must carry that latch onto the stub. Pre-fix both halves
+    /// dropped it: no latch on a live entry's terminal pause,
+    /// and the demote rebuilt pause_requested as false.
+    #[test]
+    fn pause_on_terminal_entry_survives_the_demote() {
+        let dir = std::env::temp_dir().join(format!("ndm-c1-demote-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = core_pattern(1024 * 1024);
+        let port = core_dead_range_server(body);
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let url = format!("http://127.0.0.1:{port}/dead.bin");
+        let stub = register_http_stub(
+            &state,
+            &url,
+            dir.to_string_lossy().as_ref(),
+            None,
+            Some("dead.bin"),
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        let id = stub.id.clone();
+        start_entry(&ctx, stub);
+        assert!(
+            wait_status(&state, &id, "error", 60),
+            "the 404-ranged download must end terminal-errored; last payload: {:?}",
+            state.get(&id).map(|e| { let p = payload_of(&e); format!("{} err={}", p.status, p.error) })
+        );
+        let entry = state.get(&id).expect("entry still listed");
+        assert!(entry.download.is_some(), "the terminal entry still holds its dead handle");
+        pause_download(ctx.clone(), id.clone()).unwrap();
+        assert!(
+            entry.pause_requested.load(Ordering::SeqCst),
+            "a pause on a terminal engine must latch on the entry (its control is dead)"
+        );
+        let stub = demote_terminal_live(&state, &entry).expect("a terminal live entry demotes");
+        assert!(
+            stub.pause_requested.load(Ordering::SeqCst),
+            "the demote must carry the recorded pause onto the stub"
+        );
+        assert_eq!(payload_of(&stub).status, "paused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C-2 (audit-233): the byte-0 heal shape — HEAD answers 200
+    /// with range support, but every range GET is refused (403)
+    /// until the address is re-probed (the heal's fresh HEAD is
+    /// what flips this fixture's server, exactly the CDN shape
+    /// the audit names). A fresh download therefore dies having
+    /// moved ZERO bytes on a typed auth death; pre-fix the heal
+    /// gate's done_bytes > 0 requirement left it in error for
+    /// good, post-fix it heals and lands byte-identical.
+    #[test]
+    fn expiry_heal_at_byte_zero_completes_byte_identical() {
+        let dir = std::env::temp_dir().join(format!("ndm-c2-byte0-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = core_pattern(2 * 1024 * 1024);
+        let heads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let port = core_head_ok_range_dead_server(body.clone(), heads.clone());
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let url = format!("http://127.0.0.1:{port}/byte0.bin");
+        let stub = register_http_stub(
+            &state,
+            &url,
+            dir.to_string_lossy().as_ref(),
+            None,
+            Some("byte0.bin"),
+            "",
+            "",
+            &main_queue_name(),
+            "",
+            "",
+            true,
+        )
+        .unwrap();
+        let id = stub.id.clone();
+        start_entry(&ctx, stub);
+        assert!(
+            wait_status(&state, &id, "finished", 180),
+            "the byte-0 auth-dead download must heal and finish; last payload: {:?}",
+            state.get(&id).map(|e| { let p = payload_of(&e); format!("{} err={} {}/{}", p.status, p.error, p.done_bytes, p.total) })
+        );
+        assert_eq!(std::fs::read(dir.join("byte0.bin")).unwrap(), body);
+        assert!(
+            heads.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+            "the heal must have re-probed the original address"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// WS-A negative: with the heal budget already spent, an
     /// auth-dead download fails honestly — no extra probe of the
     /// original address, no loop, the error stays on the entry.
@@ -15262,7 +16210,12 @@ mod tests {
         assert!(heal_decision(true, 100, MAX_HEAL_ATTEMPTS - 1, false));
         assert!(!heal_decision(true, 100, MAX_HEAL_ATTEMPTS, false), "budget spent");
         assert!(!heal_decision(false, 100, 0, false), "not an auth death");
-        assert!(!heal_decision(true, 0, 0, false), "no bytes flowed — nothing to resume");
+        // C-2: byte 0 heals too — HEAD-200-but-ranges-403 kills a
+        // fresh download before any byte flows, on the same typed
+        // signal; a plain 404 never sets auth_dead, and the
+        // budget (asserted above) bounds permanent failures
+        assert!(heal_decision(true, 0, 0, false), "byte-0 auth death heals");
+        assert!(!heal_decision(true, 0, MAX_HEAL_ATTEMPTS, false), "byte-0 still budget-bounded");
         assert!(!heal_decision(true, 100, 0, true), "user-stopped jobs never heal");
         assert_eq!(heal_backoff(0), Duration::from_secs(2));
         assert_eq!(heal_backoff(1), Duration::from_secs(4));

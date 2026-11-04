@@ -254,7 +254,14 @@ fn plain_add_error(e: &str) -> String {
     {
         "NDM could not reach that address — check the address and your connection, then try again.".to_string()
     } else if e.len() > 120 {
-        format!("Could not add the download. {}…", &e[..120])
+        // Byte-slicing at a fixed offset panics when the cut lands
+        // inside a multi-byte character (a Bengali folder name in
+        // the error does exactly that) — back off to a boundary.
+        let mut cut = 120;
+        while cut > 0 && !e.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("Could not add the download. {}…", &e[..cut])
     } else {
         format!("Could not add the download. {e}")
     }
@@ -376,7 +383,13 @@ pub fn on_components_progress(v: &serde_json::Value) {
     let wanted = {
         let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
         match guard.as_mut() {
-            Some(d) if d.setup_wanted => {
+            // Consume the wait ONLY on a terminal phase: core
+            // reports each component (yt-dlp, then deno) as its
+            // own progress payload, so clearing on the first
+            // payload stranded the fetch forever when the second
+            // component was still arriving (audit-233; the GTK
+            // shell's probe() has always gated on done/error).
+            Some(d) if d.setup_wanted && (phase == "done" || phase == "error") => {
                 d.setup_wanted = false;
                 true
             }

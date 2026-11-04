@@ -702,16 +702,43 @@ fn extract_binary(zip_path: &Path, name: &str, out: &Path) -> Result<(), String>
 /// rename it into place. Every failure path removes the temp file:
 /// a failed copy used to leave the `.extracting` file behind,
 /// contradicting the cleanup this module promises (W1 F10).
+/// W3-12: decompressed-size ceiling for one extracted binary —
+/// the same 512 MiB discipline as the updater's extract_zip.
+/// The zip's hash is pinned and verified before extraction, so
+/// this is defence in depth against a bomb-shaped artifact, not
+/// a live exposure.
+pub const MAX_EXTRACTED_BYTES: u64 = 512 * 1024 * 1024;
+
 fn write_extracted(
     entry: &mut impl Read,
     tmp: &Path,
     out: &Path,
     name: &str,
 ) -> Result<(), String> {
+    write_extracted_with_cap(entry, tmp, out, name, MAX_EXTRACTED_BYTES)
+}
+
+fn write_extracted_with_cap(
+    entry: &mut impl Read,
+    tmp: &Path,
+    out: &Path,
+    name: &str,
+    cap: u64,
+) -> Result<(), String> {
     let copied = (|| {
         let mut dst = std::fs::File::create(tmp)
             .map_err(|e| format!("cannot extract {name}: {e}"))?;
-        std::io::copy(entry, &mut dst).map_err(|e| format!("cannot extract {name}: {e}"))
+        // the cap bites DURING the copy (read one byte past it to
+        // prove overflow), never from a declared entry size
+        let n = std::io::copy(&mut entry.take(cap + 1), &mut dst)
+            .map_err(|e| format!("cannot extract {name}: {e}"))?;
+        if n > cap {
+            return Err(format!(
+                "the extracted {name} exceeds the {} MiB size cap and was discarded",
+                cap / (1024 * 1024)
+            ));
+        }
+        Ok(n)
     })();
     if let Err(e) = copied {
         let _ = std::fs::remove_file(tmp);
@@ -1018,6 +1045,25 @@ mod tests {
         assert!(err.contains("cannot extract"), "unexpected error: {err}");
         assert!(!tmp.exists(), "a failed copy must not leak the .extracting temp");
         assert!(!out.exists(), "a failed copy must not install anything");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn extract_past_the_size_cap_is_refused_and_cleaned() {
+        // W3-12: a decompressed entry past the cap is refused
+        // mid-copy and leaves neither the temp nor an install
+        let dir = temp_dir("extract-cap");
+        let out = dir.join("tool");
+        let tmp = out.with_extension("extracting");
+        let mut data = std::io::Cursor::new(vec![b'x'; 64]);
+        let err = write_extracted_with_cap(&mut data, &tmp, &out, "tool", 16).unwrap_err();
+        assert!(err.contains("size cap"), "unexpected error: {err}");
+        assert!(!tmp.exists());
+        assert!(!out.exists());
+        // exactly at the cap installs fine
+        let mut data = std::io::Cursor::new(vec![b'x'; 16]);
+        write_extracted_with_cap(&mut data, &tmp, &out, "tool", 16).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap().len(), 16);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

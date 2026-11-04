@@ -214,7 +214,11 @@ fn enablement(status: &str) -> (bool, bool, bool) {
         // (2.3.1 bug 4).
         "starting" | "resuming" => (false, true, true),
         "queued" | "paused" => (true, false, true),
-        "error" | "cancelled" => (true, false, false),
+        // Error/cancelled: nothing is running to cancel, but
+        // Cancel must still dismiss the dialog — greying it left
+        // the window X as the only way out, the same trap the
+        // finished arm below was fixed for (audit-233 B-1).
+        "error" | "cancelled" => (true, false, true),
         // Finished: nothing left to pause or resume, but Cancel
         // must still dismiss the dialog — greying it left the
         // window X as the only way out (2.3.1 gate finding).
@@ -588,13 +592,30 @@ impl ProgDlg {
         self.lim_dirty.set(false);
         let on = self.lim_on.is_active();
         self.lim_val.set_sensitive(on);
-        let kb: u64 = self
-            .lim_val
-            .text()
-            .trim()
-            .parse()
-            .unwrap_or(512)
-            .max(1);
+        // A non-numeric value used to fall back to 512 silently —
+        // the user typed one number and another took effect
+        // (audit-233). Refuse it in words and keep the live limit.
+        let raw = self.lim_val.text().trim().to_string();
+        let kb: u64 = if raw.is_empty() {
+            512
+        } else {
+            match raw.parse::<u64>() {
+                Ok(v) => v.max(1),
+                Err(_) => {
+                    self.lim_note.set_text(
+                        "That speed could not be read as a number — the current limit still applies.",
+                    );
+                    // Put the live value back in the field so the
+                    // state is evident even after the next sync
+                    // rewrites the note (global-limit message).
+                    self.lim_val.set_text(
+                        &limiter_prefill_kb(&self.last.borrow(), self.global_limit).to_string(),
+                    );
+                    return;
+                }
+            }
+        };
+        self.lim_note.set_text("");
         let bps = if on { kb * 1024 } else { 0 };
         if bps == self.last.borrow().speed_limit {
             return;

@@ -2526,9 +2526,6 @@ fn on_state_restored(hwnd: HWND) {
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
     }
-    // The Drop Basket exists from startup, hidden until the
-    // user asks for it (the Tauri basket window's visible:false).
-    crate::basket::create(hwnd);
 }
 
 /// WM_CLOSE / File → Exit — the Tauri shell's CloseRequested
@@ -2605,6 +2602,12 @@ fn bootstrap(hwnd: HWND, background: bool) -> bool {
     if INSTANCE_RAISE_PENDING.swap(false, Ordering::SeqCst) {
         raise_main_window_impl(hwnd);
     }
+    // The Drop Basket exists from startup, hidden until the
+    // user asks for it (the Tauri basket window's visible:false).
+    // It is created HERE, not in on_state_restored: a
+    // --background start never posts WM_APP_RESTORED, so the
+    // basket used to be dead for the whole session (audit-233).
+    crate::basket::create(hwnd);
     if !background {
         unsafe {
             let _ = PostMessageW(Some(hwnd), WM_APP_RESTORED, WPARAM(0), LPARAM(0));

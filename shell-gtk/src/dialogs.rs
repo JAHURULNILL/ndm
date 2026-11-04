@@ -357,7 +357,10 @@ fn run_dialog_impl(
     } else {
         None
     };
-    dialog.hide();
+    // Destroy, not hide: this dialog is built fresh per call,
+    // and hiding left every shown dialog's window alive for the
+    // whole session (audit-233 — hidden-window leak).
+    dialog.close();
     // A completion that landed while this dialog was up gets
     // its own dialog now (app.js: every modal-close path calls
     // showNextComplete back) — and so does a file offer that

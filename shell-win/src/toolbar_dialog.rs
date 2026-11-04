@@ -104,16 +104,23 @@ fn register_class() {
 }
 
 fn render(cfg: &ToolbarCfg) {
-    let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(d) = guard.as_ref() else { return };
-    let lv = ListView { hwnd: h(d.list) };
+    // Same rule as the Columns/Grabber dialogs (AUDIT-233
+    // CRITICAL): never write to a checkbox ListView while holding
+    // DLG — set_checked fires LVN_ITEMCHANGED synchronously, and
+    // any notify handler that takes this mutex would deadlock.
+    let (list_raw, size_raw) = {
+        let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = guard.as_ref() else { return };
+        (d.list, d.size)
+    };
+    let lv = ListView { hwnd: h(list_raw) };
     lv.clear();
     for (i, (_, dom, label)) in crate::TOOLBAR_DEFS.iter().enumerate() {
         lv.insert_row(i as i32, &[label.to_string()]);
         lv.set_checked(i as i32, !cfg.hidden.iter().any(|x| x == dom));
     }
     unsafe {
-        send(h(d.size), 0x014E, WPARAM(if cfg.small { 1 } else { 0 }), LPARAM(0));
+        send(h(size_raw), 0x014E, WPARAM(if cfg.small { 1 } else { 0 }), LPARAM(0));
     }
 }
 

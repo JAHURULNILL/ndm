@@ -97,6 +97,12 @@ fn note_label(text: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.set_xalign(0.0);
     l.set_line_wrap(true);
+    // WordChar, not Word: a filename or path is ONE unbroken
+    // word, and plain word wrap reports that whole word as the
+    // label's minimum width — a 187-char name stretched this
+    // dialog to 1308px (audit-233 B-2). Breaking over-long words
+    // at character boundaries keeps the cap below effective.
+    l.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
     // A wrapping label still reports its UNWRAPPED line as its
     // natural width, and the window grows to fit it — one signed
     // CDN address (thousands of chars) blew this dialog wider
@@ -210,6 +216,7 @@ fn show_complete_one(parent: &gtk::ApplicationWindow, ctx: Ctx, p: &serde_json::
     ));
     title.set_xalign(0.0);
     title.set_line_wrap(true);
+    title.set_line_wrap_mode(gtk::pango::WrapMode::WordChar);
     title.set_max_width_chars(64);
     body.pack_start(&title, false, false, 0);
     let url = p.get("url").and_then(|x| x.as_str()).unwrap_or("");

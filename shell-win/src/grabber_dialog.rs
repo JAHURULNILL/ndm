@@ -495,34 +495,44 @@ fn sync_results(d: &mut GrabDlg) {
 }
 
 fn render_kinds() {
-    let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(d) = guard.as_mut() else { return };
-    let mut counts: Vec<(String, usize)> = Vec::new();
-    for it in &d.items {
-        let kind = js(it, "kind").to_string();
-        if let Some(slot) = counts.iter_mut().find(|(k, _)| *k == kind) {
-            slot.1 += 1;
-        } else {
-            counts.push((kind, 1));
+    // Snapshot under the lock, write to the control AFTER dropping
+    // it: set_checked fires LVN_ITEMCHANGED synchronously and the
+    // notify handler takes this same non-reentrant mutex — writing
+    // under the lock deadlocks the UI thread (AUDIT-233 CRITICAL).
+    let (kinds_raw, rows) = {
+        let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = guard.as_mut() else { return };
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for it in &d.items {
+            let kind = js(it, "kind").to_string();
+            if let Some(slot) = counts.iter_mut().find(|(k, _)| *k == kind) {
+                slot.1 += 1;
+            } else {
+                counts.push((kind, 1));
+            }
         }
-    }
-    d.kind_rows = counts.iter().map(|(k, _)| k.clone()).collect();
-    let lv = ListView { hwnd: h(d.kinds_lv) };
+        d.kind_rows = counts.iter().map(|(k, _)| k.clone()).collect();
+        let rows = counts
+            .iter()
+            .map(|(kind, n)| (format!("{kind} ({n})"), !d.kinds_off.contains(kind)))
+            .collect::<Vec<_>>();
+        (d.kinds_lv, rows)
+    };
+    let lv = ListView { hwnd: h(kinds_raw) };
     lv.clear();
-    for (i, (kind, n)) in counts.iter().enumerate() {
-        lv.insert_row(i as i32, &[format!("{kind} ({n}")]);
-        lv.set_checked(i as i32, !d.kinds_off.contains(kind));
+    for (i, (label, checked)) in rows.iter().enumerate() {
+        lv.insert_row(i as i32, &[label.clone()]);
+        lv.set_checked(i as i32, *checked);
     }
 }
 
 fn render_list() {
-    {
+    let (results_raw, rows) = {
         let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
         let Some(d) = guard.as_mut() else { return };
         sync_kinds(d);
-        let lv = ListView { hwnd: h(d.results_lv) };
-        lv.clear();
         d.visible_rows.clear();
+        let mut rows: Vec<(Vec<String>, bool)> = Vec::new();
         for (i, it) in d.items.clone().iter().enumerate() {
             if !grab_visible(d, it) {
                 continue;
@@ -536,14 +546,20 @@ fn render_list() {
                 let l = js(it, "label");
                 if l.is_empty() || l == js(it, "name") { String::new() } else { l.to_string() }
             };
-            let row = lv.row_count();
-            lv.insert_row(
-                row,
-                &[js(it, "name").to_string(), label, js(it, "kind").to_string(), size],
-            );
-            lv.set_checked(row, !d.unchecked.contains(&i));
+            rows.push((
+                vec![js(it, "name").to_string(), label, js(it, "kind").to_string(), size],
+                !d.unchecked.contains(&i),
+            ));
             d.visible_rows.push(i);
         }
+        (d.results_lv, rows)
+    };
+    // Control writes happen lock-free (see render_kinds).
+    let lv = ListView { hwnd: h(results_raw) };
+    lv.clear();
+    for (row, (cells, checked)) in rows.iter().enumerate() {
+        lv.insert_row(row as i32, cells);
+        lv.set_checked(row as i32, *checked);
     }
     update_count();
 }
@@ -745,7 +761,14 @@ fn download_selected(hwnd: HWND) {
             let why = if first_err.starts_with("duplicate") {
                 "already in the download list".to_string()
             } else if first_err.len() > 90 {
-                format!("{}…", &first_err[..90])
+                // Char-boundary-safe cut (see video_dialog's
+                // plain_add_error — a fixed byte slice panics on
+                // multi-byte text).
+                let mut cut = 90;
+                while cut > 0 && !first_err.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}…", &first_err[..cut])
             } else {
                 first_err
             };
@@ -1036,6 +1059,27 @@ fn on_command(hwnd: HWND, id: i32, code: u32) {
                 return;
             }
             let mut out = crate::settings_value();
+            // F3 (audit-233): re-saving a project must carry its
+            // last_run over — the wizard state has no such field,
+            // and replacing the stored project wholesale wiped
+            // it, so the next scheduled run re-downloaded
+            // everything the project had already fetched.
+            let mut p = p;
+            let existing = out
+                .get("grab_projects")
+                .and_then(|x| x.as_array())
+                .and_then(|arr| {
+                    arr.iter()
+                        .find(|x| js(x, "name").eq_ignore_ascii_case(js(&p, "name")))
+                        .cloned()
+                });
+            if let Some(old) = existing {
+                if let Some(lr) = old.get("last_run").cloned() {
+                    if let Some(obj) = p.as_object_mut() {
+                        obj.insert("last_run".to_string(), lr);
+                    }
+                }
+            }
             let mut list: Vec<serde_json::Value> = out
                 .get("grab_projects")
                 .and_then(|x| x.as_array())

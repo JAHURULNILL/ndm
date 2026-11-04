@@ -611,25 +611,43 @@ fn refresh_cats() {
 
 fn save(hwnd: HWND) {
     let mut out;
+    let mut adjusted: Vec<&'static str> = Vec::new();
     {
         let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
         let Some(d) = guard.as_ref() else { return };
-        out = d.base.clone();
+        // F1/F2 (audit-233, shared with shell-gtk): merge onto a
+        // FRESH settings read, never the open-time snapshot —
+        // the snapshot resurrected renamed/deleted categories
+        // and reverted core-side changes (grabber last_run)
+        // made while this dialog was open. d.base now only
+        // seeds the dialog's own fields at build time.
+        let fresh = crate::settings_value();
+        out = fresh.clone();
         let num = |name: &str, dflt: u64| get_text(d, name).trim().parse::<u64>().unwrap_or(dflt);
+        // Out-of-range numbers used to be clamped silently
+        // (audit-233 minor); the save now names the adjusted
+        // fields in the status line.
+        let clamped = |name: &'static str, raw: u64, lo: u64, hi: u64, adjusted: &mut Vec<&'static str>| {
+            let v = raw.clamp(lo, hi);
+            if v != raw {
+                adjusted.push(name);
+            }
+            v
+        };
         let dir_text = get_text(d, "default_dir");
         out["default_dir"] = serde_json::json!(if dir_text.trim().is_empty() {
             "~/Downloads".to_string()
         } else {
             dir_text.trim().to_string()
         });
-        out["max_connections"] = serde_json::json!(num("max_connections", 8).clamp(1, 32));
+        out["max_connections"] = serde_json::json!(clamped("Max connections", num("max_connections", 8), 1, 32, &mut adjusted));
         out["speed_limit_bps"] = serde_json::json!(if get_check(d, "limit_on") {
             let v: f64 = get_text(d, "limit_val").trim().parse().unwrap_or(1.0);
             (v.max(0.1) * 1_048_576.0).round() as u64
         } else {
             0
         });
-        out["max_simultaneous"] = serde_json::json!(num("max_simultaneous", 0).min(10));
+        out["max_simultaneous"] = serde_json::json!(clamped("Max simultaneous downloads", num("max_simultaneous", 0), 0, 10, &mut adjusted));
         out["auto_resume"] = serde_json::json!(get_check(d, "auto_resume"));
         out["auto_update"] = serde_json::json!(get_check(d, "auto_update"));
         out["video_quality"] = serde_json::json!(get_combo(d, "video_quality"));
@@ -637,7 +655,7 @@ fn save(hwnd: HWND) {
         out["proxy_pac_url"] = serde_json::json!(get_text(d, "proxy_pac_url").trim());
         out["proxy_scheme"] = serde_json::json!(get_combo(d, "proxy_scheme"));
         out["proxy_host"] = serde_json::json!(get_text(d, "proxy_host").trim());
-        out["proxy_port"] = serde_json::json!(num("proxy_port", 0).min(65535));
+        out["proxy_port"] = serde_json::json!(clamped("Proxy port", num("proxy_port", 0), 0, 65535, &mut adjusted));
         out["proxy_user"] = serde_json::json!(get_text(d, "proxy_user").trim());
         out["proxy_pass"] = serde_json::json!(get_text(d, "proxy_pass"));
         out["proxy_http"] = serde_json::json!(get_check(d, "proxy_http"));
@@ -653,11 +671,21 @@ fn save(hwnd: HWND) {
         out["power_force"] = serde_json::json!(get_check(d, "power_force"));
         out["completion_program"] = serde_json::json!(get_text(d, "completion_program").trim());
         out["completion_args"] = serde_json::json!(get_text(d, "completion_args").trim());
-        let mut dirs = serde_json::Map::new();
+        // category_dirs: fresh base first (user categories the
+        // dialog has no fields for survive), the dialog's
+        // built-in fields then overlay it — a non-empty field
+        // sets the dir, an emptied field removes the override.
+        let mut dirs = fresh
+            .get("category_dirs")
+            .and_then(|x| x.as_object())
+            .cloned()
+            .unwrap_or_default();
         for cat in CATS {
             let v = get_text(d, &format!("cat_dir_{cat}"));
             if !v.trim().is_empty() {
                 dirs.insert(cat.to_string(), serde_json::json!(v.trim()));
+            } else {
+                dirs.remove(cat);
             }
         }
         out["category_dirs"] = serde_json::Value::Object(dirs);
@@ -665,7 +693,7 @@ fn save(hwnd: HWND) {
         // a built-in is stored only when its list differs from the
         // built-in table (an emptied field stores [] on purpose).
         let mut exts = serde_json::Map::new();
-        if let Some(old) = d.base.get("category_exts").and_then(|x| x.as_object()) {
+        if let Some(old) = fresh.get("category_exts").and_then(|x| x.as_object()) {
             for (k, v) in old {
                 if !CATS_WITH_TYPES.contains(&k.as_str()) {
                     exts.insert(k.clone(), v.clone());
@@ -691,7 +719,7 @@ fn save(hwnd: HWND) {
         // is stored only when its field is non-empty (an empty
         // list is the absence of a rule, not a rule)
         let mut sites = serde_json::Map::new();
-        if let Some(old) = d.base.get("category_sites").and_then(|x| x.as_object()) {
+        if let Some(old) = fresh.get("category_sites").and_then(|x| x.as_object()) {
             for (k, v) in old {
                 if !CATS_WITH_TYPES.contains(&k.as_str()) {
                     sites.insert(k.clone(), v.clone());
@@ -720,11 +748,21 @@ fn save(hwnd: HWND) {
         out["progress_dialog_view"] = serde_json::json!(get_combo(d, "progress_dialog_view"));
         out["clipboard_monitor"] = serde_json::json!(get_check(d, "clipboard_monitor"));
         out["quota_mb"] = serde_json::json!(num("quota_mb", 0));
-        out["quota_hours"] = serde_json::json!(num("quota_hours", 5).clamp(1, 168));
+        out["quota_hours"] = serde_json::json!(clamped("Quota hours", num("quota_hours", 5), 1, 168, &mut adjusted));
     }
     match crate::save_settings_value(std::mem::take(&mut out)) {
         Ok(()) => {
-            crate::set_status(1, "Options saved");
+            if adjusted.is_empty() {
+                crate::set_status(1, "Options saved");
+            } else {
+                crate::set_status(
+                    1,
+                    &format!(
+                        "Options saved — adjusted to the allowed range: {}",
+                        adjusted.join(", ")
+                    ),
+                );
+            }
             crate::post_refresh();
             unsafe {
                 let _ = DestroyWindow(hwnd);

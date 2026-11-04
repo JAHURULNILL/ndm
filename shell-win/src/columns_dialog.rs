@@ -135,22 +135,35 @@ fn sync_checks(d: &mut ColDlg) {
 }
 
 fn render(select: i32) {
-    let mut guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(d) = guard.as_mut() else { return };
-    let view = lv(d);
+    // Snapshot everything the control writes need, then DROP the
+    // lock before touching the ListView: set_checked fires
+    // LVN_ITEMCHANGED synchronously, and the notify handler takes
+    // this same (non-reentrant) mutex — writing under the lock
+    // deadlocks the UI thread (AUDIT-233 CRITICAL). All handlers
+    // run on this one UI thread, so the snapshot stays consistent
+    // for the writes below.
+    let (list_raw, width_raw, rows) = {
+        let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(d) = guard.as_ref() else { return };
+        (
+            d.list,
+            d.width,
+            d.staged
+                .iter()
+                .map(|c| (label_of(&c.id).to_string(), c.width, c.visible))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let view = ListView { hwnd: h(list_raw) };
     view.clear();
-    for (i, c) in d.staged.iter().enumerate() {
-        view.insert_row(
-            i as i32,
-            &[label_of(&c.id).to_string(), c.width.to_string()],
-        );
-        view.set_checked(i as i32, c.visible);
+    for (i, (label, width, visible)) in rows.iter().enumerate() {
+        view.insert_row(i as i32, &[label.clone(), width.to_string()]);
+        view.set_checked(i as i32, *visible);
     }
     if select >= 0 {
         view.set_selected(select, true);
-        if let Some(c) = d.staged.get(select as usize) {
-            let w = c.width;
-            unsafe { set_window_text(h(d.width), &w.to_string()) };
+        if let Some((_, width, _)) = rows.get(select as usize) {
+            unsafe { set_window_text(h(width_raw), &width.to_string()) };
         }
     }
 }
