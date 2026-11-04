@@ -67,7 +67,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         run: |
           v=$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
-          cd extension && zip -q ../ndm-extension-$v.zip manifest.json background.js content.js page-hook.js popup.html popup.js icon16.png icon48.png icon128.png com.ndm.host.chrome.json.tmpl com.ndm.host.firefox.json.tmpl install-host.sh README.md && cd ..
+          cd extension && zip -q ../ndm-extension-$v.zip manifest.json background.js content.js page-hook.js fb-classify.js popup.html popup.js icon16.png icon48.png icon128.png com.ndm.host.chrome.json.tmpl com.ndm.host.firefox.json.tmpl install-host.sh README.md && cd ..
           ls -la ndm-extension-$v.zip
       - name: Attach Linux assets to their GitHub release (dispatch runs only)
         if: github.event_name == 'workflow_dispatch'
