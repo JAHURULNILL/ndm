@@ -1,46 +1,33 @@
 //! NM_CUSTOMDRAW hook points for the download ListView.
 //!
 //! The ListView wrapper forwards NM_CUSTOMDRAW notifications here.
-//! Phase 2's real payload is the per-row block map (the 128-char
-//! `blocks` string + G1 `conns_state` data on ProgressPayload): one
-//! cell paints a segmented strip — sealed / active / pending spans —
-//! in the row, the same information the web UI draws on a canvas.
-//!
-//! For the scaffold the paint body is a faithful PLACEHOLDER:
-//! `paint_block_map_placeholder` draws the strip's geometry exactly
-//! (full-cell strip, 128 equal segments, alternating sealed/pending
-//! shading by segment parity) so layout, clipping and the custom-draw
-//! return-value protocol are all exercised; only the per-segment
-//! state lookup is missing.
-//!
-//! MARKER (Phase 2): replace the parity test in
-//! `paint_block_map_placeholder` with the row's real block state:
-//! '2'/sealed = solid accent, '1'/active = hatched accent,
-//! '0'/pending = background — fed from the row model the Progress
-//! handler maintains in main.rs.
+//! The payload is the per-row block map (the `blocks` string +
+//! G1 `conns_*` data on ProgressPayload, the same fields the
+//! progress dialog's strip paints): the dedicated Blocks column's
+//! cell paints a segmented strip — done / active / pending spans —
+//! in the row, mirroring shell-gtk's blockmap column. The row
+//! model in main.rs answers `row_strip(row)` with the row's real
+//! StripData (None while the payload carries no block data, in
+//! which case the cell is left to the control's default paint).
 
 use std::sync::Mutex;
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, DeleteObject, FillRect, HDC, HGDIOBJ};
 use windows::Win32::UI::Controls::{
-    CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDDS_ITEMPREPAINT, CDDS_PREPAINT,
-    CDDS_SUBITEM, NMLVCUSTOMDRAW,
+    CDRF_DODEFAULT, CDRF_NOTIFYITEMDRAW, CDRF_NOTIFYSUBITEMDRAW, CDRF_SKIPDEFAULT,
+    CDDS_ITEMPREPAINT, CDDS_PREPAINT, CDDS_SUBITEM, NMLVCUSTOMDRAW,
 };
 
-/// The listview column index whose cells carry the block map.
-/// PHASE-2 WIRING: the shipped column set (ui/app.js COLUMN_DEFS) has
-/// no block-map column — in the web UI the map lives in the progress
-/// dialog's canvas. Phase 2 decides whether the map rides the Status
-/// subitem or a dedicated column; until then custom draw is armed
-/// for this subitem index and paints only when a row model marks
-/// the row as carrying a map (the row model's `has_block_map`
-/// answer in `on_custom_draw`).
-pub const BLOCK_MAP_SUBITEM: i32 = 3;
-
 /// Handle one NM_CUSTOMDRAW for the list. Returns the CDRF_* value
-/// the window proc must return for WM_NOTIFY. `has_block_map` is the
-/// row model's answer for the item being drawn.
-pub unsafe fn on_custom_draw(nm: *mut NMLVCUSTOMDRAW, has_block_map: impl Fn(i32) -> bool) -> isize {
+/// the window proc must return for WM_NOTIFY. `block_subitem` is
+/// the Blocks column's current visible index (-1 while hidden);
+/// `row_strip` is the row model's real block state for the item
+/// being drawn.
+pub unsafe fn on_custom_draw(
+    nm: *mut NMLVCUSTOMDRAW,
+    block_subitem: i32,
+    row_strip: impl Fn(i32) -> Option<StripData>,
+) -> isize {
     if nm.is_null() {
         return CDRF_DODEFAULT as isize;
     }
@@ -52,11 +39,13 @@ pub unsafe fn on_custom_draw(nm: *mut NMLVCUSTOMDRAW, has_block_map: impl Fn(i32
     }
     if stage.0 == (CDDS_ITEMPREPAINT.0 | CDDS_SUBITEM.0) {
         // A subitem of a row is about to paint.
-        if (*nm).iSubItem == BLOCK_MAP_SUBITEM && has_block_map(cd.dwItemSpec as i32) {
-            paint_block_map_placeholder(cd.hdc, &cd.rc);
-            // We painted the cell content; still let the control
-            // paint text/borders around it.
-            return CDRF_NOTIFYSUBITEMDRAW as isize;
+        if block_subitem >= 0 && (*nm).iSubItem == block_subitem {
+            if let Some(data) = row_strip(cd.dwItemSpec as i32) {
+                paint_block_map(cd.hdc, &cd.rc, &data);
+                // The cell is fully painted; the control must not
+                // paint its (empty) text over the strip.
+                return CDRF_SKIPDEFAULT as isize;
+            }
         }
         return CDRF_NOTIFYSUBITEMDRAW as isize;
     }
@@ -238,31 +227,88 @@ pub unsafe fn paint_segment_strip(hdc: HDC, rc: &RECT, key: isize) {
     let _ = DeleteObject(HGDIOBJ(pending.0));
 }
 
-/// Placeholder strip paint — see the module header. 128 segments
-/// across the cell rect, inset by 2px, height centred.
-unsafe fn paint_block_map_placeholder(hdc: HDC, rc: &RECT) {
+/// The main list's block-map cell paint: the row's REAL block
+/// state (the same StripData the progress dialog's strip paints)
+/// as one row of segments inside the cell rect, inset by 2px,
+/// in the dialog strip's palette. '1' = done fill, '2' = pending
+/// track + the owning connection's fractional active fill,
+/// anything else = pending track; a finished row reads all-done.
+unsafe fn paint_block_map(hdc: HDC, rc: &RECT, data: &StripData) {
     let width = (rc.right - rc.left - 4).max(0);
     let top = rc.top + 3;
     let bottom = rc.bottom - 3;
     if width <= 0 || bottom <= top {
         return;
     }
-    // Segment colours (COLORREF is 0x00BBGGRR): sealed = blue-grey,
-    // pending = light grey. These are placeholders, not a palette.
-    let sealed = CreateSolidBrush(COLORREF(0x00A6_8D7C));
-    let pending = CreateSolidBrush(COLORREF(0x00E8_E8E8));
-    for i in 0..128i32 {
-        let x0 = rc.left + 2 + (width * i) / 128;
-        let x1 = rc.left + 2 + (width * (i + 1)) / 128;
-        if x1 <= x0 {
-            continue;
+    // The dialog strip's palette (COLORREF is 0x00BBGGRR).
+    let done = CreateSolidBrush(COLORREF(0x00E0_9D3F));
+    let active = CreateSolidBrush(COLORREF(0x0042_C5F5));
+    let pending = CreateSolidBrush(COLORREF(0x00DA_D2C9));
+    let n = data.blocks.len().min(1024);
+    if n == 0 {
+        let track = RECT { left: rc.left + 2, top, right: rc.right - 2, bottom };
+        FillRect(hdc, &track, pending);
+    } else {
+        // The dialog paint's mapping of G1's raw block indices
+        // onto the (possibly downsampled) cell space.
+        let total_blocks = if data.total > 0 {
+            (data.total.div_ceil(ENGINE_BLOCK) as usize).max(n)
+        } else {
+            n
+        };
+        let cell_of = |block: i64| -> Option<usize> {
+            if block < 0 {
+                return None;
+            }
+            let b = block as usize;
+            let cell = if total_blocks <= n { b } else { b * n / total_blocks };
+            if cell < n { Some(cell) } else { None }
+        };
+        let frac_of = |cell: usize| -> f64 {
+            for (w, b) in data.conns_block.iter().enumerate() {
+                if cell_of(*b) == Some(cell) {
+                    let p = data.conns_partial.get(w).copied().unwrap_or(0);
+                    return (p as f64 / ENGINE_BLOCK as f64).min(1.0);
+                }
+            }
+            0.0
+        };
+        let chars: Vec<char> = data.blocks.chars().collect();
+        let cols = n as i32;
+        for i in 0..n {
+            let col = i as i32;
+            let x0 = rc.left + 2 + (width * col) / cols;
+            let x1 = rc.left + 2 + (width * (col + 1)) / cols;
+            // Sub-pixel cells still get their 1 px; the next cell
+            // paints over any overlap.
+            let gap = if x1 - x0 >= 4 { 1 } else { 0 };
+            let cell = RECT {
+                left: x0,
+                top,
+                right: (x1 - gap).max(x0 + 1),
+                bottom,
+            };
+            let c = if data.finished { '1' } else { chars.get(i).copied().unwrap_or('0') };
+            match c {
+                '1' => {
+                    FillRect(hdc, &cell, done);
+                }
+                '2' => {
+                    FillRect(hdc, &cell, pending);
+                    // A claimed block with no bytes yet still shows
+                    // a sliver (the dialog strip's rule).
+                    let f = frac_of(i).max(0.08);
+                    let w = ((cell.right - cell.left) as f64 * f).ceil() as i32;
+                    let fill = RECT { right: (cell.left + w).min(cell.right), ..cell };
+                    FillRect(hdc, &fill, active);
+                }
+                _ => {
+                    FillRect(hdc, &cell, pending);
+                }
+            }
         }
-        let seg = RECT { left: x0, top, right: x1, bottom };
-        // PLACEHOLDER state: parity stands in for the real block
-        // state lookup (see module MARKER).
-        let brush = if i % 2 == 0 { sealed } else { pending };
-        FillRect(hdc, &seg, brush);
     }
-    let _ = DeleteObject(HGDIOBJ(sealed.0));
+    let _ = DeleteObject(HGDIOBJ(done.0));
+    let _ = DeleteObject(HGDIOBJ(active.0));
     let _ = DeleteObject(HGDIOBJ(pending.0));
 }

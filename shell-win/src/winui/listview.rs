@@ -216,11 +216,18 @@ impl ListView {
     }
 
     /// Forward an NM_CUSTOMDRAW notification (called from the parent
-    /// window's WM_NOTIFY handler). `has_block_map(row)` is the row
-    /// model's answer for the row being drawn.
-    pub unsafe fn on_custom_draw(&self, lparam: LPARAM, has_block_map: impl Fn(i32) -> bool) -> isize {
+    /// window's WM_NOTIFY handler). `block_subitem` is the Blocks
+    /// column's current visible index (-1 while hidden) and
+    /// `row_strip(row)` is the row model's real block state for
+    /// the row being drawn.
+    pub unsafe fn on_custom_draw(
+        &self,
+        lparam: LPARAM,
+        block_subitem: i32,
+        row_strip: impl Fn(i32) -> Option<super::customdraw::StripData>,
+    ) -> isize {
         use windows::Win32::UI::Controls::NMLVCUSTOMDRAW;
         let nm = lparam.0 as *mut NMLVCUSTOMDRAW;
-        super::customdraw::on_custom_draw(nm, has_block_map)
+        super::customdraw::on_custom_draw(nm, block_subitem, row_strip)
     }
 }

@@ -50,10 +50,19 @@ pub unsafe fn send(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> isize {
     SendMessageW(hwnd, msg, Some(w), Some(l)).0
 }
 
-/// Read a window's text into a String.
+/// Read a window's FULL text into a String. (This used to read
+/// into a fixed 1024-char buffer — options / scheduler / grabber
+/// read every field back through it on Save, so a stored value
+/// longer than 1023 chars was silently truncated on the way
+/// back out. Length first, then the read, like the builder
+/// dialog's full_window_text.)
 pub unsafe fn window_text(hwnd: HWND) -> String {
-    use windows::Win32::UI::WindowsAndMessaging::GetWindowTextW;
-    let mut buf = vec![0u16; 1024];
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
+    let len = GetWindowTextLengthW(hwnd);
+    if len <= 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u16; (len + 1) as usize];
     let n = GetWindowTextW(hwnd, &mut buf);
     if n <= 0 {
         return String::new();

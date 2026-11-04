@@ -21,7 +21,7 @@
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,7 +38,10 @@ use crate::{
 // ---------- URL handling ----------
 
 pub(crate) fn is_ftp_url(url: &str) -> bool {
-    url.len() >= 6 && url[..6].eq_ignore_ascii_case("ftp://")
+    // `get`, not a byte slice: a mangled paste whose byte 6 falls
+    // inside a multi-byte character must answer false, not panic
+    // the calling thread (M-1)
+    url.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("ftp://"))
 }
 
 /// A parsed ftp:// address. `pass` lives only in this struct and
@@ -221,6 +224,13 @@ impl FtpErr {
 struct FtpConn {
     reader: BufReader<TcpStream>,
     display: String,
+    /// The control connection's actual peer — the data connection
+    /// dials THIS address (with the PASV port), never a fresh DNS
+    /// resolution of the host name: a name that resolves to a
+    /// different address on the second lookup would send the data
+    /// connection to a different machine than the one that was
+    /// logged into (M-5)
+    peer: SocketAddr,
 }
 
 impl FtpConn {
@@ -236,9 +246,11 @@ impl FtpConn {
         let _ = stream.set_read_timeout(Some(read_timeout));
         let _ = stream.set_write_timeout(Some(read_timeout));
         let _ = stream.set_nodelay(true);
+        let peer = stream.peer_addr().unwrap_or(addr);
         let mut conn = FtpConn {
             reader: BufReader::new(stream),
             display: target.display.clone(),
+            peer,
         };
         let (code, _) = conn.read_reply()?;
         if code != 220 {
@@ -438,14 +450,12 @@ impl FtpConn {
         // A PASV reply pointing anywhere but the control peer is a
         // bounce-attack shape (and useless for NAT'd servers that
         // advertise their LAN address — those still serve the data
-        // on the peer we know): always dial the control host, only
-        // the port comes from the reply.
+        // on the peer we know): always dial the control peer, only
+        // the port comes from the reply. The peer ADDRESS comes
+        // from the live control connection, not a fresh DNS lookup
+        // of the host name (M-5).
         let _ = host;
-        let addr = (target.host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| FtpErr::Retry(format!("could not resolve the FTP server for {}: {e}", self.display)))?
-            .next()
-            .ok_or_else(|| FtpErr::Retry(format!("could not resolve the FTP server for {}", self.display)))?;
+        let addr = SocketAddr::new(self.peer.ip(), port);
         let data = TcpStream::connect_timeout(&addr, Duration::from_secs(15)).map_err(|e| {
             FtpErr::Retry(format!("could not open the FTP data connection at {}: {e}", self.display))
         })?;
@@ -668,8 +678,20 @@ fn ftp_download_block_run(
     if let Err(e) = conn.binary() {
         return Err(e.into_block());
     }
-    let mut reader = match conn.retr(target, *pos, TRANSFER_READ_TIMEOUT) {
-        Ok(d) => d,
+    let retr_offset = *pos;
+    let mut reader = match conn.retr(target, retr_offset, TRANSFER_READ_TIMEOUT) {
+        Ok(d) => {
+            // a RETR accepted at a resume offset is the FTP shape
+            // of a validated 206: the range was honoured, so the
+            // range-loss count clears — only PERSISTENT refusals
+            // declare the loss (M-2, mirroring the HTTP path's F6
+            // reset; without it, refusals scattered across a long
+            // download's life accumulated into a phantom loss)
+            if retr_offset > 0 {
+                shared.range_200_count.store(0, Ordering::Relaxed);
+            }
+            d
+        }
         Err(FtpErr::RestRefused(m)) => {
             // the server accepted REST at probe time and refuses
             // now — the range-loss shape: count it like the HTTP
@@ -925,7 +947,7 @@ pub(crate) fn ftp_worker(
                     }
                 }
             }
-            let (b_first, b_last) = {
+            let (b_first, b_last, resume_off) = {
                 let st = plock(&shared.state);
                 while cursor < claim_end && st.done[cursor] == 1 {
                     cursor += 1;
@@ -935,15 +957,32 @@ pub(crate) fn ftp_worker(
                 }
                 let first = cursor;
                 while cursor < claim_end && st.done[cursor] == 0 {
+                    // B-4 parity with the HTTP worker (M-4): a
+                    // partial block in the group's MIDDLE ends the
+                    // group before it — the run advances linearly
+                    // and would otherwise plough over that block's
+                    // journaled prefix from its start, re-fetching
+                    // bytes the journal already vouches for
+                    if cursor > first
+                        && st.partial.get(cursor).copied().unwrap_or(0) > 0
+                    {
+                        break;
+                    }
                     cursor += 1;
                 }
-                (first, cursor)
+                let resume_off = st.partial.get(first).copied().unwrap_or(0);
+                (first, cursor, resume_off)
             };
 
             let start = b_first as u64 * block_size;
             let end = ((b_last as u64) * block_size - 1).min(total - 1);
             let mut cur_block = b_first;
-            let mut cur_pos = start;
+            // B-4 parity (M-4): resume inside the first block at
+            // its journaled prefix — those bytes are already in
+            // the file (the run's RETR starts at exactly this
+            // offset), instead of re-fetching the whole block on
+            // every restart as this path used to
+            let mut cur_pos = start + resume_off;
             let mut attempt = 0;
             shared.block_state[cur_block].store(2, Ordering::Relaxed);
             if let Some(b) = shared.conn_block.get(id) {
@@ -1192,10 +1231,6 @@ fn ftp_single_fallback_download(target: &FtpTarget, file: &Arc<File>, shared: &A
 /// the server has given an answer retrying cannot change (login
 /// refused, file not available), mirroring the HTTP path's
 /// `single_error_is_permanent`.
-fn ftp_single_error_is_permanent(e: &str) -> bool {
-    e.contains("(530)") || e.contains("(550)")
-}
-
 /// The FTP single-stream start — used when the probe found no
 /// usable REST (or no SIZE): no resume, no acceleration, exactly
 /// the HTTP single-stream contract. The same spool protection
@@ -1288,22 +1323,28 @@ pub(crate) fn start_ftp_single_stream(
             s.push(".ndm.spool");
             PathBuf::from(s)
         };
-        let attempt_once = || -> Result<(), String> {
+        // M-3: attempts return the classified FtpErr itself, so
+        // the retry policy keys off the STRUCTURE (a 530/550 the
+        // server actually answered, classified at the source in
+        // connect/login/retr) — never a substring scan of a
+        // message string that embeds the file's own path, where a
+        // file named "x (550).bin" made every transient failure
+        // look permanent.
+        let attempt_once = || -> Result<(), FtpErr> {
             shared.active_workers.store(1, Ordering::Relaxed);
             if let Some(p) = shared.conn_phase.first() {
                 p.store(1, Ordering::Relaxed);
             }
-            let mut conn = FtpConn::connect(&target, TRANSFER_CONNECT_TIMEOUT, TRANSFER_READ_TIMEOUT)
-                .map_err(|e| e.message())?;
-            conn.binary().map_err(|e| e.message())?;
+            let mut conn = FtpConn::connect(&target, TRANSFER_CONNECT_TIMEOUT, TRANSFER_READ_TIMEOUT)?;
+            conn.binary()?;
             if let Some(p) = shared.conn_phase.first() {
                 p.store(2, Ordering::Relaxed);
             }
-            let mut reader = conn.retr(&target, 0, TRANSFER_READ_TIMEOUT).map_err(|e| e.message())?;
+            let mut reader = conn.retr(&target, 0, TRANSFER_READ_TIMEOUT)?;
             let write_path: &Path = if spool { &spool_path } else { &out };
             let f = File::create(write_path).map_err(|e| match crate::disk_full_sentence(&e) {
-                Some(s) => format!("{s} (create: {e})"),
-                None => format!("create: {e}"),
+                Some(s) => FtpErr::Retry(format!("{s} (create: {e})")),
+                None => FtpErr::Retry(format!("create: {e}")),
             })?;
             let mut buf = vec![0u8; 512 * 1024];
             let mut pos = 0u64;
@@ -1328,10 +1369,10 @@ pub(crate) fn start_ftp_single_stream(
                     stall_clock = Instant::now();
                 }
                 if stall_clock.elapsed() > STALL_LIMIT {
-                    return Err(format!(
+                    return Err(FtpErr::Retry(format!(
                         "no progress for {}s — the server stopped sending data",
                         STALL_LIMIT.as_secs()
-                    ));
+                    )));
                 }
                 if held == 0 {
                     let grant = pace_grant_size(&shared, buf.len());
@@ -1340,7 +1381,7 @@ pub(crate) fn start_ftp_single_stream(
                     }
                     let n = reader.read(&mut buf[..grant]).map_err(|e| {
                         pace_refund_both(&shared, grant as u64);
-                        format!("read: {e}")
+                        FtpErr::Retry(format!("read: {e}"))
                     })?;
                     if (n as u64) < grant as u64 {
                         pace_refund_both(&shared, grant as u64 - n as u64);
@@ -1357,7 +1398,7 @@ pub(crate) fn start_ftp_single_stream(
                 }
                 let n = held;
                 held = 0;
-                crate::write_at(&f, &buf[..n], pos).map_err(|e| plain_write_error(&e))?;
+                crate::write_at(&f, &buf[..n], pos).map_err(|e| FtpErr::Retry(plain_write_error(&e)))?;
                 pos += n as u64;
                 if note_stall_progress(pos, &mut stall_watermark, &mut stall_clock) {
                     *plock(&shared.last_progress) = stall_clock;
@@ -1366,9 +1407,9 @@ pub(crate) fn start_ftp_single_stream(
                     if spool {
                         let _ = std::fs::remove_file(&spool_path);
                     }
-                    return Err(format!(
+                    return Err(FtpErr::Retry(format!(
                         "server sent more data than the probed size ({expected_total} bytes)"
-                    ));
+                    )));
                 }
                 shared.fetched_session.fetch_add(n as u64, Ordering::Relaxed);
                 if let Some(cb) = shared.conn_bytes.first() {
@@ -1379,15 +1420,48 @@ pub(crate) fn start_ftp_single_stream(
                 if spool {
                     let _ = std::fs::remove_file(&spool_path);
                 }
-                return Err(format!(
+                return Err(FtpErr::Retry(format!(
                     "short download: got {pos} of {expected_total} bytes"
-                ));
+                )));
+            }
+            if expected_total == 0 {
+                // H-1: with no probed size, the byte count cannot
+                // witness completion — the server's post-transfer
+                // control reply is the only witness there is. A
+                // clean EOF on the data connection proves nothing
+                // by itself: a server (or middlebox) that cuts a
+                // transfer short closes the data connection in
+                // exactly the same way, and only the control reply
+                // tells the two apart — 226 confirms the whole
+                // file arrived; 426 (or anything else, or no reply
+                // at all) means it did not, so the attempt fails
+                // and the state file stays for a later resume
+                // instead of a truncated file being crowned
+                // Finished and the journal deleted.
+                match conn.read_reply() {
+                    Ok((226, _)) => {}
+                    Ok((code, _)) => {
+                        if spool {
+                            let _ = std::fs::remove_file(&spool_path);
+                        }
+                        return Err(FtpErr::Retry(format!(
+                            "the FTP server at {} did not confirm the transfer completed (reply {code}) — the file may be incomplete",
+                            target.display
+                        )));
+                    }
+                    Err(e) => {
+                        if spool {
+                            let _ = std::fs::remove_file(&spool_path);
+                        }
+                        return Err(e);
+                    }
+                }
             }
             if spool {
                 drop(f);
                 if let Err(e) = std::fs::rename(&spool_path, &out) {
                     let _ = std::fs::remove_file(&spool_path);
-                    return Err(format!("could not replace the partial file: {e}"));
+                    return Err(FtpErr::Retry(format!("could not replace the partial file: {e}")));
                 }
             }
             Ok(())
@@ -1412,8 +1486,12 @@ pub(crate) fn start_ftp_single_stream(
                         set_status(&shared, Status::Cancelled);
                         break Ok(());
                     }
-                    if ftp_single_error_is_permanent(&e) || attempt >= 5 {
-                        break Err(e);
+                    // M-3: permanence is the error's own class,
+                    // decided where the reply code was seen — not
+                    // a substring of the message text
+                    let permanent = matches!(e, FtpErr::Permanent(_));
+                    if permanent || attempt >= 5 {
+                        break Err(e.message());
                     }
                     let deadline = Instant::now() + Duration::from_secs(1u64 << (attempt - 1));
                     while Instant::now() < deadline {
@@ -1615,9 +1693,11 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(300));
             });
             let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let peer = stream.peer_addr().unwrap();
             let mut conn = FtpConn {
                 reader: BufReader::new(stream),
                 display: "test".to_string(),
+                peer,
             };
             let res = conn.read_reply();
             if expect_ok {
@@ -1631,6 +1711,19 @@ mod tests {
             }
             let _ = server.join();
         }
+    }
+
+    #[test]
+    fn is_ftp_url_is_char_boundary_safe() {
+        // M-1 regression: byte 6 inside a multi-byte character
+        // used to panic the slicing thread outright
+        assert!(!is_ftp_url("ftpxxé"));
+        assert!(!is_ftp_url("ftp:/é"));
+        assert!(is_ftp_url("ftp://127.0.0.1/f.bin"));
+        assert!(is_ftp_url("FTP://127.0.0.1/f.bin"));
+        assert!(!is_ftp_url("ftp:/f.bin"));
+        assert!(!is_ftp_url("https://example.com/f.bin"));
+        assert!(!is_ftp_url("ftp"));
     }
 
     #[test]
@@ -1681,6 +1774,156 @@ mod tests {
         // non-FTP and credential-free URLs pass through untouched
         assert_eq!(journal_url("https://example.com/f.bin"), "https://example.com/f.bin");
         assert_eq!(journal_url("ftp://127.0.0.1/f.bin"), "ftp://127.0.0.1:21/f.bin");
+    }
+
+    /// A scripted in-process FTP server for the unknown-size
+    /// single-stream path (H-1): SIZE and MDTM are refused, so
+    /// the probe reports an unknown-size, non-resumable file;
+    /// RETR serves `send` bytes over the data connection, closes
+    /// it with a clean FIN, and only then answers `final_code`
+    /// on the control connection — the exact shape in which a
+    /// truncated transfer is indistinguishable from a complete
+    /// one without reading that reply. Connections are handled
+    /// on detached threads over an ephemeral port, so nothing
+    /// here can collide with the fixture server's fixed port.
+    fn spawn_fake_ftp(send: Vec<u8>, final_code: u16) -> u16 {
+        use std::io::{BufRead, BufReader, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut sock) = stream else { continue };
+                let send = send.clone();
+                std::thread::spawn(move || {
+                    let Ok(mut reader) = sock.try_clone().map(BufReader::new) else {
+                        return;
+                    };
+                    let mut data_listener: Option<std::net::TcpListener> = None;
+                    let _ = sock.write_all(b"220 fake ready\r\n");
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                        let cmd = line.trim().to_ascii_uppercase();
+                        let reply: String = if cmd.starts_with("USER") {
+                            "331 password required\r\n".to_string()
+                        } else if cmd.starts_with("PASS") {
+                            "230 logged in\r\n".to_string()
+                        } else if cmd.starts_with("SYST") {
+                            "215 UNIX\r\n".to_string()
+                        } else if cmd.starts_with("TYPE") {
+                            "200 binary mode\r\n".to_string()
+                        } else if cmd.starts_with("SIZE") || cmd.starts_with("MDTM") {
+                            "550 not available\r\n".to_string()
+                        } else if cmd.starts_with("REST") {
+                            "350 restart ok\r\n".to_string()
+                        } else if cmd.starts_with("PASV") {
+                            match std::net::TcpListener::bind("127.0.0.1:0") {
+                                Ok(l) => {
+                                    let p = l.local_addr().unwrap().port();
+                                    data_listener = Some(l);
+                                    format!(
+                                        "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                                        p >> 8,
+                                        p & 0xff
+                                    )
+                                }
+                                Err(_) => "425 no data listener\r\n".to_string(),
+                            }
+                        } else if cmd.starts_with("RETR") {
+                            let _ = sock.write_all(b"150 opening data connection\r\n");
+                            if let Some(l) = data_listener.take() {
+                                if let Ok((mut data, _)) = l.accept() {
+                                    let _ = data.write_all(&send);
+                                    // clean FIN — byte-for-byte the
+                                    // close of a complete transfer
+                                    drop(data);
+                                }
+                            }
+                            format!("{final_code} closing\r\n")
+                        } else if cmd.starts_with("QUIT") {
+                            let _ = sock.write_all(b"221 bye\r\n");
+                            break;
+                        } else {
+                            "502 not implemented\r\n".to_string()
+                        };
+                        if sock.write_all(reply.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn unknown_size_ftp_finishes_only_on_a_226_witness() {
+        let _serial = serial();
+        let body = pattern_body(300_000);
+        let port = spawn_fake_ftp(body.clone(), 226);
+        let url = format!("ftp://127.0.0.1:{port}/file.bin");
+        let out = tmp_out("witness-ok");
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(60)), Some(Status::Finished));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        wait_settled(&dl, Duration::from_secs(10));
+        assert!(
+            !state_path_for(&out).exists(),
+            "a witnessed finish removes the journal"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn unknown_size_ftp_abort_426_is_an_error_not_a_finish() {
+        let _serial = serial();
+        // the server sends only part of the body, closes the data
+        // connection cleanly, then answers 426 — before the fix
+        // this exact shape was crowned Finished and the journal
+        // deleted, leaving a truncated file with no way back
+        let body = pattern_body(300_000);
+        let partial = body[..100_000].to_vec();
+        let port = spawn_fake_ftp(partial.clone(), 426);
+        let url = format!("ftp://127.0.0.1:{port}/file.bin");
+        let out = tmp_out("witness-abort");
+        // a previous attempt's leftovers: a partial file and its
+        // journal — the pair the spool rule (and the journal-
+        // kept promise) exists for
+        let old_partial = body[..50_000].to_vec();
+        std::fs::write(&out, &old_partial).unwrap();
+        let state = serde_json::json!({
+            "url": journal_url(&url),
+            "total": 0,
+            "block_size": 1,
+            "etag": null,
+            "last_modified": null,
+            "done": [0],
+            "partial": [],
+        });
+        std::fs::write(state_path_for(&out), state.to_string()).unwrap();
+        let dl = start(&url, &out, 4, 256 * 1024).unwrap();
+        assert_eq!(wait_terminal(&dl, Duration::from_secs(90)), Some(Status::Error));
+        let err = dl.progress().error.clone().unwrap_or_default();
+        assert!(
+            err.contains("did not confirm the transfer completed"),
+            "unexpected error: {err}"
+        );
+        wait_settled(&dl, Duration::from_secs(10));
+        assert!(
+            state_path_for(&out).exists(),
+            "an unwitnessed transfer keeps its journal for resume"
+        );
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            old_partial,
+            "the unverified spool body must not replace the partial"
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
     }
 
     #[test]

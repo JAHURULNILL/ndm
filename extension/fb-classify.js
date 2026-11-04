@@ -349,6 +349,42 @@ function classifyFacebook(input) {
   return { options, diagnostics: diag };
 }
 
+/* The id a Comet video object carries for ITSELF, or '' when
+   it carries none that names a video: a digit string of 5+
+   (FB's id shape) or a finite number. Anything else — short
+   or junk strings, nested values — names nothing and must
+   not be coerced into an identity. */
+function videoObjectId(obj) {
+  if (!obj || typeof obj !== 'object') return '';
+  if (typeof obj.id === 'string' && /^\d{5,}$/.test(obj.id)) return obj.id;
+  if (typeof obj.id === 'number' && Number.isFinite(obj.id)) return String(obj.id);
+  return '';
+}
+
+/* Key classified page objects by video id — the page hook's
+   scan decision, kept pure so the identity rule is unit-
+   tested. An object keys ONLY under the id it carries
+   itself (first one wins, and only when it yields options);
+   an object with no derivable id is skipped, NEVER keyed
+   to the page's id (audit F3): a permalink page serialises
+   its recommendations beside the main video, and the old
+   fallback let the first id-less object in scan order claim
+   the page id — the picker then offered a sibling's streams
+   under the page video's identity. A genuinely id-less main
+   object loses the page-data rung (the recorder and yt-dlp
+   rungs still serve it): a missing offer beats a wrong
+   video — the same rule fallbackTargetFor keeps. */
+function keyOptionsByVideoId(objects) {
+  const byId = new Map();
+  for (const obj of objects || []) {
+    const id = videoObjectId(obj);
+    if (!id || byId.has(id)) continue;
+    const opts = optionsFromVideoObject(obj, []);
+    if (opts.length) byId.set(id, opts);
+  }
+  return byId;
+}
+
 /* ------------------------------------------------------------------ */
 /* Recorder grouping key (audit-232 §2 prerequisite): on Facebook   */
 /* one page holds MANY videos, so a captured stream may only be     */
@@ -431,6 +467,7 @@ return {
   classifyPerformanceEntry, optionsFromVideoObject,
   facebookVideoId, isFacebookHostname, fallbackTargetFor,
   streamGroupKey, offerableGroups, fbcdnVideoToken, isFbCdnUrl,
+  videoObjectId, keyOptionsByVideoId,
 };
 
 })();

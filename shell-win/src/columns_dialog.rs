@@ -172,7 +172,9 @@ fn apply_width(d: &mut ColDlg) {
     let view = lv(d);
     let Some(row) = view.selected_rows().into_iter().next() else { return };
     let text = unsafe { window_text(h(d.width)) };
-    let w: i32 = text.trim().parse().unwrap_or(0);
+    // An unreadable width keeps the column's current width —
+    // it used to silently become 0 and hide the column.
+    let Ok(w) = text.trim().parse::<i32>() else { return };
     if let Some(c) = d.staged.get_mut(row as usize) {
         c.width = w.clamp(0, 800);
     }

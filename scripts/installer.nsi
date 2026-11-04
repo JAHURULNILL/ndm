@@ -59,7 +59,7 @@
 ; the app supports (7/8/8.1/10/11).
 
 !ifndef VERSION
-  !define VERSION "2.3.2"
+  !define VERSION "2.3.5"
 !endif
 !ifndef SRCROOT
   !define SRCROOT "NDM-Windows-Portable"
@@ -184,14 +184,19 @@ Section "Install"
   !insertmacro NDM_PAYLOAD_FILE api-ms-win-*.dll
 
   SetOutPath "$INSTDIR\extension"
+  ; The extension payload is the curated set the extension
+  ; packager ships — never build artefacts that happen to sit in
+  ; the source folder: gen_icons.py is the icon build script and
+  ; manifest.firefox.json belongs to the separate Firefox zip
+  ; (Firefox reads the manifest.json placed beside it there).
   !ifdef UNIVERSAL
     ${If} ${RunningX64}
-      File /r "${SRCROOT}\x64\extension\*.*"
+      File /r /x gen_icons.py /x manifest.firefox.json "${SRCROOT}\x64\extension\*.*"
     ${Else}
-      File /r "${SRCROOT}\x86\extension\*.*"
+      File /r /x gen_icons.py /x manifest.firefox.json "${SRCROOT}\x86\extension\*.*"
     ${EndIf}
   !else
-    File /r "${SRCROOT}\extension\*.*"
+    File /r /x gen_icons.py /x manifest.firefox.json "${SRCROOT}\extension\*.*"
   !endif
 
   SetOutPath "$INSTDIR"
@@ -236,7 +241,42 @@ Section "Install"
   WriteRegDWORD HKCU "${UNREGKEY}" "NoRepair" 1
 SectionEnd
 
+; Is ndm-app.exe currently running? Sets $0 to 0 when tasklist
+; finds the process, non-zero otherwise. Used by the uninstaller
+; before it touches any file.
+!macro NDM_CHECK_RUNNING
+  nsExec::ExecToStack '"$SYSDIR\cmd.exe" /C tasklist /FI "IMAGENAME eq ndm-app.exe" /NH | findstr /I /C:"ndm-app.exe" > NUL'
+  Pop $0
+  Pop $1
+!macroend
+
 Section "Uninstall"
+  ; A still-running instance holds its exe locked and owns the
+  ; single-instance port: without this check the deletes below
+  ; half-land (shortcuts and registry go, the locked exe stays
+  ; for the /REBOOTOK sweep) and the "uninstalled" app keeps
+  ; running — and blocking a reinstall's first launch — until
+  ; reboot. Ask it to close first: taskkill without /F sends
+  ; WM_CLOSE, the graceful path. Interactive uninstalls refuse
+  ; while it stays up (nothing has been deleted yet); silent
+  ; ones force-close so an unattended uninstall cannot strand
+  ; a zombie holding the port.
+  !insertmacro NDM_CHECK_RUNNING
+  ${If} $0 == 0
+    nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /IM ndm-app.exe'
+    Sleep 1500
+    !insertmacro NDM_CHECK_RUNNING
+    ${If} $0 == 0
+      ${If} ${Silent}
+        nsExec::ExecToLog '"$SYSDIR\taskkill.exe" /F /IM ndm-app.exe'
+        Sleep 500
+      ${Else}
+        MessageBox MB_OK|MB_ICONEXCLAMATION "${APPNAME} is still running. Close it, then run the uninstaller again."
+        Abort
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+
   Delete "$DESKTOP\${APPNAME}.lnk"
   Delete "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk"
   Delete "$SMPROGRAMS\${APPNAME}\Uninstall ${APPNAME}.lnk"

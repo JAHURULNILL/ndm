@@ -23,9 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     IsDialogMessageW, LoadCursorW, RegisterClassW, ShowWindow, TranslateMessage, BM_GETCHECK,
     BM_SETCHECK,
-    BS_AUTOCHECKBOX, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST, CS_HREDRAW,
-    CS_VREDRAW, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MSG, SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
+    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, CBS_DROPDOWNLIST,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, DM_SETDEFID, ES_AUTOHSCROLL, HMENU, IDC_ARROW, MSG,
+    SW_SHOW, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WNDCLASSW, WS_BORDER, WS_CAPTION, WS_CHILD,
+    WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE,
 };
 
 pub const ID_OK: i32 = 9001;
@@ -190,8 +191,9 @@ fn hwnd_of(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
 }
 
-/// Read a control's FULL text (the shared window_text caps at
-/// 1024 chars — a pasted import list is longer than that).
+/// Read a control's FULL text, length first (a pasted import
+/// list outgrows any fixed buffer; the shared window_text now
+/// uses this same approach).
 unsafe fn full_window_text(hwnd: HWND) -> String {
     use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextLengthW, GetWindowTextW};
     let len = GetWindowTextLengthW(hwnd);
@@ -251,6 +253,17 @@ unsafe extern "system" fn dlg_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
     match msg {
         WM_COMMAND => {
             let id = (w.0 & 0xffff) as i32;
+            // IDOK (1) / IDCANCEL (2): what IsDialogMessageW sends
+            // for Enter / Esc when no button consumed them first —
+            // they mean the same as this dialog's OK / Cancel.
+            if id == 1 {
+                finish_dialog(hwnd, true, false);
+                return LRESULT(0);
+            }
+            if id == 2 {
+                finish_dialog(hwnd, false, false);
+                return LRESULT(0);
+            }
             if id == ID_OK {
                 finish_dialog(hwnd, true, false);
                 return LRESULT(0);
@@ -334,6 +347,39 @@ pub fn show_modal(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
     outcome
 }
 
+/// Parents currently disabled by an open modal, as a multiset:
+/// nested modals over the SAME parent each hold one entry. The
+/// epilogue used to re-enable the parent unconditionally, so
+/// closing an inner modal re-enabled the window while an outer
+/// modal was still open over it.
+static PARENT_DISABLES: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+
+fn disable_parent(parent: HWND) {
+    let mut guard = PARENT_DISABLES.lock().unwrap_or_else(|e| e.into_inner());
+    let first = !guard.contains(&(parent.0 as isize));
+    guard.push(parent.0 as isize);
+    if first {
+        unsafe {
+            let _ = EnableWindow(parent, false);
+        }
+    }
+}
+
+fn enable_parent(parent: HWND) {
+    let still_held = {
+        let mut guard = PARENT_DISABLES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = guard.iter().position(|p| *p == parent.0 as isize) {
+            guard.remove(pos);
+        }
+        guard.contains(&(parent.0 as isize))
+    };
+    if !still_held {
+        unsafe {
+            let _ = EnableWindow(parent, true);
+        }
+    }
+}
+
 fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
     unsafe {
         let class_buf = wide("NdmWinUiDialog");
@@ -344,8 +390,8 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
             pcw(&class_buf),
             pcw(&title_buf),
             WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-            0,
-            0,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
             spec.width,
             height,
             Some(parent),
@@ -432,9 +478,18 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
         let total_w = btns.len() as i32 * bw + (btns.len() as i32 - 1) * 8;
         let mut bx = spec.width - margin - 16 - total_w;
         for (id, label) in btns {
-            create_child(hwnd, "BUTTON", label, WS_CHILD | WS_VISIBLE | WS_TABSTOP, bx, by, bw, 26, id);
+            // OK is the default push button: Enter activates it
+            // (with DM_SETDEFID below, IsDialogMessageW routes
+            // Enter to it instead of dropping the key).
+            let style = if id == ID_OK {
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32)
+            } else {
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP
+            };
+            create_child(hwnd, "BUTTON", label, style, bx, by, bw, 26, id);
             bx += bw + 8;
         }
+        send(hwnd, DM_SETDEFID, WPARAM(ID_OK as usize), LPARAM(0));
 
         {
             let mut guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -449,7 +504,7 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
         }
 
         // Modality: disable the parent for the duration of the loop.
-        let _ = EnableWindow(parent, false);
+        disable_parent(parent);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let mut msg = MSG::default();
         loop {
@@ -479,7 +534,7 @@ fn show_modal_inner(parent: HWND, spec: &DialogSpec) -> DialogOutcome {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        let _ = EnableWindow(parent, true);
+        enable_parent(parent);
 
         let outcome = {
             let mut guard = DIALOG_STATE.lock().unwrap_or_else(|e| e.into_inner());

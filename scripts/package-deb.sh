@@ -42,9 +42,44 @@ install -m 755 "$BIN" "$STAGE/usr/bin/ndm-app"
 # shows no icons (2.3.1 gate finding).
 mkdir -p "$STAGE/usr/lib/ndm" "$STAGE/usr/share/ndm/extension"
 install -m 755 "$HOST_BIN" "$STAGE/usr/lib/ndm/ndm-host"
-for f in manifest.json background.js content.js page-hook.js fb-classify.js popup.html popup.js icon16.png icon48.png icon128.png; do
+# The extension file set is DERIVED from extension/manifest.json —
+# every file the manifest names (content scripts, background,
+# popup, both icon maps) plus the popup's own script — never a
+# hand-written list. A hand list is exactly how 2.3.2 shipped a
+# package silently missing a content script; here a manifest-named
+# file that is absent makes install fail the build instead.
+EXT_FILES=$(python3 - <<'PYEOF'
+import json, re
+m = json.load(open('extension/manifest.json'))
+need = []
+def add(f):
+    if f and f not in need:
+        need.append(f)
+add('manifest.json')
+for cs in m.get('content_scripts', []):
+    for f in cs.get('js', []):
+        add(f)
+bg = m.get('background', {})
+add(bg.get('service_worker'))
+for f in bg.get('scripts', []):
+    add(f)
+action = m.get('action', {})
+add(action.get('default_popup'))
+for f in (action.get('default_icon') or {}).values():
+    add(f)
+for f in (m.get('icons') or {}).values():
+    add(f)
+popup = action.get('default_popup')
+if popup:
+    html = open(f'extension/{popup}').read()
+    for src in re.findall(r'<script[^>]+src="([^"]+)"', html):
+        add(src)
+print('\n'.join(need))
+PYEOF
+)
+while IFS= read -r f; do
   install -m 644 "extension/$f" "$STAGE/usr/share/ndm/extension/$f"
-done
+done <<< "$EXT_FILES"
 install -m 755 scripts/ndm-setup-browser.sh "$STAGE/usr/bin/ndm-setup-browser"
 
 for spec in "32x32 32x32.png" "64x64 64x64.png" "128x128 128x128.png" "256x256 128x128@2x.png" "512x512 icon.png"; do
@@ -114,6 +149,50 @@ fi
 exit 0
 POSTINST
 chmod 755 "$STAGE/DEBIAN/postinst"
+
+# Undo the postinst's (and the app's) per-user browser
+# registrations on remove/purge: a leftover com.ndm.host.json
+# pointing at the just-deleted /usr/lib/ndm/ndm-host leaves every
+# browser holding a live registration for a program that no longer
+# exists. The sweep covers the installing user's home (SUDO_USER,
+# like the postinst) plus every home under /home — the app
+# registers for whoever launches it, which may be another user.
+# A file is removed ONLY when it is NDM's own registration for
+# THIS package's host binary — a portable install's registration
+# (a different host path) and anything else is left untouched.
+cat > "$STAGE/DEBIAN/postrm" << 'POSTRM'
+#!/bin/sh
+case "$1" in
+  remove|purge) ;;
+  *) exit 0 ;;
+esac
+HOST=/usr/lib/ndm/ndm-host
+clean_home() {
+  H="$1"
+  [ -n "$H" ] && [ -d "$H" ] || return 0
+  for cfg in google-chrome google-chrome-beta chromium chromium-browser BraveSoftware/Brave-Browser microsoft-edge vivaldi opera; do
+    f="$H/.config/$cfg/NativeMessagingHosts/com.ndm.host.json"
+    if [ -f "$f" ] && grep -q "\"path\":\"$HOST\"" "$f" 2>/dev/null; then
+      rm -f "$f" || true
+      rmdir "$H/.config/$cfg/NativeMessagingHosts" 2>/dev/null || true
+    fi
+  done
+  f="$H/.mozilla/native-messaging-hosts/com.ndm.host.json"
+  if [ -f "$f" ] && grep -q "\"path\":\"$HOST\"" "$f" 2>/dev/null; then
+    rm -f "$f" || true
+    rmdir "$H/.mozilla/native-messaging-hosts" 2>/dev/null || true
+  fi
+}
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+  clean_home "$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
+for d in /home/*; do
+  [ -d "$d" ] && clean_home "$d"
+done
+clean_home /root
+exit 0
+POSTRM
+chmod 755 "$STAGE/DEBIAN/postrm"
 
 find "$STAGE" -type d -exec chmod 755 {} +
 dpkg-deb --build --root-owner-group "$STAGE" "$OUT"

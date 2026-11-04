@@ -138,6 +138,15 @@ pub fn is_open() -> bool {
     WIN_RAW.load(Ordering::SeqCst) != 0
 }
 
+/// The live window handle, for the main loop's dialog-message
+/// routing (IsDialogMessageW): a modeless dialog gets Tab
+/// navigation and Esc semantics only when its messages pass
+/// through it.
+pub fn dialog_hwnd() -> Option<HWND> {
+    let r = WIN_RAW.load(Ordering::SeqCst);
+    if r == 0 { None } else { Some(h(r)) }
+}
+
 /// Forward one UpdateProgress payload (any thread; boxed,
 /// reclaimed on post failure — the sink's pattern).
 pub fn forward_progress(v: serde_json::Value) {
@@ -229,9 +238,10 @@ fn apply_info(hwnd: HWND, info: &Info) {
         d.last_text = String::new();
         d.bar_pos = -1;
     }
-    if info.mandatory {
-        set_closable(hwnd, false);
-    }
+    // The closable state follows the LATEST offer: a window
+    // created for a mandatory offer (no WS_SYSMENU) that later
+    // receives a non-mandatory one must become closable again.
+    set_closable(hwnd, !info.mandatory);
 }
 
 fn set_bar_text(d: &mut UpdDlg, text: &str) {

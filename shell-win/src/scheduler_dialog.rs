@@ -90,6 +90,15 @@ struct SchedDlg {
 static DLG: Mutex<Option<SchedDlg>> = Mutex::new(None);
 static WIN_RAW: AtomicIsize = AtomicIsize::new(0);
 
+/// The live window handle, for the main loop's dialog-message
+/// routing (IsDialogMessageW): a modeless dialog gets Tab
+/// navigation and Esc semantics only when its messages pass
+/// through it.
+pub fn dialog_hwnd() -> Option<HWND> {
+    let r = WIN_RAW.load(Ordering::SeqCst);
+    if r == 0 { None } else { Some(h(r)) }
+}
+
 fn h(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
 }
@@ -516,10 +525,24 @@ fn save(hwnd: HWND) {
     // 1) the edited queue's fields into the working list, then the
     // whole settings object through core (sanitize mirrors the
     // legacy global scheduler fields from Main itself)
-    let (sel, staged, new_queues) = {
+    let (sel, staged, new_queues, capped) = {
         let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
         let Some(d) = guard.as_ref() else { return };
-        let max: u64 = unsafe { window_text(h(d.max)) }.trim().parse().unwrap_or(0);
+        // An unreadable max refuses the save in words (the
+        // audit-233 pattern, same as the time fields below);
+        // empty keeps its meaning of 0 = use the Options value.
+        // A value over the cap is clamped but NAMED afterwards,
+        // not silently cut.
+        let max_text = unsafe { window_text(h(d.max)) };
+        let max: u64 = match max_text.trim().parse::<u64>() {
+            Ok(v) => v,
+            Err(_) if max_text.trim().is_empty() => 0,
+            Err(_) => {
+                set_status(d, "That max-simultaneous value could not be read — nothing was saved.");
+                return;
+            }
+        };
+        let capped = max > 10;
         let start_s = unsafe { window_text(h(d.start)) }.trim().to_string();
         let stop_s = unsafe { window_text(h(d.stop)) }.trim().to_string();
         let one_time_s = unsafe { window_text(h(d.one_time)) }.trim().to_string();
@@ -566,7 +589,7 @@ fn save(hwnd: HWND) {
                 *q = edited.clone();
             }
         }
-        (d.sel.clone(), d.staged_order.clone(), new_queues)
+        (d.sel.clone(), d.staged_order.clone(), new_queues, capped)
     };
     if let Err(e) = persist_queue_list(&new_queues) {
         let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
@@ -614,6 +637,9 @@ fn save(hwnd: HWND) {
         }
     }
     crate::post_refresh();
+    if capped {
+        crate::set_status(1, "Scheduler saved — max simultaneous was capped at 10");
+    }
     unsafe {
         let _ = DestroyWindow(hwnd);
     }

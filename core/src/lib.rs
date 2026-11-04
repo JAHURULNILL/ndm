@@ -11528,6 +11528,30 @@ pub fn handle_incoming_line(handle: &Ctx, line: &str) {
             );
             return;
         }
+        // M-7: the mirror disagreement — the page URL names one
+        // Facebook video, but the recorder keyed this capture to
+        // a DIFFERENT one (the permalink page was playing a
+        // sibling: an auto-advanced reel, an embedded player).
+        // set_identity prefers the page-URL id, so storing this
+        // set would serve the keyed video's streams under the
+        // page video's identity — one video's download wearing
+        // another's name. Reject it exactly like the unkeyed
+        // case above; agreement (or no key) passes.
+        if let Some(id) = capture::facebook_video_id(url) {
+            if !video_key.is_empty() && video_key != format!("fb:{id}") {
+                eprintln!("[ndm] incoming captured_streams line dropped: recorder key disagrees with the page's video id");
+                drop_cookies_token(&state, &token);
+                write_ack_and_result(
+                    handle,
+                    ack_id.as_deref(),
+                    serde_json::json!({
+                        "ok": false,
+                        "error": "the captured streams belong to a different video than this page — open the video itself and try again"
+                    }),
+                );
+                return;
+            }
+        }
         capture::store_set(
             data_dir(&state).as_deref(),
             capture::CapturedSet {
@@ -15329,6 +15353,50 @@ mod tests {
             capture::get_set(Some(&dir), &capture::video_identity(feed)).is_none(),
             "the bare feed identity must hold no merged set"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M-7: a permalink page whose recorder key names a
+    /// DIFFERENT video (the page was playing a sibling) is
+    /// rejected at the drain — set_identity prefers the page-URL
+    /// id, so storing it would serve the keyed video's streams
+    /// under the page video's identity. The agreeing key stores
+    /// normally under the shared identity.
+    #[test]
+    fn captured_streams_line_with_disagreeing_video_key_is_dropped() {
+        let dir = std::env::temp_dir().join(format!("ndm-capfb7-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(state_with_data_file(dir.join("downloads.json")));
+        let ctx = Ctx::new(state.clone(), Arc::new(NullSink));
+        let page = "https://www.facebook.com/watch/?v=111111111111111";
+        let line = |id: &str, key: &str, url: &str| {
+            serde_json::json!({
+                "id": id,
+                "kind": "captured_streams",
+                "url": page,
+                "pageUrl": page,
+                "title": "Permalink video",
+                "storeOnly": true,
+                "videoKey": key,
+                "streams": [
+                    { "url": url, "mimeType": "video/mp4", "qualityLabel": "720p",
+                      "hasAudio": true, "hasVideo": true }
+                ]
+            })
+            .to_string()
+        };
+        // the key names another video than the page does: dropped
+        handle_incoming_line(&ctx, &line("fb-x", "fb:222222222222222", "https://video.example.fbcdn.net/wrong.mp4"));
+        assert!(
+            capture::get_set(Some(&dir), "fb:111111111111111").is_none(),
+            "a disagreeing capture must not be stored under the page's video"
+        );
+        // the agreeing key: stored under the shared identity
+        handle_incoming_line(&ctx, &line("fb-y", "fb:111111111111111", "https://video.example.fbcdn.net/right.mp4"));
+        let set = capture::get_set(Some(&dir), "fb:111111111111111")
+            .expect("an agreeing capture must be stored");
+        assert_eq!(set.streams[0].url, "https://video.example.fbcdn.net/right.mp4");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

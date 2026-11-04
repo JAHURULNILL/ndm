@@ -76,6 +76,7 @@ struct GrabDlg {
     queue_sel: gtk::ComboBoxText,
     // step 3
     mode_whole: gtk::RadioButton,
+    mode_levels: gtk::RadioButton,
     depth_same: gtk::SpinButton,
     depth_other: gtk::SpinButton,
     no_parent: gtk::CheckButton,
@@ -253,6 +254,11 @@ fn grab_dir_for(base: &str, start_url: &str, item_url: &str) -> String {
         return base.to_string();
     }
     parts.pop(); // the file name itself
+    // Page-controlled segments are joined under the user's base
+    // folder verbatim, and core does not re-sanitize the composed
+    // dir — a "." / ".." segment would escape the base (the
+    // Windows shell's twin fix). Such segments are dropped.
+    parts.retain(|s| s != "." && s != "..");
     let (shost, ssegs, strailing) = url_parts(start_url);
     if shost == host {
         let mut root = ssegs;
@@ -815,6 +821,7 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
         convert,
         queue_sel,
         mode_whole,
+        mode_levels,
         depth_same,
         depth_other,
         no_parent,
@@ -1075,7 +1082,10 @@ fn reset(d: &Rc<GrabDlg>) {
     d.excl.set_text("");
     d.depth_same.set_value(1.0);
     d.depth_other.set_value(0.0);
-    d.mode_whole.set_active(false);
+    // Restore the build-time default by activating the LEVELS
+    // radio: merely deactivating mode_whole left the group with
+    // no active button at all after a whole-site session.
+    d.mode_levels.set_active(true);
     d.no_parent.set_active(false);
     d.subfolders.set_active(false);
     d.add_queue.set_active(false);

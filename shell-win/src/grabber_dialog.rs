@@ -141,6 +141,15 @@ struct GrabDlg {
 static DLG: Mutex<Option<GrabDlg>> = Mutex::new(None);
 static WIN_RAW: AtomicIsize = AtomicIsize::new(0);
 
+/// The live window handle, for the main loop's dialog-message
+/// routing (IsDialogMessageW): a modeless dialog gets Tab
+/// navigation and Esc semantics only when its messages pass
+/// through it.
+pub fn dialog_hwnd() -> Option<HWND> {
+    let r = WIN_RAW.load(Ordering::SeqCst);
+    if r == 0 { None } else { Some(h(r)) }
+}
+
 fn h(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
 }
@@ -648,6 +657,12 @@ fn grab_dir_for(base: &str, start_url: &str, item_url: &str) -> String {
     let (i_host, i_path) = split(item_url);
     let mut parts: Vec<&str> = i_path.split('/').filter(|s| !s.is_empty()).collect();
     parts.pop(); // the file name itself
+    // Page-controlled segments are joined under the user's base
+    // folder verbatim by the caller, and core does not
+    // re-sanitize the composed dir — a "." / ".." segment (or
+    // one carrying a Windows separator) would escape the base.
+    // Such segments are dropped, never joined.
+    parts.retain(|s| *s != "." && *s != ".." && !s.contains('\\'));
     let (s_host, s_path) = split(start_url);
     if s_host == i_host {
         let mut root: Vec<&str> = s_path.split('/').filter(|s| !s.is_empty()).collect();

@@ -85,7 +85,10 @@ pub fn entry(initial: &str) -> gtk::Entry {
     let e = gtk::Entry::new();
     e.set_text(initial);
     e.set_hexpand(true);
-    e.set_activates_default(true);
+    // No activates_default: these entries live in multi-field
+    // forms (Options, Scheduler, Grabber) where Enter in ANY
+    // field used to save-and-close the whole dialog mid-edit.
+    // Focused single-purpose forms (dialogs.rs) set it themselves.
     e
 }
 
@@ -112,7 +115,7 @@ pub fn spin(min: f64, max: f64, val: f64, digits: u32) -> gtk::SpinButton {
     let s = gtk::SpinButton::with_range(min, max, if digits > 0 { 0.5 } else { 1.0 });
     s.set_digits(digits);
     s.set_value(val);
-    s.set_activates_default(true);
+    // See entry(): no Enter-to-save in multi-field forms.
     s
 }
 

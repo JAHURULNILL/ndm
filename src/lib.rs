@@ -5649,7 +5649,14 @@ pub struct Peeked {
 pub fn peek_state(url: &str, out: &Path) -> Option<Peeked> {
     let raw = std::fs::read(state_path_for(out)).ok()?;
     let s = serde_json::from_slice::<State>(&raw).ok()?;
-    if s.url != url || !out.exists() {
+    // H-2: the journal records an FTP target under its REDACTED
+    // address (journal_url — credentials never touch disk), so
+    // the comparison must normalize the caller's raw URL the
+    // same way; comparing raw-to-redacted missed every
+    // credentialed-FTP journal and reported resumable downloads
+    // as unresumable after a restart. Non-FTP URLs pass through
+    // journal_url unchanged.
+    if s.url != ftp::journal_url(url) || !out.exists() {
         return None;
     }
     // the same poison guard start() applies: a state whose block map
@@ -5701,7 +5708,12 @@ pub fn rebind_state_url(out: &Path, old_url: &str, new_url: &str) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    if s.url != old_url
+    // H-2: both sides are normalized through journal_url — the
+    // journal holds the redacted FTP address, and the rewritten
+    // journal must hold the NEW address in that same redacted
+    // form, or the resume filter and peek_state would refuse it
+    // on the very next start. Non-FTP URLs are unchanged by it.
+    if s.url != ftp::journal_url(old_url)
         || s.block_size == 0
         || s.block_size > 64 * 1024 * 1024
         || s.done.len() != s.total.div_ceil(s.block_size) as usize
@@ -5711,7 +5723,7 @@ pub fn rebind_state_url(out: &Path, old_url: &str, new_url: &str) -> bool {
     {
         return false;
     }
-    s.url = new_url.to_string();
+    s.url = ftp::journal_url(new_url);
     // write-then-rename, exactly as save_state does it — the
     // on-disk journal is never torn. This write is one-shot and
     // user-initiated (not the periodic hot path), so it takes the
@@ -11569,8 +11581,42 @@ mod audit208_tests {
     }
 
     #[test]
-    fn rebind_state_url_flips_only_a_valid_matching_journal() {
+    fn credentialed_ftp_journal_peeks_and_rebinds_by_raw_url() {
+        // H-2 regression: an FTP journal stores the target's
+        // REDACTED address (journal_url — credentials never touch
+        // disk), while callers hold the RAW credentialed URL.
+        // peek/rebind compared raw-to-redacted and missed every
+        // such journal: after a restart the entry read as
+        // unresumable, and a Refresh Address discarded its sealed
+        // progress outright.
         let body = pattern_body(1024 * 1024);
+        let block = 256 * 1024u64;
+        let out = tmp_out("ftprebind");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+        let raw1 = "ftp://nill:s3cret@127.0.0.1:2121/dir/old.bin";
+        let raw2 = "ftp://nill:s3cret@127.0.0.1:2122/dir/fresh.bin";
+        std::fs::write(&out, &body).unwrap();
+        // the journal exactly as the engine writes it: redacted
+        write_journal(&out, &ftp::journal_url(raw1), body.len() as u64, block, &[1, 1, 0, 0]);
+        let pk = peek_state(raw1, &out).expect("the raw URL must find its redacted journal");
+        assert_eq!(pk.total, body.len() as u64);
+        assert_eq!(pk.done_bytes, 2 * block);
+        // the flip: raw old → raw new, stored redacted
+        assert!(rebind_state_url(&out, raw1, raw2));
+        assert!(peek_state(raw1, &out).is_none());
+        assert!(peek_state(raw2, &out).is_some(), "the refreshed address must keep the journal");
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(state_path_for(&out)).unwrap()).unwrap();
+        let stored_url = stored["url"].as_str().unwrap();
+        assert_eq!(stored_url, ftp::journal_url(raw2));
+        assert!(!stored_url.contains("s3cret"), "journal leaked the password: {stored_url}");
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(state_path_for(&out));
+    }
+
+    #[test]
+    fn rebind_state_url_flips_only_a_valid_matching_journal() {        let body = pattern_body(1024 * 1024);
         let block = 256 * 1024u64;
         let out = tmp_out("rebind");
         let _ = std::fs::remove_file(&out);

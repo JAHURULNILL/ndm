@@ -84,6 +84,15 @@ struct VidDlg {
 static DLG: Mutex<Option<VidDlg>> = Mutex::new(None);
 static WIN_RAW: AtomicIsize = AtomicIsize::new(0);
 
+/// The live window handle, for the main loop's dialog-message
+/// routing (IsDialogMessageW): a modeless dialog gets Tab
+/// navigation and Esc semantics only when its messages pass
+/// through it.
+pub fn dialog_hwnd() -> Option<HWND> {
+    let r = WIN_RAW.load(Ordering::SeqCst);
+    if r == 0 { None } else { Some(h(r)) }
+}
+
 fn h(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
 }
@@ -358,7 +367,7 @@ fn probe(hwnd: HWND, url: String) {
                 let v = serde_json::to_value(&info).unwrap_or(serde_json::Value::Null);
                 post(hwnd, WM_VD_PROBE, 1, Box::new((url, v)));
             }
-            Err(e) => post(hwnd, WM_VD_PROBE, 0, Box::new(e)),
+            Err(e) => post(hwnd, WM_VD_PROBE, 0, Box::new((url, e))),
         }
     });
 }
@@ -878,10 +887,19 @@ unsafe extern "system" fn vid_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     apply_probe(v, &probed_url);
                 }
             } else if l.0 != 0 {
-                let e = *Box::from_raw(l.0 as *mut String);
-                let guard = DLG.lock().unwrap_or_else(|e2| e2.into_inner());
-                if let Some(d) = guard.as_ref() {
-                    set_status(d, &e);
+                let (probed_url, e) = *Box::from_raw(l.0 as *mut (String, String));
+                // The same staleness guard the success arm uses:
+                // an error for an address the user has already
+                // replaced must not land on the new probe.
+                let current = {
+                    let guard = DLG.lock().unwrap_or_else(|e2| e2.into_inner());
+                    guard.as_ref().map(|d| unsafe { window_text(h(d.url)) }.trim().to_string())
+                };
+                if current.as_deref() == Some(probed_url.as_str()) {
+                    let guard = DLG.lock().unwrap_or_else(|e2| e2.into_inner());
+                    if let Some(d) = guard.as_ref() {
+                        set_status(d, &e);
+                    }
                 }
             }
             LRESULT(0)

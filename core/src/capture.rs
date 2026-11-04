@@ -513,7 +513,13 @@ fn load_sets(dir: &Path) -> Vec<(String, CapturedSet)> {
     let Ok(map) = serde_json::from_str::<HashMap<String, CapturedSet>>(&raw) else {
         return Vec::new();
     };
-    map.into_iter().collect()
+    // M-8: expired sets are pruned at load, not carried — every
+    // reader refuses them anyway, so keeping them only lets dead
+    // captures crowd the cap and evict live ones
+    let now = now_unix();
+    map.into_iter()
+        .filter(|(_, s)| now.saturating_sub(s.received_unix) <= SET_MAX_AGE_SECS)
+        .collect()
 }
 
 fn persist_sets(dir: &Path, sets: &[(String, CapturedSet)]) {
@@ -542,10 +548,25 @@ pub fn store_set(dir: Option<&Path>, set: CapturedSet) {
             *sets = load_sets(d);
         }
     }
+    // M-8: sets that aged past the max age during this session
+    // are pruned on store too (load_sets prunes the disk copy)
+    let now = now_unix();
+    sets.retain(|(_, s)| now.saturating_sub(s.received_unix) <= SET_MAX_AGE_SECS);
     sets.retain(|(k, _)| k != &identity);
     sets.push((identity, set));
     while sets.len() > SETS_CAP {
-        sets.remove(0);
+        // M-8: evict the OLDEST by stored timestamp. The vec's
+        // order after a restart is the durable map's iteration
+        // order — arbitrary — so the old remove(0) evicted at
+        // random and could drop a fresh capture while antiques
+        // stayed; received_unix order is the deterministic rule
+        let oldest = sets
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, s))| s.received_unix)
+            .map(|(i, _)| i)
+            .unwrap();
+        sets.remove(oldest);
     }
     if let Some(d) = dir {
         persist_sets(d, &sets);
@@ -1041,6 +1062,51 @@ mod tests {
         let err = preresolved_for(Some(&dir), &set.page_url, "ndmcap:0000000000000000", 1_000)
             .unwrap_err();
         assert_eq!(err, MISSING_MESSAGE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_eviction_is_oldest_first_and_prunes_expired() {
+        // M-8: eviction used to remove index 0 of a vec whose
+        // order after a restart is the durable map's (arbitrary)
+        // iteration order — random eviction that could drop the
+        // freshest capture — and expired sets were never pruned,
+        // so they crowded the cap permanently.
+        let dir = std::env::temp_dir().join(format!("ndm-capture-m8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = now_unix();
+        let mk = |i: usize, received: u64| CapturedSet {
+            page_url: format!("https://example.com/m8-{i}"),
+            title: String::new(),
+            streams: Vec::new(),
+            received_unix: received,
+            video_key: String::new(),
+        };
+        // one long-expired set: a later store must prune it from
+        // the durable file, not carry it forever
+        store_set(Some(&dir), mk(999, now - SET_MAX_AGE_SECS - 60));
+        // fill past the cap with staggered ages (m8-0 oldest)
+        for i in 0..SETS_CAP + 2 {
+            store_set(Some(&dir), mk(i, now - ((SETS_CAP + 2 - i) as u64) * 60));
+        }
+        let raw = std::fs::read_to_string(dir.join(SETS_FILE)).unwrap();
+        assert!(
+            !raw.contains("example.com/m8-999"),
+            "the expired set must be pruned from the store"
+        );
+        assert!(
+            !raw.contains("example.com/m8-0\""),
+            "the oldest set must be evicted first"
+        );
+        assert!(
+            !raw.contains("example.com/m8-1\""),
+            "the second-oldest set must be evicted next"
+        );
+        assert!(
+            raw.contains("example.com/m8-33\""),
+            "the newest set must be kept"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -433,6 +433,12 @@ fn set_notice(ui: &Ui, text: &str) {
     ui.status[2].set_text(text);
 }
 
+/// An init_paths failure from main(): the window does not exist
+/// yet when it happens, so the error waits here for build_ui to
+/// put it in the status bar — the Err arm's comment has always
+/// promised that surface; this slot is what keeps the promise.
+static INIT_PATHS_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 // ---------------------------------------------------------------------------
 // List data — the mirror, the filter, full refreshes.
 // ---------------------------------------------------------------------------
@@ -558,9 +564,11 @@ thread_local! {
 /// selection and the list's state instead of sitting lit at
 /// all times. Nothing selected ⇒ Resume/Stop/Delete off; a
 /// stoppable selection (downloading/starting/merging/queued)
-/// lights Stop; a selection with anything not actively
-/// transferring lights Resume (paused, error, finished,
-/// queued); Stop All only while something is downloading;
+/// lights Stop; a selection with anything resumable lights
+/// Resume (paused, error, cancelled, queued — but never a
+/// finished entry: there is nothing left to resume, and a lit
+/// Resume on a complete download reads as a live action);
+/// Stop All only while something is downloading;
 /// Delete Completed only while a finished row exists. Add
 /// URL / Options / Scheduler / Grabber / queue buttons are
 /// state-independent and stay sensitive.
@@ -577,7 +585,10 @@ pub(crate) fn refresh_toolbar_states(ui: &Ui) {
             ) {
                 any_stoppable = true;
             }
-            if !matches!(d.status.as_str(), "downloading" | "starting" | "merging") {
+            if !matches!(
+                d.status.as_str(),
+                "downloading" | "starting" | "merging" | "finished"
+            ) {
                 any_resumable = true;
             }
         }
@@ -974,7 +985,21 @@ fn show_file_info_inner(
         .to_string();
     let dir_initial = match &retry {
         Some((args, _)) => args.dir.clone(),
-        None if probed_dir.is_empty() => default_dir,
+        // The stored setting keeps its "~/" form; the field shows
+        // the folder the download will really use (a probe success
+        // already hands back the resolved absolute path — the
+        // failed-probe fallback must match it, not show the raw
+        // setting string).
+        None if probed_dir.is_empty() => {
+            if let Some(rest) = default_dir.strip_prefix("~/") {
+                match std::env::var_os("HOME") {
+                    Some(h) => format!("{}/{}", h.to_string_lossy(), rest),
+                    None => default_dir,
+                }
+            } else {
+                default_dir
+            }
+        }
         None => probed_dir,
     };
     // app.js: the offered title's basename is the name; the
@@ -1750,10 +1775,26 @@ fn refresh_address(ui: &Rc<Ui>, id: &str) {
     if new_url.is_empty() {
         return;
     }
-    match sink::refresh_url(ui.ctx.clone(), id.to_string(), new_url) {
-        Ok(()) => set_notice(ui, "Address refreshed — the download stays paused"),
-        Err(e) => set_notice(ui, &format!("Could not refresh the address: {}", e)),
-    }
+    // refresh_url probes the new address over the network; on
+    // the UI thread a slow server froze the whole window for the
+    // probe's duration. Same thread + channel pattern as the
+    // other async commands (resume_ids above).
+    let (tx, rx) = gtk::glib::MainContext::channel::<Result<(), String>>(
+        gtk::glib::Priority::DEFAULT,
+    );
+    let ctx = ui.ctx.clone();
+    let id = id.to_string();
+    std::thread::spawn(move || {
+        let _ = tx.send(sink::refresh_url(ctx, id, new_url));
+    });
+    let ui2 = ui.clone();
+    rx.attach(None, move |r| {
+        match r {
+            Ok(()) => set_notice(&ui2, "Address refreshed — the download stays paused"),
+            Err(e) => set_notice(&ui2, &format!("Could not refresh the address: {}", e)),
+        }
+        gtk::glib::ControlFlow::Break
+    });
 }
 
 /// Export the downloads list (app.js exportList): core's
@@ -2564,6 +2605,46 @@ fn apply_menu_sort(ui: &Rc<Ui>, key: &str) {
     );
 }
 
+thread_local! {
+    /// The current File Name column, refreshed by every
+    /// populate_columns — the flexible column the refit below
+    /// resizes (see refit_name_column).
+    static NAME_COLUMN: std::cell::RefCell<Option<gtk::TreeViewColumn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The name column is the list's flexible column: when the
+/// fixed columns together are wider than the viewport, GTK
+/// clips the LAST columns instead of shrinking any fixed one —
+/// at ordinary window widths the Last Try Date lost its year
+/// (field bug Y-4's root, which a wider date column alone could
+/// never fix). On every allocation, hand the name column
+/// exactly the width the others leave behind (its cell
+/// ellipsizes), so every fixed column — dates included — is
+/// always fully on screen; in a roomy window the name column
+/// takes the slack, as its expand flag already intended.
+fn refit_name_column(view: &gtk::TreeView) {
+    let alloc = view.allocation().width();
+    if alloc <= 0 {
+        return;
+    }
+    let name_col = NAME_COLUMN.with(|c| c.borrow().clone());
+    let Some(name_col) = name_col else { return };
+    if !view.columns().iter().any(|c| c == &name_col) {
+        return;
+    }
+    let others: i32 = view
+        .columns()
+        .iter()
+        .filter(|c| *c != &name_col)
+        .map(|c| c.width())
+        .sum();
+    let target = (alloc - others).clamp(140, 1600);
+    if (name_col.width() - target).abs() > 2 {
+        name_col.set_fixed_width(target);
+    }
+}
+
 pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
     for col in view.columns() {
         view.remove_column(&col);
@@ -2596,7 +2677,23 @@ pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
         if c.width > 0 {
             col.set_fixed_width(c.width);
             col.set_sizing(gtk::TreeViewColumnSizing::Fixed);
-        } else if matches!(c.id.as_str(), "name" | "desc" | "saveto") {
+        }
+        if matches!(c.id.as_str(), "lasttry" | "added") {
+            // A date column narrower than its default clips the
+            // year (field bug Y-4); never let it shrink below the
+            // width its text needs, even when the window is tight
+            // and the expandable name column should be the one to
+            // give.
+            let def = prefs::COLUMN_DEFS
+                .iter()
+                .find(|(id, _, _, _)| *id == c.id)
+                .map(|(_, _, w, _)| *w)
+                .unwrap_or(0);
+            if def > 0 {
+                col.set_min_width(def);
+            }
+        }
+        if c.width <= 0 && matches!(c.id.as_str(), "name" | "desc" | "saveto") {
             // Width 0 means "automatic", but an autosized column
             // holding unbounded text (a 187-char filename, a long
             // path) requisitions its full text width and drags
@@ -2652,6 +2749,9 @@ pub(crate) fn populate_columns(view: &gtk::TreeView, cfg: &[prefs::ColumnCfg]) {
         gtk::prelude::CellLayoutExt::pack_start(&col, &cell, true);
         gtk::prelude::CellLayoutExt::add_attribute(&col, &cell, "text", model_col as i32);
         view.append_column(&col);
+        if c.id == "name" {
+            NAME_COLUMN.with(|slot| *slot.borrow_mut() = Some(col.clone()));
+        }
     }
 }
 
@@ -2952,6 +3052,15 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                                 (COL_SPEED, &0.0f64 as &dyn gtk::glib::ToValue),
                             ],
                         );
+                        refresh_status_counts(ui);
+                    } else if let Some(d) = ui.entries.borrow().get(id).cloned() {
+                        // The row was filtered out while it was
+                        // downloading (the Finished filter was
+                        // active): completion is what makes it
+                        // visible, so insert it — updating alone
+                        // left the Finished view without the row
+                        // until a manual refresh.
+                        apply_progress(ui, &d);
                         refresh_status_counts(ui);
                     }
                 } else if let Some(mut iter) = iter_for(&ui.store, id) {
@@ -3273,6 +3382,7 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
     let (cat_store, cat_view) = build_category_pane();
     let col_cfg = prefs::load_columns();
     let list = build_download_list(&store, &col_cfg);
+    list.connect_size_allocate(|view, _alloc| refit_name_column(view));
 
     let ui = Rc::new(Ui {
         window: window.clone(),
@@ -3613,6 +3723,13 @@ fn build_ui(app: &gtk::Application, ctx: &Ctx, receiver: &gtksink::ReceiverSlot)
             set_notice(&ui, &notice);
         }
     }
+    // An init_paths failure outranks any startup notice: it means
+    // the app is running against lost state.
+    if let Ok(mut slot) = INIT_PATHS_ERROR.lock() {
+        if let Some(err) = slot.take() {
+            set_notice(&ui, &err);
+        }
+    }
     // Pull a latched update offer (app.js pulls get_pending_update
     // on load — the launch check's emit can predate this shell's
     // listener on a cold start).
@@ -3668,7 +3785,24 @@ fn acquire_instance_guard(dir: &std::path::Path) -> Option<std::fs::File> {
         .write(true)
         .open(dir.join("instance.lock"))
         .ok()?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let mut rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 && std::env::var_os("NDM_RESTART_WAIT").is_some() {
+        // Update-restart handoff: the old process still holds the
+        // lock while it shuts down, and it is EXPECTED to release
+        // it momentarily. Without a wait, this process read the
+        // held lock as "another instance is running", queued a
+        // raise to the dying process and exited — the restart
+        // silently left no app at all. Retry briefly; a genuinely
+        // running instance (env unset, or still alive after the
+        // wait) falls through to the normal path below.
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                break;
+            }
+        }
+    }
     if rc == 0 {
         return Some(file);
     }
@@ -3727,6 +3861,13 @@ fn main() {
             // still show the window with the failure in the
             // status bar rather than running against lost state.
             eprintln!("[ndm-shell-gtk] init_paths({}) failed: {}", dir.display(), e);
+            if let Ok(mut slot) = INIT_PATHS_ERROR.lock() {
+                *slot = Some(format!(
+                    "NDM could not open its data folder ({}): {} — downloads are shown from memory only and nothing will be saved.",
+                    dir.display(),
+                    e
+                ));
+            }
         }
     }
 

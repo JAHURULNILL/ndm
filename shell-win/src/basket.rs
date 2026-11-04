@@ -52,6 +52,15 @@ const BASKET_W: i32 = 232;
 const BASKET_H: i32 = 118;
 
 static WIN_RAW: AtomicIsize = AtomicIsize::new(0);
+
+/// The live window handle, for the main loop's dialog-message
+/// routing (IsDialogMessageW): a modeless dialog gets Tab
+/// navigation and Esc semantics only when its messages pass
+/// through it.
+pub fn dialog_hwnd() -> Option<HWND> {
+    let r = WIN_RAW.load(Ordering::SeqCst);
+    if r == 0 { None } else { Some(h(r)) }
+}
 static NOTE_RAW: AtomicIsize = AtomicIsize::new(0);
 static BRUSH_RAW: AtomicIsize = AtomicIsize::new(0);
 // The registered drop target is kept for the window's whole
@@ -335,7 +344,9 @@ unsafe extern "system" fn basket_wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPA
             LRESULT(0)
         }
         WM_DROPFILES => {
-            let hdrop = HDROP(l.0 as *mut core::ffi::c_void);
+            // The HDROP rides wParam (the message contract — the
+            // main window's handler reads it from there too).
+            let hdrop = HDROP(w.0 as *mut core::ffi::c_void);
             if let Some(c) = crate::ctx() {
                 let count = DragQueryFileW(hdrop, 0xFFFF_FFFF, None);
                 for i in 0..count {

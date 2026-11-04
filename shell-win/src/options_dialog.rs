@@ -80,6 +80,15 @@ struct OptDlg {
 static DLG: Mutex<Option<OptDlg>> = Mutex::new(None);
 static WIN_RAW: AtomicIsize = AtomicIsize::new(0);
 
+/// The live window handle, for the main loop's dialog-message
+/// routing (IsDialogMessageW): a modeless dialog gets Tab
+/// navigation and Esc semantics only when its messages pass
+/// through it.
+pub fn dialog_hwnd() -> Option<HWND> {
+    let r = WIN_RAW.load(Ordering::SeqCst);
+    if r == 0 { None } else { Some(h(r)) }
+}
+
 fn h(raw: isize) -> HWND {
     HWND(raw as *mut core::ffi::c_void)
 }
@@ -612,6 +621,7 @@ fn refresh_cats() {
 fn save(hwnd: HWND) {
     let mut out;
     let mut adjusted: Vec<&'static str> = Vec::new();
+    let mut refused: Vec<&'static str> = Vec::new();
     {
         let guard = DLG.lock().unwrap_or_else(|e| e.into_inner());
         let Some(d) = guard.as_ref() else { return };
@@ -623,7 +633,19 @@ fn save(hwnd: HWND) {
         // seeds the dialog's own fields at build time.
         let fresh = crate::settings_value();
         out = fresh.clone();
-        let num = |name: &str, dflt: u64| get_text(d, name).trim().parse::<u64>().unwrap_or(dflt);
+        // An unreadable number refuses in words (the audit-233
+        // pattern): the field keeps its CURRENT value and is
+        // named in the status line, instead of silently writing
+        // a built-in default over what the user had.
+        let num = |name: &str, label: &'static str, dflt: u64, refused: &mut Vec<&'static str>| -> u64 {
+            match get_text(d, name).trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    refused.push(label);
+                    fresh.get(name).and_then(|x| x.as_u64()).unwrap_or(dflt)
+                }
+            }
+        };
         // Out-of-range numbers used to be clamped silently
         // (audit-233 minor); the save now names the adjusted
         // fields in the status line.
@@ -640,14 +662,19 @@ fn save(hwnd: HWND) {
         } else {
             dir_text.trim().to_string()
         });
-        out["max_connections"] = serde_json::json!(clamped("Max connections", num("max_connections", 8), 1, 32, &mut adjusted));
+        out["max_connections"] = serde_json::json!(clamped("Max connections", num("max_connections", "Max connections", 8, &mut refused), 1, 32, &mut adjusted));
         out["speed_limit_bps"] = serde_json::json!(if get_check(d, "limit_on") {
-            let v: f64 = get_text(d, "limit_val").trim().parse().unwrap_or(1.0);
-            (v.max(0.1) * 1_048_576.0).round() as u64
+            match get_text(d, "limit_val").trim().parse::<f64>() {
+                Ok(v) => (v.max(0.1) * 1_048_576.0).round() as u64,
+                Err(_) => {
+                    refused.push("Speed limit");
+                    fresh.get("speed_limit_bps").and_then(|x| x.as_u64()).unwrap_or(0)
+                }
+            }
         } else {
             0
         });
-        out["max_simultaneous"] = serde_json::json!(clamped("Max simultaneous downloads", num("max_simultaneous", 0), 0, 10, &mut adjusted));
+        out["max_simultaneous"] = serde_json::json!(clamped("Max simultaneous downloads", num("max_simultaneous", "Max simultaneous downloads", 0, &mut refused), 0, 10, &mut adjusted));
         out["auto_resume"] = serde_json::json!(get_check(d, "auto_resume"));
         out["auto_update"] = serde_json::json!(get_check(d, "auto_update"));
         out["video_quality"] = serde_json::json!(get_combo(d, "video_quality"));
@@ -655,7 +682,7 @@ fn save(hwnd: HWND) {
         out["proxy_pac_url"] = serde_json::json!(get_text(d, "proxy_pac_url").trim());
         out["proxy_scheme"] = serde_json::json!(get_combo(d, "proxy_scheme"));
         out["proxy_host"] = serde_json::json!(get_text(d, "proxy_host").trim());
-        out["proxy_port"] = serde_json::json!(clamped("Proxy port", num("proxy_port", 0), 0, 65535, &mut adjusted));
+        out["proxy_port"] = serde_json::json!(clamped("Proxy port", num("proxy_port", "Proxy port", 0, &mut refused), 0, 65535, &mut adjusted));
         out["proxy_user"] = serde_json::json!(get_text(d, "proxy_user").trim());
         out["proxy_pass"] = serde_json::json!(get_text(d, "proxy_pass"));
         out["proxy_http"] = serde_json::json!(get_check(d, "proxy_http"));
@@ -744,25 +771,40 @@ fn save(hwnd: HWND) {
             .collect::<Vec<_>>());
         out["exit_when_done"] = serde_json::json!(get_check(d, "exit_when_done"));
         out["sound_events"] = serde_json::json!(get_check(d, "sound_events"));
-        out["show_complete_dialog"] = serde_json::json!(get_check(d, "show_complete_dialog"));
+        // The one managed key another surface patches on its
+        // own while Options may be open: the Download Complete
+        // dialog's "show again" choice saves show_complete_dialog
+        // directly (main.rs). Write the checkbox only when the
+        // user actually changed it here — `out` starts as the
+        // fresh read, so skipping keeps the newer value instead
+        // of resurrecting the open-time one.
+        if get_check(d, "show_complete_dialog")
+            != d.base.get("show_complete_dialog").and_then(|x| x.as_bool()).unwrap_or(true)
+        {
+            out["show_complete_dialog"] = serde_json::json!(get_check(d, "show_complete_dialog"));
+        }
         out["progress_dialog_view"] = serde_json::json!(get_combo(d, "progress_dialog_view"));
         out["clipboard_monitor"] = serde_json::json!(get_check(d, "clipboard_monitor"));
-        out["quota_mb"] = serde_json::json!(num("quota_mb", 0));
-        out["quota_hours"] = serde_json::json!(clamped("Quota hours", num("quota_hours", 5), 1, 168, &mut adjusted));
+        out["quota_mb"] = serde_json::json!(num("quota_mb", "Quota (MB)", 0, &mut refused));
+        out["quota_hours"] = serde_json::json!(clamped("Quota hours", num("quota_hours", "Quota hours", 5, &mut refused), 1, 168, &mut adjusted));
     }
     match crate::save_settings_value(std::mem::take(&mut out)) {
         Ok(()) => {
-            if adjusted.is_empty() {
-                crate::set_status(1, "Options saved");
+            let mut msg = if adjusted.is_empty() {
+                "Options saved".to_string()
             } else {
-                crate::set_status(
-                    1,
-                    &format!(
-                        "Options saved — adjusted to the allowed range: {}",
-                        adjusted.join(", ")
-                    ),
+                format!(
+                    "Options saved — adjusted to the allowed range: {}",
+                    adjusted.join(", ")
+                )
+            };
+            if !refused.is_empty() {
+                msg += &format!(
+                    " — not numbers, kept unchanged: {}",
+                    refused.join(", ")
                 );
             }
+            crate::set_status(1, &msg);
             crate::post_refresh();
             unsafe {
                 let _ = DestroyWindow(hwnd);

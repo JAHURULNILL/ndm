@@ -26,7 +26,15 @@ pub fn set(key: &str, value: serde_json::Value) {
     let mut all = load_all();
     all[key] = value;
     if let Ok(body) = serde_json::to_string(&all) {
-        let _ = std::fs::write(prefs_path(), body);
+        // Write-rename, like every other store in this app: a
+        // crash mid-write used to leave torn JSON, and load_all's
+        // silent {} fallback then reset EVERY UI preference at
+        // the next start.
+        let path = prefs_path();
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, body).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
 
@@ -95,6 +103,22 @@ pub fn load_columns() -> Vec<ColumnCfg> {
     // the name column is the list's anchor — it cannot be hidden
     if let Some(nm) = out.iter_mut().find(|o| o.id == "name") {
         nm.visible = true;
+    }
+    // Date columns saved narrower than today's default (an older
+    // build's default was 130 for Last Try Date) keep clipping the
+    // year forever, because the saved width wins over the new
+    // default (field bug Y-4's surviving half). Floor a saved
+    // non-zero date width at the current default; 0 stays
+    // "automatic".
+    for c in out.iter_mut().filter(|c| matches!(c.id.as_str(), "lasttry" | "added")) {
+        let def = COLUMN_DEFS
+            .iter()
+            .find(|(id, _, _, _)| *id == c.id)
+            .map(|(_, _, w, _)| *w)
+            .unwrap_or(0);
+        if c.width > 0 && c.width < def {
+            c.width = def;
+        }
     }
     out
 }

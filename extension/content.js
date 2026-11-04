@@ -254,6 +254,7 @@
         ? videoEl.closest('article, [role="article"], [data-testid*="post" i]')
         : null;
       let cur = videoEl;
+      let firstPlain = '';
       for (let depth = 0; depth < 16 && cur && cur !== document.body; depth++, cur = cur.parentElement) {
         const links = cur.querySelectorAll ? cur.querySelectorAll('a[href]') : [];
         for (const a of links) {
@@ -265,11 +266,24 @@
             /(twitter|x)\.com\/[^/]+\/status\/\d+/i.test(h) ||
             /youtube\.com\/(watch\?v=|shorts\/)/i.test(h)
           ) {
-            return h.split('&__cft__')[0];
+            const clean = h.split('&__cft__')[0];
+            // A permalink anchor that WRAPS the clicked player
+            // is structurally this post's own — it outranks
+            // every other candidate, including an author-pasted
+            // link to a DIFFERENT video sitting earlier in the
+            // post text (audit F5: DOM order alone returned
+            // that in-text link). The first plain candidate is
+            // remembered and the climb continues within the
+            // same scope, in case a wrapping one sits higher;
+            // with none, the remembered candidate is exactly
+            // what the old first-match walk returned.
+            if (a.contains && a.contains(videoEl)) return clean;
+            if (!firstPlain) firstPlain = clean;
           }
         }
         if (container ? cur === container : depth >= 3) break;
       }
+      if (firstPlain) return firstPlain;
     }
 
     // 4. For generic sites: if the background worker sniffed an
@@ -3060,6 +3074,11 @@
           paintDetails(progEls);
           syncLimiter();
           btnPause.style.display = entry.id ? '' : 'none';
+          // Cancel joins Pause in hiding while there is no
+          // entry to act on: its handler is inert without an
+          // id, so showing it would offer a control that does
+          // nothing (the old static branch hid both).
+          btnCancel.style.display = entry.id ? '' : 'none';
           btnResume.style.display = 'none';
           btnShow.style.display = entry.id ? 'none' : '';
           return;
@@ -3386,9 +3405,15 @@
         chrome.runtime.sendMessage({ action: 'ndm-show-app' }).catch(() => {});
       });
 
-      if (!entry.id) {
-        // The send may have landed but returned no id (timeout):
-        // nothing exists to poll or control — static state only.
+      if (!entry.id && !entry.queueId) {
+        // The send returned neither an entry id nor a queue
+        // handle: nothing exists to poll, adopt or control —
+        // static state only. (An id-less entry WITH a queueId
+        // falls through to tick, whose first job is adopting
+        // the id the app named for the queued start — audit F1:
+        // this guard used to catch queueId entries too, so the
+        // adoption poll below never ran and the card waited
+        // statically through the whole download.)
         btnPause.style.display = 'none';
         btnCancel.style.display = 'none';
         btnShow.style.display = '';
@@ -3406,18 +3431,33 @@
           // must not render a download that may not exist
           // (field bug Y-2: a dead-id card sat on "Downloading
           // in NDM…" through a whole download and its finish).
+          let rr = null;
           try {
-            const rr = await chrome.runtime.sendMessage({
+            rr = await chrome.runtime.sendMessage({
               action: 'ndm-start-result',
               queueId: entry.queueId,
             });
-            if (rr && rr.ok && rr.id) {
-              entry.id = rr.id;
-              if (entry.regKey) {
-                flyEntryRegistry.set(entry.regKey, { id: rr.id, name: entry.name });
-              }
-            }
           } catch (e) {}
+          if (rr && rr.ok && rr.id) {
+            entry.id = rr.id;
+            if (entry.regKey) {
+              flyEntryRegistry.set(entry.regKey, { id: rr.id, name: entry.name });
+            }
+          } else if (rr && !rr.pending && typeof rr.error === 'string' && rr.error) {
+            // The stored result is a REFUSAL: the app drained
+            // the queue line and turned the start down (a
+            // duplicate it would not force, a rejected URL —
+            // see the host's result store). The wait is over,
+            // so the card fails with the app's own reason
+            // instead of spinning until the unresolved timeout
+            // (audit F1). NOT refusals, and still waited out
+            // below: the host's {pending:true} "not drained
+            // yet", and a bare {ok:false} with no error — the
+            // background's shape for a native-call hiccup,
+            // which says nothing about the start itself.
+            renderFailed('error', rr);
+            return;
+          }
           if (!entry.id) {
             waited++;
             if (waited > 150) entry.unresolved = true;
@@ -4342,11 +4382,16 @@
         confirmTakeover();
         closed = true;
         closeBrowserModal();
-        if (!later && resp && resp.id) {
+        if (!later && resp && resp.id && !resp.dupe) {
           // E2: a "Download Now" start lands in the flyout's
           // progress card, like a video start. (A "later" start
           // is queued in the app on purpose — the toast below
-          // stays its confirmation.)
+          // stays its confirmation.) The !dupe guard matches the
+          // video paths' order (audit F2): a duplicate reply
+          // carries the EXISTING entry's id too, so testing id
+          // alone made every duplicate open a phantom progress
+          // card for an entry this start did not create, and
+          // the "Already in NDM" toast below never fired.
           openEntryProgressCard(resp.id, chosenName, targetUrl);
         } else if (resp && resp.dupe) {
           // IDM asks about duplicates; the silent path just points

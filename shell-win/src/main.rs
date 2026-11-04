@@ -243,9 +243,28 @@ fn ctx() -> Option<Ctx> {
 static CACHE: Mutex<Vec<ProgressView>> = Mutex::new(Vec::new());
 /// Entry ids currently displayed, parallel to ListView rows.
 static DISPLAY: Mutex<Vec<String>> = Mutex::new(Vec::new());
-/// Per-display-row "has a block map" flags, parallel to DISPLAY —
-/// the custom-draw snapshot is a clone of this, never a rescan.
-static BLOCK_FLAGS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+/// Per-display-row block-map strips, parallel to DISPLAY — the
+/// custom-draw snapshot is a clone of this, never a rescan.
+/// None while the row's payload carries no block data.
+static BLOCK_DATA: Mutex<Vec<Option<winui::customdraw::StripData>>> = Mutex::new(Vec::new());
+
+/// The row's block-map strip for custom draw, built from the
+/// view's payload exactly as the progress dialog builds its own
+/// (blocks + G1 connection fields); None while the payload has
+/// no block string yet.
+fn strip_of(p: &ProgressView) -> Option<winui::customdraw::StripData> {
+    if p.blocks.is_empty() {
+        return None;
+    }
+    Some(winui::customdraw::StripData {
+        blocks: p.blocks.clone(),
+        conns_partial: p.conns_partial.clone(),
+        conns_block: p.conns_block.clone(),
+        conns_state: p.conns_state.clone(),
+        total: p.total,
+        finished: p.status == "finished",
+    })
+}
 /// The active tree filter, in the web UI's currentCat vocabulary:
 /// "All Downloads" | a category | "Unfinished" | "Finished" |
 /// "Grabber" | "queue:<name>". Default mirrors ui/app.js line 33.
@@ -415,6 +434,9 @@ fn cell_for(p: &ProgressView, id: &str) -> String {
         "desc" => p.description.clone(),
         "added" => p.added.clone(),
         "saveto" => p.save_to.clone(),
+        // The Blocks cell is custom-drawn from the row's strip;
+        // its text stays empty.
+        "blocks" => String::new(),
         _ => String::new(),
     }
 }
@@ -433,7 +455,7 @@ fn row_cells(p: &ProgressView) -> Vec<String> {
 // native window has no localStorage. File Name is the anchor:
 // it cannot be hidden (loadColumnCfg forces it visible).
 // ----------------------------------------------------------------
-pub const COLUMN_DEFS: [(&str, &str, i32, bool); 10] = [
+pub const COLUMN_DEFS: [(&str, &str, i32, bool); 11] = [
     ("name", "File Name", 0, false),
     ("q", "Q", 30, false),
     ("size", "Size", 84, false),
@@ -444,6 +466,9 @@ pub const COLUMN_DEFS: [(&str, &str, i32, bool); 10] = [
     ("desc", "Description", 150, false),
     ("added", "Date Added", 168, true),
     ("saveto", "Save To", 240, true),
+    // The block map's dedicated column (shell-gtk parity): its
+    // cells are custom-drawn from the row's real block state.
+    ("blocks", "Blocks", 160, false),
 ];
 
 #[derive(Clone, Debug)]
@@ -489,9 +514,9 @@ fn load_column_cfg() -> Vec<ColumnCfg> {
 static COLUMN_CFG: Mutex<Vec<ColumnCfg>> = Mutex::new(Vec::new());
 /// Columns currently inserted in the main ListView.
 static COLUMN_COUNT: Mutex<i32> = Mutex::new(0);
-/// Visible index of the Status column (the block map's subitem),
-/// or -1 while Status is hidden.
-static BLOCK_SUBITEM: Mutex<i32> = Mutex::new(3);
+/// Visible index of the Blocks column (the block map's subitem),
+/// or -1 while Blocks is hidden.
+static BLOCK_SUBITEM: Mutex<i32> = Mutex::new(-1);
 
 pub fn column_cfg() -> Vec<ColumnCfg> {
     let mut guard = COLUMN_CFG.lock().unwrap_or_else(|e| e.into_inner());
@@ -639,7 +664,7 @@ fn layout_children(cx: i32, cy: i32) {
 
 /// Rebuild the main ListView's columns from the configuration
 /// and re-render the rows under it (the block map follows the
-/// Status column to its new subitem, or disarms while hidden).
+/// Blocks column to its new subitem, or disarms while hidden).
 pub fn apply_columns() {
     let vis = visible_columns();
     let lv = list_view();
@@ -657,7 +682,7 @@ pub fn apply_columns() {
     }
     *COLUMN_COUNT.lock().unwrap_or_else(|e| e.into_inner()) = vis.len() as i32;
     *BLOCK_SUBITEM.lock().unwrap_or_else(|e| e.into_inner()) =
-        vis.iter().position(|c| c.id == "status").map(|i| i as i32).unwrap_or(-1);
+        vis.iter().position(|c| c.id == "blocks").map(|i| i as i32).unwrap_or(-1);
     rebuild_display();
 }
 
@@ -747,14 +772,14 @@ fn rebuild_display() {
     lv.clear();
     let mut display = DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
     display.clear();
-    let mut flags = BLOCK_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut flags = BLOCK_DATA.lock().unwrap_or_else(|e| e.into_inner());
     flags.clear();
     let mut row = 0;
     for p in cache.iter() {
         if matches_filter(p, &filter) {
             lv.insert_row(row, &row_cells(p));
             display.push(p.id.clone());
-            flags.push(!p.blocks.is_empty());
+            flags.push(strip_of(p));
             row += 1;
         }
     }
@@ -1046,14 +1071,14 @@ fn upsert_progress_row(p: &ProgressView) {
     };
     let lv = list_view();
     let mut display = DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
-    let mut flags = BLOCK_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut flags = BLOCK_DATA.lock().unwrap_or_else(|e| e.into_inner());
     let in_display = display.iter().position(|id| id == &p.id);
     if matches_filter(p, &filter) {
         match in_display {
             Some(row) => {
                 lv.update_row(row as i32, &row_cells(p));
                 if let Some(f) = flags.get_mut(row) {
-                    *f = !p.blocks.is_empty();
+                    *f = strip_of(p);
                 }
             }
             None => {
@@ -1067,7 +1092,7 @@ fn upsert_progress_row(p: &ProgressView) {
                     .count();
                 lv.insert_row(pos as i32, &row_cells(p));
                 display.insert(pos, p.id.clone());
-                flags.insert(pos, !p.blocks.is_empty());
+                flags.insert(pos, strip_of(p));
                 state_dirty = true;
             }
         }
@@ -1098,7 +1123,7 @@ fn remove_row(id: &str) {
     if let Some(row) = display.iter().position(|x| x == id) {
         list_view().delete_row(row as i32);
         display.remove(row);
-        let mut flags = BLOCK_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut flags = BLOCK_DATA.lock().unwrap_or_else(|e| e.into_inner());
         if row < flags.len() {
             flags.remove(row);
         }
@@ -2922,7 +2947,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 .collect();
             *COLUMN_COUNT.lock().unwrap_or_else(|e| e.into_inner()) = columns.len() as i32;
             *BLOCK_SUBITEM.lock().unwrap_or_else(|e| e.into_inner()) =
-                vis.iter().position(|c| c.id == "status").map(|i| i as i32).unwrap_or(-1);
+                vis.iter().position(|c| c.id == "blocks").map(|i| i as i32).unwrap_or(-1);
             if let Ok(lv) = ListView::create(hwnd, ID_LIST, &columns) {
                 H_LIST = lv.hwnd;
             }
@@ -2960,16 +2985,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) ->
                 let code = (*hdr).code;
                 if (*hdr).idFrom == ID_LIST as usize {
                     if code == NM_CUSTOMDRAW {
-                        let has_map = {
-                            let snapshot: Vec<bool> = BLOCK_FLAGS
+                        let subitem = *BLOCK_SUBITEM.lock().unwrap_or_else(|e| e.into_inner());
+                        let row_strip = {
+                            let snapshot: Vec<Option<winui::customdraw::StripData>> = BLOCK_DATA
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .clone();
-                            move |row: i32| snapshot.get(row as usize).copied().unwrap_or(false)
+                            move |row: i32| snapshot.get(row as usize).cloned().unwrap_or_default()
                         };
                         // The closure borrows nothing after this call;
                         // on_custom_draw only invokes it synchronously.
-                        return LRESULT(list_view().on_custom_draw(l, has_map));
+                        return LRESULT(list_view().on_custom_draw(l, subitem, row_strip));
                     }
                     if code == LVN_BEGINDRAG {
                         // Drag-out (WS-J): a drag begun on a
@@ -3288,8 +3314,41 @@ fn main() {
             if windows::Win32::UI::WindowsAndMessaging::TranslateAcceleratorW(hwnd, accel, &mut msg) != 0 {
                 continue;
             }
+            if modeless_dialog_message(&mut msg) {
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+    }
+}
+
+/// Dialog-message routing for the modeless windows (progress,
+/// options, scheduler, update, basket, video, grabber): without
+/// an IsDialogMessageW pass their messages never get dialog
+/// semantics — Tab navigation between fields and Esc did
+/// nothing. IsDialogMessageW itself checks whether the message
+/// belongs to the window, so non-dialog messages fall through
+/// untouched.
+fn modeless_dialog_message(msg: &mut MSG) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IsDialogMessageW, IsWindow};
+    let mut hwnds: Vec<HWND> = Vec::new();
+    hwnds.extend(progress_dialog::dialog_hwnds());
+    for one in [
+        options_dialog::dialog_hwnd(),
+        scheduler_dialog::dialog_hwnd(),
+        update_dialog::dialog_hwnd(),
+        basket::dialog_hwnd(),
+        video_dialog::dialog_hwnd(),
+        grabber_dialog::dialog_hwnd(),
+    ] {
+        if let Some(h) = one {
+            hwnds.push(h);
+        }
+    }
+    unsafe {
+        hwnds.iter().any(|&h| {
+            IsWindow(Some(h)).as_bool() && IsDialogMessageW(h, msg).as_bool()
+        })
     }
 }

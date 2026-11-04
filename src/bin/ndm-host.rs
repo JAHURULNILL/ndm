@@ -157,6 +157,31 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
+        // M-9: a host killed mid-append leaves a TORN final line
+        // with no trailing newline. Appending straight onto it
+        // glues this line to the fragment; the app's drain then
+        // drops the combined line as unparseable — losing THIS
+        // hand-off after the caller was already told it queued.
+        // If the file does not end with a newline, terminate the
+        // fragment first so this line starts clean (the fragment
+        // itself stays a bad line the drain drops, as it already
+        // does). O_APPEND keeps the write at the true end; the
+        // seek only positions the read.
+        {
+            use std::io::Seek as _;
+            if let Ok(meta) = file.metadata() {
+                if meta.len() > 0
+                    && file
+                        .seek(std::io::SeekFrom::Start(meta.len() - 1))
+                        .is_ok()
+                {
+                    let mut last = [0u8; 1];
+                    if file.read_exact(&mut last).is_ok() && last[0] != b'\n' {
+                        file.write_all(b"\n")?;
+                    }
+                }
+            }
+        }
         file.write_all(line.as_bytes())
     })();
     if let Some(f) = guard.take() {
@@ -170,9 +195,11 @@ fn append_to_queue(mut obj: Value, cookies: &str) -> io::Result<()> {
     result
 }
 
-/// Create the queue lock, recording this process's pid inside it so
-/// later hosts can tell a live owner from a dead one instantly
-/// instead of guessing from the file's age.
+/// Create the queue lock, recording this process's pid AND its
+/// start token inside it so later hosts can tell a live owner
+/// from a dead one instantly instead of guessing from the file's
+/// age — and can tell the OWNER from a stranger who recycled the
+/// owner's pid after it died (F6).
 fn acquire_queue_lock(lock_path: &std::path::Path) -> Option<std::fs::File> {
     use std::io::Write as _;
     let mut f = OpenOptions::new()
@@ -180,8 +207,79 @@ fn acquire_queue_lock(lock_path: &std::path::Path) -> Option<std::fs::File> {
         .create_new(true)
         .open(lock_path)
         .ok()?;
-    let _ = f.write_all(std::process::id().to_string().as_bytes());
+    let pid = std::process::id();
+    let content = match process_start_token(pid) {
+        Some(token) => format!("{pid} {token}"),
+        None => pid.to_string(),
+    };
+    let _ = f.write_all(content.as_bytes());
     Some(f)
+}
+
+/// A token that identifies one process INSTANCE, not just its
+/// pid: unix reads the start time from /proc/<pid>/stat (field
+/// 22); windows reads the creation FILETIME. A pid recycled by a
+/// later process always carries a different token — that is the
+/// whole point (F6).
+#[cfg(unix)]
+fn process_start_token(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    // `rest` begins at field 3 (state); starttime is field 22
+    rest.split_whitespace().nth(19).map(str::to_string)
+}
+
+#[cfg(windows)]
+fn process_start_token(pid: u32) -> Option<String> {
+    // Win32 creation-time probe, declared directly like
+    // process_alive's calls below.
+    mod win {
+        use std::ffi::c_void;
+        pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+        #[repr(C)]
+        pub struct FileTime {
+            pub low: u32,
+            pub high: u32,
+        }
+        extern "system" {
+            pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            pub fn GetProcessTimes(
+                handle: *mut c_void,
+                creation: *mut FileTime,
+                exit: *mut FileTime,
+                kernel: *mut FileTime,
+                user: *mut FileTime,
+            ) -> i32;
+            pub fn CloseHandle(handle: *mut c_void) -> i32;
+        }
+    }
+    unsafe {
+        let handle = win::OpenProcess(win::PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut creation = win::FileTime { low: 0, high: 0 };
+        let mut exit = win::FileTime { low: 0, high: 0 };
+        let mut kernel = win::FileTime { low: 0, high: 0 };
+        let mut user = win::FileTime { low: 0, high: 0 };
+        let ok = win::GetProcessTimes(
+            handle,
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        );
+        win::CloseHandle(handle);
+        if ok == 0 {
+            return None;
+        }
+        Some((((creation.high as u64) << 32) | creation.low as u64).to_string())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_start_token(_pid: u32) -> Option<String> {
+    None
 }
 
 /// Whether this pid currently names a live process.
@@ -262,9 +360,29 @@ fn lock_is_stale(lock_path: &std::path::Path) -> bool {
         .ok()
         .and_then(|t| t.elapsed().ok());
     if let Ok(content) = std::fs::read_to_string(lock_path) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            if pid != std::process::id() && !process_alive(pid) {
-                return true;
+        // "<pid>" from an older host, or "<pid> <start token>"
+        // from this one (see acquire_queue_lock)
+        let mut parts = content.split_whitespace();
+        if let Some(pid) = parts.next().and_then(|p| p.parse::<u32>().ok()) {
+            if pid != std::process::id() {
+                if !process_alive(pid) {
+                    return true;
+                }
+                // F6: a LIVE pid is not proof of ownership —
+                // pids are recycled, and a recycled pid kept a
+                // dead owner's lock "live" until the 30 s age
+                // backstop on every later hand-off. When the
+                // lock recorded the owner's start token and the
+                // pid's current token differs, the pid now names
+                // a stranger's process and the lock is debris.
+                let recorded = parts.next();
+                if let (Some(recorded), Some(current)) =
+                    (recorded, process_start_token(pid))
+                {
+                    if recorded != current {
+                        return true;
+                    }
+                }
             }
             return age.map(|d| d.as_secs() > 30).unwrap_or(false);
         }
@@ -634,6 +752,27 @@ fn handle_probe(message: &Value) -> Value {
             "ok": false,
             "error": "Could not read this page yet — please wait a few seconds and click again."
         });
+    }
+
+    // F7: the temp cookie file below is removed when the probe
+    // returns — but a host KILLED mid-probe (the browser closed)
+    // never returns, and its file, a full session-cookie export,
+    // stayed on disk forever. The name carries the owner's pid,
+    // so reap the files of hosts that are provably gone; a live
+    // host's in-flight file (a different pid, alive) is untouched.
+    if let Ok(entries) = std::fs::read_dir(base_dir.join("cookies")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let owner = name
+                .strip_prefix("probe-")
+                .and_then(|rest| rest.strip_suffix(".txt"))
+                .and_then(|pid| pid.parse::<u32>().ok());
+            if let Some(pid) = owner {
+                if pid != std::process::id() && !process_alive(pid) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 
     let mut temp_cookie_path: Option<PathBuf> = None;

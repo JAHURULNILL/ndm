@@ -475,9 +475,14 @@ fn build_update(parent: &gtk::ApplicationWindow, ctx: Ctx) -> Rc<UpdateDlg> {
         let d = dlg.clone();
         btn_restart.connect_clicked(move |_| {
             // relaunch this shell, then close the main window —
-            // its destroy quits the old process (main.rs wiring)
+            // its destroy quits the old process (main.rs wiring).
+            // NDM_RESTART_WAIT tells the new process to wait for
+            // this one's instance lock instead of mistaking the
+            // shutdown window for a running instance.
             if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).spawn();
+                let _ = std::process::Command::new(exe)
+                    .env("NDM_RESTART_WAIT", "1")
+                    .spawn();
             }
             d.parent.close();
         });

@@ -187,6 +187,14 @@ fn fetch_manifest_body(agent: &ureq::Agent, url: &str, timeout: Duration) -> Res
         .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| format!("update check failed: {e}"))?;
+    // The scheme rule applies to where the fetch ENDED, not only
+    // where it started: ureq follows redirects internally and no
+    // hop is re-checked, so an https manifest URL could 302 to a
+    // plain-http (or otherwise refused) address and its body
+    // would be parsed as the feed. The final URL is validated
+    // before the body is read; a refused landing discards it.
+    require_update_scheme(resp.get_url())
+        .map_err(|e| format!("update check failed: {e}"))?;
     if let Some(enc) = crate::response_encoding(&resp) {
         return Err(format!(
             "update check failed: server answered with Content-Encoding: {enc}"
@@ -229,27 +237,63 @@ pub fn fetch_release() -> Result<ReleaseInfo, String> {
 /// route is even attempted. Split out so the deadline is
 /// testable against local servers.
 fn fetch_release_within(urls: &[String], budget: Duration) -> Result<ReleaseInfo, String> {
-    // Try each route in turn: one unreachable host must not silently
-    // kill the update check when the other route works.
+    // Gather EVERY route's answer within the shared budget and
+    // keep the HIGHEST version on offer. The old shape returned
+    // the first route that merely parsed: the routes are mirrors
+    // of one feed, but a stale mirror — or a release whose
+    // manifest attach lagged on one route — silently won by
+    // answering first, and every installed app behind it read
+    // "up to date" through even a mandatory update. Equal
+    // versions keep the earlier route's copy (route order is
+    // preference order). A route that fails or won't parse is
+    // noted and the next is still asked, as before.
     let agent = manifest_agent();
     let started = Instant::now();
+    let mut best: Option<ReleaseInfo> = None;
     let mut last_err = String::new();
     for url in urls {
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
-            last_err = "update check failed: timed out".to_string();
+            if best.is_none() {
+                last_err = "update check failed: timed out".to_string();
+            }
             break;
         }
-        let fetched = fetch_manifest_body(&agent, url, remaining);
+        // Once one route has answered, the rest are only asked
+        // whether they know a NEWER version — a courtesy question
+        // with a short grace, so a blackholed mirror cannot stall
+        // every launch check for the whole budget. Before any
+        // answer, a route gets whatever budget is left, exactly
+        // as patient as the check has always been.
+        let route_budget = if best.is_some() {
+            remaining.min(Duration::from_secs(10))
+        } else {
+            remaining
+        };
+        let fetched = fetch_manifest_body(&agent, url, route_budget);
         match fetched {
-            Ok(body) => match serde_json::from_str(&body) {
-                Ok(info) => return Ok(info),
+            Ok(body) => match serde_json::from_str::<ReleaseInfo>(&body) {
+                Ok(info) => {
+                    let is_newer = match &best {
+                        None => true,
+                        Some(b) => {
+                            version_cmp(&info.version, &b.version)
+                                == std::cmp::Ordering::Greater
+                        }
+                    };
+                    if is_newer {
+                        best = Some(info);
+                    }
+                }
                 Err(e) => last_err = format!("update info was unreadable: {e}"),
             },
             Err(e) => last_err = e,
         }
     }
-    Err(last_err)
+    match best {
+        Some(info) => Ok(info),
+        None => Err(last_err),
+    }
 }
 
 /// Absolute ceiling on one update package when the server gives
@@ -261,6 +305,16 @@ fn fetch_release_within(urls: &[String], budget: Duration) -> Result<ReleaseInfo
 /// update packages are tens of MiB; 2 GiB is generous headroom,
 /// not a limit a genuine release can brush against.
 pub const MAX_UPDATE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Overall deadline for ONE package download. The shared agent's
+/// per-read timeout (30 s) cannot bound the whole transfer: a
+/// server dribbling one byte per read-never-quite-30 s stretches
+/// a tens-of-MiB package across hours of "downloading". Thirty
+/// minutes is far beyond a genuine package on a slow link (it
+/// covers the full 2 GiB ceiling at ~1.1 MB/s, and real packages
+/// are tens of MiB) while still ending a dribble — the same
+/// overall-deadline discipline as the manifest's (MANIFEST_DEADLINE).
+pub const PACKAGE_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
 /// The manifest is a small JSON record; anything past 1 MiB is
 /// not a manifest, however it was served.
@@ -320,6 +374,13 @@ fn download_file_with_ceiling(
         .set("Accept-Encoding", "identity")
         .call()
         .map_err(|e| format!("download failed: {e}"))?;
+    // As on the manifest fetch: the scheme rule is re-checked
+    // against the FINAL URL after any redirects — an https
+    // package URL that 302s to plain http is refused before a
+    // single body byte is saved (the hash check below is the
+    // integrity backstop, never a reason to accept a downgrade).
+    require_update_scheme(resp.get_url())
+        .map_err(|e| format!("download failed: {e}"))?;
     if let Some(enc) = crate::response_encoding(&resp) {
         return Err(format!(
             "download failed: server answered with Content-Encoding: {enc}"
@@ -343,7 +404,17 @@ fn download_file_with_ceiling(
     let mut buf = vec![0u8; 256 * 1024];
     let mut downloaded: u64 = 0;
     let mut last: u64 = 0;
+    let started = Instant::now();
     let result = loop {
+        // the overall package deadline, checked per chunk (each
+        // read is itself bounded by the agent's per-read timeout,
+        // so this fires promptly when the budget is spent)
+        if started.elapsed() > PACKAGE_DEADLINE {
+            break Err(format!(
+                "the update download took longer than {} minutes and was aborted — the server is sending too slowly",
+                PACKAGE_DEADLINE.as_secs() / 60
+            ));
+        }
         match reader.read(&mut buf) {
             Ok(0) => break Ok(()),
             Ok(n) => {
@@ -829,6 +900,50 @@ mod tests {
             elapsed < Duration::from_secs(8),
             "two-route check must stay inside its shared budget, took {elapsed:?} ({err})"
         );
+    }
+
+    #[test]
+    fn fetch_release_within_takes_the_highest_version_across_routes() {
+        // Item 9 regression: the first PARSEABLE route used to
+        // win outright, so a stale mirror answering first made
+        // every client behind it read "up to date" — through
+        // even a mandatory update. All routes are now asked and
+        // the highest version wins, in either order.
+        let older = br#"{"version":"2.3.4","notes":"old route"}"#;
+        let newer = br#"{"version":"2.3.5","notes":"new route"}"#;
+        let urls = vec![
+            serve_plain(older, ""),
+            serve_plain(newer, ""),
+        ];
+        let info = fetch_release_within(&urls, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.version, "2.3.5");
+        assert_eq!(info.notes, "new route");
+        // reversed: the newer route first must not be displaced
+        // by the older one answering second
+        let urls = vec![
+            serve_plain(newer, ""),
+            serve_plain(older, ""),
+        ];
+        let info = fetch_release_within(&urls, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.version, "2.3.5");
+        assert_eq!(info.notes, "new route");
+        // equal versions: the earlier route's copy stands (route
+        // order is preference order)
+        let same_a = br#"{"version":"2.3.5","notes":"route a"}"#;
+        let same_b = br#"{"version":"2.3.5","notes":"route b"}"#;
+        let urls = vec![
+            serve_plain(same_a, ""),
+            serve_plain(same_b, ""),
+        ];
+        let info = fetch_release_within(&urls, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.notes, "route a");
+        // a route that fails outright does not poison the check
+        let urls = vec![
+            "http://127.0.0.1:1/release.json".to_string(),
+            serve_plain(newer, ""),
+        ];
+        let info = fetch_release_within(&urls, Duration::from_secs(30)).unwrap();
+        assert_eq!(info.version, "2.3.5");
     }
 
     #[test]

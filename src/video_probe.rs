@@ -367,6 +367,14 @@ fn thumbnail_host_is_public(url: &str) -> bool {
     } else {
         authority.split(':').next().unwrap_or("")
     };
+    // M-16: `localhost` is a NAME, so it slips past the literal-IP
+    // checks below — the updater's guard refuses it outright, and
+    // so does this one (including *.localhost, which resolvers
+    // treat the same way)
+    let host_lc = host.to_ascii_lowercase();
+    if host_lc == "localhost" || host_lc.ends_with(".localhost") {
+        return false;
+    }
     let Ok(ip) = host.parse::<std::net::IpAddr>() else {
         return true; // a hostname, not a literal IP
     };
@@ -400,13 +408,29 @@ fn fetch_thumbnail_data_uri(url: &str) -> Option<String> {
     let agent = crate::apply_proxy_for(ureq::AgentBuilder::new(), url)
         .timeout_connect(Duration::from_secs(4))
         .timeout_read(Duration::from_secs(4))
+        // M-16: redirects are NOT followed. The host guard above
+        // judges the URL the page supplied; a 302 from a public
+        // CDN to http://127.0.0.1/… (or any private address)
+        // would otherwise be fetched without the final URL ever
+        // being re-validated. A redirecting thumbnail simply
+        // falls back to its raw URL in the caller, as any failed
+        // fetch does.
+        .redirects(0)
         .user_agent(crate::BROWSER_UA)
         .build();
     let resp = agent
         .get(url)
         .set("Accept-Encoding", "identity")
+        // M-19: an OVERALL deadline across connect + every read,
+        // the updater manifest pattern — the per-operation
+        // timeouts alone let a dribbling server (a byte every
+        // few seconds, 384 KiB to go) hold the probe for hours
+        .timeout(Duration::from_secs(10))
         .call()
         .ok()?;
+    if (300..400).contains(&resp.status()) {
+        return None; // a redirect we refuse to follow (see above)
+    }
     if crate::response_encoding(&resp).is_some() {
         return None;
     }
@@ -755,6 +779,21 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
             }
         }
     }
+    // M-17: is there any audio to download at all? An audio-only
+    // format exists, or a video format whose acodec is a real
+    // codec — or unreported (a direct file is muxed, so its sound
+    // rides inside it). When NO format carries audio (a silent
+    // video: every acodec explicitly "none" and no audio-only
+    // formats), there are no audio bytes to estimate and no audio
+    // option to offer — the code below used to invent both: a
+    // phantom 128 kbps × duration size folded into every video
+    // row, and an "Audio Only" row whose download could only
+    // fail the sound check or land silent.
+    let has_audio_source = has_direct_audio
+        || has_hls_audio
+        || formats
+            .iter()
+            .any(|f| format_has_video(f) && reported_acodec(f) != Some("none"));
     // The ext the audio selector (ba[ext=m4a]/ba/b) will actually
     // fetch, in the selector's own preference order. The audio
     // option's label must name THIS format — a hardcoded "MP3"
@@ -778,7 +817,10 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
         best_m4a_size
     } else if best_any_audio_size > 0 {
         best_any_audio_size
-    } else if duration_f64 > 0.0 {
+    } else if duration_f64 > 0.0 && has_audio_source {
+        // an estimate for a source that EXISTS but reports no
+        // size (a muxed direct file) — never for a silent video
+        // (M-17: no source, no bytes)
         ((128_000.0 / 8.0) * duration_f64) as u64
     } else {
         0
@@ -982,18 +1024,22 @@ fn build_options(formats: &[serde_json::Value], duration_f64: f64) -> Vec<Qualit
     } else {
         format!("{a_kind} • Audio Only • {audio_st}")
     };
-    options.push(QualityOption {
-        selector: "ba[ext=m4a]/ba/b".into(),
-        label: a_label,
-        ext: a_ext,
-        note: audio_note,
-        size_bytes: audio_bytes,
-        size_approx: audio_approx,
-        size_text: audio_st,
-        audio: true,
-        height: 0,
-        source: String::new(),
-    });
+    // M-17: no audio source in the format list → no audio row at
+    // all (a silent video gets video rows only, honestly sized)
+    if has_audio_source {
+        options.push(QualityOption {
+            selector: "ba[ext=m4a]/ba/b".into(),
+            label: a_label,
+            ext: a_ext,
+            note: audio_note,
+            size_bytes: audio_bytes,
+            size_approx: audio_approx,
+            size_text: audio_st,
+            audio: true,
+            height: 0,
+            source: String::new(),
+        });
+    }
 
     options
 }
@@ -1347,6 +1393,12 @@ mod tests {
         // and hostnames (resolution check out of scope) pass
         for u in [
             "http://127.0.0.1:8080/x.jpg",
+            // M-16: localhost is a NAME, not an IP literal — it
+            // used to slip past this guard entirely (the updater's
+            // guard refuses it; now this one does too)
+            "http://localhost/x.jpg",
+            "http://localhost:8080/x.jpg",
+            "https://cdn.localhost/x.jpg",
             "https://10.0.0.5/x.jpg",
             "https://192.168.1.1/x.jpg",
             "https://172.16.0.9/x.jpg",
@@ -1598,6 +1650,38 @@ mod tests {
         assert_eq!(fetch_hls_default_audio(&plain, "", ""), Some(expected));
         let encoded = serve_manifest("Content-Encoding: gzip\r\n", master);
         assert_eq!(fetch_hls_default_audio(&encoded, "", ""), None);
+    }
+
+    #[test]
+    fn silent_video_formats_yield_no_audio_option() {
+        // M-17 regression: a silent video — every format's acodec
+        // explicitly "none", no audio-only formats — used to get a
+        // fabricated "Audio Only" row sized at a phantom
+        // 128 kbps × duration, and that phantom was also folded
+        // into the video rows' sizes. Now: video rows only, sized
+        // by the video bytes alone.
+        let formats = vec![
+            serde_json::json!({
+                "vcodec": "avc1.640028", "acodec": "none", "ext": "mp4",
+                "height": 720, "filesize": 8_000_000, "protocol": "https"
+            }),
+            serde_json::json!({
+                "vcodec": "avc1.640028", "acodec": "none", "ext": "mp4",
+                "height": 360, "filesize": 3_000_000, "protocol": "https"
+            }),
+        ];
+        let options = build_options(&formats, 100.0);
+        assert!(
+            options.iter().all(|o| !o.audio),
+            "a silent video must not offer an audio row: {:?}",
+            options.iter().map(|o| &o.label).collect::<Vec<_>>()
+        );
+        assert_eq!(options.len(), 2, "one row per height");
+        let row720 = options.iter().find(|o| o.height == 720).unwrap();
+        assert_eq!(
+            row720.size_bytes, 8_000_000,
+            "the video row must not carry phantom audio bytes"
+        );
     }
 
     #[test]

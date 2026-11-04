@@ -5,8 +5,8 @@ use windows::core::{PCWSTR, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Controls::{
     BTNS_AUTOSIZE, BTNS_BUTTON, BTNS_SEP, TBBUTTON, TBSTATE_ENABLED, TBSTATE_HIDDEN, TBSTYLE_FLAT,
-    TBSTYLE_LIST, TB_ADDBUTTONSW, TB_ADDSTRINGW, TB_AUTOSIZE, TB_BUTTONSTRUCTSIZE, TB_SETBUTTONSIZE,
-    TB_SETSTATE, TOOLBARCLASSNAMEW,
+    TBSTYLE_LIST, TB_ADDBUTTONSW, TB_ADDSTRINGW, TB_AUTOSIZE, TB_BUTTONSTRUCTSIZE, TB_GETSTATE,
+    TB_SETBUTTONSIZE, TB_SETSTATE, TOOLBARCLASSNAMEW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WINDOW_STYLE, WS_CHILD, WS_VISIBLE};
 
@@ -74,27 +74,35 @@ impl Toolbar {
         }
     }
 
-    /// Enable or grey one button by command id (TB_SETSTATE; a
-    /// disabled button keeps its place and label, visibly greyed).
-    pub fn set_enabled(&self, id: i32, enabled: bool) {
-        let state = if enabled { TBSTATE_ENABLED as isize } else { 0 };
+    /// Merge one state bit into a button's TBSTATE byte
+    /// (TB_GETSTATE → TB_SETSTATE read-modify-write): the
+    /// absolute writes this replaces let the last caller win —
+    /// refresh_command_states re-enabling a button silently
+    /// un-hid it, and the Customize dialog hiding one silently
+    /// re-enabled it.
+    fn merge_state(&self, id: i32, bit: isize, on: bool) {
         unsafe {
-            send(self.hwnd, TB_SETSTATE, WPARAM(id as usize), LPARAM(state));
+            let cur = send(self.hwnd, TB_GETSTATE, WPARAM(id as usize), LPARAM(0)) & 0xff;
+            let next = if on { cur | bit } else { cur & !bit };
+            if next != cur {
+                send(self.hwnd, TB_SETSTATE, WPARAM(id as usize), LPARAM(next));
+            }
         }
+    }
+
+    /// Enable or grey one button by command id (a disabled button
+    /// keeps its place and label, visibly greyed; its hidden bit
+    /// is preserved).
+    pub fn set_enabled(&self, id: i32, enabled: bool) {
+        self.merge_state(id, TBSTATE_ENABLED as isize, enabled);
     }
 
     /// Show or hide one button (TBSTATE_HIDDEN — the Customize
     /// Toolbar dialog's off state; the button keeps its slot in
-    /// the table, it just leaves the bar).
+    /// the table, it just leaves the bar; its enabled bit is
+    /// preserved).
     pub fn set_hidden(&self, id: i32, hidden: bool) {
-        let state = if hidden {
-            TBSTATE_HIDDEN as isize
-        } else {
-            TBSTATE_ENABLED as isize
-        };
-        unsafe {
-            send(self.hwnd, TB_SETSTATE, WPARAM(id as usize), LPARAM(state));
-        }
+        self.merge_state(id, TBSTATE_HIDDEN as isize, hidden);
     }
 
     /// Set the button size (the Customize dialog's small bar);

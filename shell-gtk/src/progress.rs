@@ -175,7 +175,7 @@ fn title_for(d: &ProgressView) -> String {
         return format!("100% {}", d.name);
     }
     if d.total > 0 {
-        format!("{}% {}", d.done_bytes * 100 / d.total, d.name)
+        format!("{}% {}", (d.done_bytes * 100 / d.total).min(100), d.name)
     } else {
         d.name.clone()
     }
@@ -397,7 +397,11 @@ impl ProgDlg {
             &self.f_left,
             &mut c.left,
             if d.status == "downloading" && d.total > 0 && d.speed_bps > 0.0 {
-                fmt_left_dialog((d.total - d.done_bytes) as f64 / d.speed_bps)
+                // saturating: a plain-download payload can report
+                // done > total (core does not clamp it there); a
+                // bare subtraction wraps in release and panics in
+                // debug builds.
+                fmt_left_dialog(d.total.saturating_sub(d.done_bytes) as f64 / d.speed_bps)
             } else {
                 "—".to_string()
             },
@@ -596,9 +600,10 @@ impl ProgDlg {
         // the user typed one number and another took effect
         // (audit-233). Refuse it in words and keep the live limit.
         let raw = self.lim_val.text().trim().to_string();
-        let kb: u64 = if raw.is_empty() {
-            512
-        } else {
+        // An empty field takes the same refusal path: it used to
+        // fall back to 512 silently, exactly the substitution the
+        // non-numeric branch below exists to prevent.
+        let kb: u64 = {
             match raw.parse::<u64>() {
                 Ok(v) => v.max(1),
                 Err(_) => {

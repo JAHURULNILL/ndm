@@ -38,6 +38,40 @@ fn tool_cmd<S: AsRef<std::ffi::OsStr>>(prog: S) -> Command {
     c
 }
 
+/// Kill a child process AND its descendants (M-11). yt-dlp
+/// spawns ffmpeg for the merge; killing yt-dlp alone orphans the
+/// ffmpeg, which keeps writing the merged file — holding the
+/// output open, burning CPU, and racing the next run's files
+/// (and, because it inherits the stdout pipe, stalling the run
+/// thread's own exit). Unix: the yt-dlp child is spawned as a
+/// process-group leader (see the spawn site), so a group SIGKILL
+/// takes the whole tree — declared directly against libc like
+/// the engine's flock, no new dependency. Windows: taskkill /T
+/// walks the tree.
+fn kill_child_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        // negative pid = the child's whole process group; already
+        // gone is fine — the direct kill below lands either way
+        unsafe {
+            let _ = kill(-(child.id() as i32), 9);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 /// Parse `ffmpeg -hide_banner -i <file>` stderr to check `(has_video, has_audio)`.
 pub fn streams_in_ffmpeg_info(text: &str) -> (bool, bool) {
     let mut video = false;
@@ -1164,6 +1198,32 @@ pub fn stem_taken_on_disk(dir: &Path, cand: &str, audio: bool) -> bool {
     })
 }
 
+/// M-12: stems claimed by jobs in THIS process. The disk check
+/// alone cannot arbitrate two CONCURRENT same-title jobs: both
+/// look before either has written a byte (a resolve can take
+/// seconds), both walk away with the bare stem, and their part
+/// files and finals then share names. A claim is taken when a
+/// stem is chosen and released when the choosing job's run
+/// thread exits (AliveGuard) — by then the job's files are on
+/// disk and the disk check arbitrates from there. Claims are
+/// kind-scoped exactly like stem_taken_on_disk.
+static STEM_CLAIMS: Mutex<Vec<(PathBuf, String, bool)>> = Mutex::new(Vec::new());
+
+fn claim_stem(dir: &Path, stem: &str, audio: bool) {
+    let mut claims = STEM_CLAIMS.lock().unwrap();
+    let key = (dir.to_path_buf(), stem.to_string(), audio);
+    if !claims.contains(&key) {
+        claims.push(key);
+    }
+}
+
+fn release_stem(dir: &Path, stem: &str, audio: bool) {
+    STEM_CLAIMS
+        .lock()
+        .unwrap()
+        .retain(|(d, s, a)| !(d == dir && s == stem && *a == audio));
+}
+
 /// Choose a non-colliding filename stem inside `dir` so two downloads
 /// of the same kind with the same title (or two qualities of the same
 /// video) never overwrite each other or collide on `.part` files.
@@ -1172,12 +1232,22 @@ pub fn unique_stem_on_disk(dir: &Path, base_stem: &str, audio: bool) -> String {
     if stem.is_empty() {
         return String::new();
     }
-    if !stem_taken_on_disk(dir, &stem, audio) {
+    // choose + claim under one lock (M-12): the winner is claimed
+    // in the same instant it is picked, so a racing job sees the
+    // claim even before the first byte hits the disk
+    let mut claims = STEM_CLAIMS.lock().unwrap();
+    let taken = |claims: &[(PathBuf, String, bool)], cand: &str| {
+        stem_taken_on_disk(dir, cand, audio)
+            || claims.iter().any(|(d, s, a)| d == dir && s == cand && *a == audio)
+    };
+    if !taken(&claims, &stem) {
+        claims.push((dir.to_path_buf(), stem.clone(), audio));
         return stem;
     }
     for n in 1..10_000 {
         let cand = format!("{stem} ({n})");
-        if !stem_taken_on_disk(dir, &cand, audio) {
+        if !taken(&claims, &cand) {
+            claims.push((dir.to_path_buf(), cand.clone(), audio));
             return cand;
         }
     }
@@ -2088,6 +2158,15 @@ impl Drop for AliveGuard {
         self.0
             .alive
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        // M-12: the run is over — release the stem claim. The
+        // job's files (its parts, or the merged final) are on
+        // disk by now, and the disk check arbitrates the stem
+        // from here.
+        if let Some(stem) = self.0.chosen_stem.lock().unwrap().clone() {
+            if !stem.is_empty() {
+                release_stem(&self.0.dir, &stem, self.0.audio);
+            }
+        }
     }
 }
 
@@ -2304,6 +2383,10 @@ impl VideoJob {
         let mut guard = self.chosen_stem.lock().unwrap();
         if let Some(existing) = guard.as_ref() {
             if !existing.is_empty() {
+                // re-assert the claim (M-12): a previous run of
+                // this job released it at exit, and the stem is
+                // this job's again for the new run
+                claim_stem(&self.dir, existing, self.audio);
                 return existing.clone();
             }
         }
@@ -2964,17 +3047,31 @@ impl VideoJob {
                 ff_args.extend(["-c:a".into(), "libmp3lame".into(), "-q:a".into(), "0".into()]);
             }
         } else if part_paths.len() >= 2 {
+            // M-10: map by the streams' actual kinds, not a
+            // hard-coded 0=video / 1=audio. The input order is the
+            // resolver's, and a pair that arrives [audio, video]
+            // would otherwise map the audio input's (nonexistent)
+            // video stream and the video input's audio. `primary`
+            // — the same computation the connection split makes
+            // per attempt — names the video side; 3+-stream sets
+            // keep the historic 0/1 mapping.
+            let primary = streams.iter().position(|s| !s.has_audio).unwrap_or(0);
+            let (v_in, a_in) = if part_paths.len() == 2 && primary == 1 {
+                (1usize, 0usize)
+            } else {
+                (0usize, 1usize)
+            };
             ff_args.extend([
                 "-map".into(),
-                "0:v:0".into(),
+                format!("{v_in}:v:0"),
                 "-map".into(),
-                "1:a:0".into(),
+                format!("{a_in}:a:0"),
                 "-c:v".into(),
                 "copy".into(),
             ]);
             // copy when the audio is already AAC, re-encode
             // otherwise (see merge_audio_args, WS-D D3)
-            ff_args.extend(merge_audio_args(&part_paths[1], components_dir));
+            ff_args.extend(merge_audio_args(&part_paths[a_in], components_dir));
             ff_args.extend(["-movflags".into(), "+faststart".into()]);
         } else if final_ext == "mp4" || final_ext == "m4a" || final_ext == "mov" {
             // Normalize the audio to AAC like the two-stream branch:
@@ -3112,6 +3209,14 @@ impl VideoJob {
                     p.final_path = Some(kept);
                     return true;
                 }
+            }
+            // H-3: re-check the generation immediately before the
+            // publish + parts sweep below — the audio check above
+            // can take seconds, and a thread whose run has been
+            // superseded must neither publish a verdict nor delete
+            // files the newer run owns.
+            if self.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                return true;
             }
             match audio_result {
                 Ok(verified) => {
@@ -3800,6 +3905,18 @@ impl VideoJob {
                 }
             }
         }
+        // H-3: the child check above cannot see the phases that
+        // have no child — above all the merge window, where the
+        // previous run's thread is still finalizing (ffmpeg +
+        // ensure_audio can take seconds) after its child exited.
+        // A second spawn in that window started a parallel run
+        // whose generation bump orphaned the first thread, which
+        // then published and swept against the NEW run's parts.
+        // The alive flag spans the whole thread, so it is the
+        // gate: a run is in flight, or it is not.
+        if self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("this video is already downloading".to_string());
+        }
         *self.stop_flag.lock().unwrap() = None;
         let my_gen = self
             .gen
@@ -3983,12 +4100,18 @@ impl VideoJob {
             // would then skip that file as "pre-existing" and report
             // a finished download as an error
             let before = dir_snapshot(&job.dir);
-            let Ok(mut child) = tool_cmd(&ytdlp)
-                .args(&args)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            else {
+            // M-11: on unix the child leads its own process
+            // group, so pause/cancel can kill the whole tree —
+            // including the ffmpeg yt-dlp spawns for the merge —
+            // with one group signal (see kill_child_tree)
+            let mut cmd = tool_cmd(&ytdlp);
+            cmd.args(&args).stdout(Stdio::piped()).stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                cmd.process_group(0);
+            }
+            let Ok(mut child) = cmd.spawn() else {
                 let mut p = job.progress.lock().unwrap();
                 p.status = "error".to_string();
                 p.conns = 0;
@@ -4241,6 +4364,14 @@ impl VideoJob {
                 }
                 (_, o) => o,
             };
+            // H-3: the same generation re-check before THIS
+            // publish + sweep: the outcome resolution above (the
+            // audio guard) can take seconds, and a superseded
+            // thread must not publish over — or sweep the parts
+            // of — the run that replaced it.
+            if job.gen.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                return;
+            }
             let expected_media = *job.expected_media.lock().unwrap();
             let mut p = job.progress.lock().unwrap();
             p.conns = 0;
@@ -4374,7 +4505,10 @@ impl VideoJob {
         }
         *self.stop_flag.lock().unwrap() = Some("paused".to_string());
         if let Some(c) = self.child.lock().unwrap().as_mut() {
-            let _ = c.kill();
+            // M-11: the whole tree — an orphaned ffmpeg grandchild
+            // would keep merging into the file this pause means
+            // to freeze
+            kill_child_tree(c);
         }
         let mut p = self.progress.lock().unwrap();
         // "starting" included (A2): a pause that lands while the
@@ -4408,7 +4542,8 @@ impl VideoJob {
             d.control.cancel();
         }
         if let Some(c) = lock_ok(&self.child).as_mut() {
-            let _ = c.kill();
+            // M-11: the whole tree, as in pause()
+            kill_child_tree(c);
         }
         let mut p = lock_ok(&self.progress);
         p.status = "cancelled".to_string();
@@ -4491,7 +4626,30 @@ impl VideoJob {
             .map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false))
             .unwrap_or(false);
         if running {
-            return Ok(());
+            if self.stop_flag.lock().unwrap().is_none() {
+                // genuinely still downloading — nothing to resume
+                return Ok(());
+            }
+            // M-13: a pause/cancel landed and its kill is still
+            // in flight — the child has not exited yet, but the
+            // stop flag guarantees the run is ending and its
+            // thread will publish the stop. Returning Ok here (the
+            // old shape) silently DROPPED the resume: the flag
+            // stayed set, the thread published "paused", and the
+            // entry sat stopped after the user explicitly resumed
+            // it. Instead, wait (bounded) for the old run to
+            // settle, then fall through to a fresh spawn; a run
+            // that will not settle reports not-resumed honestly
+            // instead of pretending.
+            let deadline = Instant::now() + std::time::Duration::from_secs(5);
+            while self.is_live() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            if self.is_live() {
+                return Err(
+                    "the download is still stopping — try resume again in a moment".to_string(),
+                );
+            }
         }
         self.spawn(components_dir)
     }
@@ -6737,6 +6895,25 @@ At least one output file must be specified";
         std::fs::write(dir.join(format!("{s1}.mp4")), b"2").unwrap();
         let s2 = unique_stem_on_disk(&dir, "Fixture Player — Test Video", false);
         assert_eq!(s2, "Fixture Player — Test Video (2)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unique_stem_on_disk_claims_against_concurrent_jobs() {
+        // M-12: with NOTHING on disk yet (both jobs still in
+        // their resolve window), the second chooser must not
+        // also walk away with the bare stem — the disk check
+        // alone handed it to both, and their part files and
+        // finals then shared names
+        let dir = std::env::temp_dir().join(format!("ndm-uniq-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = unique_stem_on_disk(&dir, "Race Title", false);
+        let b = unique_stem_on_disk(&dir, "Race Title", false);
+        assert_eq!(a, "Race Title");
+        assert_eq!(b, "Race Title (1)");
+        // the other kind is a separate namespace, as on disk
+        assert_eq!(unique_stem_on_disk(&dir, "Race Title", true), "Race Title");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

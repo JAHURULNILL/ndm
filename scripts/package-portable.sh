@@ -22,10 +22,44 @@ mkdir -p "$PKG/ndm/components" "$PKG/ndm/extension"
 cp "$APP" "$PKG/ndm/ndm-app"
 cp "$HOST" "$PKG/ndm/ndm-host"
 cp tools/yt-dlp tools/deno tools/ffmpeg "$PKG/ndm/components/"
-cp extension/manifest.json extension/background.js extension/content.js \
-   extension/page-hook.js extension/fb-classify.js extension/popup.html extension/popup.js \
-   extension/icon16.png extension/icon48.png extension/icon128.png \
-   "$PKG/ndm/extension/"
+# The extension file set is DERIVED from extension/manifest.json —
+# every file the manifest names (content scripts, background,
+# popup, both icon maps) plus the popup's own script — never a
+# hand-written list (see package-deb.sh: a hand list is how 2.3.2
+# shipped a package silently missing a content script). A named
+# file that is absent makes cp fail the build instead.
+EXT_FILES=$(python3 - <<'PYEOF'
+import json, re
+m = json.load(open('extension/manifest.json'))
+need = []
+def add(f):
+    if f and f not in need:
+        need.append(f)
+add('manifest.json')
+for cs in m.get('content_scripts', []):
+    for f in cs.get('js', []):
+        add(f)
+bg = m.get('background', {})
+add(bg.get('service_worker'))
+for f in bg.get('scripts', []):
+    add(f)
+action = m.get('action', {})
+add(action.get('default_popup'))
+for f in (action.get('default_icon') or {}).values():
+    add(f)
+for f in (m.get('icons') or {}).values():
+    add(f)
+popup = action.get('default_popup')
+if popup:
+    html = open(f'extension/{popup}').read()
+    for src in re.findall(r'<script[^>]+src="([^"]+)"', html):
+        add(src)
+print('\n'.join(need))
+PYEOF
+)
+while IFS= read -r f; do
+  cp "extension/$f" "$PKG/ndm/extension/$f"
+done <<< "$EXT_FILES"
 cp extension/icon128.png "$PKG/ndm/ndm.png"
 strip "$PKG/ndm/components/ffmpeg" 2>/dev/null || true
 chmod +x "$PKG/ndm/ndm-app" "$PKG/ndm/ndm-host" "$PKG/ndm/components/"*

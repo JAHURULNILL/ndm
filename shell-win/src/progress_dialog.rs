@@ -218,6 +218,15 @@ pub fn exists(id: &str) -> bool {
     hwnd_of(id).is_some()
 }
 
+/// All live dialog windows, for the main loop's dialog-message
+/// routing (IsDialogMessageW): a modeless dialog gets Tab
+/// navigation and Esc semantics only when its messages pass
+/// through it.
+pub fn dialog_hwnds() -> Vec<HWND> {
+    let guard = WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.values().map(|&r| h(r)).collect()
+}
+
 /// Forward one progress payload to the entry's dialog, if any
 /// (boxed, reclaimed on post failure — the sink's pattern).
 pub fn forward(view: &ProgressView) {
@@ -980,10 +989,27 @@ fn sync_limiter(d: &mut ProgDlg, view: &ProgressView) {
 fn apply_limit(d: &mut ProgDlg) {
     let on = dlg::is_checked(h(d.limit_on));
     dlg::set_enabled(h(d.limit_val), on);
-    let kb: u64 = unsafe { window_text(h(d.limit_val)) }
-        .trim()
-        .parse()
-        .unwrap_or(512);
+    let text = unsafe { window_text(h(d.limit_val)) };
+    let kb: u64 = match text.trim().parse() {
+        Ok(kb) => kb,
+        Err(_) => {
+            // Refuse in words (the GTK audit-233 pattern): an
+            // unreadable value used to silently become 512 KB/s.
+            // The live limit stays; the field is restored to it
+            // and the note line says why. limit_cache keeps the
+            // last synced state so the next payload tick does not
+            // immediately overwrite the refusal.
+            let cur = prefill_kb(d.speed_limit, d.global_limit).to_string();
+            unsafe {
+                set_window_text(h(d.limit_val), &cur);
+                set_window_text(
+                    h(d.limit_note),
+                    "That limit could not be read — type a number of KB/s. The limit was not changed.",
+                );
+            }
+            return;
+        }
+    };
     let bps = if on { kb.max(1) * 1024 } else { 0 };
     d.limit_cache = None; // the next tick re-syncs from the payload
     if bps == d.speed_limit {

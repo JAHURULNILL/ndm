@@ -205,13 +205,24 @@
       const label = tag ? `${h}p (${tag}${fpsTag})` : `${h}p${fpsTag}`;
       // fps lives in the label only — baking it into the note as
       // well printed it twice on every row.
-      const noteParts = ['MP4'];
+      // The container named is the WINNING format's own (audit
+      // F4): the scorer above prefers mp4, but at heights
+      // YouTube serves no AVC for (1440p and up are VP9/AV1
+      // only) the winner is a WebM stream — and the page-data
+      // hand-over below carries THOSE streams. The old
+      // hardcoded MP4 promised a container the download does
+      // not have. (The fallback selector still asks yt-dlp for
+      // mp4 first: it only runs when no streams were carried,
+      // where this row's own formats never reach the app.)
+      const winMime = ((item.format && item.format.mimeType) || '').toLowerCase();
+      const ext = winMime.includes('webm') ? 'webm' : 'mp4';
+      const noteParts = [ext === 'webm' ? 'WEBM' : 'MP4'];
       if (sizeText) noteParts.push(sizeText);
 
       const opt = {
         selector: `bv*[height<=${h}][ext=mp4]+ba[ext=m4a]/b[height<=${h}][ext=mp4]/bv*[height<=${h}]+ba/b[height<=${h}]/b`,
         label,
-        ext: 'mp4',
+        ext,
         note: noteParts.join(' • '),
         size_bytes: totalBytes,
         size_text: sizeText,
@@ -410,19 +421,7 @@
        carries many scripts and the scan runs on picker
        requests, so it must stay cheap. */
     function collectFbVideos() {
-      const byId = new Map();
-      const pageId = FBC.facebookVideoId(location.href);
-      const addObject = obj => {
-        const diag = [];
-        const opts = FBC.optionsFromVideoObject(obj, diag);
-        if (!opts.length) return;
-        let id = '';
-        if (typeof obj.id === 'string' && /^\d{5,}$/.test(obj.id)) id = obj.id;
-        else if (typeof obj.id === 'number' && Number.isFinite(obj.id)) id = String(obj.id);
-        if (!id) id = pageId; // a permalink page names its one video
-        if (!id) return; // unkeyable on a feed: skipped, never guessed
-        if (!byId.has(id)) byId.set(id, opts);
-      };
+      const objects = [];
       let scanned = 0;
       let walked = 0;
       for (const s of document.querySelectorAll('script')) {
@@ -449,11 +448,18 @@
           parsed = JSON.parse(t);
         } catch (e) {}
         if (!parsed) continue;
-        const objs = [];
-        FBC.findVideoObjects(parsed, objs, new Set());
-        for (const o of objs) addObject(o);
+        FBC.findVideoObjects(parsed, objects, new Set());
       }
-      return byId;
+      // Keying is the classifier's pure, unit-tested decision
+      // (fb-classify's keyOptionsByVideoId): an object keys
+      // ONLY under the id it carries itself. The old scan
+      // keyed an id-less object to the PAGE's id, first in
+      // scan order — on a permalink page, whose recommendations
+      // are serialised beside the main video, an id-less
+      // sibling claimed the page video's identity and the
+      // picker offered the sibling's streams under it
+      // (audit F3).
+      return FBC.keyOptionsByVideoId(objects);
     }
 
     function broadcastFbInfo(onlyId) {
