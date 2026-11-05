@@ -15540,6 +15540,7 @@ mod tests {
         .unwrap();
         std::fs::write(site_dir.join("style.css"), "body{}").unwrap();
         std::fs::write(site_dir.join("doc.pdf"), "%PDF-fake").unwrap();
+        let server_err = site_dir.join("server.err");
         let mut server = std::process::Command::new("python3")
             .args([
                 "-m",
@@ -15551,12 +15552,23 @@ mod tests {
                 site_dir.to_str().unwrap(),
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&server_err).unwrap())
             .spawn()
             .expect("python3 http.server");
-        // wait for the port
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // Wait for the port — 60 s, not 10, with an early-exit
+        // check: the FTP fixture learned this in CI #79 (a cold
+        // Windows runner — process creation + AV scan of a fresh
+        // python — ate the whole 10 s) and this test hit the same
+        // wall in CI #86. A child that dies first reports its exit
+        // status and stderr instead of a silent deadline burn.
+        let deadline = Instant::now() + Duration::from_secs(60);
         while std::net::TcpStream::connect("127.0.0.1:8937").is_err() {
+            if let Ok(Some(status)) = server.try_wait() {
+                panic!(
+                    "fixture server exited early: {status}; stderr: {}",
+                    std::fs::read_to_string(&server_err).unwrap_or_default()
+                );
+            }
             assert!(Instant::now() < deadline, "the fixture server never came up");
             std::thread::sleep(Duration::from_millis(100));
         }
