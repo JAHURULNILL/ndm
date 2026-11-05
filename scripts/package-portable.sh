@@ -21,6 +21,7 @@ rm -rf "$PKG"
 mkdir -p "$PKG/ndm/components" "$PKG/ndm/extension"
 cp "$APP" "$PKG/ndm/ndm-app"
 cp "$HOST" "$PKG/ndm/ndm-host"
+cp THIRD_PARTY_LICENSES.md "$PKG/ndm/THIRD_PARTY_LICENSES.md"
 cp tools/yt-dlp tools/deno tools/ffmpeg "$PKG/ndm/components/"
 # The extension file set is DERIVED from extension/manifest.json —
 # every file the manifest names (content scripts, background,

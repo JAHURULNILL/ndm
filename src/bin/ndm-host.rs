@@ -700,6 +700,7 @@ fn handle_probe_file(message: &Value) -> Value {
         referer,
         authorization: None,
         user_agent: None,
+        ..Default::default()
     };
     apply_saved_proxy_settings();
     match ndm::probe_with_auth(url, &auth) {

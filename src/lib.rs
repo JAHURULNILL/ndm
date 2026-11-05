@@ -81,6 +81,7 @@ fn write_block_error(e: &io::Error) -> BlockError {
 }
 
 pub mod components;
+pub mod digest;
 pub mod ftp;
 pub mod updater;
 pub mod video_probe;
@@ -1569,6 +1570,19 @@ pub struct Auth {
     /// browser's own UA instead of the BROWSER_UA constant
     /// (audit-232 S3). None → the constant, as before.
     pub user_agent: Option<String>,
+    /// the raw site login, when the caller has one — Digest
+    /// (RFC 7616) challenge-response needs the password itself;
+    /// the prebuilt Basic header above cannot be transformed
+    /// into a Digest answer. Kept in memory only, never
+    /// persisted by the engine. Callers that set `authorization`
+    /// from a login/password pair set these alongside (slice 7).
+    pub login: Option<String>,
+    /// the raw password paired with `login` (see above).
+    pub password: Option<String>,
+    /// the job's live Digest session (challenge + nonce count)
+    /// once a server has challenged us — shared by every
+    /// request of the job through this Auth value's clones.
+    pub digest: std::sync::Arc<std::sync::Mutex<Option<digest::DigestState>>>,
 }
 
 fn apply_auth(req: ureq::Request, auth: &Auth) -> ureq::Request {
@@ -1798,6 +1812,33 @@ fn merged_cookie_header(
     }
 }
 
+
+/// The preemptive Digest answer for this request, when the
+/// job holds a live Digest session for the URL's host and the
+/// raw credentials it answers with (slice 7, RFC 7616).
+fn digest_header_for(auth: &Auth, method: &str, url: &str) -> Option<String> {
+    let login = auth.login.as_ref()?;
+    let pw = auth.password.as_ref()?;
+    let guard = auth.digest.lock().unwrap();
+    let state = guard.as_ref()?;
+    if state.host != host_key(url) {
+        return None;
+    }
+    state.header_for(login, pw, method, &digest::uri_of(url))
+}
+
+/// Store a fresh Digest challenge as the job's session.
+/// False when the job carries no raw credentials to answer
+/// with — the 401 then stands as an ordinary auth failure.
+fn digest_install(auth: &Auth, url: &str, challenge: digest::Challenge) -> bool {
+    if auth.login.is_none() || auth.password.is_none() {
+        return false;
+    }
+    let mut guard = auth.digest.lock().unwrap();
+    *guard = Some(digest::DigestState::new(challenge, host_key(url)));
+    true
+}
+
 /// One request through the job's cookie jar, following redirects
 /// MANUALLY — the probe and transfer agents are built with ureq's
 /// own following disabled, because that follower strips Cookie on
@@ -1822,6 +1863,7 @@ fn jar_call(
     headers: &[(&str, &str)],
 ) -> Result<ureq::Response, ureq::Error> {
     let mut url = start_url.to_string();
+    let mut digest_retried = false;
     for hop in 0..=5u32 {
         let mut req = if method == "HEAD" {
             agent.head(&url)
@@ -1843,6 +1885,12 @@ fn jar_call(
         for (k, v) in headers {
             req = req.set(k, v);
         }
+        // slice 7: a live Digest session answers preemptively —
+        // computed per request (method, URI, fresh nonce count)
+        // and overriding any static Authorization for this hop
+        if let Some(h) = digest_header_for(auth, method, &url) {
+            req = req.set("Authorization", &h);
+        }
         match req.call() {
             Ok(resp) => {
                 jar.capture(&resp, &url);
@@ -1863,6 +1911,24 @@ fn jar_call(
                 // fresh session cookie): capture before returning
                 if let ureq::Error::Status(_, resp) = &e {
                     jar.capture(resp, &url);
+                }
+                // slice 7: a 401 carrying a Digest challenge,
+                // with credentials on the job, earns ONE retry
+                // with a computed answer (the retry burns one
+                // redirect hop of budget). A later stale=true
+                // challenge refreshes the same way on its call.
+                if !digest_retried {
+                    if let ureq::Error::Status(401, resp) = &e {
+                        let challenge = resp
+                            .header("www-authenticate")
+                            .and_then(digest::parse_challenge);
+                        if let Some(chal) = challenge {
+                            if digest_install(auth, &url, chal) {
+                                digest_retried = true;
+                                continue;
+                            }
+                        }
+                    }
                 }
                 return Err(e);
             }
@@ -9885,6 +9951,7 @@ mod audit207_tests {
             referer: Some("http://127.0.0.1/page".to_string()),
             authorization: Some("Basic abc".to_string()),
             user_agent: None,
+            ..Default::default()
         };
         let _ = probe_with_auth(&url, &auth);
         let seen = seen.lock().unwrap();

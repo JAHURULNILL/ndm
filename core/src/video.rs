@@ -1548,7 +1548,7 @@ fn resolution_cache_evict(key: &ResolutionKey) {
 /// the seconds around a Download click; without this they could
 /// each spawn their own yt-dlp for it — the exact duplicate the
 /// caches exist to remove, merely raced instead of serialised.
-static RESOLVE_INFLIGHT: (Mutex<Vec<ResolutionKey>>, Condvar) =
+static RESOLVE_INFLIGHT: (Mutex<Vec<(ResolutionKey, Instant)>>, Condvar) =
     (Mutex::new(Vec::new()), Condvar::new());
 
 /// Rebuild the probe a cache hit stands for, so a resolve that
@@ -1572,7 +1572,7 @@ struct InflightClaim(ResolutionKey);
 impl Drop for InflightClaim {
     fn drop(&mut self) {
         let (lock, cvar) = &RESOLVE_INFLIGHT;
-        lock.lock().unwrap().retain(|k| k != &self.0);
+        lock.lock().unwrap().retain(|(k, _)| k != &self.0);
         cvar.notify_all();
     }
 }
@@ -1595,8 +1595,22 @@ fn resolve_streams_once(
     let (lock, cvar) = &RESOLVE_INFLIGHT;
     {
         let mut inflight = lock.lock().unwrap();
-        let deadline = Instant::now() + RESOLVE_TIMEOUT + std::time::Duration::from_secs(15);
-        while inflight.contains(key) {
+        // A waiter's budget hangs off the OWNER's start, not its
+        // own arrival: the owner gets RESOLVE_TIMEOUT for the
+        // yt-dlp run plus a short grace for its cache store, and
+        // a caller that arrives late in that window waits only
+        // what is left of it. (Before, every waiter started a
+        // fresh 60 s clock of its own, so a click landing near
+        // the end of a hung resolve could sit silent for a
+        // second full minute — the field complaint behind
+        // slice 1 of the 2.3.6 rebuild.)
+        let owner_deadline = |inflight: &Vec<(ResolutionKey, Instant)>| {
+            inflight
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, since)| *since + RESOLVE_TIMEOUT + std::time::Duration::from_secs(5))
+        };
+        while let Some(deadline) = owner_deadline(&inflight) {
             let (guard, _) = cvar
                 .wait_timeout(inflight, std::time::Duration::from_millis(100))
                 .unwrap();
@@ -1608,12 +1622,12 @@ fn resolve_streams_once(
                 break;
             }
         }
-        if inflight.contains(key) {
+        if inflight.iter().any(|(k, _)| k == key) {
             // the owner overran its budget without producing a
             // cache entry: take over rather than wait forever
-            inflight.retain(|k| k != key);
+            inflight.retain(|(k, _)| k != key);
         }
-        inflight.push(key.clone());
+        inflight.push((key.clone(), Instant::now()));
     }
     let _claim = InflightClaim(key.clone());
     let probe = produce()?;
@@ -1651,6 +1665,52 @@ struct ResolutionProbe {
     format_size: Option<u64>,
     format_size_exact: bool,
     resolved: Option<(String, Vec<DirectStream>)>,
+}
+
+/// True when a resolved stream URL points at a playlist
+/// document (HLS/DASH) rather than media bytes — the native
+/// manifest engine's trigger (slice 6).
+fn is_playlist_url(u: &str) -> bool {
+    let l = u.to_ascii_lowercase();
+    l.contains(".m3u8") || l.contains(".mpd")
+}
+
+
+/// Append a suffix to a path's file name verbatim (slice 6):
+/// Path::with_extension is NOT safe for the segment temp names
+/// — ".{stem}.seg0_1" parses "seg0_1" as the extension, so
+/// every segment's marker/tmp name collided into one file.
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// One downloadable unit of a manifest plan: a media segment
+/// or an initialisation segment, optionally a byte range of
+/// its resource.
+#[derive(Clone)]
+struct SegRef {
+    uri: String,
+    range: Option<(u64, u64)>,
+}
+
+/// A manifest download plan for ONE output part file.
+struct SegPlan {
+    part_path: PathBuf,
+    items: Vec<SegRef>,
+}
+
+/// How the native manifest path ended (slice 6).
+enum ManifestOutcome {
+    /// Part files are complete; proceed to the shared finalize.
+    Done(Vec<PathBuf>),
+    /// Pause/cancel landed: the run is handled, parts stay.
+    Stopped,
+    /// Not a manifest this engine can take (encrypted, live,
+    /// unparseable, mixed set…): the caller falls back exactly
+    /// as it did before the manifest path existed.
+    Failed,
 }
 
 /// True when a yt-dlp format is a playlist (HLS/DASH) rather than
@@ -2133,17 +2193,40 @@ pub fn seed_picker_resolutions(
     password: &str,
     components_dir: &Path,
 ) {
+    // The warmed rows resolve in PARALLEL, one thread each (the
+    // count stays bounded at two by picker_warm_indices). Run
+    // sequentially, the second row's resolve could not even
+    // START until the first finished — up to a full
+    // RESOLVE_TIMEOUT later — so a click on the not-yet-started
+    // row paid the whole resolve anyway: the very wait this
+    // seeding exists to remove (slice 2 of the 2.3.6 rebuild).
+    // Each warm still dedups through resolve_streams_once, and
+    // this function's callers already run it on a background
+    // thread, so joining here changes no caller's timing.
+    let mut threads = Vec::new();
     for i in picker_warm_indices(options, quality_pref) {
         let o = &options[i];
-        warm_resolution(
-            url,
-            &o.selector,
-            o.audio,
-            cookies.clone(),
-            login,
-            password,
-            components_dir,
-        );
+        let url = url.to_string();
+        let sel = o.selector.clone();
+        let audio = o.audio;
+        let cookies = cookies.clone();
+        let login = login.to_string();
+        let pw = password.to_owned();
+        let components_dir = components_dir.to_path_buf();
+        threads.push(std::thread::spawn(move || {
+            warm_resolution(
+                &url,
+                &sel,
+                audio,
+                cookies,
+                &login,
+                &pw,
+                &components_dir,
+            );
+        }));
+    }
+    for t in threads {
+        let _ = t.join();
     }
 }
 
@@ -2516,6 +2599,403 @@ impl VideoJob {
         StreamSettle::Done
     }
 
+    /// Slice 6: the native manifest engine. When the resolved
+    /// selection is a playlist (HLS/DASH), download its segments
+    /// with this app's own fetches — pooled, throttled, pausable
+    /// — into the same part files the block engine would have
+    /// produced, so the shared finalize below takes over
+    /// unchanged. Anything this path cannot honestly take
+    /// (encrypted HLS, live playlists, mixed direct+playlist
+    /// sets, multi-playlist sets) answers Failed and the job
+    /// proceeds exactly as before.
+    fn run_manifest_path(
+        self: &Arc<Self>,
+        streams: &[DirectStream],
+        stem: &str,
+        max_conn: usize,
+        my_gen: u64,
+    ) -> ManifestOutcome {
+        use crate::manifest as mf;
+        let Some(primary) = streams.iter().find(|s| is_playlist_url(&s.url)) else {
+            return ManifestOutcome::Failed;
+        };
+        if streams.len() > 1 {
+            return ManifestOutcome::Failed;
+        }
+        let fetch = |url: &str| -> Option<String> {
+            ndm::video_probe::fetch_bytes_with_auth(
+                url,
+                primary.cookie.as_deref(),
+                primary.referer.as_deref(),
+                primary.user_agent.as_deref(),
+                None,
+            )
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let Some(text) = fetch(&primary.url) else {
+            return ManifestOutcome::Failed;
+        };
+        let part = |idx: usize, ext: &str| {
+            self.dir
+                .join(format!(".{stem}.ndm_stream{idx}.{ext}.part"))
+        };
+        let mut plans: Vec<SegPlan> = Vec::new();
+        if text.contains("<MPD") {
+            let mpd = mf::parse_mpd(&text, &primary.url);
+            let (video, audio) = mf::pick_dash(&mpd, 0);
+            let rep_plan = |rep: &mf::DashRep| SegPlan {
+                items: rep
+                    .init
+                    .iter()
+                    .map(|(u, r)| SegRef {
+                        uri: u.clone(),
+                        range: *r,
+                    })
+                    .chain(rep.segments.iter().map(|s| SegRef {
+                        uri: s.uri.clone(),
+                        range: s.range,
+                    }))
+                    .collect::<Vec<_>>(),
+                part_path: PathBuf::new(),
+            };
+            if self.audio {
+                let Some(a) = audio else {
+                    return ManifestOutcome::Failed;
+                };
+                let mut p = rep_plan(a);
+                p.part_path = part(0, "mp4");
+                plans.push(p);
+            } else {
+                let Some(v) = video else {
+                    return ManifestOutcome::Failed;
+                };
+                let mut p = rep_plan(v);
+                p.part_path = part(0, "mp4");
+                plans.push(p);
+                if let Some(a) = audio {
+                    let mut p = rep_plan(a);
+                    p.part_path = part(1, "mp4");
+                    plans.push(p);
+                    *self.expect_audio.lock().unwrap() = true;
+                }
+            }
+        } else if text.contains("#EXTM3U") {
+            let media_plan = |media: &mf::HlsMedia, idx: usize, audio_part: bool| SegPlan {
+                items: media
+                    .init
+                    .iter()
+                    .map(|(u, r)| SegRef {
+                        uri: u.clone(),
+                        range: *r,
+                    })
+                    .chain(media.segments.iter().map(|s| SegRef {
+                        uri: s.uri.clone(),
+                        range: s.range,
+                    }))
+                    .collect::<Vec<_>>(),
+                part_path: part(
+                    idx,
+                    if media.init.is_some() {
+                        if audio_part {
+                            "m4a"
+                        } else {
+                            "mp4"
+                        }
+                    } else {
+                        "ts"
+                    },
+                ),
+            };
+            if text.contains("#EXT-X-STREAM-INF") {
+                let master = mf::parse_hls_master(&text, &primary.url);
+                if self.audio {
+                    let Some(a) = master
+                        .audios
+                        .iter()
+                        .find(|a| a.is_default)
+                        .or_else(|| master.audios.first())
+                    else {
+                        return ManifestOutcome::Failed;
+                    };
+                    let Some(atext) = fetch(&a.uri) else {
+                        return ManifestOutcome::Failed;
+                    };
+                    let amedia = mf::parse_hls_media(&atext, &a.uri);
+                    if amedia.key_method.is_some() || !amedia.ended || amedia.segments.is_empty() {
+                        return ManifestOutcome::Failed;
+                    }
+                    plans.push(media_plan(&amedia, 0, true));
+                } else {
+                    let Some(variant) = mf::pick_variant(&master, 0) else {
+                        return ManifestOutcome::Failed;
+                    };
+                    let Some(vtext) = fetch(&variant.uri) else {
+                        return ManifestOutcome::Failed;
+                    };
+                    let vmedia = mf::parse_hls_media(&vtext, &variant.uri);
+                    if vmedia.key_method.is_some() || !vmedia.ended || vmedia.segments.is_empty() {
+                        return ManifestOutcome::Failed;
+                    }
+                    plans.push(media_plan(&vmedia, 0, false));
+                    if let Some(a) = mf::pick_audio(&master, variant) {
+                        if let Some(atext) = fetch(&a.uri) {
+                            let amedia = mf::parse_hls_media(&atext, &a.uri);
+                            if amedia.key_method.is_none()
+                                && amedia.ended
+                                && !amedia.segments.is_empty()
+                            {
+                                plans.push(media_plan(&amedia, 1, true));
+                                *self.expect_audio.lock().unwrap() = true;
+                            }
+                        }
+                    }
+                }
+            } else {
+                let media = mf::parse_hls_media(&text, &primary.url);
+                if media.key_method.is_some() || !media.ended || media.segments.is_empty() {
+                    return ManifestOutcome::Failed;
+                }
+                plans.push(media_plan(&media, 0, self.audio));
+                if !self.audio {
+                    if let Some(pa) = self.pair_audio_url.lock().unwrap().clone() {
+                        if let Some(atext) = fetch(&pa) {
+                            let amedia = mf::parse_hls_media(&atext, &pa);
+                            if amedia.key_method.is_none()
+                                && amedia.ended
+                                && !amedia.segments.is_empty()
+                            {
+                                plans.push(media_plan(&amedia, 1, true));
+                                *self.expect_audio.lock().unwrap() = true;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            return ManifestOutcome::Failed;
+        }
+        if plans.is_empty() || plans.iter().any(|p| p.items.is_empty()) {
+            return ManifestOutcome::Failed;
+        }
+        self.download_plans(&plans, stem, max_conn, my_gen, primary)
+    }
+
+    /// The segment pool behind run_manifest_path: workers pull
+    /// plan items in any order, land each in a temp file with a
+    /// length marker (a marked temp is a completed segment —
+    /// that is the resume state), then the parts are assembled
+    /// in order. Pause/cancel are honoured between items; the
+    /// job's speed limit throttles the pool as a whole.
+    fn download_plans(
+        self: &Arc<Self>,
+        plans: &[SegPlan],
+        stem: &str,
+        max_conn: usize,
+        my_gen: u64,
+        auth_stream: &DirectStream,
+    ) -> ManifestOutcome {
+        use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+        // Flatten the work: (plan idx, item idx, ref).
+        let mut work: Vec<(usize, usize, SegRef)> = Vec::new();
+        for (pi, plan) in plans.iter().enumerate() {
+            for (ii, item) in plan.items.iter().enumerate() {
+                work.push((pi, ii, item.clone()));
+            }
+        }
+        let temp_for = |pi: usize, ii: usize| {
+            self.dir.join(format!(".{stem}.seg{pi}_{ii}"))
+        };
+        // Resume: marked temps count as already downloaded.
+        let done_bytes = AtomicU64::new(0);
+        let mut remaining = Vec::new();
+        for (wi, (pi, ii, _)) in work.iter().enumerate() {
+            let data = temp_for(*pi, *ii);
+            let marker = sibling_path(&data, ".ok");
+            let have = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|len| {
+                    std::fs::metadata(&data).map(|m| m.len() == *len).unwrap_or(false)
+                });
+            match have {
+                Some(len) => {
+                    done_bytes.fetch_add(len, Ordering::Relaxed);
+                }
+                None => remaining.push(wi),
+            }
+        }
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let active = AtomicUsize::new(0);
+        let started = Instant::now();
+        let job = self.clone();
+        let work_ref = &work;
+        let remaining_ref = &remaining;
+        let done_ref = &done_bytes;
+        let next_ref = &next;
+        let failed_ref = &failed;
+        let active_ref = &active;
+        let cookie = auth_stream.cookie.clone();
+        let referer = auth_stream.referer.clone();
+        let user_agent = auth_stream.user_agent.clone();
+        let stem_owned = stem.to_string();
+        let workers = max_conn.clamp(1, 32).min(remaining.len().max(1));
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let job = job.clone();
+                let cookie = cookie.clone();
+                let referer = referer.clone();
+                let user_agent = user_agent.clone();
+                let stem_owned = stem_owned.clone();
+                scope.spawn(move || loop {
+                    if failed_ref.load(Ordering::Relaxed)
+                        || job.gen.load(Ordering::SeqCst) != my_gen
+                        || job.stop_flag.lock().unwrap().is_some()
+                    {
+                        return;
+                    }
+                    // Whole-pool speed limit: sleep off any
+                    // lead over the limit before fetching more.
+                    let lim = job.limit();
+                    if lim > 0 {
+                        let done = done_ref.load(Ordering::Relaxed) as f64;
+                        let ahead = done / lim as f64 - started.elapsed().as_secs_f64();
+                        if ahead > 0.05 {
+                            std::thread::sleep(std::time::Duration::from_secs_f64(ahead.min(1.0)));
+                            continue;
+                        }
+                    }
+                    let wi = next_ref.fetch_add(1, Ordering::Relaxed);
+                    let Some(&work_idx) = remaining_ref.get(wi) else {
+                        return;
+                    };
+                    let (pi, ii, item) = &work_ref[work_idx];
+                    active_ref.fetch_add(1, Ordering::Relaxed);
+                    let mut result = None;
+                    for _attempt in 0..2 {
+                        match ndm::video_probe::fetch_bytes_with_auth(
+                            &item.uri,
+                            cookie.as_deref(),
+                            referer.as_deref(),
+                            user_agent.as_deref(),
+                            item.range,
+                        ) {
+                            Ok(bytes) => {
+                                result = Some(bytes);
+                                break;
+                            }
+                            Err(_) => {
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                            }
+                        }
+                    }
+                    active_ref.fetch_sub(1, Ordering::Relaxed);
+                    let Some(bytes) = result else {
+                        failed_ref.store(true, Ordering::Relaxed);
+                        return;
+                    };
+                    if let Some((_, want)) = item.range {
+                        if (bytes.len() as u64) != want {
+                            failed_ref.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                    let data = job
+                        .dir
+                        .join(format!(".{stem_owned}.seg{pi}_{ii}"));
+                    let tmp = sibling_path(&data, ".tmp");
+                    if std::fs::write(&tmp, &bytes).is_err()
+                        || std::fs::rename(&tmp, &data).is_err()
+                        || std::fs::write(
+                            sibling_path(&data, ".ok"),
+                            (bytes.len() as u64).to_string(),
+                        )
+                        .is_err()
+                    {
+                        failed_ref.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                    let total_done = done_ref.fetch_add(bytes.len() as u64, Ordering::Relaxed)
+                        + bytes.len() as u64;
+                    let mut p = job.progress.lock().unwrap();
+                    p.done = total_done;
+                    p.conns = active_ref.load(Ordering::Relaxed);
+                    p.last_progress_at = Instant::now();
+                    if p.status == "starting" {
+                        p.status = "downloading".to_string();
+                    }
+                });
+            }
+            // Speed sampler on this thread while the pool runs.
+            let mut last_done = done_ref.load(Ordering::Relaxed);
+            let mut last_at = Instant::now();
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let now_done = done_ref.load(Ordering::Relaxed);
+                let dt = last_at.elapsed().as_secs_f64();
+                if dt > 0.0 {
+                    let mut p = job.progress.lock().unwrap();
+                    p.speed_bps = (now_done.saturating_sub(last_done)) as f64 / dt;
+                }
+                last_done = now_done;
+                last_at = Instant::now();
+                if failed_ref.load(Ordering::Relaxed)
+                    || job.gen.load(Ordering::SeqCst) != my_gen
+                    || job.stop_flag.lock().unwrap().is_some()
+                    || next_ref.load(Ordering::Relaxed) >= remaining_ref.len()
+                        && active_ref.load(Ordering::Relaxed) == 0
+                {
+                    break;
+                }
+            }
+        });
+        if self.gen.load(Ordering::SeqCst) != my_gen || self.stop_flag.lock().unwrap().is_some() {
+            return ManifestOutcome::Stopped;
+        }
+        if failed.load(Ordering::Relaxed) {
+            return ManifestOutcome::Failed;
+        }
+        // Assemble the parts in item order.
+        let mut part_paths = Vec::new();
+        let mut grand_total = 0u64;
+        for (pi, plan) in plans.iter().enumerate() {
+            let mut out = match std::fs::File::create(&plan.part_path) {
+                Ok(f) => f,
+                Err(_) => return ManifestOutcome::Failed,
+            };
+            for ii in 0..plan.items.len() {
+                let data = temp_for(pi, ii);
+                match std::fs::read(&data) {
+                    Ok(bytes) => {
+                        use std::io::Write;
+                        if out.write_all(&bytes).is_err() {
+                            return ManifestOutcome::Failed;
+                        }
+                        grand_total += bytes.len() as u64;
+                    }
+                    Err(_) => return ManifestOutcome::Failed,
+                }
+            }
+            drop(out);
+            for ii in 0..plan.items.len() {
+                let data = temp_for(pi, ii);
+                let _ = std::fs::remove_file(&data);
+                let _ = std::fs::remove_file(sibling_path(&data, ".ok"));
+            }
+            part_paths.push(plan.part_path.clone());
+        }
+        {
+            let mut p = self.progress.lock().unwrap();
+            p.total = grand_total;
+            p.done = grand_total;
+            p.total_locked = true;
+            p.speed_bps = 0.0;
+            p.conns = 0;
+        }
+        ManifestOutcome::Done(part_paths)
+    }
+
     fn run_parallel_engine(
         self: &Arc<Self>,
         ytdlp: &Path,
@@ -2675,6 +3155,24 @@ impl VideoJob {
         // yt-dlp-resolved streams under this selector — later
         // stall re-resolves use it instead of the capture key
         let mut reresolve_sel: Option<String> = None;
+        // Slice 6: playlist selections go through the native
+        // manifest engine first. Done → the shared finalize
+        // below runs on its part files; Stopped → the run is
+        // handled; Failed → fall back to yt-dlp immediately
+        // (the block-engine loop would only download the
+        // playlist document itself and churn).
+        let mut manifest_handled = false;
+        if streams.iter().any(|s| is_playlist_url(&s.url)) {
+            match self.run_manifest_path(&streams, &stem, max_conn, my_gen) {
+                ManifestOutcome::Done(paths) => {
+                    part_paths = paths;
+                    manifest_handled = true;
+                }
+                ManifestOutcome::Stopped => return true,
+                ManifestOutcome::Failed => return false,
+            }
+        }
+        if !manifest_handled {
         'attempts: loop {
             // A stop that landed while the previous attempt was
             // being recovered from — above all during the
@@ -2721,6 +3219,7 @@ impl VideoJob {
                     referer: st.referer.clone(),
                     user_agent: st.user_agent.clone(),
                     authorization: None,
+                    ..Default::default()
                 };
                 // WS-D D2 (audit-232 S4): a pair starts each side
                 // with the FULL pool spawned but only its pair
@@ -2976,6 +3475,7 @@ impl VideoJob {
                     // loop: restart every stream from its offset
                 }
             }
+        }
         }
 
         self.active_downloads.lock().unwrap().clear();

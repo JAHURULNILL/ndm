@@ -41,6 +41,8 @@ install -m 755 "$BIN" "$STAGE/usr/bin/ndm-app"
 # are rendered through — without it a minimal system silently
 # shows no icons (2.3.1 gate finding).
 mkdir -p "$STAGE/usr/lib/ndm" "$STAGE/usr/share/ndm/extension"
+mkdir -p "$STAGE/usr/share/doc/ndm"
+install -m 644 THIRD_PARTY_LICENSES.md "$STAGE/usr/share/doc/ndm/THIRD_PARTY_LICENSES.md"
 install -m 755 "$HOST_BIN" "$STAGE/usr/lib/ndm/ndm-host"
 # The extension file set is DERIVED from extension/manifest.json —
 # every file the manifest names (content scripts, background,

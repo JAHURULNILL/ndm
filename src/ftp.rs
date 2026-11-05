@@ -567,15 +567,25 @@ fn probe_ftp_once(url: &str, auth: &Auth) -> Result<Probe, FtpErr> {
         Some(t) => (t, false),
         None => (0, true),
     };
-    // resumable = SIZE gave a total AND a real REST inside the
-    // file is accepted (the connection is disposable, so the
-    // pending restart point costs nothing)
+    // resumable = SIZE gave a total AND REST is proven HONEST
+    // by a byte witness (M-6): some servers answer 350 to REST
+    // and then stream RETR from byte 0 anyway — the block
+    // engine would splice those bytes at the resume offset and
+    // silently corrupt the file (witnessed in the rig: a
+    // "finished" 6 MiB download first differing at a block
+    // boundary). A 350 alone is a claim; the witness fetches
+    // bytes [0..K+1) and [1..K+1) on two disposable connections
+    // and believes REST only when the second is the first
+    // shifted by exactly one byte. A pathological file whose
+    // first K+1 bytes are 1-periodic fails the witness and is
+    // treated as non-resumable — slower, never wrong.
     let mut range_ok = false;
     if !unknown_size && total > 1 {
-        let (code, _) = conn.cmd("REST 1")?;
-        range_ok = code == 350;
+        drop(conn);
+        range_ok = rest_is_honest(&target, total);
+    } else {
+        conn.quit();
     }
-    conn.quit();
     let name = file_name_of(url);
     Ok(Probe {
         total,
@@ -589,6 +599,45 @@ fn probe_ftp_once(url: &str, auth: &Auth) -> Result<Probe, FtpErr> {
         cookies: CookieJar::new(),
         range_unverified: false,
     })
+}
+
+
+/// The M-6 byte witness: does this server's REST actually
+/// shift the RETR stream? Fetches K+1 bytes at a base offset
+/// and K bytes at base+1 (K = min(64, ...)) on two fresh
+/// connections; REST is honest iff the second stream equals
+/// the first shifted by exactly one byte.
+/// Any failure — refusal, short read, transport error — is a
+/// NO: the safe direction is the single-stream path.
+fn rest_is_honest(target: &FtpTarget, total: u64) -> bool {
+    // the witness window sits at offsets 1..2 whenever the
+    // file allows: offset 0 stays untouched by the probe, so
+    // a probe never looks like a restart in server logs (or in
+    // the resume test's RETR accounting)
+    let base: u64 = if total > 66 { 1 } else { 0 };
+    let k = (total - base - 1).min(64) as usize;
+    let sample = |offset: u64, want: usize| -> Option<Vec<u8>> {
+        let mut conn =
+            FtpConn::connect(target, PROBE_CONNECT_TIMEOUT, PROBE_READ_TIMEOUT).ok()?;
+        conn.binary().ok()?;
+        let data = conn.retr(target, offset, PROBE_READ_TIMEOUT).ok()?;
+        let mut buf = vec![0u8; want];
+        let mut filled = 0usize;
+        let mut data = data;
+        while filled < want {
+            use std::io::Read;
+            match data.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(_) => return None,
+            }
+        }
+        buf.truncate(filled);
+        Some(buf)
+    };
+    let Some(a) = sample(base, k + 1) else { return false };
+    let Some(b) = sample(base + 1, k) else { return false };
+    a.len() == k + 1 && b.len() == k && b[..] == a[1..]
 }
 
 /// Byte-compare one range of the partial file against a fresh

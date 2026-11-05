@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod capture;
+pub mod manifest;
 pub mod video;
 
 /* ---------- Phase 1 seam (NATIVE-PHASE1-LOG.md section 3) ----------
@@ -4009,6 +4010,25 @@ pub fn spawn_emit_loop(app: Ctx, entry: Arc<Entry>) {
             }
             let status = payload.status.clone();
             let total_now = payload.total;
+            // Slice 1 (2.3.6): a video entry's explicit detail is
+            // stamped "Resolving…" at start (start_video) and
+            // nothing ever cleared it — detail_of prefers the
+            // explicit text over the status fallback, so the card
+            // kept saying "Resolving…" through the download, the
+            // merge and the finish, long after the resolve ended.
+            // The resolve is over the moment the job's own status
+            // leaves "starting": hand the detail back to the
+            // truthful status fallback from then on. (A restart
+            // re-stamps it and the job returns to "starting", so
+            // a live resolve keeps its label.)
+            if let Some(job) = &entry.video {
+                if job.progress.lock_ok().status != "starting" {
+                    let mut d = entry.detail.lock_ok();
+                    if *d == "Resolving\u{2026}" {
+                        d.clear();
+                    }
+                }
+            }
             // keep the browser panel's progress file in step with
             // the event stream: ~2 writes/sec while bytes move,
             // and ALWAYS on a status transition (every non-downloading
@@ -4359,11 +4379,24 @@ pub async fn start_engine(app: Ctx, stub: &Arc<Entry>) -> Result<Arc<Entry>, Str
             Some(stub.referer.clone())
         };
         let authorization = basic_auth_header(&stub.login, &stub.password);
+        let raw_login = if stub.login.is_empty() {
+            None
+        } else {
+            Some(stub.login.clone())
+        };
+        let raw_pw = if stub.password.is_empty() {
+            None
+        } else {
+            Some(stub.password.clone())
+        };
         ndm::Auth {
             cookie,
             referer,
             authorization,
             user_agent: None,
+            login: raw_login,
+            password: raw_pw,
+            digest: Default::default(),
         }
     };
     // the probe inside ndm::start can take seconds; the entry must count
@@ -8378,11 +8411,18 @@ pub async fn probe_file(
         login.as_deref().unwrap_or(""),
         password.as_deref().unwrap_or(""),
     );
+    let raw_pw: Option<String> = match &password {
+        Some(p) => Some(p.clone()),
+        None => None,
+    };
     let auth = ndm::Auth {
         cookie,
         referer,
         authorization,
         user_agent: None,
+        login: login.clone(),
+        password: raw_pw,
+        digest: Default::default(),
     };
     // Change 4 (2.0.4): remember this probe for the Start that
     // follows (probe-once handoff) — signature taken over the auth
@@ -11978,6 +12018,10 @@ pub fn sync_sweep(ctx: &Ctx, queue: &str) {
         } else {
             (e.login.clone(), e.password.clone())
         };
+        let raw_pw3 = {
+            let p = &password;
+            if p.is_empty() { None } else { Some(p.clone()) }
+        };
         let auth = ndm::Auth {
             cookie: state
                 .cookies_path(&e.cookies)
@@ -11990,6 +12034,13 @@ pub fn sync_sweep(ctx: &Ctx, queue: &str) {
             },
             authorization: basic_auth_header(&login, &password),
             user_agent: None,
+            login: if login.is_empty() {
+                None
+            } else {
+                Some(login.clone())
+            },
+            password: raw_pw3,
+            digest: Default::default(),
         };
         let probe = match ndm::probe_with_auth(&e.url, &auth) {
             Ok(p) => p,
@@ -13774,6 +13825,7 @@ mod tests {
             referer: None,
             authorization: None,
             user_agent: None,
+            ..Default::default()
         };
         let probe = ndm::Probe {
             total: 1234,

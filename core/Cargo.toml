@@ -1,6 +1,6 @@
 [package]
 name = "ndm-core"
-version = "2.3.5"
+version = "2.3.6"
 edition = "2021"
 description = "NDM core — app state, journal, scheduler, updater latch and command bodies extracted from the Tauri shell (Phase 1 of the native programme); UI-free, events leave through the EventSink seam"
 license = "MIT OR Apache-2.0"

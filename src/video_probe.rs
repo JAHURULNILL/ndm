@@ -643,6 +643,58 @@ pub fn fetch_hls_default_audio(url: &str, referer: &str, cookie: &str) -> Option
     hls_default_audio_rendition(&text, url)
 }
 
+/// Fetch a URL's full body with a download's auth — the native
+/// manifest engine's reader (slice 6): playlist documents and
+/// media segments. Same conventions as every other fetch in
+/// the app: the configured proxy for the URL, identity encoding
+/// (a compressed segment is a corrupt segment), the captured
+/// session's cookie/referer/user-agent when the stream has
+/// them. `range` asks for exactly those bytes (offset, len).
+pub fn fetch_bytes_with_auth(
+    url: &str,
+    cookie: Option<&str>,
+    referer: Option<&str>,
+    user_agent: Option<&str>,
+    range: Option<(u64, u64)>,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let agent = crate::apply_proxy_for(ureq::AgentBuilder::new(), url)
+        .timeout(Duration::from_secs(60))
+        .build();
+    let mut req = agent
+        .get(url)
+        .set("Accept-Encoding", "identity")
+        .set(
+            "User-Agent",
+            user_agent.unwrap_or("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
+        );
+    if let Some(r) = referer {
+        if !r.is_empty() {
+            req = req.set("Referer", r);
+        }
+    }
+    if let Some(c) = cookie {
+        if !c.is_empty() {
+            req = req.set("Cookie", c);
+        }
+    }
+    if let Some((off, len)) = range {
+        let range_value = format!("bytes={}-{}", off, off + len.saturating_sub(1));
+        req = req.set("Range", &range_value);
+    }
+    let resp = req
+        .call()
+        .map_err(|e| format!("fetch failed for {url}: {e}"))?;
+    if crate::response_encoding(&resp).is_some() {
+        return Err(format!("compressed response for {url}"));
+    }
+    let mut body = Vec::new();
+    resp.into_reader()
+        .read_to_end(&mut body)
+        .map_err(|e| format!("read failed for {url}: {e}"))?;
+    Ok(body)
+}
+
 /// The vcodec yt-dlp actually reported, if any. `null` (the
 /// generic extractor does this for direct media files) and a
 /// missing key both mean "unknown" — NOT "no video stream".

@@ -43,6 +43,7 @@ pub fn modal_exit() {
     if !modal_open() {
         crate::modals::pump_complete();
         crate::pump_file_offers();
+        crate::pump_capture_queue();
     }
 }
 
@@ -368,6 +369,7 @@ fn run_dialog_impl(
     if !modal_open() {
         crate::modals::pump_complete();
         crate::pump_file_offers();
+        crate::pump_capture_queue();
     }
     result
 }

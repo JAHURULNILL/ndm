@@ -1349,6 +1349,60 @@ thread_local! {
     static FILE_OFFER_ANCHOR: RefCell<Option<Rc<Ui>>> = RefCell::new(None);
 }
 
+thread_local! {
+    /// Slice 3 (2.3.6): video/grab captures that arrived while
+    /// another capture-born dialog was on screen, in arrival
+    /// order — (kind, url, cookies). File offers have always
+    /// queued this way; video and grab captures used to open
+    /// their windows immediately, so a single page action could
+    /// stack two or three dialogs at once (field complaint #4).
+    static CAPTURE_QUEUE: RefCell<std::collections::VecDeque<(&'static str, String, Option<String>)>> =
+        RefCell::new(std::collections::VecDeque::new());
+    /// The Ui the capture pump runs against (same anchor
+    /// pattern as FILE_OFFER_ANCHOR).
+    static CAPTURE_ANCHOR: RefCell<Option<Rc<Ui>>> = RefCell::new(None);
+}
+
+/// Is a capture-born dialog on screen right now — a modal, a
+/// presented file offer, the video picker, the grabber wizard?
+/// While one is up, further video/grab captures queue instead
+/// of opening on top of it.
+fn capture_dialog_visible() -> bool {
+    dialogs::modal_open()
+        || ADD_FLOW_ACTIVE.with(|f| f.get())
+        || FILE_OFFER_PRESENTED.with(|p| p.borrow().is_some())
+        || video::is_open()
+        || grabber::is_open()
+}
+
+fn queue_capture(ui: &Rc<Ui>, kind: &'static str, url: String, cookies: Option<String>) {
+    CAPTURE_ANCHOR.with(|a| *a.borrow_mut() = Some(ui.clone()));
+    CAPTURE_QUEUE.with(|q| q.borrow_mut().push_back((kind, url, cookies)));
+}
+
+/// Present the next queued video/grab capture, if the way is
+/// clear. Called from every dialog-clearing seam (modal_exit,
+/// run_dialog's end, the file-offer settle hook, the video
+/// picker's close and the grabber's hides), exactly like
+/// pump_file_offers.
+pub fn pump_capture_queue() {
+    if capture_dialog_visible() {
+        return;
+    }
+    let Some(ui) = CAPTURE_ANCHOR.with(|a| a.borrow().clone()) else {
+        return;
+    };
+    let next = CAPTURE_QUEUE.with(|q| q.borrow_mut().pop_front());
+    let Some((kind, url, cookies)) = next else {
+        return;
+    };
+    if kind == "video" {
+        video::show(ui, Some(url), cookies);
+    } else {
+        grabber::show(ui, Some(url), true);
+    }
+}
+
 fn queue_incoming_file(ui: &Rc<Ui>, payload: serde_json::Value) {
     FILE_OFFER_ANCHOR.with(|a| *a.borrow_mut() = Some(ui.clone()));
     let url = payload
@@ -1381,6 +1435,8 @@ pub fn pump_file_offers() {
     if dialogs::modal_open()
         || ADD_FLOW_ACTIVE.with(|f| f.get())
         || FILE_OFFER_PRESENTED.with(|p| p.borrow().is_some())
+        || video::is_open()
+        || grabber::is_open()
     {
         return;
     }
@@ -1408,6 +1464,7 @@ pub fn pump_file_offers() {
     let on_done = Rc::new(move || {
         FILE_OFFER_PRESENTED.with(|p| *p.borrow_mut() = None);
         pump_file_offers();
+        pump_capture_queue();
     });
     open_file_dialog_flow(&ui, Some(&next), on_done);
 }
@@ -3119,7 +3176,11 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                 .filter(|x| !x.is_empty())
                 .map(|x| x.to_string());
             if url.starts_with("http://") || url.starts_with("https://") {
-                video::show(ui.clone(), Some(url), cookies);
+                if capture_dialog_visible() {
+                    queue_capture(ui, "video", url, cookies);
+                } else {
+                    video::show(ui.clone(), Some(url), cookies);
+                }
             } else {
                 set_notice(ui, "Incoming video without an address");
             }
@@ -3136,7 +3197,11 @@ fn handle_app_event(ui: &Rc<Ui>, event: AppEvent) {
                 .unwrap_or("")
                 .to_string();
             if url.starts_with("http://") || url.starts_with("https://") {
-                grabber::show(ui.clone(), Some(url), true);
+                if capture_dialog_visible() {
+                    queue_capture(ui, "grab", url, None);
+                } else {
+                    grabber::show(ui.clone(), Some(url), true);
+                }
             } else {
                 set_notice(ui, "Incoming grab without an address");
             }

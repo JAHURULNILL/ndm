@@ -287,6 +287,11 @@ pub fn show(ui: Rc<Ui>, url: Option<String>, cookies: Option<String>) {
         window.connect_delete_event(move |_, _| {
             discard_if_abandoned(&d);
             DLG.with(|x| *x.borrow_mut() = None);
+            // Slice 3: this picker was the screen's one capture
+            // dialog; queued offers and captures get their
+            // turn now.
+            crate::pump_file_offers();
+            crate::pump_capture_queue();
             gtk::glib::Propagation::Proceed
         });
     }
@@ -295,6 +300,18 @@ pub fn show(ui: Rc<Ui>, url: Option<String>, cookies: Option<String>) {
     if url.is_some() {
         start_fetch(&dlg);
     }
+}
+
+/// Slice 3: is the picker on screen right now? The capture
+/// arbitration in main.rs queues competing video/grab captures
+/// while it is.
+pub fn is_open() -> bool {
+    DLG.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|d| d.window.is_visible())
+            .unwrap_or(false)
+    })
 }
 
 fn discard_if_abandoned(d: &Rc<VideoDlg>) {

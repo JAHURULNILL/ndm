@@ -596,9 +596,26 @@ fn download_selected(d: &Rc<GrabDlg>) {
         } else {
             refresh_list(&d2.ui);
             d2.window.hide();
+            // Slice 3: the wizard yielded the screen; queued
+            // offers and captures get their turn now.
+            crate::pump_file_offers();
+            crate::pump_capture_queue();
         }
         gtk::glib::ControlFlow::Break
     });
+}
+
+/// Slice 3: is the wizard on screen right now? The capture
+/// arbitration in main.rs queues competing video/grab captures
+/// while it is. (The wizard hides rather than destroys, so
+/// visibility — not existence — is the test.)
+pub fn is_open() -> bool {
+    DLG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .map(|d| d.window.is_visible())
+            .unwrap_or(false)
+    })
 }
 
 pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
@@ -899,12 +916,20 @@ pub fn show(ui: Rc<Ui>, prefill: Option<String>, auto_explore: bool) {
     }
     {
         let w = window.clone();
-        btn_cancel.connect_clicked(move |_| w.hide());
+        btn_cancel.connect_clicked(move |_| {
+            w.hide();
+            // Slice 3: queued offers/captures get a turn now.
+            crate::pump_file_offers();
+            crate::pump_capture_queue();
+        });
     }
     {
         let d = d.clone();
         window.connect_delete_event(move |w, _| {
             w.hide();
+            // Slice 3: queued offers/captures get a turn now.
+            crate::pump_file_offers();
+            crate::pump_capture_queue();
             gtk::glib::Propagation::Stop
         });
         let _ = &d;
