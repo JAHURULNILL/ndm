@@ -23,6 +23,7 @@
 //! ProgressDialogReveal.
 
 mod blockmap;
+mod updater_window;
 mod dialogs;
 mod form;
 mod gtksink;
@@ -3887,6 +3888,13 @@ fn acquire_instance_guard(dir: &std::path::Path) -> Option<std::fs::File> {
 }
 
 fn main() {
+    // 2.3.7: the standalone update checker runs before
+    // everything — it must not bootstrap the journal, the engine
+    // or the main window; it probes, maybe shows its one small
+    // window, and exits (see updater_window.rs).
+    if std::env::args().any(|a| a == updater_window::FLAG) {
+        updater_window::run();
+    }
     // The single-instance floor runs before ANY state work:
     // a second process must not sweep, restore or persist
     // against the shared journal. The guard File lives in this
@@ -3913,6 +3921,7 @@ fn main() {
             sink::run_startup_sweeps(&state);
             sink::check_ext_notice(&ctx, &state);
             sink::run_launch_update_check(ctx.clone());
+            updater_window::register_autostart();
             sink::run_update_recheck_loop(ctx.clone());
             sink::run_component_warmup(ctx.clone());
             sink::startup_resume(&ctx);

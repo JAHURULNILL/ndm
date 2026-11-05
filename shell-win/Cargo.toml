@@ -1,6 +1,6 @@
 [package]
 name = "ndm-shell-win"
-version = "2.3.6"
+version = "2.3.7"
 edition = "2021"
 description = "NDM — native Windows shell (raw Win32 via the windows crate, winui helpers)"
 license = "MIT OR Apache-2.0"
@@ -34,6 +34,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_SystemServices",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Time",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 windows-core = "0.62"

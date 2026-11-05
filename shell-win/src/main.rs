@@ -35,6 +35,7 @@ mod scheduler_dialog;
 mod video_dialog;
 mod sink;
 mod update_dialog;
+mod updater_window;
 mod winui;
 
 use sink::{AppEvent, AppState, Ctx, EventSink, ProgressView};
@@ -2430,7 +2431,7 @@ fn bind_and_serve_instance(port: u16) -> bool {
 /// `41000 + (hash % 12000)` (src-tauri/src/main.rs:418, verbatim
 /// — including its APPDATA/XDG base computation, so the port
 /// agrees with the Tauri shell's on the same profile).
-fn instance_port() -> u16 {
+pub(crate) fn instance_port() -> u16 {
     let dir = {
         #[cfg(windows)]
         let base = std::env::var_os("APPDATA").map(PathBuf::from);
@@ -2452,7 +2453,7 @@ fn instance_port() -> u16 {
     41000 + (h % 12000) as u16
 }
 
-fn instance_ping(port: u16, verb: &str) -> bool {
+pub(crate) fn instance_ping(port: u16, verb: &str) -> bool {
     use std::io::{Read, Write};
     let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let Ok(mut s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300))
@@ -2515,7 +2516,7 @@ fn acquire_instance() -> Instance {
 /// Shell API) + the app identifier "com.ndm.downloadmanager".
 /// The APPDATA-env fallback mirrors the guard's own base
 /// computation for the (practically unreachable) failure arm.
-fn app_data_dir() -> PathBuf {
+pub(crate) fn app_data_dir() -> PathBuf {
     unsafe {
         if let Ok(pw) = SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None) {
             let s = pw.to_string().unwrap_or_default();
@@ -2600,6 +2601,7 @@ fn bootstrap(hwnd: HWND, background: bool) -> bool {
     ndm_core::run_startup_sweeps(state);
     ndm_core::check_ext_notice(&c, state);
     ndm_core::run_launch_update_check(c.clone());
+    updater_window::register_update_task();
     ndm_core::run_update_recheck_loop(c.clone());
     ndm_core::run_component_warmup(c.clone());
     ndm_core::startup_resume(&c);
@@ -3239,6 +3241,11 @@ fn main() {
                 std::path::Path::new(&args[2]),
                 std::path::Path::new(&args[3]),
             );
+        }
+        // 2.3.7: the standalone update checker — same early seam
+        // (before the guard, before any state); it never returns.
+        if args.iter().any(|a| a == updater_window::FLAG) {
+            updater_window::run();
         }
     }
 

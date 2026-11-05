@@ -17,6 +17,11 @@ pub mod capture;
 pub mod manifest;
 pub mod video;
 
+/// The engine crate's updater, re-exported so the shells can
+/// name ReleaseInfo (the 2.3.7 checker's stored offer) without
+/// taking a second dependency on the engine crate itself.
+pub use ndm::updater;
+
 /* ---------- Phase 1 seam (NATIVE-PHASE1-LOG.md section 3) ----------
    Everything the extracted core used to say to the window goes
    through AppEvent + EventSink; everything it used to ask of the
@@ -7770,6 +7775,155 @@ pub fn do_check_update(app: &Ctx) -> serde_json::Value {
 }
 
 
+/// The background checker's decision, pure (2.3.7): does this
+/// fetched feed record offer THIS copy an installable update?
+/// Same rules as the in-app latch — a well-formed version,
+/// strictly newer, with a package this platform can install —
+/// without touching any app state.
+pub fn update_offer_from(info: &ndm::updater::ReleaseInfo, current: &str) -> bool {
+    release_version_well_formed(&info.version)
+        && ndm::updater::version_cmp(&info.version, current)
+            == std::cmp::Ordering::Greater
+        && usable_update_asset(info)
+}
+
+/// Fetch the feed and decide for the standalone update checker
+/// (2.3.7): Ok(Some(info)) = show the update window, Ok(None) =
+/// nothing to offer, Err = the check itself failed (stay silent;
+/// a checker that cannot reach the feed must never nag).
+pub fn update_offer() -> Result<Option<ndm::updater::ReleaseInfo>, String> {
+    let info = ndm::updater::fetch_release()?;
+    let current = env!("CARGO_PKG_VERSION");
+    Ok(if update_offer_from(&info, current) {
+        Some(info)
+    } else {
+        None
+    })
+}
+
+/// Install a downloaded .deb with admin rights — the chain the
+/// in-app update has always used, factored out so the standalone
+/// checker (2.3.7) runs the IDENTICAL steps: pkexec + apt-get,
+/// then PackageKit, then the desktop's own installer UI. Ok is
+/// "installed" or "opened" (handed to the desktop installer).
+/// Not cfg-gated: install_update's tail compiles on Windows too
+/// (it returns earlier there), so this must exist on both.
+pub fn install_deb_with_admin(dest: &std::path::Path) -> Result<&'static str, String> {
+    let script = format!(
+        "DEBIAN_FRONTEND=noninteractive apt-get install -y {}",
+        shell_quote(&dest.to_string_lossy())
+    );
+    let status = std::process::Command::new("pkexec")
+        .args(["sh", "-c", &script])
+        .status();
+    match status {
+        Ok(st) if st.success() => Ok("installed"),
+        _ => {
+            let pk = std::process::Command::new("pkcon")
+                .args(["install-local", "-y"])
+                .arg(dest)
+                .status();
+            if let Ok(st) = pk {
+                if st.success() {
+                    return Ok("installed");
+                }
+            }
+            let opened = std::process::Command::new("xdg-open").arg(dest).status();
+            match opened {
+                Ok(st) if st.success() => Ok("opened"),
+                _ => Err("the system installer could not be started".to_string()),
+            }
+        }
+    }
+}
+
+/// The update package for THIS copy, chosen exactly as
+/// install_update chooses it (2.3.7): which asset, what it is
+/// called on disk, and whether installing it means running a
+/// system installer (true) or swapping a portable tree (false —
+/// Windows portable flavour only).
+pub struct UpdatePackage {
+    pub url: String,
+    pub sha256: String,
+    pub file_name: &'static str,
+    pub installer: bool,
+}
+
+pub fn update_package(info: &ndm::updater::ReleaseInfo) -> Option<UpdatePackage> {
+    #[cfg(windows)]
+    {
+        let installer = windows_is_installer_flavour();
+        let (url, sha256) = win_update_package(info, std::env::consts::ARCH, installer);
+        if url.is_empty() {
+            return None;
+        }
+        Some(UpdatePackage {
+            url,
+            sha256,
+            file_name: if installer { "ndm-setup.exe" } else { "ndm-update.zip" },
+            installer,
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        if info.deb_url.is_empty() {
+            return None;
+        }
+        Some(UpdatePackage {
+            url: info.deb_url.clone(),
+            sha256: info.deb_sha256.clone(),
+            file_name: "ndm-update.deb",
+            installer: true,
+        })
+    }
+}
+
+/// Download the update package into `dir` with hash verification
+/// (the updater's own downloader), returning the package path.
+pub fn download_update_package(
+    info: &ndm::updater::ReleaseInfo,
+    dir: &std::path::Path,
+    cb: &dyn Fn(u64, u64),
+) -> Result<std::path::PathBuf, String> {
+    let pkg = update_package(info)
+        .ok_or("this update has no installable package for your copy of NDM")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(pkg.file_name);
+    ndm::updater::download_file(&pkg.url, &dest, &pkg.sha256, cb)?;
+    Ok(dest)
+}
+
+/// How long a dismissed update offer stays dismissed (2.3.7):
+/// "Later" silences the SAME version for a day, not forever —
+/// and a newer version always speaks again immediately.
+pub const UPDATE_SNOOZE_SECS: u64 = 24 * 60 * 60;
+
+/// Was this exact version's window already shown within the
+/// snooze window? Reads the checker's tiny state file
+/// ({version, shown_unix}); any unreadable state = not snoozed.
+pub fn update_shown_recently(file: &std::path::Path, version: &str, now_unix: u64) -> bool {
+    let Ok(body) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    if v.get("version").and_then(|x| x.as_str()) != Some(version) {
+        return false;
+    }
+    let shown = v.get("shown_unix").and_then(|x| x.as_u64()).unwrap_or(0);
+    now_unix.saturating_sub(shown) < UPDATE_SNOOZE_SECS
+}
+
+/// Record that the update window was shown for this version.
+pub fn record_update_shown(file: &std::path::Path, version: &str, now_unix: u64) {
+    let body = serde_json::json!({ "version": version, "shown_unix": now_unix });
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(file, body.to_string());
+}
+
 pub async fn check_update(app: Ctx) -> Result<serde_json::Value, String> {
     let joined =
         crate::rt::spawn_blocking(move || do_check_update(&app)).await;
@@ -7901,36 +8055,9 @@ pub async fn install_update(app: Ctx) -> Result<(), String> {
             ndm::updater::download_file(&info.deb_url, &dest, &info.deb_sha256, &cb)
             .and_then(|_| {
                 let _ = app.emit(AppEvent::UpdateProgress(serde_json::json!({ "phase": "installing" }),));
-                let script = format!(
-                    "DEBIAN_FRONTEND=noninteractive apt-get install -y {}",
-                    shell_quote(&dest.to_string_lossy())
-                );
-                let status = std::process::Command::new("pkexec")
-                    .args(["sh", "-c", &script])
-                    .status();
-                match status {
-                    Ok(st) if st.success() => Ok("installed"),
-                    _ => {
-                        // PackageKit route (GNOME Software's backend)
-                        let pk = std::process::Command::new("pkcon")
-                            .args(["install-local", "-y"])
-                            .arg(&dest)
-                            .status();
-                        if let Ok(st) = pk {
-                            if st.success() {
-                                return Ok("installed");
-                            }
-                        }
-                        // last resort: the desktop's own installer UI
-                        let opened = std::process::Command::new("xdg-open")
-                            .arg(&dest)
-                            .status();
-                        match opened {
-                            Ok(st) if st.success() => Ok("opened"),
-                            _ => Err("the system installer could not be started".to_string()),
-                        }
-                    }
-                }
+                // the chain itself lives in install_deb_with_admin
+                // so the standalone checker runs the identical steps
+                install_deb_with_admin(&dest)
             })
         }))
         .unwrap_or_else(|_| Err("the update failed unexpectedly".to_string()));
@@ -7993,21 +8120,38 @@ pub fn run_windows_update(
     ndm::updater::download_file(&url, &dest, &sha, &cb)?;
     let _ = app.emit(AppEvent::UpdateProgress(serde_json::json!({ "phase": "installing",
             "message": "Installing the update — NDM will close and reopen on the new version…" }),));
+    finish_windows_update(&dest, installer)?;
+    app.exit();
+    Ok(())
+}
+
+/// Everything after the Windows package lands (2.3.7 factor, so
+/// the standalone checker runs the IDENTICAL steps): installer
+/// flavour spawns the silent setup; portable flavour stages the
+/// tree and hands the swap to a detached copy of this binary in
+/// temp. Ok means "the handover is armed — the caller must exit
+/// now"; the setup (installer contract) or the helper relaunches
+/// NDM on the new version. Any error leaves the running version
+/// completely untouched.
+#[cfg(windows)]
+pub fn finish_windows_update(dest: &Path, installer: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let install_dir = exe
         .parent()
         .ok_or("cannot locate the install folder")?
         .to_path_buf();
     if installer {
-        // silent install over the running copy; the app exits so
-        // the installer can replace its files, and the installer
-        // relaunches NDM when it is done (SPEC §C contract)
-        std::process::Command::new(&dest)
+        // silent install over the running copy; the caller exits
+        // so the installer can replace its files, and the
+        // installer relaunches NDM when it is done (SPEC §C
+        // contract)
+        std::process::Command::new(dest)
             .arg("/S")
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("the installer could not be started: {e}"))?;
-        app.exit();
         return Ok(());
     }
     // portable: stage the new tree beside the installation, then
@@ -8035,7 +8179,6 @@ pub fn run_windows_update(
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("cannot start the update: {e}"))?;
-    app.exit();
     Ok(())
 }
 
@@ -14334,6 +14477,51 @@ mod tests {
         // as optional
         let offer = pending_update_payload(Some(&info), false);
         assert_eq!(offer["mandatory"], false);
+    }
+
+    #[test]
+    fn update_offer_decision_matches_the_latch_rules() {
+        // 2.3.7: the background checker offers exactly what the
+        // in-app latch would — strictly newer, well-formed, with
+        // a package this platform can install
+        let mk = |version: &str, deb_url: &str| -> ndm::updater::ReleaseInfo {
+            serde_json::from_value(serde_json::json!({
+                "version": version,
+                "notes": "",
+                "min_supported": "",
+                "deb_url": deb_url,
+            }))
+            .expect("release info parses")
+        };
+        assert!(update_offer_from(&mk("2.3.7", "https://x/ndm.deb"), "2.3.6"));
+        assert!(!update_offer_from(&mk("2.3.6", "https://x/ndm.deb"), "2.3.6"));
+        assert!(!update_offer_from(&mk("2.3.5", "https://x/ndm.deb"), "2.3.6"));
+        assert!(!update_offer_from(&mk("2.x", "https://x/ndm.deb"), "2.3.6"));
+        assert!(!update_offer_from(&mk("", "https://x/ndm.deb"), "2.3.6"));
+        #[cfg(not(windows))]
+        assert!(!update_offer_from(&mk("2.3.7", ""), "2.3.6"));
+    }
+
+    #[test]
+    fn update_snooze_is_per_version_and_expires() {
+        // 2.3.7: "Later" silences the same version for a day;
+        // a newer version speaks again at once, and yesterday's
+        // dismissal never leaks into today
+        let dir = std::env::temp_dir()
+            .join(format!("ndm-test-snooze-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("update-check.json");
+        let now = 1_700_000_000u64;
+        assert!(!update_shown_recently(&file, "2.3.7", now));
+        record_update_shown(&file, "2.3.7", now);
+        assert!(update_shown_recently(&file, "2.3.7", now + 3600));
+        assert!(!update_shown_recently(&file, "2.3.8", now + 3600));
+        assert!(!update_shown_recently(
+            &file,
+            "2.3.7",
+            now + UPDATE_SNOOZE_SECS + 1
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── 2.0.8 hunt batch (Wave 2, app) ──

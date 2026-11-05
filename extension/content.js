@@ -4563,7 +4563,8 @@
         to { opacity: 1; transform: scale(1); }
       }
       .ndm-modal {
-        width: 540px; max-width: 100%;
+        width: 540px; max-width: calc(100vw - 32px);
+        max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px);
         background: #f5f8fc;
         border: 1px solid #8ea8c6;
         border-radius: 10px;
@@ -4598,7 +4599,9 @@
       .ndm-m-body {
         padding: 14px;
         display: flex; flex-direction: column; gap: 12px;
+        overflow-y: auto; min-height: 0; overscroll-behavior: contain;
       }
+      .ndm-m-body > * { flex: none; }
       .ndm-m-preview {
         display: flex; gap: 12px; align-items: center;
         background: #fff; border: 1px solid #c5d4e6;
@@ -4666,7 +4669,7 @@
       }
       .ndm-m-qlist {
         background: #fff; border: 1px solid #b8cae0;
-        border-radius: 7px; max-height: 225px; overflow-y: auto;
+        border-radius: 7px; max-height: min(225px, 34vh); overflow-y: auto;
         divide-y: 1px solid #edf2f8;
       }
       .ndm-m-loading {
