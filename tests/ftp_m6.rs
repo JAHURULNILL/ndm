@@ -9,15 +9,23 @@
 
 use std::time::{Duration, Instant};
 
+fn rig_source() -> std::path::PathBuf {
+    // runtime lookup, NOT env! at compile time: Windows has no
+    // HOME in the compile environment and the test targets must
+    // still BUILD there (CI caught this on the 2.3.6 tag run)
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    std::path::Path::new(&home)
+        .join("workspace/ndm-rig")
+        .join("ftp-root/bigftp.bin")
+}
+
 #[test]
 #[ignore]
 fn lying_rest_server_does_not_corrupt() {
     let url = "ftp://127.0.0.1:2121/bigftp.bin";
-    let source = std::fs::read(
-        std::path::Path::new(env!("HOME"))
-            .join("workspace/ndm-rig/ftp-root/bigftp.bin"),
-    )
-    .expect("source file");
+    let source = std::fs::read(rig_source()).expect("source file");
     let probe = ndm::probe(url).expect("probe");
     println!(
         "probe: total={} range_ok={} unknown_size={}",

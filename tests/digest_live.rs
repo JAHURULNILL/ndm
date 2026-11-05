@@ -42,13 +42,22 @@ fn run(url: &str, auth: ndm::Auth, tag: &str) -> Result<Vec<u8>, String> {
     }
 }
 
+fn rig_source() -> std::path::PathBuf {
+    // runtime lookup, NOT env! at compile time: Windows has no
+    // HOME in the compile environment and the test targets must
+    // still BUILD there (CI caught this on the 2.3.6 tag run)
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    std::path::Path::new(&home)
+        .join("workspace/ndm-rig")
+        .join("www/big.bin")
+}
+
 #[test]
 #[ignore]
 fn digest_protected_download_is_byte_identical() {
-    let source = std::fs::read(
-        std::path::Path::new(env!("HOME")).join("workspace/ndm-rig/www/big.bin"),
-    )
-    .expect("rig big.bin");
+    let source = std::fs::read(rig_source()).expect("rig big.bin");
     for alg in ["MD5", "SHA-256"] {
         let url = format!("http://127.0.0.1:8794/big.bin?alg={alg}");
         let got = run(&url, auth_with("s3cret-pw"), alg).expect(alg);
