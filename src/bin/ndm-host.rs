@@ -36,6 +36,47 @@ fn app_data_dir() -> io::Result<PathBuf> {
     Ok(data_home()?.join(HOST_DIR_NAME))
 }
 
+/// Append one line to `host.log` in the data dir — the bridge's
+/// evidence file (the app's registration code in ndm-core carries
+/// the same helper and writes its verdicts to the same file).
+/// Chrome discards this process's stderr, so a failure that is
+/// only eprintln!'d leaves no trace in the field; the file is
+/// what makes a dead channel diagnosable. One rotation level
+/// keeps it bounded. Best effort throughout, and NEVER stdout —
+/// stdout is the protocol.
+fn append_host_log(line: &str) {
+    use std::io::Write as _;
+    let Ok(dir) = app_data_dir() else { return };
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("host.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 256 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("host.log.old"));
+        }
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Run `f` behind a panic shield: a handler panic must cost one
+/// message its reply, never the whole channel — a dead host
+/// process is exactly the browser's opaque "error when
+/// communicating with the native messaging host", with the user's
+/// download flow dead and no path to a cause. The panic hook
+/// installed in main() records the panic in host.log; here it
+/// becomes a plain {ok:false} the extension can surface.
+fn guarded<T>(f: impl FnOnce() -> T) -> Option<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).ok()
+}
+
+fn handle_guarded(message: &Value) -> Value {
+    match guarded(|| handle(message)) {
+        Some(v) => v,
+        None => json!({ "ok": false, "error": "internal host error" }),
+    }
+}
+
 fn queue_path() -> io::Result<PathBuf> {
     Ok(app_data_dir()?.join(QUEUE_FILE_NAME))
 }
@@ -1898,6 +1939,25 @@ mod tests {
     }
 
     #[test]
+    fn panic_shield_turns_a_panic_into_none_not_death() {
+        // the field failure this guards: one handler panic used
+        // to kill the whole host process, and the browser showed
+        // only "error when communicating". Behind the shield the
+        // same panic is a None the caller turns into {ok:false},
+        // and the channel lives for the next message.
+        let fallen: Option<Value> = guarded(|| panic!("simulated handler fault"));
+        assert!(fallen.is_none());
+        let fine: Option<Value> = guarded(|| json!({ "ok": true }));
+        assert_eq!(fine, Some(json!({ "ok": true })));
+        // and through the real dispatch seam: a normal message
+        // still gets its normal reply
+        assert_eq!(
+            handle_guarded(&json!({ "type": "ping" })),
+            json!({ "ok": true, "pong": true })
+        );
+    }
+
+    #[test]
     fn oversized_inbound_length_is_invalid_data() {
         // the COSMETIC finding's mechanism: main() exits nonzero
         // exactly for InvalidData framing errors — make sure a
@@ -1911,6 +1971,22 @@ mod tests {
 }
 
 fn main() {
+    // Evidence first: a panic anywhere in this process is logged
+    // to host.log (the default hook still prints to stderr, which
+    // the browser discards). The start line below is the other
+    // half of the field diagnosis: a host.log with register lines
+    // but no start line means the browser never launched the host;
+    // start lines with a panic line name the real fault.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        append_host_log(&format!("{} host panic: {info}", unix_now_secs()));
+        default_hook(info);
+    }));
+    append_host_log(&format!(
+        "{} host start pid={}",
+        unix_now_secs(),
+        std::process::id()
+    ));
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut input = stdin.lock();
@@ -1922,6 +1998,10 @@ fn main() {
             Ok(None) => break,
             Err(e) => {
                 eprintln!("ndm-host: framing error, exiting: {e}");
+                append_host_log(&format!(
+                    "{} host framing error, exiting: {e}",
+                    unix_now_secs()
+                ));
                 // an invalid length prefix (e.g. >1 MiB inbound) is
                 // a protocol violation, not a clean close: exit
                 // nonzero so the failure is visible instead of a
@@ -1933,11 +2013,15 @@ fn main() {
             }
         };
         let reply = match message {
-            Ok(value) => handle(&value),
+            Ok(value) => handle_guarded(&value),
             Err(detail) => json!({ "ok": false, "error": detail }),
         };
         if let Err(e) = write_reply(&mut output, &reply) {
             eprintln!("ndm-host: cannot write reply, exiting: {e}");
+            append_host_log(&format!(
+                "{} host cannot write reply, exiting: {e}",
+                unix_now_secs()
+            ));
             break;
         }
     }

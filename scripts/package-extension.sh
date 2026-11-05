@@ -5,10 +5,15 @@
 # The Firefox manifest is REGENERATED from manifest.json on every
 # run (background.service_worker -> background.scripts with
 # fb-classify.js preloaded, "key" dropped — AMO rejects it; the
-# gecko id pins the add-on identity), so the two packages can
-# never drift apart. Both zips are checked against the manifest:
-# every file the manifest names must be inside the zip (the same
-# guard the release workflow runs).
+# gecko id injected here pins the add-on identity), so the two
+# packages can never drift apart. The source manifest itself is
+# the CHROMIUM manifest and must stay free of the Firefox-only
+# browser_specific_settings block: Chromium shows it as an
+# "unrecognized manifest key" warning and badges the extension
+# with a red Errors button that reads as breakage. Both zips are
+# checked against the manifest: every file the manifest names
+# must be inside the zip (the same guard the release workflow
+# runs).
 set -eu
 cd "$(dirname "$0")/.."
 EXT=extension
@@ -30,6 +35,11 @@ for k, v in src.items():
         ff['background'] = {"scripts": ["fb-classify.js", "background.js"]}
     else:
         ff[k] = v
+# Firefox-only identity block, injected here and ONLY here: the
+# source manifest is the Chromium one and stays clean of it (see
+# the header). Dropping it from the source without injecting it
+# here would unpin the add-on's identity on every reinstall.
+ff['browser_specific_settings'] = {"gecko": {"id": "ndm@nill.download"}}
 with open(f'{ext}/manifest.firefox.json', 'w') as f:
     json.dump(ff, f, indent=2)
     f.write('\n')

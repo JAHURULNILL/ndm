@@ -6,7 +6,7 @@
 # widgets only.
 [package]
 name = "ndm-shell-gtk"
-version = "2.3.7"
+version = "2.3.8"
 edition = "2021"
 description = "NDM — native GTK 3 shell over the ndm-core seam (Linux)"
 license = "MIT OR Apache-2.0"

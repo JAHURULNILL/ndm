@@ -11823,7 +11823,58 @@ pub fn native_host_path() -> Option<PathBuf> {
 /// The native-messaging manifest bodies, built with serde_json
 /// (not string interpolation) on every platform: a host path
 /// containing a quote or backslash must not corrupt the manifest.
+/// The host path as it must appear inside a native-messaging
+/// manifest. `native_host_path` canonicalizes, and on Windows a
+/// canonicalized path carries the verbatim prefix (`\\?\C:\...`,
+/// `\\?\UNC\server\...`): plain DOS paths are what browser host
+/// launchers are built and tested against, and the verbatim form
+/// is a known launch-failure shape (the browser finds the
+/// manifest, yet the channel dies as "error when communicating").
+/// Strip the prefix so the manifest always names the plain path.
+/// Pure string work, compiled on every platform (the tests below
+/// exercise it anywhere); the builders apply it only on Windows,
+/// where canonicalize can produce the prefix.
+pub fn plain_manifest_host_path(host: &str) -> String {
+    if let Some(rest) = host.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = host.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn manifest_path(host: &str) -> String {
+    plain_manifest_host_path(host)
+}
+
+#[cfg(not(windows))]
+fn manifest_path(host: &str) -> String {
+    host.to_string()
+}
+
+/// Append one line to `host.log` in the app-data dir — the shared
+/// evidence file for the whole browser-bridge path: the app logs
+/// its registration verdict here at every launch, the host logs
+/// its starts and failures (ndm-host carries the same helper).
+/// One rotation level keeps it bounded (~256 KB + one backup).
+/// Best effort throughout: logging must never break its caller.
+pub fn append_host_log(dir: &Path, line: &str) {
+    use std::io::Write as _;
+    let path = dir.join("host.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 256 * 1024 {
+            let _ = std::fs::rename(&path, dir.join("host.log.old"));
+        }
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 pub fn chrome_host_manifest(host: &str) -> String {
+    let host = manifest_path(host);
     serde_json::json!({
         "name": "com.ndm.host",
         "description": "Nill Download Manager native messaging host",
@@ -11835,6 +11886,7 @@ pub fn chrome_host_manifest(host: &str) -> String {
 }
 
 pub fn firefox_host_manifest(host: &str) -> String {
+    let host = manifest_path(host);
     serde_json::json!({
         "name": "com.ndm.host",
         "description": "Nill Download Manager native messaging host",
@@ -11893,6 +11945,66 @@ pub fn register_native_hosts_windows(host: &Path) {
             .args(["add", key, "/ve", "/t", "REG_SZ", "/d", manifest, "/f"])
             .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
             .status();
+    }
+    verify_windows_host_registration(&dir, &chrome_path, &host);
+}
+
+/// Read back what `register_native_hosts_windows` just wrote —
+/// the manifest file (does it parse? does its path name a real
+/// file? is it the plain, un-prefixed path?) and the Chrome
+/// registry value (does it name that manifest?) — and leave the
+/// verdict as one line in host.log. Registration used to be
+/// fire-and-forget: when the bridge failed in the field there was
+/// no evidence anywhere of which link in the chain broke. A FAIL
+/// line names the broken link; the next launch retries the write
+/// regardless, exactly as before.
+#[cfg(windows)]
+fn verify_windows_host_registration(dir: &Path, chrome_manifest: &Path, host: &str) {
+    use std::os::windows::process::CommandExt;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let verdict = (|| -> Result<(), String> {
+        let raw = std::fs::read_to_string(chrome_manifest)
+            .map_err(|e| format!("manifest unreadable: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|e| format!("manifest unparseable: {e}"))?;
+        let p = v
+            .get("path")
+            .and_then(|x| x.as_str())
+            .ok_or("manifest has no path")?;
+        if !Path::new(p).is_file() {
+            return Err(format!("manifest path is not a file: {p}"));
+        }
+        let want = plain_manifest_host_path(host);
+        if p != want {
+            return Err(format!("manifest path mismatch: {p} != {want}"));
+        }
+        let out = std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKCU\Software\Google\Chrome\NativeMessagingHosts\com.ndm.host",
+                "/ve",
+            ])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output()
+            .map_err(|e| format!("reg query failed: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.contains(&chrome_manifest.to_string_lossy().into_owned()) {
+            return Err("Chrome registry value does not name the manifest".to_string());
+        }
+        Ok(())
+    })();
+    match verdict {
+        Ok(()) => append_host_log(
+            dir,
+            &format!(
+                "{ts} register ok host={}",
+                plain_manifest_host_path(host)
+            ),
+        ),
+        Err(why) => append_host_log(dir, &format!("{ts} register FAIL {why}")),
     }
 }
 
@@ -14477,6 +14589,37 @@ mod tests {
         // as optional
         let offer = pending_update_payload(Some(&info), false);
         assert_eq!(offer["mandatory"], false);
+    }
+
+    #[test]
+    fn manifest_host_path_strips_the_windows_verbatim_prefix() {
+        // native_host_path canonicalizes; on Windows that yields
+        // \\?\ verbatim paths, which must never reach a browser
+        // host manifest — the browser finds the manifest yet the
+        // launch dies ("error when communicating"). The strip is
+        // pure string work, so it is locked in here on any OS.
+        assert_eq!(
+            plain_manifest_host_path(r"\\?\C:\Users\nill\AppData\Local\Programs\Nill Download Manager\ndm-host.exe"),
+            r"C:\Users\nill\AppData\Local\Programs\Nill Download Manager\ndm-host.exe"
+        );
+        assert_eq!(
+            plain_manifest_host_path(r"\\?\UNC\server\share\ndm-host.exe"),
+            r"\\server\share\ndm-host.exe"
+        );
+        // plain paths pass through untouched, on either platform
+        assert_eq!(
+            plain_manifest_host_path(r"C:\Program Files\NDM\ndm-host.exe"),
+            r"C:\Program Files\NDM\ndm-host.exe"
+        );
+        assert_eq!(
+            plain_manifest_host_path("/usr/lib/ndm/ndm-host"),
+            "/usr/lib/ndm/ndm-host"
+        );
+        // the builders embed exactly the path they are given here
+        // (off-Windows there is no prefix to strip)
+        let m = chrome_host_manifest("/usr/lib/ndm/ndm-host");
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        assert_eq!(v["path"], "/usr/lib/ndm/ndm-host");
     }
 
     #[test]

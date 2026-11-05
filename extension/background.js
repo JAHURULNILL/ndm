@@ -12,6 +12,21 @@
 
 const HOST_NAME = 'com.ndm.host';
 
+/* Map a raw native-messaging failure to the words the user sees.
+   Chrome's own text for a host that launched but whose channel
+   broke ("Error when communicating with the native messaging
+   host") names no cause and no next step; the one action that
+   heals the common cases is opening the app (it re-registers the
+   bridge and starts the current host). Anything else passes
+   through verbatim — inventing friendly text for errors we do
+   not understand would hide real faults. */
+function friendlyHostError(text) {
+  if (/Error when communicating/i.test(text || '')) {
+    return "NDM's browser bridge stopped unexpectedly. Open the NDM app once, then try again.";
+  }
+  return text || 'Could not reach NDM native host.';
+}
+
 /* The shared Facebook module (fb-classify.js): the classifier and
    the pure per-video grouping decisions the recorder below keys
    its captures by. Loaded once here; if it somehow fails, FBC
@@ -522,7 +537,7 @@ function sendCapturedNative(msg) {
             ok: false,
             error: missing
               ? 'NDM native host is not registered. Open the NDM desktop app once to register it.'
-              : text || 'Could not reach NDM native host.',
+              : friendlyHostError(text),
           });
           return;
         }
@@ -855,7 +870,7 @@ function sendToNdm(message) {
             ok: false,
             error: missing
               ? 'NDM native host is not registered. Open the NDM desktop app once to register it.'
-              : text || 'Could not reach NDM native host.',
+              : friendlyHostError(text),
           });
           return;
         }
@@ -943,7 +958,7 @@ function sendControl(type, entry, extra) {
           const text = chrome.runtime.lastError.message || '';
           const missing = /not found|No such native/i.test(text);
           setHostStatus(missing ? 'host-missing' : 'fail');
-          resolve({ ok: false, error: text || 'Could not reach NDM native host.' });
+          resolve({ ok: false, error: friendlyHostError(text) });
           return;
         }
         const ok = !!(response && response.ok);
@@ -997,7 +1012,7 @@ function probeWithNdm(url, cookies) {
             ok: false,
             error: missing
               ? 'NDM native host is not registered. Open the NDM desktop app once to register it.'
-              : text || 'Could not reach NDM native host.',
+              : friendlyHostError(text),
           });
           return;
         }
