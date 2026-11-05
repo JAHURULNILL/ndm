@@ -42,7 +42,7 @@ jobs:
           # changed upstream tarball fails this step loudly instead
           # of shipping an unverified ffmpeg. Refresh the pin
           # deliberately when adopting a newer build.
-          echo "41935986e233c418caef02fe35c5d5a8a4c5c59e8cdd65701dde742d8ec1fbea /tmp/ff.tar.xz" | sha256sum -c -
+          echo "2138a5fc4d7b7f2f8eadbf1f1a3e76700d8729483c800afea9f99d3e55b00072 /tmp/ff.tar.xz" | sha256sum -c -
           tar -xJf /tmp/ff.tar.xz -C /tmp
           cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg tools/ffmpeg
           chmod +x tools/ffmpeg
