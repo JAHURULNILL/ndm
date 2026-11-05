@@ -14484,12 +14484,21 @@ mod tests {
         // 2.3.7: the background checker offers exactly what the
         // in-app latch would — strictly newer, well-formed, with
         // a package this platform can install
-        let mk = |version: &str, deb_url: &str| -> ndm::updater::ReleaseInfo {
+        // every platform asset is filled from the same value:
+        // usable_update_asset reads deb_url off-Windows and the
+        // win_* URLs on Windows, so a deb-only fixture makes the
+        // offer platform-dependent and the Windows CI test fails
+        // on a correct refusal (2.3.7, run #91)
+        let mk = |version: &str, asset_url: &str| -> ndm::updater::ReleaseInfo {
             serde_json::from_value(serde_json::json!({
                 "version": version,
                 "notes": "",
                 "min_supported": "",
-                "deb_url": deb_url,
+                "deb_url": asset_url,
+                "win_url": asset_url,
+                "win_setup_url": asset_url,
+                "win_x86_url": asset_url,
+                "win_x86_setup_url": asset_url,
             }))
             .expect("release info parses")
         };
@@ -14498,7 +14507,6 @@ mod tests {
         assert!(!update_offer_from(&mk("2.3.5", "https://x/ndm.deb"), "2.3.6"));
         assert!(!update_offer_from(&mk("2.x", "https://x/ndm.deb"), "2.3.6"));
         assert!(!update_offer_from(&mk("", "https://x/ndm.deb"), "2.3.6"));
-        #[cfg(not(windows))]
         assert!(!update_offer_from(&mk("2.3.7", ""), "2.3.6"));
     }
 
